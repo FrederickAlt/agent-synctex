@@ -1,9 +1,10 @@
 # pdf-preview
 
-Pi extension that exposes four tools:
+Pi extension that exposes five tools:
 
 - `show_latex` — compile LaTeX source and trigger the fixed preview pipeline.
 - `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
+- `get_synctex_callback_command` — print the current session's exact Zathura inverse SyncTeX callback command for manual configuration.
 - `compile_latex_file` — compile a local LaTeX source file in place without opening or publishing a preview.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
@@ -15,6 +16,7 @@ LaTeX project-relative includes/assets resolve without using the backend service
 
 - `index.ts` — Pi extension entry point.
 - `pdf_tracking.ts` — PDF validation, Zathura opening, and in-memory session tracking helpers.
+- `synctex.ts` and `scripts/pi_synctex_callback.mjs` — session-scoped inverse SyncTeX IPC and Zathura callback forwarding.
 - `scripts/show_latex_mcp.py` — copied service bridge used by the extension.
 - `scripts/show_latex_viewer.py` and `systemd/codex-show-latex-viewer.service` — same helper service files from the original implementation.
 
@@ -32,6 +34,24 @@ pi -e /path/to/pdf-preview
 `open_pdf(pdf_file_path)` validates that the path exists, is readable, is a regular PDF file, then launches Zathura with `--fork`. Successful calls return `ok: pdf_id=<id> pdf=<path>` and include `pdf_id` in tool details. IDs are short-lived, session-local values; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID within that session where practical, while distinct PDFs receive distinct IDs.
 
 Open failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
+
+## Inverse SyncTeX PDF clicks
+
+Each Pi session starts a private Unix-socket callback endpoint with a random token. PDFs opened through `open_pdf` are launched with Zathura's `--synctex-editor-command=<command>` already set to the correct session-specific callback.
+
+When Zathura invokes the callback, the extension pastes this block at the current interactive editor cursor and does not submit it or trigger/steer an agent turn:
+
+```text
+PDF click: relative/path/main.tex:123
+<source line>
+
+```
+
+The path is relative to the Pi session cwd. The source line is included when the clicked source file is readable; otherwise the block still ends with the blank line.
+
+For manual Zathura configuration, call `get_synctex_callback_command` or run the `/synctex_callback_command` slash command in the current Pi session. The returned command is exact for that session only and should be configured as Zathura's `synctex-editor-command`; do not reuse it in another Pi session.
+
+In headless/non-interactive sessions the callback never submits a message automatically. If a PDF click arrives while the agent is busy/streaming, it only pastes into the editor.
 
 ## Development
 

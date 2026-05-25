@@ -81,6 +81,29 @@ test("openPdfInZathura launches zathura with --fork and the PDF path", async () 
 	assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), ["--fork", pdf]);
 });
 
+test("openPdfInZathura wires an inverse SyncTeX editor command when provided", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const argsFile = join(dir, "args.txt");
+	const fakeZathura = join(dir, "zathura");
+	const synctexCommand = "node callback.mjs --file '%{input}' --line '%{line}'";
+	writeMinimalPdf(pdf);
+	writeFileSync(fakeZathura, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	await openPdfInZathura(pdf, undefined, {
+		command: fakeZathura,
+		timeoutMs: 1000,
+		synctexEditorCommand: synctexCommand,
+	});
+
+	assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), [
+		`--synctex-editor-command=${synctexCommand}`,
+		"--fork",
+		pdf,
+	]);
+});
+
 test("openPdfInZathura surfaces zathura launch failures", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");

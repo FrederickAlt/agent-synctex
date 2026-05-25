@@ -4,9 +4,10 @@ import { accessSync, constants, existsSync, mkdirSync, readFileSync, statSync, w
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { normalizePdfFilePath, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
+import { SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;
@@ -541,6 +542,35 @@ function resolveMcpScriptPath(): string {
 	return candidates[0] ?? "/tmp/show_latex_mcp.py";
 }
 
+function resolveSynctexCallbackScriptPath(): string {
+	const candidates: string[] = [];
+
+	try {
+		const extDir = dirname(fileURLToPath(new URL("./", import.meta.url)));
+		candidates.push(resolve(extDir, "scripts", "pi_synctex_callback.mjs"));
+	} catch {
+		// extension root detection unavailable in this runtime mode
+	}
+
+	candidates.push(resolve(process.cwd(), "scripts", "pi_synctex_callback.mjs"));
+	candidates.push(resolve(process.cwd(), ".pi", "extensions", "pdf-preview", "scripts", "pi_synctex_callback.mjs"));
+	candidates.push(resolve(homedir(), ".pi", "agent", "extensions", "pdf-preview", "scripts", "pi_synctex_callback.mjs"));
+
+	for (const candidate of candidates) {
+		if (existsSync(candidate)) return candidate;
+	}
+
+	return candidates[0] ?? "/tmp/pi_synctex_callback.mjs";
+}
+
+function synctexPasteTarget(ctx: ExtensionContext): SynctexPasteTarget {
+	return {
+		cwd: ctx.cwd,
+		hasUI: ctx.hasUI,
+		ui: ctx.ui,
+	};
+}
+
 class ShowLatexMcpClient {
 	private child: ChildProcessWithoutNullStreams | null = null;
 	private lineReader: Interface | null = null;
@@ -1007,8 +1037,10 @@ class ShowLatexMcpClient {
 }
 
 const MCP_SCRIPT_PATH = resolveMcpScriptPath();
+const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
 const pdfTracker = new PdfTracker();
+const synctexCallbacks = new SynctexCallbackServer({ callbackScriptPath: SYNCTEX_CALLBACK_SCRIPT_PATH });
 
 const LatexCompilerParam = Type.Optional(Type.Union([
 	Type.Literal("lualatex"),
@@ -1061,6 +1093,8 @@ const SetLatexPreambleParams = Type.Object(
 	{ additionalProperties: false },
 );
 
+const SynctexCallbackCommandParams = Type.Object({}, { additionalProperties: false });
+
 async function compileAndPreviewLatex(latexSource: string, compiler?: LatexCompiler, signal?: AbortSignal): Promise<string> {
 	if (!latexSource.trim()) {
 		throw new Error("latex_source must be a non-empty string");
@@ -1075,6 +1109,23 @@ async function compileAndPreviewLatex(latexSource: string, compiler?: LatexCompi
 
 export default function (pi: ExtensionAPI) {
 	initializeLatexPreambleFile();
+
+	pi.on("session_start", (_event, ctx) => {
+		void synctexCallbacks.ensureStarted(synctexPasteTarget(ctx)).catch((error) => {
+			if (ctx.hasUI) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Failed to start SyncTeX callback server: ${message}`, "error");
+			}
+		});
+	});
+
+	pi.registerCommand("synctex_callback_command", {
+		description: "Paste the exact session-specific Zathura SyncTeX callback command into the editor for manual configuration.",
+		async handler(_args, ctx) {
+			const command = await synctexCallbacks.ensureStarted(synctexPasteTarget(ctx));
+			if (ctx.hasUI) ctx.ui.pasteToEditor(`${command}\n`);
+		},
+	});
 
 	pi.registerTool({
 		name: "show_latex",
@@ -1110,16 +1161,18 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "open_pdf",
 		label: "Open PDF",
-		description: "Open an existing local PDF in Zathura and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same normalized PDF path again reuses its existing ID where practical.",
+		description: "Open an existing local PDF in Zathura and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same normalized PDF path again reuses its existing ID where practical. Zathura is launched with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
 		promptSnippet: "Open and track a local PDF in Zathura",
 		promptGuidelines: [
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
 			"Pass an existing local PDF path. The returned pdf_id is short-lived and valid only in the current Pi session.",
+			"Extension-opened Zathura PDFs are wired to paste inverse SyncTeX clicks into the current interactive editor without triggering an agent turn.",
 		],
 		parameters: OpenPdfParams,
-		async execute(_toolCallId, params, signal) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			let requestedPath = "";
 			let pdfPath = "";
+			let synctexCommand = "";
 			try {
 				requestedPath = String(params.pdf_file_path ?? "");
 				if (!requestedPath.trim()) {
@@ -1127,18 +1180,51 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				pdfPath = normalizePdfFilePath(requestedPath);
-				await openPdfInZathura(pdfPath, signal);
+				if (ctx) {
+					synctexCommand = await synctexCallbacks.ensureStarted(synctexPasteTarget(ctx));
+				}
+				await openPdfInZathura(pdfPath, signal, synctexCommand ? { synctexEditorCommand: synctexCommand } : {});
 				const trackedPdf = pdfTracker.trackOpenedPdf(pdfPath);
+				const text = synctexCommand
+					? `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
+					: `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}`;
 				return {
-					content: [{ type: "text", text: `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}` }],
-					details: { pdf_id: trackedPdf.id, pdf: trackedPdf.path },
+					content: [{ type: "text", text }],
+					details: { pdf_id: trackedPdf.id, pdf: trackedPdf.path, synctex_callback_command: synctexCommand },
 				};
 			} catch (error) {
 				throw latexToolFailure("open-pdf", "Open PDF failed", {
 					requested_path: requestedPath,
 					pdf: pdfPath,
+					synctex_callback_command: synctexCommand,
 				}, error);
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: "get_synctex_callback_command",
+		label: "Get SyncTeX Callback Command",
+		description: "Return the exact session-specific Zathura inverse SyncTeX callback command for manual configuration. The command forwards Zathura %{input}/%{line} clicks to this Pi session and only pastes text into the interactive editor; it never submits a message.",
+		promptSnippet: "Get the current session's Zathura inverse SyncTeX callback command",
+		promptGuidelines: [
+			"Use get_synctex_callback_command when the user wants to configure Zathura manually for inverse SyncTeX clicks.",
+			"The returned command is specific to the current running Pi session and should be used as Zathura's synctex-editor-command.",
+		],
+		parameters: SynctexCallbackCommandParams,
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			if (!ctx) throw new Error("SyncTeX callback command is only available inside a Pi session");
+			const command = await synctexCallbacks.ensureStarted(synctexPasteTarget(ctx));
+			const text = [
+				"Zathura SyncTeX callback command:",
+				command,
+				"",
+				"Manual use: configure this as zathura's synctex-editor-command for the current Pi session.",
+			].join("\n");
+			return {
+				content: [{ type: "text", text }],
+				details: { command },
+			};
 		},
 	});
 
@@ -1204,6 +1290,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		pdfTracker.clear();
+		await synctexCallbacks.close();
 		await mcpClient.shutdown();
 	});
 }
