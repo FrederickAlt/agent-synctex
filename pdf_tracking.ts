@@ -254,6 +254,8 @@ function runPdfOpenProcess(
 			settled = true;
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);
+			child.stdout.destroy();
+			child.stderr.destroy();
 			callback();
 		};
 
@@ -261,7 +263,7 @@ function runPdfOpenProcess(
 			finish(() => reject(error));
 		});
 
-		child.on("close", (exitCode, closeSignal) => {
+		child.on("exit", (exitCode, closeSignal) => {
 			finish(() => resolvePromise({
 				exitCode,
 				signal: closeSignal,
