@@ -6,7 +6,7 @@ import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { normalizePdfFilePath, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
+import { jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./pdf_tracking.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;
@@ -1038,6 +1038,10 @@ const CompileLatexFileParams = Type.Object(
 			minLength: 1,
 		}),
 		compiler: LatexCompilerParam,
+		open_pdf: Type.Optional(Type.Boolean({
+			description: "When true, open and track the compiled PDF after successful compilation. Defaults to false.",
+			default: false,
+		})),
 	},
 	{ additionalProperties: false },
 );
@@ -1048,6 +1052,24 @@ const OpenPdfParams = Type.Object(
 			description: "Path to an existing local PDF file to open in Zathura and track for later SyncTeX actions.",
 			minLength: 1,
 		}),
+	},
+	{ additionalProperties: false },
+);
+
+const JumpPdfParams = Type.Object(
+	{
+		pdf_id: Type.Number({
+			description: "Tracked numeric PDF ID returned by open_pdf or compile_latex_file(..., open_pdf=true). Arbitrary PDF paths are not accepted.",
+			minimum: 1,
+		}),
+		line: Type.Number({
+			description: "1-based source line to jump to. The tool supplies the SyncTeX column automatically.",
+			minimum: 1,
+		}),
+		source_file: Type.Optional(Type.String({
+			description: "Optional source file for the SyncTeX jump. Omit when the tracked PDF has a known default source; pass it for included-file or ambiguous SyncTeX cases.",
+			minLength: 1,
+		})),
 	},
 	{ additionalProperties: false },
 );
@@ -1071,6 +1093,14 @@ async function compileAndPreviewLatex(latexSource: string, compiler?: LatexCompi
 	}
 
 	return mcpClient.callShowLatex(applyLatexPreamble(latexSource, readLatexPreambleFromTmpdir()), compiler, signal);
+}
+
+function resolvePositiveInteger(value: unknown, name: string): number {
+	const numberValue = typeof value === "number" ? value : Number(value);
+	if (!Number.isInteger(numberValue) || numberValue < 1) {
+		throw new Error(`${name} must be a positive integer`);
+	}
+	return numberValue;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1126,12 +1156,11 @@ export default function (pi: ExtensionAPI) {
 					throw new Error("pdf_file_path must be a non-empty string");
 				}
 
-				pdfPath = normalizePdfFilePath(requestedPath);
-				await openPdfInZathura(pdfPath, signal);
-				const trackedPdf = pdfTracker.trackOpenedPdf(pdfPath);
+				const trackedPdf = await openAndTrackPdf(requestedPath, pdfTracker, signal);
+				pdfPath = trackedPdf.path;
 				return {
 					content: [{ type: "text", text: `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}` }],
-					details: { pdf_id: trackedPdf.id, pdf: trackedPdf.path },
+					details: { pdf_id: trackedPdf.id, pdf: trackedPdf.path, source: trackedPdf.sourceFile },
 				};
 			} catch (error) {
 				throw latexToolFailure("open-pdf", "Open PDF failed", {
@@ -1143,12 +1172,51 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "jump_pdf",
+		label: "Jump PDF",
+		description: "Perform a line-based Zathura forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. Uses the tracked default source file when known, or pass source_file for ambiguous/included-file jumps.",
+		promptSnippet: "Jump to a source line in a tracked PDF",
+		promptGuidelines: [
+			"Use jump_pdf to move an already tracked Zathura PDF to a source line via forward SyncTeX.",
+			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); do not pass arbitrary PDF paths.",
+			"Omit source_file when the tracked PDF has a known default source. If the tool asks for source_file, retry with the relevant .tex file, especially for included files.",
+		],
+		parameters: JumpPdfParams,
+		async execute(_toolCallId, params, signal) {
+			let pdfId = 0;
+			let line = 0;
+			let sourceFile: string | undefined;
+			try {
+				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
+				line = resolvePositiveInteger(params.line, "line");
+				sourceFile = params.source_file === undefined ? undefined : String(params.source_file);
+				if (sourceFile !== undefined && !sourceFile.trim()) {
+					throw new Error("source_file must be a non-empty string when provided");
+				}
+
+				const result = await jumpToTrackedPdf(pdfId, line, sourceFile, pdfTracker, signal);
+				return {
+					content: [{ type: "text", text: `ok: pdf_id=${pdfId} line=${line} source=${result.sourceFile} pdf=${result.pdf}${result.reopened ? " reopened=true" : ""}` }],
+					details: { pdf_id: pdfId, line, source: result.sourceFile, pdf: result.pdf, reopened: result.reopened },
+				};
+			} catch (error) {
+				throw latexToolFailure("jump-pdf", "PDF jump failed", {
+					pdf_id: pdfId || params.pdf_id,
+					line: line || params.line,
+					source_file: sourceFile ?? params.source_file,
+				}, error);
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "compile_latex_file",
 		label: "Compile LaTeX File",
-		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles. This tool does not open or publish a preview.",
+		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set open_pdf=true to open and track the successfully compiled PDF. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles.",
 		promptSnippet: "Compile a local LaTeX file as PDF",
 		promptGuidelines: [
-			"Use compile_latex_file when the user asks to compile an existing LaTeX source file path without opening a preview. Omit compiler for the lualatex default, or set compiler when a different engine is needed.",
+			"Use compile_latex_file when the user asks to compile an existing LaTeX source file path. Omit compiler for the lualatex default, or set compiler when a different engine is needed.",
+			"By default this compiles only. Set open_pdf=true only when the user wants the compiled PDF opened/tracked immediately.",
 			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
 			"On failure this tool returns only a short error message and writes details to a temporary log file.",
 		],
@@ -1156,7 +1224,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal) {
 			let requestedPath = "";
 			let latexFilePath = "";
+			let pdfPath = "";
 			let compiler: LatexCompiler | undefined;
+			let shouldOpenPdf = false;
 			try {
 				requestedPath = String(params.latex_file_path ?? "");
 				if (!requestedPath.trim()) {
@@ -1165,16 +1235,36 @@ export default function (pi: ExtensionAPI) {
 
 				latexFilePath = resolveLatexFilePath(requestedPath);
 				compiler = resolveLatexCompiler(params.compiler);
-				const pdfPath = await compileLatexFile(latexFilePath, compiler, signal);
-				return {
-					content: [{ type: "text", text: `ok: ${pdfPath}` }],
-					details: { source: latexFilePath, pdf: pdfPath },
-				};
+				shouldOpenPdf = params.open_pdf === true;
+				pdfPath = await compileLatexFile(latexFilePath, compiler, signal);
+				if (!shouldOpenPdf) {
+					return {
+						content: [{ type: "text", text: `ok: ${pdfPath}` }],
+						details: { source: latexFilePath, pdf: pdfPath },
+					};
+				}
+
+				try {
+					const trackedPdf = await openAndTrackPdf(pdfPath, pdfTracker, signal, undefined, latexFilePath);
+					return {
+						content: [{ type: "text", text: `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}` }],
+						details: { source: latexFilePath, pdf: trackedPdf.path, pdf_id: trackedPdf.id },
+					};
+				} catch (error) {
+					throw latexToolFailure("compile-latex-file", "LaTeX compile succeeded but opening failed", {
+						requested_path: requestedPath,
+						source: latexFilePath,
+						compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
+						pdf: pdfPath,
+					}, error);
+				}
 			} catch (error) {
 				throw latexToolFailure("compile-latex-file", "LaTeX compile failed", {
 					requested_path: requestedPath,
 					source: latexFilePath,
 					compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
+					open_pdf: shouldOpenPdf,
+					pdf: pdfPath,
 				}, error);
 			}
 		},
