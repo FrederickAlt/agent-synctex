@@ -223,6 +223,8 @@ function runPdfOpenProcess(
 		let settled = false;
 
 		const child = spawn(command, args, {
+			detached: true,
+			stdio: ["ignore", "pipe", "pipe"],
 			env: {
 				...process.env,
 				HOME: process.env.HOME || homedir(),
@@ -237,6 +239,7 @@ function runPdfOpenProcess(
 
 		child.stdout.on("data", appendOutput);
 		child.stderr.on("data", appendOutput);
+		child.unref();
 
 		const timer = setTimeout(() => {
 			timedOut = true;

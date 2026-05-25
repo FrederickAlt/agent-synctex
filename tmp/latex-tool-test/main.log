@@ -1,4 +1,4 @@
-This is LuaHBTeX, Version 1.18.0 (TeX Live 2025/dev/Debian)  (format=lualatex 2026.5.20)  25 MAY 2026 19:19
+This is LuaHBTeX, Version 1.18.0 (TeX Live 2025/dev/Debian)  (format=lualatex 2026.5.20)  25 MAY 2026 19:27
  file:line:error style messages enabled.
 **main.tex
 (./main.tex
@@ -44,8 +44,8 @@ mf-dist/tex/latex/base/article.cls
 Document Class: article 2024/06/29 v1.4n Standard LaTeX document class
 (/usr/share/texlive/texmf-dist/tex/latex/base/size10.clo
 File: size10.clo 2024/06/29 v1.4n Standard LaTeX file (size option)
-luaotfload | db : Font names database not found, generating new one.
-luaotfload | db : This can take several minutes; please be patient.)
+luaotfload | db : Font names database loaded from /home/frederick/.texlive2025/t
+exmf-var/luatex-cache/generic/names/luaotfload-names.luc.gz)
 \c@part=\count194
 \c@section=\count195
 \c@subsection=\count196

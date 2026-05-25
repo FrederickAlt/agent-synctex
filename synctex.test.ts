@@ -179,6 +179,58 @@ test("callback script forwards clicks to only the matching session token", async
 	}
 });
 
+test("callback server refreshes the editor immediately after a click when the UI exposes setEditorText", async () => {
+	const dir = tempDir();
+	const cwd = join(dir, "project");
+	const source = join(cwd, "main.tex");
+	mkdirSync(cwd, { recursive: true });
+	writeFileSync(source, "alpha\nbeta\n", { flag: "wx" });
+
+	let editorText = "existing prompt\n";
+	let refreshedText = "";
+	const server = new SynctexCallbackServer({
+		tmpDir: dir,
+		callbackScriptPath: resolve("scripts/pi_synctex_callback.mjs"),
+		nodePath: process.execPath,
+	});
+	await server.ensureStarted({
+		cwd,
+		hasUI: true,
+		ui: {
+			pasteToEditor(text: string) {
+				editorText += text;
+			},
+			getEditorText() {
+				return editorText;
+			},
+			setEditorText(text: string) {
+				refreshedText = text;
+				editorText = text;
+			},
+		},
+	});
+
+	try {
+		const result = await runCallbackScript([
+			"--socket",
+			server.socketPath,
+			"--token",
+			server.token,
+			"--file",
+			source,
+			"--line",
+			"2",
+		]);
+		assert.equal(result.exitCode, 0, result.stderr);
+		assert.equal(
+			refreshedText,
+			"existing prompt\nPDF click: main.tex:2\nbeta\n\n",
+		);
+	} finally {
+		await server.close();
+	}
+});
+
 test("callback invocation handles substituted paths containing quotes, spaces, and shell metacharacters", async () => {
 	const dir = tempDir();
 	const cwd = join(dir, "project with spaces");

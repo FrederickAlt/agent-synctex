@@ -9,6 +9,8 @@ export interface SynctexPasteTarget {
 	hasUI: boolean;
 	ui?: {
 		pasteToEditor(text: string): void;
+		setEditorText?(text: string): void;
+		getEditorText?(): string;
 	};
 }
 
@@ -226,7 +228,11 @@ export class SynctexCallbackServer {
 			return { ok: true, pasted: false };
 		}
 
-		target.ui.pasteToEditor(formatSynctexPasteBlock(message, target.cwd));
+		const text = formatSynctexPasteBlock(message, target.cwd);
+		target.ui.pasteToEditor(text);
+		if (typeof target.ui.setEditorText === "function" && typeof target.ui.getEditorText === "function") {
+			target.ui.setEditorText(target.ui.getEditorText());
+		}
 		return { ok: true, pasted: true };
 	}
 }

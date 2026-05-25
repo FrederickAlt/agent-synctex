@@ -22,6 +22,11 @@ function writeMinimalPdf(path: string): void {
 	writeFileSync(path, "%PDF-1.7\n% test\n%%EOF\n");
 }
 
+function activeChildProcessHandles(): number {
+	const getActiveHandles = (process as typeof process & { _getActiveHandles: () => Array<{ constructor?: { name?: string } }> })._getActiveHandles;
+	return getActiveHandles().filter((handle: { constructor?: { name?: string } }) => handle.constructor?.name === "ChildProcess").length;
+}
+
 test("assertReadablePdfFile rejects missing, directory, and non-PDF paths clearly", () => {
 	const dir = tempDir();
 	assert.throws(() => assertReadablePdfFile(join(dir, "missing.pdf")), /Cannot stat PDF file/);
@@ -308,4 +313,19 @@ test("openPdfInZathura surfaces zathura launch failures", async () => {
 		() => openPdfInZathura(pdf, undefined, { command: fakeZathura, timeoutMs: 1000 }),
 		/zathura failed to open .*exited 7[\s\S]*no display/,
 	);
+});
+
+test("openPdfInZathura does not leave a live child handle after the launch settles", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const fakeZathura = join(dir, "zathura");
+	writeMinimalPdf(pdf);
+	writeFileSync(fakeZathura, `#!/bin/sh\n(sleep 30) &\nexit 0\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	const before = activeChildProcessHandles();
+	await openPdfInZathura(pdf, undefined, { command: fakeZathura, timeoutMs: 1000 });
+	await new Promise((resolve) => setImmediate(resolve));
+
+	assert.equal(activeChildProcessHandles(), before);
 });
