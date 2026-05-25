@@ -1325,7 +1325,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "open_pdf",
 		label: "Open PDF",
-		description: "Open an existing local PDF in Zathura and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same normalized PDF path again reuses its existing ID where practical. Zathura is launched with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
+		description: "Open an existing local PDF in Zathura and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same PDF path multiple times creates independently tracked Zathura windows where supported, so jump_pdf can target each pdf_id separately. Zathura is launched with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
 		promptSnippet: "Open and track a local PDF in Zathura",
 		promptGuidelines: [
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
@@ -1356,12 +1356,13 @@ export default function (pi: ExtensionAPI) {
 						: undefined,
 				);
 				pdfPath = trackedPdf.path;
+				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
 				const text = synctexCommand
-					? `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
-					: `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}`;
+					? `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
+					: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
 				return {
 					content: [{ type: "text", text }],
-					details: { pdf_id: trackedPdf.id, pdf: trackedPdf.path, source: trackedPdf.sourceFile, synctex_callback_command: synctexCommand },
+					details: { pdf_id: trackedPdf.id, pid: trackedPdf.pid, pdf: trackedPdf.path, source: trackedPdf.sourceFile, synctex_callback_command: synctexCommand },
 				};
 			} catch (error) {
 				throw latexToolFailure("open-pdf", "Open PDF failed", {
@@ -1376,7 +1377,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "close_pdf",
 		label: "Close PDF",
-		description: "Close an extension-tracked Zathura PDF window by pdf_id. The extension sends SIGTERM only to local zathura processes whose command line contains the tracked PDF path, then removes the PDF from this session's tracking table.",
+		description: "Close an extension-tracked Zathura PDF window by pdf_id. When the Zathura process ID is known, only that instance is closed; otherwise the extension falls back to local zathura processes whose command line contains the tracked PDF path. The PDF is then removed from this session's tracking table.",
 		promptSnippet: "Close a tracked PDF in Zathura",
 		promptGuidelines: [
 			"Use close_pdf when the user asks to close a PDF previously opened or tracked by this extension.",
@@ -1411,6 +1412,7 @@ export default function (pi: ExtensionAPI) {
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); do not pass arbitrary PDF paths.",
 			"source_file is optional only when the target line is in the tracked default source file; provide it whenever the target is in another source file or needs disambiguation.",
 			"When the target content is in a file included by \\input, \\include, or similar, pass source_file as the included .tex file and use the line number from that included file. Do not jump to the parent file's \\input/\\include line unless that directive itself is the target.",
+			"After a successful jump, do not tell the user which line you jumped to unless they explicitly ask for the exact line; the user will see the line in the PDF viewer.",
 		],
 		parameters: JumpPdfParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -1529,12 +1531,13 @@ export default function (pi: ExtensionAPI) {
 							: undefined,
 						latexFilePath,
 					);
+					const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
 					const text = synctexCommand
-						? `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
-						: `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}`;
+						? `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
+						: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
 					return {
 						content: [{ type: "text", text }],
-						details: { source: latexFilePath, pdf: trackedPdf.path, pdf_id: trackedPdf.id, synctex_callback_command: synctexCommand },
+						details: { source: latexFilePath, pdf: trackedPdf.path, pdf_id: trackedPdf.id, pid: trackedPdf.pid, synctex_callback_command: synctexCommand },
 					};
 				} catch (error) {
 					throw latexToolFailure("compile-latex-file", "LaTeX compile succeeded but opening failed", {

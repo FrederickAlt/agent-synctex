@@ -50,27 +50,31 @@ test("normalizePdfFilePath resolves symlinks so equivalent paths share one ident
 	assert.equal(normalizePdfFilePath(link), normalizePdfFilePath(pdf));
 });
 
-test("PdfTracker assigns short session-local IDs and reuses the same path ID", () => {
+test("PdfTracker assigns short session-local IDs and tracks repeated paths separately", () => {
 	const tracker = new PdfTracker();
 	const first = tracker.trackOpenedPdf("/tmp/one.pdf");
 	const repeated = tracker.trackOpenedPdf("/tmp/one.pdf");
 	const second = tracker.trackOpenedPdf("/tmp/two.pdf");
 
 	assert.equal(first.id, 1);
-	assert.equal(repeated.id, first.id);
-	assert.equal(second.id, 2);
+	assert.equal(repeated.id, 2);
+	assert.equal(second.id, 3);
 	assert.equal(tracker.getById(first.id)?.path, "/tmp/one.pdf");
+	assert.equal(tracker.getByPath("/tmp/one.pdf")?.id, repeated.id);
 	assert.equal(tracker.getByPath("/tmp/two.pdf")?.id, second.id);
+	assert.deepEqual(tracker.getAllByPath("/tmp/one.pdf").map((entry) => entry.id), [first.id, repeated.id]);
 });
 
-test("PdfTracker stores and updates tracked default source files", () => {
+test("PdfTracker stores default source files and can update a reopened instance", () => {
 	const tracker = new PdfTracker();
 	const first = tracker.trackOpenedPdf("/tmp/one.pdf");
 	assert.equal(first.sourceFile, undefined);
+	assert.equal(first.pid, undefined);
 
-	const repeated = tracker.trackOpenedPdf("/tmp/one.pdf", "/tmp/main.tex");
-	assert.equal(repeated.id, first.id);
-	assert.equal(repeated.sourceFile, "/tmp/main.tex");
+	const reopened = tracker.markReopened(first.id, 1234, "/tmp/main.tex");
+	assert.equal(reopened?.id, first.id);
+	assert.equal(first.sourceFile, "/tmp/main.tex");
+	assert.equal(first.pid, 1234);
 });
 
 test("PdfTracker clear drops session state and resets IDs", () => {
@@ -185,6 +189,17 @@ test("openAndTrackPdf stores an exact default source from the caller", async () 
 	assert.equal(trackedPdf.sourceFile, source);
 });
 
+test("openAndTrackPdf stores a zathura PID returned by the opener", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	writeMinimalPdf(pdf);
+
+	const tracker = new PdfTracker();
+	const trackedPdf = await openAndTrackPdf(pdf, tracker, undefined, async () => 4321);
+
+	assert.equal(trackedPdf.pid, 4321);
+});
+
 test("openAndTrackPdf does not track when opening fails", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");
@@ -218,6 +233,24 @@ test("jumpToTrackedPdf performs a line-based SyncTeX jump using the tracked defa
 
 	assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), ["--synctex-forward", `42:1:${source}`, pdf]);
 	assert.deepEqual(result, { pdf, sourceFile: source, line: 42, reopened: false });
+});
+
+test("jumpToTrackedPdf targets the tracked zathura PID when known", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	const argsFile = join(dir, "args.txt");
+	const fakeZathura = join(dir, "zathura");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+	writeFileSync(fakeZathura, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, 4242);
+	await jumpToTrackedPdf(trackedPdf.id, 12, undefined, tracker, undefined, { command: fakeZathura, timeoutMs: 1000 });
+
+	assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), ["--synctex-forward", `12:1:${source}`, "--synctex-pid=4242", pdf]);
 });
 
 test("jumpToTrackedPdf asks for source_file when no default source is known", async () => {
@@ -292,7 +325,7 @@ test("openPdfInZathura launches zathura with --fork and the PDF path", async () 
 	assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), ["--fork", pdf]);
 });
 
-test("openPdfInZathura does not launch a second zathura when the PDF is already open", async () => {
+test("openPdfInZathura can reuse an existing zathura when requested", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");
 	const argsFile = join(dir, "args.txt");
@@ -305,6 +338,7 @@ test("openPdfInZathura does not launch a second zathura when the PDF is already 
 		command: fakeZathura,
 		timeoutMs: 1000,
 		isAlreadyOpen: () => true,
+		reuseExisting: true,
 	});
 
 	assert.equal(existsSync(argsFile), false);
@@ -401,4 +435,21 @@ test("closeTrackedPdf closes and removes a tracked PDF", () => {
 	assert.deepEqual(result, { pdf: "/tmp/paper.pdf", pdfId: trackedPdf.id, closedPids: [303], wasTracked: true });
 	assert.equal(tracker.getById(trackedPdf.id), undefined);
 	assert.equal(tracker.getByPath("/tmp/paper.pdf"), undefined);
+});
+
+test("closeTrackedPdf closes only the tracked PID when multiple windows share a PDF path", () => {
+	const tracker = new PdfTracker();
+	const first = tracker.trackOpenedPdf("/tmp/paper.pdf", undefined, 101);
+	const second = tracker.trackOpenedPdf("/tmp/paper.pdf", undefined, 202);
+	const killed: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+	const result = closeTrackedPdf(first.id, tracker, {
+		findPids: () => [101, 202],
+		killProcess: (pid, signal) => killed.push({ pid, signal }),
+	});
+
+	assert.deepEqual(result, { pdf: "/tmp/paper.pdf", pdfId: first.id, closedPids: [101], wasTracked: true });
+	assert.deepEqual(killed, [{ pid: 101, signal: "SIGTERM" }]);
+	assert.equal(tracker.getById(first.id), undefined);
+	assert.equal(tracker.getById(second.id), second);
+	assert.equal(tracker.getByPath("/tmp/paper.pdf"), second);
 });

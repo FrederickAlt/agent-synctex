@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { gunzipSync } from "node:zlib";
 import { accessSync, closeSync, constants, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -8,6 +8,7 @@ export interface TrackedPdf {
 	id: number;
 	path: string;
 	sourceFile?: string;
+	pid?: number;
 	openedAtMs: number;
 	lastOpenedAtMs: number;
 }
@@ -25,10 +26,12 @@ interface ZathuraOpenOptions {
 	timeoutMs?: number;
 	synctexEditorCommand?: string;
 	isAlreadyOpen?: (pdfFilePath: string) => boolean;
+	reuseExisting?: boolean;
 }
 
 interface ZathuraJumpOptions extends ZathuraOpenOptions {
 	opener?: PdfOpener;
+	synctexPid?: number;
 }
 
 interface ZathuraCloseOptions {
@@ -52,6 +55,10 @@ export interface PdfCloseResult {
 
 const PDF_HEADER = "%PDF-";
 const ZATHURA_OPEN_TIMEOUT_MS = 5_000;
+const ZATHURA_PID_DETECTION_TIMEOUT_MS = 750;
+const ZATHURA_PID_POLL_MS = 50;
+const ZATHURA_DBUS_READY_TIMEOUT_MS = 750;
+const ZATHURA_DBUS_FALLBACK_DELAY_MS = 200;
 const PROC_ROOT = "/proc";
 
 function readProcessArgs(pid: string, procRoot = PROC_ROOT): string[] | undefined {
@@ -342,13 +349,61 @@ function runPdfOpenProcess(
 	});
 }
 
+function delay(ms: number): Promise<void> {
+	return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+function zathuraDbusServiceReady(pid: number): boolean | undefined {
+	const result = spawnSync("gdbus", [
+		"introspect",
+		"--session",
+		"--dest",
+		`org.pwmt.zathura.PID-${pid}`,
+		"--object-path",
+		"/org/pwmt/zathura",
+	], { stdio: "ignore", timeout: 500 });
+	if (result.error && "code" in result.error && result.error.code === "ENOENT") return undefined;
+	return result.status === 0;
+}
+
+async function waitForZathuraDbusReady(pid: number, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+	const deadline = Date.now() + Math.max(0, Math.min(timeoutMs, ZATHURA_DBUS_READY_TIMEOUT_MS));
+	while (!signal?.aborted && Date.now() < deadline) {
+		const ready = zathuraDbusServiceReady(pid);
+		if (ready === true) return;
+		if (ready === undefined) break;
+		await delay(ZATHURA_PID_POLL_MS);
+	}
+	await delay(ZATHURA_DBUS_FALLBACK_DELAY_MS);
+}
+
+async function waitForNewZathuraPid(
+	pdfFilePath: string,
+	beforePids: Set<number>,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<number | undefined> {
+	const deadline = Date.now() + Math.max(0, Math.min(timeoutMs, ZATHURA_PID_DETECTION_TIMEOUT_MS));
+	while (true) {
+		const newPids = zathuraPidsForPdf(pdfFilePath).filter((pid) => !beforePids.has(pid));
+		if (newPids.length) {
+			const pid = Math.max(...newPids);
+			await waitForZathuraDbusReady(pid, timeoutMs, signal);
+			return pid;
+		}
+		if (signal?.aborted || Date.now() >= deadline) return undefined;
+		await delay(ZATHURA_PID_POLL_MS);
+	}
+}
+
 export async function openPdfInZathura(
 	pdfFilePath: string,
 	signal?: AbortSignal,
 	options: ZathuraOpenOptions = {},
-): Promise<void> {
-	const isAlreadyOpen = options.isAlreadyOpen ?? zathuraAlreadyOpen;
-	if (isAlreadyOpen(pdfFilePath)) return;
+): Promise<number | undefined> {
+	const existingPids = new Set(zathuraPidsForPdf(pdfFilePath));
+	const isAlreadyOpen = options.isAlreadyOpen ?? ((path: string) => existingPids.size > 0 || zathuraAlreadyOpen(path));
+	if (options.reuseExisting && isAlreadyOpen(pdfFilePath)) return existingPids.size ? Math.max(...existingPids) : undefined;
 
 	const command = options.command ?? "zathura";
 	const timeoutMs = options.timeoutMs ?? ZATHURA_OPEN_TIMEOUT_MS;
@@ -376,6 +431,8 @@ export async function openPdfInZathura(
 		const details = output ? `\n${output}` : "";
 		throw new Error(`zathura failed to open ${pdfFilePath}: exited ${status}${details}`);
 	}
+
+	return waitForNewZathuraPid(pdfFilePath, existingPids, timeoutMs, signal);
 }
 
 async function jumpPdfInZathura(
@@ -383,13 +440,16 @@ async function jumpPdfInZathura(
 	sourceFile: string,
 	line: number,
 	signal?: AbortSignal,
-	options: ZathuraOpenOptions = {},
+	options: ZathuraJumpOptions = {},
 ): Promise<void> {
 	const command = options.command ?? "zathura";
 	const timeoutMs = options.timeoutMs ?? ZATHURA_OPEN_TIMEOUT_MS;
+	const args = ["--synctex-forward", `${line}:1:${sourceFile}`];
+	if (options.synctexPid !== undefined) args.push(`--synctex-pid=${options.synctexPid}`);
+	args.push(pdfFilePath);
 	let result: PdfOpenProcessResult;
 	try {
-		result = await runPdfOpenProcess(command, ["--synctex-forward", `${line}:1:${sourceFile}`, pdfFilePath], timeoutMs, signal);
+		result = await runPdfOpenProcess(command, args, timeoutMs, signal);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Failed to start zathura for SyncTeX jump: ${message}`);
@@ -409,32 +469,37 @@ async function jumpPdfInZathura(
 	}
 }
 
-export type PdfOpener = (pdfFilePath: string, signal?: AbortSignal) => Promise<void>;
+export type PdfOpener = (pdfFilePath: string, signal?: AbortSignal) => Promise<number | undefined | void>;
 
 export class PdfTracker {
-	private readonly trackedPdfsByPath = new Map<string, TrackedPdf>();
+	private readonly trackedPdfsByPath = new Map<string, TrackedPdf[]>();
 	private readonly trackedPdfsById = new Map<number, TrackedPdf>();
 	private nextPdfId = 1;
 
-	trackOpenedPdf(normalizedPdfPath: string, defaultSourceFile?: string): TrackedPdf {
-		const existing = this.trackedPdfsByPath.get(normalizedPdfPath);
-		if (existing) {
-			if (defaultSourceFile) existing.sourceFile = defaultSourceFile;
-			existing.lastOpenedAtMs = Date.now();
-			return existing;
-		}
-
+	trackOpenedPdf(normalizedPdfPath: string, defaultSourceFile?: string, pid?: number): TrackedPdf {
 		const now = Date.now();
-		const trackedPdf = {
+		const trackedPdf: TrackedPdf = {
 			id: this.nextPdfId,
 			path: normalizedPdfPath,
 			sourceFile: defaultSourceFile,
+			pid,
 			openedAtMs: now,
 			lastOpenedAtMs: now,
 		};
 		this.nextPdfId += 1;
-		this.trackedPdfsByPath.set(normalizedPdfPath, trackedPdf);
+		const pathEntries = this.trackedPdfsByPath.get(normalizedPdfPath) ?? [];
+		pathEntries.push(trackedPdf);
+		this.trackedPdfsByPath.set(normalizedPdfPath, pathEntries);
 		this.trackedPdfsById.set(trackedPdf.id, trackedPdf);
+		return trackedPdf;
+	}
+
+	markReopened(pdfId: number, pid?: number, defaultSourceFile?: string): TrackedPdf | undefined {
+		const trackedPdf = this.trackedPdfsById.get(pdfId);
+		if (!trackedPdf) return undefined;
+		if (defaultSourceFile) trackedPdf.sourceFile = defaultSourceFile;
+		trackedPdf.pid = pid;
+		trackedPdf.lastOpenedAtMs = Date.now();
 		return trackedPdf;
 	}
 
@@ -443,14 +508,21 @@ export class PdfTracker {
 	}
 
 	getByPath(normalizedPdfPath: string): TrackedPdf | undefined {
-		return this.trackedPdfsByPath.get(normalizedPdfPath);
+		const pathEntries = this.trackedPdfsByPath.get(normalizedPdfPath);
+		return pathEntries?.at(-1);
+	}
+
+	getAllByPath(normalizedPdfPath: string): TrackedPdf[] {
+		return [...(this.trackedPdfsByPath.get(normalizedPdfPath) ?? [])];
 	}
 
 	untrackById(pdfId: number): TrackedPdf | undefined {
 		const trackedPdf = this.trackedPdfsById.get(pdfId);
 		if (!trackedPdf) return undefined;
 		this.trackedPdfsById.delete(pdfId);
-		this.trackedPdfsByPath.delete(trackedPdf.path);
+		const pathEntries = this.trackedPdfsByPath.get(trackedPdf.path)?.filter((entry) => entry.id !== pdfId) ?? [];
+		if (pathEntries.length) this.trackedPdfsByPath.set(trackedPdf.path, pathEntries);
+		else this.trackedPdfsByPath.delete(trackedPdf.path);
 		return trackedPdf;
 	}
 
@@ -497,6 +569,28 @@ export function closeTrackedPdf(
 	if (!trackedPdf) {
 		throw new Error(`Unknown tracked pdf_id=${pdfId}. Open the PDF first with open_pdf or compile_latex_file(..., open_pdf=true).`);
 	}
+
+	if (trackedPdf.pid !== undefined) {
+		const findPids = options.findPids ?? zathuraPidsForPdf;
+		const killProcess = options.killProcess ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+		if (!findPids(trackedPdf.path).includes(trackedPdf.pid)) {
+			tracker.untrackById(pdfId);
+			return { pdf: trackedPdf.path, pdfId, closedPids: [], wasTracked: true };
+		}
+		try {
+			killProcess(trackedPdf.pid, "SIGTERM");
+			tracker.untrackById(pdfId);
+			return { pdf: trackedPdf.path, pdfId, closedPids: [trackedPdf.pid], wasTracked: true };
+		} catch (error) {
+			if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") {
+				tracker.untrackById(pdfId);
+				return { pdf: trackedPdf.path, pdfId, closedPids: [], wasTracked: true };
+			}
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`Failed to close zathura process ${trackedPdf.pid} for ${trackedPdf.path}: ${message}`);
+		}
+	}
+
 	const closedPids = closePdfInZathura(trackedPdf.path, options);
 	tracker.untrackById(pdfId);
 	return { pdf: trackedPdf.path, pdfId, closedPids, wasTracked: true };
@@ -510,8 +604,8 @@ export async function openAndTrackPdf(
 	defaultSourceFile?: string,
 ): Promise<TrackedPdf> {
 	const pdfPath = normalizePdfFilePath(pdfFilePath);
-	await opener(pdfPath, signal);
-	return tracker.trackOpenedPdf(pdfPath, defaultSourceFile ?? inferDefaultSourceFileForPdf(pdfPath));
+	const pid = await opener(pdfPath, signal);
+	return tracker.trackOpenedPdf(pdfPath, defaultSourceFile ?? inferDefaultSourceFileForPdf(pdfPath), typeof pid === "number" ? pid : undefined);
 }
 
 export async function jumpToTrackedPdf(
@@ -536,20 +630,20 @@ export async function jumpToTrackedPdf(
 	assertReadableSourceFile(resolvedSourceFile);
 
 	try {
-		await jumpPdfInZathura(trackedPdf.path, resolvedSourceFile, line, signal, options);
+		await jumpPdfInZathura(trackedPdf.path, resolvedSourceFile, line, signal, { ...options, synctexPid: options.synctexPid ?? trackedPdf.pid });
 		return { pdf: trackedPdf.path, sourceFile: resolvedSourceFile, line, reopened: false };
 	} catch (firstJumpError) {
 		const opener = options.opener ?? ((pdfPath: string, abortSignal?: AbortSignal) => openPdfInZathura(pdfPath, abortSignal, options));
 		try {
-			await opener(trackedPdf.path, signal);
-			tracker.trackOpenedPdf(trackedPdf.path, trackedPdf.sourceFile);
+			const pid = await opener(trackedPdf.path, signal);
+			tracker.markReopened(pdfId, typeof pid === "number" ? pid : undefined, trackedPdf.sourceFile);
 		} catch (reopenError) {
 			const message = reopenError instanceof Error ? reopenError.message : String(reopenError);
 			throw new Error(`Tracked PDF pdf_id=${pdfId} appears closed or unavailable, and could not be reopened at ${trackedPdf.path}: ${message}`);
 		}
 
 		try {
-			await jumpPdfInZathura(trackedPdf.path, resolvedSourceFile, line, signal, options);
+			await jumpPdfInZathura(trackedPdf.path, resolvedSourceFile, line, signal, { ...options, synctexPid: options.synctexPid ?? trackedPdf.pid });
 			return { pdf: trackedPdf.path, sourceFile: resolvedSourceFile, line, reopened: true };
 		} catch (secondJumpError) {
 			const firstMessage = firstJumpError instanceof Error ? firstJumpError.message : String(firstJumpError);
