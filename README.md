@@ -2,15 +2,17 @@
 
 Pi extension that exposes five tools:
 
-- `show_latex` — compile LaTeX source and trigger the fixed preview pipeline.
+- `show_latex` — compile LaTeX source and trigger the preview pipeline.
 - `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
 - `get_synctex_callback_command` — print the current session's exact Zathura inverse SyncTeX callback command for manual configuration.
 - `compile_latex_file` — compile a local LaTeX source file in place without opening or publishing a preview.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
 Snippet previews communicate with an MCP-style stdio service (`show_latex_mcp.py`) and forward
-`tools/call` with `show_latex`. File compiles are spawned directly by the extension so normal
-LaTeX project-relative includes/assets resolve without using the backend service.
+`tools/call` with `show_latex`. Each successful preview writes an operation-scoped PDF and an
+atomic ready descriptor that pairs that PDF with the session's SyncTeX callback command. File
+compiles are spawned directly by the extension so normal LaTeX project-relative includes/assets
+resolve without using the backend service.
 
 ## Files
 

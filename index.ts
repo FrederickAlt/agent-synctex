@@ -1,6 +1,6 @@
 import { createInterface, type Interface } from "node:readline";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,7 +62,6 @@ const MCP_TMPDIR = "/tmp/codex-show-latex";
 const LATEX_PREAMBLE_FILE_NAMES = ["preamble.tex", "praeamble.tex"] as const;
 const LATEX_PREAMBLE_PATH = resolve(MCP_TMPDIR, "preamble.tex");
 const DEFAULT_LATEX_COMPILER = "lualatex";
-const VIEWER_SYNCTEX_COMMAND_PATH = resolve(MCP_TMPDIR, "zathura-synctex-editor-command");
 const LATEX_COMPILERS = [DEFAULT_LATEX_COMPILER, "pdflatex", "xelatex", "latexmk"] as const;
 type LatexCompiler = (typeof LATEX_COMPILERS)[number];
 const DEFAULT_SNIPPET_PREAMBLE = [
@@ -143,20 +142,6 @@ function initializeLatexPreambleFile(): void {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Failed to copy cwd preamble ${cwdPreambleFile} to ${LATEX_PREAMBLE_PATH}: ${message}`);
-	}
-}
-
-function writeViewerSynctexCommand(command: string): void {
-	ensurePreviewTmpdirAccessible();
-	writeFileSync(VIEWER_SYNCTEX_COMMAND_PATH, `${command}\n`, { mode: 0o600 });
-	chmodSync(VIEWER_SYNCTEX_COMMAND_PATH, 0o600);
-}
-
-function clearViewerSynctexCommand(): void {
-	try {
-		unlinkSync(VIEWER_SYNCTEX_COMMAND_PATH);
-	} catch {
-		// The viewer may not have been configured in this session yet.
 	}
 }
 
@@ -619,7 +604,12 @@ class ShowLatexMcpClient {
 		this.initialized = true;
 	}
 
-	async callShowLatex(latexSource: string, compiler?: LatexCompiler, signal?: AbortSignal): Promise<string> {
+	async callShowLatex(
+		latexSource: string,
+		compiler?: LatexCompiler,
+		synctexEditorCommand?: string,
+		signal?: AbortSignal,
+	): Promise<string> {
 		await this.initialize();
 		const requestStartedMs = Date.now();
 		let beforeStatus: PipelineStatusSnapshot | null = null;
@@ -633,6 +623,7 @@ class ShowLatexMcpClient {
 
 		const argumentsPayload: Record<string, string> = { latex_source: latexSource };
 		if (compiler) argumentsPayload.compiler = compiler;
+		if (synctexEditorCommand) argumentsPayload.synctex_editor_command = synctexEditorCommand;
 
 		const result = await this.sendRequest(
 			"tools/call",
@@ -1055,37 +1046,48 @@ const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
 const pdfTracker = new PdfTracker();
-let synctexCallbacks: SynctexCallbackServer | undefined;
+const synctexCallbacksByContext = new WeakMap<ExtensionContext, SynctexCallbackServer>();
+const synctexCallbackServers = new Set<SynctexCallbackServer>();
 
 function createSynctexCallbackServer(): SynctexCallbackServer {
 	return new SynctexCallbackServer({ callbackScriptPath: SYNCTEX_CALLBACK_SCRIPT_PATH });
 }
 
 async function rotateSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCallbackServer> {
-	const previous = synctexCallbacks;
+	const previous = synctexCallbacksByContext.get(ctx);
 	const next = createSynctexCallbackServer();
-	synctexCallbacks = next;
-	clearViewerSynctexCommand();
+	synctexCallbacksByContext.set(ctx, next);
+	synctexCallbackServers.add(next);
+	if (previous) synctexCallbackServers.delete(previous);
 	await previous?.close();
 	await next.ensureStarted(synctexPasteTarget(ctx));
-	writeViewerSynctexCommand(next.command);
 	return next;
 }
 
 async function ensureSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCallbackServer> {
-	if (!synctexCallbacks) {
-		synctexCallbacks = createSynctexCallbackServer();
+	let server = synctexCallbacksByContext.get(ctx);
+	if (!server) {
+		server = createSynctexCallbackServer();
+		synctexCallbacksByContext.set(ctx, server);
+		synctexCallbackServers.add(server);
 	}
-	await synctexCallbacks.ensureStarted(synctexPasteTarget(ctx));
-	writeViewerSynctexCommand(synctexCallbacks.command);
-	return synctexCallbacks;
+	await server.ensureStarted(synctexPasteTarget(ctx));
+	return server;
 }
 
-async function shutdownSynctexCallbacks(): Promise<void> {
-	const server = synctexCallbacks;
-	synctexCallbacks = undefined;
-	clearViewerSynctexCommand();
-	await server?.close();
+async function shutdownSynctexCallbacks(ctx?: ExtensionContext): Promise<void> {
+	if (ctx) {
+		const server = synctexCallbacksByContext.get(ctx);
+		if (!server) return;
+		synctexCallbacksByContext.delete(ctx);
+		synctexCallbackServers.delete(server);
+		await server.close();
+		return;
+	}
+
+	const servers = [...synctexCallbackServers];
+	synctexCallbackServers.clear();
+	await Promise.all(servers.map((server) => server.close()));
 }
 
 const LatexCompilerParam = Type.Optional(Type.Union([
@@ -1141,7 +1143,12 @@ const SetLatexPreambleParams = Type.Object(
 
 const SynctexCallbackCommandParams = Type.Object({}, { additionalProperties: false });
 
-async function compileAndPreviewLatex(latexSource: string, compiler?: LatexCompiler, signal?: AbortSignal): Promise<string> {
+async function compileAndPreviewLatex(
+	latexSource: string,
+	compiler?: LatexCompiler,
+	synctexEditorCommand?: string,
+	signal?: AbortSignal,
+): Promise<string> {
 	if (!latexSource.trim()) {
 		throw new Error("latex_source must be a non-empty string");
 	}
@@ -1150,7 +1157,12 @@ async function compileAndPreviewLatex(latexSource: string, compiler?: LatexCompi
 		throw new Error(`MCP script not found at ${MCP_SCRIPT_PATH}`);
 	}
 
-	return mcpClient.callShowLatex(applyLatexPreamble(latexSource, readLatexPreambleFromTmpdir()), compiler, signal);
+	return mcpClient.callShowLatex(
+		applyLatexPreamble(latexSource, readLatexPreambleFromTmpdir()),
+		compiler,
+		synctexEditorCommand,
+		signal,
+	);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1193,11 +1205,8 @@ export default function (pi: ExtensionAPI) {
 				if (ctx) {
 					const server = await ensureSynctexCallbacks(ctx);
 					synctexCommand = server.command;
-					writeViewerSynctexCommand(synctexCommand);
-				} else {
-					clearViewerSynctexCommand();
 				}
-				const text = await compileAndPreviewLatex(latexSource, compiler, signal);
+				const text = await compileAndPreviewLatex(latexSource, compiler, synctexCommand, signal);
 				return {
 					content: [{ type: "text", text }],
 					details: {},
@@ -1344,9 +1353,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		pdfTracker.clear();
-		await shutdownSynctexCallbacks();
+		await shutdownSynctexCallbacks(ctx);
 		await mcpClient.shutdown();
 	});
 }

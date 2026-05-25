@@ -53,6 +53,20 @@ test("formatSynctexPasteBlock uses cwd-relative paths and includes the source li
 	);
 });
 
+test("formatSynctexPasteBlock preserves leading and trailing spaces in clicked paths", () => {
+	const dir = tempDir();
+	const cwd = join(dir, "project");
+	const sourceName = "  spaced.tex  ";
+	const source = join(cwd, sourceName);
+	mkdirSync(cwd, { recursive: true });
+	writeFileSync(source, "space sensitive\n", { flag: "wx" });
+
+	assert.equal(
+		formatSynctexPasteBlock({ file: source, line: 1 }, cwd),
+		`PDF click: ${sourceName}:1\nspace sensitive\n\n`,
+	);
+});
+
 test("formatSynctexPasteBlock keeps paths relative to cwd for files outside the project", () => {
 	const dir = tempDir();
 	const cwd = join(dir, "project");

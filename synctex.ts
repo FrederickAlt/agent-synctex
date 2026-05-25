@@ -63,8 +63,8 @@ export function createSynctexCallbackArgv(options: {
 }
 
 function resolveClickedFile(filePath: string, cwd: string): string {
-	const trimmed = filePath.trim();
-	return isAbsolute(trimmed) ? resolve(trimmed) : resolve(cwd, trimmed);
+	if (filePath.length === 0) throw new Error("missing file");
+	return isAbsolute(filePath) ? resolve(filePath) : resolve(cwd, filePath);
 }
 
 function relativeClickedFilePath(filePath: string, cwd: string): string {
@@ -214,7 +214,7 @@ export class SynctexCallbackServer {
 		if (message.token !== this.token) {
 			return { ok: false, error: "invalid token" };
 		}
-		if (typeof message.file !== "string" || !message.file.trim()) {
+		if (typeof message.file !== "string" || message.file.length === 0) {
 			return { ok: false, error: "missing file" };
 		}
 		if (!Number.isInteger(message.line) || message.line < 1) {
