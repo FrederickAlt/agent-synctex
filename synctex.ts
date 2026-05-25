@@ -35,6 +35,8 @@ interface SynctexCallbackResponse {
 
 const DEFAULT_SYNCTEX_TMPDIR = resolve(tmpdir(), "codex-show-latex");
 const SOCKET_NAME_PREFIX = "pi-synctex-";
+const ZATHURA_INPUT_PLACEHOLDER = "%{input}";
+const ZATHURA_LINE_PLACEHOLDER = "%{line}";
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -54,9 +56,9 @@ export function createSynctexCallbackArgv(options: {
 		"--token",
 		options.token,
 		"--file",
-		"%{input}",
+		ZATHURA_INPUT_PLACEHOLDER,
 		"--line",
-		"%{line}",
+		ZATHURA_LINE_PLACEHOLDER,
 	];
 }
 
@@ -93,6 +95,7 @@ export function createSynctexCallbackCommand(options: {
 	socketPath: string;
 	token: string;
 }): string {
+	// Zathura parses this command into argv before replacing placeholders, then spawns argv directly.
 	return createSynctexCallbackArgv(options).map(shellQuote).join(" ");
 }
 

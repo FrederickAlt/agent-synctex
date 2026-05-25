@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -31,6 +31,13 @@ function runCallbackProcess(argv: string[]): Promise<{ exitCode: number | null; 
 
 function runCallbackScript(args: string[]): Promise<{ exitCode: number | null; stderr: string }> {
 	return runCallbackProcess([process.execPath, "scripts/pi_synctex_callback.mjs", ...args]);
+}
+
+function parseZathuraEditorCommandTemplate(command: string): string[] {
+	const script = "import json, shlex, sys; print(json.dumps(shlex.split(sys.argv[1])))";
+	const result = spawnSync("python3", ["-c", script, command], { encoding: "utf8" });
+	assert.equal(result.status, 0, result.stderr);
+	return JSON.parse(result.stdout) as string[];
 }
 
 test("formatSynctexPasteBlock uses cwd-relative paths and includes the source line", () => {
@@ -161,7 +168,8 @@ test("callback script forwards clicks to only the matching session token", async
 test("callback invocation handles substituted paths containing quotes, spaces, and shell metacharacters", async () => {
 	const dir = tempDir();
 	const cwd = join(dir, "project with spaces");
-	const source = join(cwd, "quote ' and $dollar;$(touch pwned)&.tex");
+	const sourceName = "quote ' and \"double\" $dollar;$(touch pwned)&.tex";
+	const source = join(cwd, sourceName);
 	mkdirSync(cwd, { recursive: true });
 	writeFileSync(source, "strange path line\n", { flag: "wx" });
 
@@ -182,15 +190,19 @@ test("callback invocation handles substituted paths containing quotes, spaces, a
 	});
 
 	try {
-		const argv = createSynctexCallbackArgv({
+		const command = createSynctexCallbackCommand({
 			nodePath: process.execPath,
 			callbackScriptPath: resolve("scripts/pi_synctex_callback.mjs"),
 			socketPath: server.socketPath,
 			token: server.token,
-		}).map((arg) => arg.replaceAll("%{input}", source).replaceAll("%{line}", "1"));
+		});
+		const argvTemplate = parseZathuraEditorCommandTemplate(command);
+		assert.equal(argvTemplate[argvTemplate.indexOf("--file") + 1], "%{input}");
+		assert.equal(argvTemplate[argvTemplate.indexOf("--line") + 1], "%{line}");
+		const argv = argvTemplate.map((arg) => arg.replaceAll("%{input}", source).replaceAll("%{line}", "1"));
 		const result = await runCallbackProcess(argv);
 		assert.equal(result.exitCode, 0, result.stderr);
-		assert.deepEqual(pasted, ["PDF click: quote ' and $dollar;$(touch pwned)&.tex:1\nstrange path line\n\n"]);
+		assert.deepEqual(pasted, [`PDF click: ${sourceName}:1\nstrange path line\n\n`]);
 	} finally {
 		await server.close();
 	}
