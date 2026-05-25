@@ -1,6 +1,6 @@
 import { createInterface, type Interface } from "node:readline";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,6 +62,7 @@ const MCP_TMPDIR = "/tmp/codex-show-latex";
 const LATEX_PREAMBLE_FILE_NAMES = ["preamble.tex", "praeamble.tex"] as const;
 const LATEX_PREAMBLE_PATH = resolve(MCP_TMPDIR, "preamble.tex");
 const DEFAULT_LATEX_COMPILER = "lualatex";
+const VIEWER_SYNCTEX_COMMAND_PATH = resolve(MCP_TMPDIR, "zathura-synctex-editor-command");
 const LATEX_COMPILERS = [DEFAULT_LATEX_COMPILER, "pdflatex", "xelatex", "latexmk"] as const;
 type LatexCompiler = (typeof LATEX_COMPILERS)[number];
 const DEFAULT_SNIPPET_PREAMBLE = [
@@ -142,6 +143,20 @@ function initializeLatexPreambleFile(): void {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Failed to copy cwd preamble ${cwdPreambleFile} to ${LATEX_PREAMBLE_PATH}: ${message}`);
+	}
+}
+
+function writeViewerSynctexCommand(command: string): void {
+	ensurePreviewTmpdirAccessible();
+	writeFileSync(VIEWER_SYNCTEX_COMMAND_PATH, `${command}\n`, { mode: 0o600 });
+	chmodSync(VIEWER_SYNCTEX_COMMAND_PATH, 0o600);
+}
+
+function clearViewerSynctexCommand(): void {
+	try {
+		unlinkSync(VIEWER_SYNCTEX_COMMAND_PATH);
+	} catch {
+		// The viewer may not have been configured in this session yet.
 	}
 }
 
@@ -1040,7 +1055,38 @@ const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
 const pdfTracker = new PdfTracker();
-const synctexCallbacks = new SynctexCallbackServer({ callbackScriptPath: SYNCTEX_CALLBACK_SCRIPT_PATH });
+let synctexCallbacks: SynctexCallbackServer | undefined;
+
+function createSynctexCallbackServer(): SynctexCallbackServer {
+	return new SynctexCallbackServer({ callbackScriptPath: SYNCTEX_CALLBACK_SCRIPT_PATH });
+}
+
+async function rotateSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCallbackServer> {
+	const previous = synctexCallbacks;
+	const next = createSynctexCallbackServer();
+	synctexCallbacks = next;
+	clearViewerSynctexCommand();
+	await previous?.close();
+	await next.ensureStarted(synctexPasteTarget(ctx));
+	writeViewerSynctexCommand(next.command);
+	return next;
+}
+
+async function ensureSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCallbackServer> {
+	if (!synctexCallbacks) {
+		synctexCallbacks = createSynctexCallbackServer();
+	}
+	await synctexCallbacks.ensureStarted(synctexPasteTarget(ctx));
+	writeViewerSynctexCommand(synctexCallbacks.command);
+	return synctexCallbacks;
+}
+
+async function shutdownSynctexCallbacks(): Promise<void> {
+	const server = synctexCallbacks;
+	synctexCallbacks = undefined;
+	clearViewerSynctexCommand();
+	await server?.close();
+}
 
 const LatexCompilerParam = Type.Optional(Type.Union([
 	Type.Literal("lualatex"),
@@ -1111,7 +1157,7 @@ export default function (pi: ExtensionAPI) {
 	initializeLatexPreambleFile();
 
 	pi.on("session_start", (_event, ctx) => {
-		void synctexCallbacks.ensureStarted(synctexPasteTarget(ctx)).catch((error) => {
+		void rotateSynctexCallbacks(ctx).catch((error) => {
 			if (ctx.hasUI) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Failed to start SyncTeX callback server: ${message}`, "error");
@@ -1122,8 +1168,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("synctex_callback_command", {
 		description: "Paste the exact session-specific Zathura SyncTeX callback command into the editor for manual configuration.",
 		async handler(_args, ctx) {
-			const command = await synctexCallbacks.ensureStarted(synctexPasteTarget(ctx));
-			if (ctx.hasUI) ctx.ui.pasteToEditor(`${command}\n`);
+			const server = await ensureSynctexCallbacks(ctx);
+			if (ctx.hasUI) ctx.ui.pasteToEditor(`${server.command}\n`);
 		},
 	});
 
@@ -1137,12 +1183,20 @@ export default function (pi: ExtensionAPI) {
 			"If you would otherwise repeat the same LaTeX packages, macros, or style setup, write them with set_latex_preamble or put them in ./preamble.tex or ./praeamble.tex before startup; those files are for pre-\\begin{document} code only, so the preview input should be just the document body or \\begin{document}...\\end{document}.",
 		],
 		parameters: ShowLatexParams,
-		async execute(_toolCallId, params, signal) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			let latexSource = "";
 			let compiler: LatexCompiler | undefined;
+			let synctexCommand = "";
 			try {
 				latexSource = String(params.latex_source ?? "");
 				compiler = resolveLatexCompiler(params.compiler);
+				if (ctx) {
+					const server = await ensureSynctexCallbacks(ctx);
+					synctexCommand = server.command;
+					writeViewerSynctexCommand(synctexCommand);
+				} else {
+					clearViewerSynctexCommand();
+				}
 				const text = await compileAndPreviewLatex(latexSource, compiler, signal);
 				return {
 					content: [{ type: "text", text }],
@@ -1153,6 +1207,7 @@ export default function (pi: ExtensionAPI) {
 					compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
 					latex_source_length: latexSource.length,
 					latex_source_tail: tailText(latexSource, 30000),
+					synctex_callback_command: synctexCommand,
 				}, error);
 			}
 		},
@@ -1181,7 +1236,8 @@ export default function (pi: ExtensionAPI) {
 
 				pdfPath = normalizePdfFilePath(requestedPath);
 				if (ctx) {
-					synctexCommand = await synctexCallbacks.ensureStarted(synctexPasteTarget(ctx));
+					const server = await ensureSynctexCallbacks(ctx);
+					synctexCommand = server.command;
 				}
 				await openPdfInZathura(pdfPath, signal, synctexCommand ? { synctexEditorCommand: synctexCommand } : {});
 				const trackedPdf = pdfTracker.trackOpenedPdf(pdfPath);
@@ -1214,16 +1270,16 @@ export default function (pi: ExtensionAPI) {
 		parameters: SynctexCallbackCommandParams,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			if (!ctx) throw new Error("SyncTeX callback command is only available inside a Pi session");
-			const command = await synctexCallbacks.ensureStarted(synctexPasteTarget(ctx));
+			const server = await ensureSynctexCallbacks(ctx);
 			const text = [
 				"Zathura SyncTeX callback command:",
-				command,
+				server.command,
 				"",
 				"Manual use: configure this as zathura's synctex-editor-command for the current Pi session.",
 			].join("\n");
 			return {
 				content: [{ type: "text", text }],
-				details: { command },
+				details: { command: server.command },
 			};
 		},
 	});
@@ -1290,7 +1346,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		pdfTracker.clear();
-		await synctexCallbacks.close();
+		await shutdownSynctexCallbacks();
 		await mcpClient.shutdown();
 	});
 }

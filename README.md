@@ -37,7 +37,7 @@ Open failures are reported as tool errors and logged under `/tmp/codex-show-late
 
 ## Inverse SyncTeX PDF clicks
 
-Each Pi session starts a private Unix-socket callback endpoint with a random token. PDFs opened through `open_pdf` are launched with Zathura's `--synctex-editor-command=<command>` already set to the correct session-specific callback.
+Each Pi session starts a private Unix-socket callback endpoint with a random token; session switches and shutdowns close the old endpoint so older callback commands stop working. PDFs opened through `open_pdf` and LaTeX previews opened by `scripts/show_latex_viewer.py` are launched with Zathura's `--synctex-editor-command=<command>` already set to the correct session-specific callback.
 
 When Zathura invokes the callback, the extension pastes this block at the current interactive editor cursor and does not submit it or trigger/steer an agent turn:
 
@@ -49,7 +49,7 @@ PDF click: relative/path/main.tex:123
 
 The path is relative to the Pi session cwd. The source line is included when the clicked source file is readable; otherwise the block still ends with the blank line.
 
-For manual Zathura configuration, call `get_synctex_callback_command` or run the `/synctex_callback_command` slash command in the current Pi session. The returned command is exact for that session only and should be configured as Zathura's `synctex-editor-command`; do not reuse it in another Pi session.
+For manual Zathura configuration, call `get_synctex_callback_command` or run the `/synctex_callback_command` slash command in the current Pi session. The returned command is exact for that session only and should be configured as Zathura's `synctex-editor-command`; do not reuse it in another Pi session. The command is built as a Zathura argv template so `%{input}` is substituted as one file-path argument, including paths with quotes, spaces, or shell metacharacters.
 
 In headless/non-interactive sessions the callback never submits a message automatically. If a PDF click arrives while the agent is busy/streaming, it only pastes into the editor.
 

@@ -3,7 +3,8 @@
 
 Runs outside the Codex sandbox, normally as a systemd --user service.
 Watches the fixed ready marker and opens the fixed PDF path in Zathura.
-Accepts no commands, paths, shell snippets, JSON, sockets, or network traffic.
+Reads only the fixed preview PDF and an optional session callback command
+written by the Pi extension under the private fixed temp directory.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ DEFAULT_TMPDIR = "/tmp/codex-show-latex"
 PDF_NAME = "show-latex.pdf"
 READY_NAME = "show-latex.ready"
 ZATHURA_LOG_NAME = "zathura.log"
+SYNCTEX_COMMAND_NAME = "zathura-synctex-editor-command"
 DEFAULT_POLL_SEC = 0.5
 MIN_REOPEN_INTERVAL_SEC = 1.0
 
@@ -44,6 +46,10 @@ def ready_path() -> Path:
 
 def log_path() -> Path:
     return tmpdir() / ZATHURA_LOG_NAME
+
+
+def synctex_command_path() -> Path:
+    return tmpdir() / SYNCTEX_COMMAND_NAME
 
 
 def ensure_secure_tmpdir(create: bool = True) -> Path:
@@ -78,6 +84,29 @@ def log(message: str) -> None:
             f.write(f"[{ts}] helper: {message}\n")
     except Exception:
         pass
+
+
+def read_synctex_editor_command() -> Optional[str]:
+    path = synctex_command_path()
+    try:
+        st_l = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st_l.st_mode):
+        log(f"ignoring symlink synctex command path: {path}")
+        return None
+    if not stat.S_ISREG(st_l.st_mode):
+        log(f"ignoring non-regular synctex command path: {path}")
+        return None
+    if st_l.st_uid != os.geteuid():
+        log(f"ignoring synctex command not owned by uid {os.geteuid()}: {path}")
+        return None
+    try:
+        command = path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        log(f"failed to read synctex command: {e}")
+        return None
+    return command or None
 
 
 def regular_pdf_is_safe_enough(path: Path) -> bool:
@@ -155,7 +184,7 @@ def gui_env() -> dict[str, str]:
     return env
 
 
-def process_has_zathura_pdf(pid: int, pdf: Path) -> bool:
+def process_has_zathura_pdf(pid: int, pdf: Path, synctex_command: Optional[str] = None) -> bool:
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except Exception:
@@ -169,10 +198,14 @@ def process_has_zathura_pdf(pid: int, pdf: Path) -> bool:
     if "zathura" not in exe:
         return False
     wanted = str(pdf)
-    return any(arg == wanted for arg in args[1:])
+    if not any(arg == wanted for arg in args[1:]):
+        return False
+    if synctex_command is None:
+        return True
+    return any(arg == f"--synctex-editor-command={synctex_command}" for arg in args[1:])
 
 
-def zathura_already_open(pdf: Path) -> bool:
+def zathura_already_open(pdf: Path, synctex_command: Optional[str] = None) -> bool:
     for child in Path("/proc").iterdir():
         if not child.name.isdigit():
             continue
@@ -180,7 +213,7 @@ def zathura_already_open(pdf: Path) -> bool:
             pid = int(child.name)
         except ValueError:
             continue
-        if process_has_zathura_pdf(pid, pdf):
+        if process_has_zathura_pdf(pid, pdf, synctex_command):
             return True
     return False
 
@@ -202,17 +235,24 @@ def open_pdf_if_needed(last_proc: Optional[subprocess.Popen]) -> Optional[subpro
     if not regular_pdf_is_safe_enough(pdf):
         return last_proc
 
-    if last_proc is not None and last_proc.poll() is None:
-        log("zathura already tracked; relying on auto-reload")
-        return last_proc
+    synctex_command = read_synctex_editor_command()
 
-    if zathura_already_open(pdf):
-        log("zathura already open for fixed pdf; relying on auto-reload")
+    if last_proc is not None and last_proc.poll() is None:
+        if process_has_zathura_pdf(last_proc.pid, pdf, synctex_command):
+            log("zathura already tracked with current SyncTeX command; relying on auto-reload")
+            return last_proc
+        log("tracked zathura lacks current SyncTeX command; launching configured viewer")
+
+    if zathura_already_open(pdf, synctex_command):
+        log("zathura already open for fixed pdf with current SyncTeX command; relying on auto-reload")
         return None
 
     env = gui_env()
     viewer = find_viewer()
-    cmd = [viewer, str(pdf)]
+    cmd = [viewer]
+    if synctex_command:
+        cmd.append(f"--synctex-editor-command={synctex_command}")
+    cmd.append(str(pdf))
     log(
         "launching "
         + " ".join(cmd)
@@ -257,7 +297,7 @@ def run_check() -> int:
 def status_text() -> str:
     ensure_secure_tmpdir(create=True)
     lines = [f"tmpdir={tmpdir()}"]
-    for name, path in (("pdf", pdf_path()), ("ready", ready_path()), ("log", log_path())):
+    for name, path in (("pdf", pdf_path()), ("ready", ready_path()), ("log", log_path()), ("synctex_command", synctex_command_path())):
         try:
             st = os.lstat(path)
             kind = "symlink" if stat.S_ISLNK(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "other"

@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+	createSynctexCallbackArgv,
 	createSynctexCallbackCommand,
 	formatSynctexPasteBlock,
 	SynctexCallbackServer,
@@ -14,9 +15,9 @@ function tempDir(): string {
 	return mkdtempSync(join(tmpdir(), "synctex-test-"));
 }
 
-function runCallbackScript(args: string[]): Promise<{ exitCode: number | null; stderr: string }> {
+function runCallbackProcess(argv: string[]): Promise<{ exitCode: number | null; stderr: string }> {
 	return new Promise((resolvePromise, reject) => {
-		const child = spawn(process.execPath, ["scripts/pi_synctex_callback.mjs", ...args], {
+		const child = spawn(argv[0], argv.slice(1), {
 			cwd: process.cwd(),
 		});
 		let stderr = "";
@@ -26,6 +27,10 @@ function runCallbackScript(args: string[]): Promise<{ exitCode: number | null; s
 		child.on("error", reject);
 		child.on("close", (exitCode) => resolvePromise({ exitCode, stderr }));
 	});
+}
+
+function runCallbackScript(args: string[]): Promise<{ exitCode: number | null; stderr: string }> {
+	return runCallbackProcess([process.execPath, "scripts/pi_synctex_callback.mjs", ...args]);
 }
 
 test("formatSynctexPasteBlock uses cwd-relative paths and includes the source line", () => {
@@ -76,6 +81,26 @@ test("createSynctexCallbackCommand returns a Zathura placeholder command with se
 		command,
 		"'/usr/bin/node' '/tmp/pi synctex/callback.mjs' '--socket' '/tmp/pi-synctex.sock' '--token' 'abc123' '--file' '%{input}' '--line' '%{line}'",
 	);
+});
+
+test("createSynctexCallbackArgv keeps Zathura placeholders as whole argv tokens", () => {
+	assert.deepEqual(createSynctexCallbackArgv({
+		nodePath: "/usr/bin/node",
+		callbackScriptPath: "/tmp/callback.mjs",
+		socketPath: "/tmp/pi-synctex.sock",
+		token: "abc123",
+	}), [
+		"/usr/bin/node",
+		"/tmp/callback.mjs",
+		"--socket",
+		"/tmp/pi-synctex.sock",
+		"--token",
+		"abc123",
+		"--file",
+		"%{input}",
+		"--line",
+		"%{line}",
+	]);
 });
 
 test("callback script forwards clicks to only the matching session token", async () => {
@@ -130,6 +155,88 @@ test("callback script forwards clicks to only the matching session token", async
 		assert.deepEqual(pasted, ["PDF click: main.tex:2\nbeta\n\n"]);
 	} finally {
 		await server.close();
+	}
+});
+
+test("callback invocation handles substituted paths containing quotes, spaces, and shell metacharacters", async () => {
+	const dir = tempDir();
+	const cwd = join(dir, "project with spaces");
+	const source = join(cwd, "quote ' and $dollar;$(touch pwned)&.tex");
+	mkdirSync(cwd, { recursive: true });
+	writeFileSync(source, "strange path line\n", { flag: "wx" });
+
+	const pasted: string[] = [];
+	const server = new SynctexCallbackServer({
+		tmpDir: dir,
+		callbackScriptPath: resolve("scripts/pi_synctex_callback.mjs"),
+		nodePath: process.execPath,
+	});
+	await server.ensureStarted({
+		cwd,
+		hasUI: true,
+		ui: {
+			pasteToEditor(text: string) {
+				pasted.push(text);
+			},
+		},
+	});
+
+	try {
+		const argv = createSynctexCallbackArgv({
+			nodePath: process.execPath,
+			callbackScriptPath: resolve("scripts/pi_synctex_callback.mjs"),
+			socketPath: server.socketPath,
+			token: server.token,
+		}).map((arg) => arg.replaceAll("%{input}", source).replaceAll("%{line}", "1"));
+		const result = await runCallbackProcess(argv);
+		assert.equal(result.exitCode, 0, result.stderr);
+		assert.deepEqual(pasted, ["PDF click: quote ' and $dollar;$(touch pwned)&.tex:1\nstrange path line\n\n"]);
+	} finally {
+		await server.close();
+	}
+});
+
+test("closing a callback server invalidates its command and new sessions rotate endpoints", async () => {
+	const dir = tempDir();
+	const first = new SynctexCallbackServer({
+		tmpDir: dir,
+		callbackScriptPath: resolve("scripts/pi_synctex_callback.mjs"),
+		nodePath: process.execPath,
+	});
+	await first.ensureStarted({ cwd: dir, hasUI: false });
+	const firstSocket = first.socketPath;
+	const firstToken = first.token;
+	const firstCommand = first.command;
+	await first.close();
+
+	const stale = await runCallbackScript([
+		"--socket",
+		firstSocket,
+		"--token",
+		firstToken,
+		"--file",
+		join(dir, "main.tex"),
+		"--line",
+		"1",
+	]);
+	assert.equal(stale.exitCode, 1);
+	await assert.rejects(
+		() => first.ensureStarted({ cwd: dir, hasUI: false }),
+		/closed/,
+	);
+
+	const second = new SynctexCallbackServer({
+		tmpDir: dir,
+		callbackScriptPath: resolve("scripts/pi_synctex_callback.mjs"),
+		nodePath: process.execPath,
+	});
+	await second.ensureStarted({ cwd: dir, hasUI: false });
+	try {
+		assert.notEqual(second.socketPath, firstSocket);
+		assert.notEqual(second.token, firstToken);
+		assert.notEqual(second.command, firstCommand);
+	} finally {
+		await second.close();
 	}
 });
 

@@ -40,6 +40,26 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+export function createSynctexCallbackArgv(options: {
+	nodePath: string;
+	callbackScriptPath: string;
+	socketPath: string;
+	token: string;
+}): string[] {
+	return [
+		options.nodePath,
+		options.callbackScriptPath,
+		"--socket",
+		options.socketPath,
+		"--token",
+		options.token,
+		"--file",
+		"%{input}",
+		"--line",
+		"%{line}",
+	];
+}
+
 function resolveClickedFile(filePath: string, cwd: string): string {
 	const trimmed = filePath.trim();
 	return isAbsolute(trimmed) ? resolve(trimmed) : resolve(cwd, trimmed);
@@ -73,24 +93,14 @@ export function createSynctexCallbackCommand(options: {
 	socketPath: string;
 	token: string;
 }): string {
-	return [
-		options.nodePath,
-		options.callbackScriptPath,
-		"--socket",
-		options.socketPath,
-		"--token",
-		options.token,
-		"--file",
-		"%{input}",
-		"--line",
-		"%{line}",
-	].map(shellQuote).join(" ");
+	return createSynctexCallbackArgv(options).map(shellQuote).join(" ");
 }
 
 export class SynctexCallbackServer {
 	private server: Server | undefined;
 	private target: SynctexPasteTarget | undefined;
 	private startPromise: Promise<void> | undefined;
+	private closed = false;
 	readonly socketPath: string;
 	readonly token: string;
 	private readonly callbackScriptPath: string;
@@ -114,6 +124,7 @@ export class SynctexCallbackServer {
 	}
 
 	async ensureStarted(target: SynctexPasteTarget): Promise<string> {
+		if (this.closed) throw new Error("SyncTeX callback server has been closed");
 		this.target = target;
 		if (!this.server) {
 			this.server = this.createServer();
@@ -130,6 +141,7 @@ export class SynctexCallbackServer {
 	}
 
 	async close(): Promise<void> {
+		this.closed = true;
 		const server = this.server;
 		this.server = undefined;
 		this.target = undefined;
