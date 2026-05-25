@@ -1,17 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { gzipSync } from "node:zlib";
-import { chmodSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	assertReadablePdfFile,
+	closePdfInZathura,
+	closeTrackedPdf,
 	inferDefaultSourceFileForPdf,
 	jumpToTrackedPdf,
 	normalizePdfFilePath,
 	openAndTrackPdf,
 	openPdfInZathura,
 	PdfTracker,
+	processArgsMatchZathuraPdf,
 } from "./pdf_tracking.ts";
 
 function tempDir(): string {
@@ -84,6 +87,31 @@ test("PdfTracker clear drops session state and resets IDs", () => {
 	const nextSessionPdf = tracker.trackOpenedPdf("/tmp/one.pdf");
 	assert.equal(nextSessionPdf.id, 1);
 	assert.notEqual(nextSessionPdf, first);
+});
+
+test("PdfTracker can untrack a single PDF", () => {
+	const tracker = new PdfTracker();
+	const first = tracker.trackOpenedPdf("/tmp/one.pdf");
+	const second = tracker.trackOpenedPdf("/tmp/two.pdf");
+
+	assert.equal(tracker.untrackById(first.id), first);
+	assert.equal(tracker.getById(first.id), undefined);
+	assert.equal(tracker.getByPath("/tmp/one.pdf"), undefined);
+	assert.equal(tracker.getById(second.id), second);
+	assert.equal(tracker.untrackById(999), undefined);
+});
+
+test("processArgsMatchZathuraPdf recognizes zathura processes for a PDF", () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const otherPdf = join(dir, "other.pdf");
+	writeMinimalPdf(pdf);
+	writeMinimalPdf(otherPdf);
+	const normalizedPdf = realpathSync(pdf);
+
+	assert.equal(processArgsMatchZathuraPdf(["/usr/bin/zathura", "--fork", pdf], normalizedPdf), true);
+	assert.equal(processArgsMatchZathuraPdf(["/usr/bin/zathura", otherPdf], normalizedPdf), false);
+	assert.equal(processArgsMatchZathuraPdf(["/usr/bin/evince", pdf], normalizedPdf), false);
 });
 
 test("inferDefaultSourceFileForPdf prefers a readable same-basename source", () => {
@@ -264,6 +292,24 @@ test("openPdfInZathura launches zathura with --fork and the PDF path", async () 
 	assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), ["--fork", pdf]);
 });
 
+test("openPdfInZathura does not launch a second zathura when the PDF is already open", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const argsFile = join(dir, "args.txt");
+	const fakeZathura = join(dir, "zathura");
+	writeMinimalPdf(pdf);
+	writeFileSync(fakeZathura, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	await openPdfInZathura(pdf, undefined, {
+		command: fakeZathura,
+		timeoutMs: 1000,
+		isAlreadyOpen: () => true,
+	});
+
+	assert.equal(existsSync(argsFile), false);
+});
+
 test("openPdfInZathura returns after zathura --fork parent exits even if viewer keeps stdio open", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");
@@ -328,4 +374,31 @@ test("openPdfInZathura does not leave a live child handle after the launch settl
 	await new Promise((resolve) => setImmediate(resolve));
 
 	assert.equal(activeChildProcessHandles(), before);
+});
+
+test("closePdfInZathura sends SIGTERM to matching zathura processes", () => {
+	const killed: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+	const closedPids = closePdfInZathura("/tmp/paper.pdf", {
+		findPids: () => [101, 202],
+		killProcess: (pid, signal) => killed.push({ pid, signal }),
+	});
+
+	assert.deepEqual(closedPids, [101, 202]);
+	assert.deepEqual(killed, [
+		{ pid: 101, signal: "SIGTERM" },
+		{ pid: 202, signal: "SIGTERM" },
+	]);
+});
+
+test("closeTrackedPdf closes and removes a tracked PDF", () => {
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf("/tmp/paper.pdf");
+	const result = closeTrackedPdf(trackedPdf.id, tracker, {
+		findPids: () => [303],
+		killProcess: () => {},
+	});
+
+	assert.deepEqual(result, { pdf: "/tmp/paper.pdf", pdfId: trackedPdf.id, closedPids: [303], wasTracked: true });
+	assert.equal(tracker.getById(trackedPdf.id), undefined);
+	assert.equal(tracker.getByPath("/tmp/paper.pdf"), undefined);
 });

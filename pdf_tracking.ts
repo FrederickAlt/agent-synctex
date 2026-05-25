@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { gunzipSync } from "node:zlib";
-import { accessSync, closeSync, constants, existsSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -24,10 +24,16 @@ interface ZathuraOpenOptions {
 	command?: string;
 	timeoutMs?: number;
 	synctexEditorCommand?: string;
+	isAlreadyOpen?: (pdfFilePath: string) => boolean;
 }
 
 interface ZathuraJumpOptions extends ZathuraOpenOptions {
 	opener?: PdfOpener;
+}
+
+interface ZathuraCloseOptions {
+	findPids?: (pdfFilePath: string) => number[];
+	killProcess?: (pid: number, signal: NodeJS.Signals) => void;
 }
 
 export interface PdfJumpResult {
@@ -37,8 +43,66 @@ export interface PdfJumpResult {
 	reopened: boolean;
 }
 
+export interface PdfCloseResult {
+	pdf: string;
+	pdfId: number;
+	closedPids: number[];
+	wasTracked: boolean;
+}
+
 const PDF_HEADER = "%PDF-";
 const ZATHURA_OPEN_TIMEOUT_MS = 5_000;
+const PROC_ROOT = "/proc";
+
+function readProcessArgs(pid: string, procRoot = PROC_ROOT): string[] | undefined {
+	try {
+		const raw = readFileSync(join(procRoot, pid, "cmdline"));
+		if (raw.length === 0) return undefined;
+		return raw.toString("utf8").split("\0").filter(Boolean);
+	} catch {
+		return undefined;
+	}
+}
+
+function argMatchesPdfPath(arg: string, normalizedPdfPath: string): boolean {
+	if (arg === normalizedPdfPath) return true;
+	if (!arg.includes("/") && !arg.endsWith(".pdf")) return false;
+	try {
+		return realpathSync(resolve(arg)) === normalizedPdfPath;
+	} catch {
+		return false;
+	}
+}
+
+export function processArgsMatchZathuraPdf(args: string[], normalizedPdfPath: string): boolean {
+	if (args.length === 0) return false;
+	if (!basename(args[0]).includes("zathura")) return false;
+	return args.slice(1).some((arg) => argMatchesPdfPath(arg, normalizedPdfPath));
+}
+
+export function zathuraPidsForPdf(pdfFilePath: string, procRoot = PROC_ROOT): number[] {
+	let entries: string[];
+	try {
+		entries = readdirSync(procRoot);
+	} catch {
+		return [];
+	}
+
+	const normalizedPdfPath = normalizePdfFilePath(pdfFilePath);
+	const pids: number[] = [];
+	for (const entry of entries) {
+		if (!/^\d+$/.test(entry)) continue;
+		const args = readProcessArgs(entry, procRoot);
+		if (args && processArgsMatchZathuraPdf(args, normalizedPdfPath)) {
+			pids.push(Number(entry));
+		}
+	}
+	return pids;
+}
+
+export function zathuraAlreadyOpen(pdfFilePath: string): boolean {
+	return zathuraPidsForPdf(pdfFilePath).length > 0;
+}
 
 function expandHomePath(path: string): string {
 	if (path === "~") return homedir();
@@ -283,6 +347,9 @@ export async function openPdfInZathura(
 	signal?: AbortSignal,
 	options: ZathuraOpenOptions = {},
 ): Promise<void> {
+	const isAlreadyOpen = options.isAlreadyOpen ?? zathuraAlreadyOpen;
+	if (isAlreadyOpen(pdfFilePath)) return;
+
 	const command = options.command ?? "zathura";
 	const timeoutMs = options.timeoutMs ?? ZATHURA_OPEN_TIMEOUT_MS;
 	let result: PdfOpenProcessResult;
@@ -342,7 +409,7 @@ async function jumpPdfInZathura(
 	}
 }
 
-type PdfOpener = (pdfFilePath: string, signal?: AbortSignal) => Promise<void>;
+export type PdfOpener = (pdfFilePath: string, signal?: AbortSignal) => Promise<void>;
 
 export class PdfTracker {
 	private readonly trackedPdfsByPath = new Map<string, TrackedPdf>();
@@ -379,11 +446,60 @@ export class PdfTracker {
 		return this.trackedPdfsByPath.get(normalizedPdfPath);
 	}
 
+	untrackById(pdfId: number): TrackedPdf | undefined {
+		const trackedPdf = this.trackedPdfsById.get(pdfId);
+		if (!trackedPdf) return undefined;
+		this.trackedPdfsById.delete(pdfId);
+		this.trackedPdfsByPath.delete(trackedPdf.path);
+		return trackedPdf;
+	}
+
 	clear(): void {
 		this.trackedPdfsByPath.clear();
 		this.trackedPdfsById.clear();
 		this.nextPdfId = 1;
 	}
+}
+
+export function closePdfInZathura(
+	pdfFilePath: string,
+	options: ZathuraCloseOptions = {},
+): number[] {
+	const findPids = options.findPids ?? zathuraPidsForPdf;
+	const killProcess = options.killProcess ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+	const pids = findPids(pdfFilePath);
+	const closedPids: number[] = [];
+	const failures: string[] = [];
+
+	for (const pid of pids) {
+		try {
+			killProcess(pid, "SIGTERM");
+			closedPids.push(pid);
+		} catch (error) {
+			if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") continue;
+			const message = error instanceof Error ? error.message : String(error);
+			failures.push(`${pid}: ${message}`);
+		}
+	}
+
+	if (failures.length) {
+		throw new Error(`Failed to close zathura process(es) for ${pdfFilePath}: ${failures.join("; ")}`);
+	}
+	return closedPids;
+}
+
+export function closeTrackedPdf(
+	pdfId: number,
+	tracker: PdfTracker,
+	options: ZathuraCloseOptions = {},
+): PdfCloseResult {
+	const trackedPdf = tracker.getById(pdfId);
+	if (!trackedPdf) {
+		throw new Error(`Unknown tracked pdf_id=${pdfId}. Open the PDF first with open_pdf or compile_latex_file(..., open_pdf=true).`);
+	}
+	const closedPids = closePdfInZathura(trackedPdf.path, options);
+	tracker.untrackById(pdfId);
+	return { pdf: trackedPdf.path, pdfId, closedPids, wasTracked: true };
 }
 
 export async function openAndTrackPdf(

@@ -1,9 +1,10 @@
 # pdf-preview
 
-Pi extension that exposes six tools:
+Pi extension that exposes seven tools:
 
 - `show_latex` — compile LaTeX source and trigger the preview pipeline.
 - `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
+- `close_pdf` — close a tracked Zathura PDF window by `pdf_id`.
 - `jump_pdf` — perform a line-based Zathura forward SyncTeX jump in a tracked PDF by `pdf_id`.
 - `get_synctex_callback_command` — print the current session's exact Zathura inverse SyncTeX callback command for manual configuration.
 - `compile_latex_file` — compile a local LaTeX source file in place, optionally opening/tracking the resulting PDF.
@@ -40,13 +41,15 @@ edits `~/.config/zathura/zathurarc` automatically.
 
 ## PDF tracking and jumps
 
-`open_pdf(pdf_file_path)` validates that the path exists, is readable, is a regular PDF file, then launches Zathura with `--fork`. Successful calls return `ok: pdf_id=<id> pdf=<path>` and include `pdf_id` in tool details. IDs are short-lived, session-local values valid only in the current running Pi session/process; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID within that session where practical, while distinct PDFs receive distinct IDs.
+`open_pdf(pdf_file_path)` validates that the path exists, is readable, is a regular PDF file, then launches Zathura with `--fork` unless a local Zathura process for the same normalized PDF path is already visible. Successful calls return `ok: pdf_id=<id> pdf=<path>` and include `pdf_id` in tool details. IDs are short-lived, session-local values valid only in the current running Pi session/process; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID within that session where practical, while distinct PDFs receive distinct IDs.
 
 Tracked PDFs also remember a default source file when possible. `compile_latex_file(..., open_pdf=true)` stores the compiled source path exactly. `open_pdf(existing.pdf)` attempts to infer a default source from `<basename>.tex` next to the normalized PDF and from available `.synctex`/`.synctex.gz` input records.
 
-`jump_pdf(pdf_id, line, source_file?)` performs a forward SyncTeX jump with Zathura using the tracked numeric `pdf_id`; it does not accept arbitrary PDF paths. The public tool is line-based, so callers do not pass a column. If the default source is unknown, call it again with `source_file`. If the tracked Zathura window was closed or is unavailable, the tool tries to reopen the same tracked PDF before retrying the jump.
+`jump_pdf(pdf_id, line, source_file?)` performs a forward SyncTeX jump with Zathura using the tracked numeric `pdf_id`; it does not accept arbitrary PDF paths. The public tool is line-based, so callers do not pass a column. If the default source is unknown, call it again with `source_file`. For content located in a file included with `\input`, `\include`, or similar, pass that included file as `source_file` and use the line number from that file, not the parent file’s include directive line. If the tracked Zathura window was closed or is unavailable, the tool tries to reopen the same tracked PDF before retrying the jump.
 
-Open and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
+`close_pdf(pdf_id)` sends `SIGTERM` only to local `zathura` processes whose command line contains the tracked PDF path, then removes that PDF from the in-memory tracking table. If no matching process is found, the PDF is still untracked.
+
+Open, close, and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
 
 ## Inverse SyncTeX PDF clicks
 

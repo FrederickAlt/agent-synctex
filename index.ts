@@ -6,7 +6,7 @@ import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
+import { closeTrackedPdf, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 import { SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
@@ -1136,6 +1136,16 @@ const OpenPdfParams = Type.Object(
 	{ additionalProperties: false },
 );
 
+const ClosePdfParams = Type.Object(
+	{
+		pdf_id: Type.Number({
+			description: "Tracked numeric PDF ID returned by open_pdf or compile_latex_file(..., open_pdf=true).",
+			minimum: 1,
+		}),
+	},
+	{ additionalProperties: false },
+);
+
 const JumpPdfParams = Type.Object(
 	{
 		pdf_id: Type.Number({
@@ -1143,11 +1153,11 @@ const JumpPdfParams = Type.Object(
 			minimum: 1,
 		}),
 		line: Type.Number({
-			description: "1-based source line to jump to. The tool supplies the SyncTeX column automatically.",
+			description: "1-based line in the selected source file. If source_file is provided, this line is interpreted within that file.",
 			minimum: 1,
 		}),
 		source_file: Type.Optional(Type.String({
-			description: "Optional source file for the SyncTeX jump. Omit when the tracked PDF has a known default source; pass it when no default source was inferred or when jumping to a line in an included .tex file.",
+			description: "Optional source file for the SyncTeX jump. When the target is in a file included via \\input, \\include, or similar, pass that included .tex file and use a line number from that file, not the parent file's include line.",
 			minLength: 1,
 		})),
 	},
@@ -1304,6 +1314,34 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "close_pdf",
+		label: "Close PDF",
+		description: "Close an extension-tracked Zathura PDF window by pdf_id. The extension sends SIGTERM only to local zathura processes whose command line contains the tracked PDF path, then removes the PDF from this session's tracking table.",
+		promptSnippet: "Close a tracked PDF in Zathura",
+		promptGuidelines: [
+			"Use close_pdf when the user asks to close a PDF previously opened or tracked by this extension.",
+			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true).",
+		],
+		parameters: ClosePdfParams,
+		execute(_toolCallId, params) {
+			let pdfId = 0;
+			try {
+				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
+				const result = closeTrackedPdf(pdfId, pdfTracker);
+				const closedText = result.closedPids.length ? `closed_pids=${result.closedPids.join(",")}` : "closed_pids=none";
+				return {
+					content: [{ type: "text", text: `ok: pdf_id=${pdfId} pdf=${result.pdf} ${closedText}` }],
+					details: { pdf_id: pdfId, pdf: result.pdf, closed_pids: result.closedPids },
+				};
+			} catch (error) {
+				throw latexToolFailure("close-pdf", "Close PDF failed", {
+					pdf_id: pdfId || params.pdf_id,
+				}, error);
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "jump_pdf",
 		label: "Jump PDF",
 		description: "Perform a line-based Zathura forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. The PDF must have SyncTeX data, and the source file must be readable. Uses the tracked default source file when known, or pass source_file when no default source was inferred or when jumping to an included .tex file.",
@@ -1311,7 +1349,8 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use jump_pdf to move an already tracked Zathura PDF to a source line via forward SyncTeX.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); do not pass arbitrary PDF paths.",
-			"Omit source_file when the tracked PDF has a known default source. If the tool asks for source_file, retry with the relevant readable .tex file, especially for included files.",
+			"source_file is optional only when the target line is in the tracked default source file; provide it whenever the target is in another source file or needs disambiguation.",
+			"When the target content is in a file included by \\input, \\include, or similar, pass source_file as the included .tex file and use the line number from that included file. Do not jump to the parent file's \\input/\\include line unless that directive itself is the target.",
 		],
 		parameters: JumpPdfParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
