@@ -32,9 +32,15 @@ pi -e /path/to/pdf-preview
 # pi -e /path/to/pdf-preview/index.ts
 ```
 
+Keep the checked-out `scripts/` directory with the extension. The inverse SyncTeX callback helper
+is `scripts/pi_synctex_callback.mjs`; it is spawned on demand by Zathura callback commands and is
+not a systemd service. The preview viewer helper remains `scripts/show_latex_viewer.py` (or the
+installed `codex-show-latex-viewer.service` from the secure-split package). The extension never
+edits `~/.config/zathura/zathurarc` automatically.
+
 ## PDF tracking and jumps
 
-`open_pdf(pdf_file_path)` validates that the path exists, is readable, is a regular PDF file, then launches Zathura with `--fork`. Successful calls return `ok: pdf_id=<id> pdf=<path>` and include `pdf_id` in tool details. IDs are short-lived, session-local values; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID within that session where practical, while distinct PDFs receive distinct IDs.
+`open_pdf(pdf_file_path)` validates that the path exists, is readable, is a regular PDF file, then launches Zathura with `--fork`. Successful calls return `ok: pdf_id=<id> pdf=<path>` and include `pdf_id` in tool details. IDs are short-lived, session-local values valid only in the current running Pi session/process; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID within that session where practical, while distinct PDFs receive distinct IDs.
 
 Tracked PDFs also remember a default source file when possible. `compile_latex_file(..., open_pdf=true)` stores the compiled source path exactly. `open_pdf(existing.pdf)` attempts to infer a default source from `<basename>.tex` next to the normalized PDF and from available `.synctex`/`.synctex.gz` input records.
 
@@ -58,6 +64,22 @@ The path is relative to the Pi session cwd. The source line is included when the
 
 For manual Zathura configuration, call `get_synctex_callback_command` or run the `/synctex_callback_command` slash command in the current Pi session. The returned command is exact for that session only and should be configured as Zathura's `synctex-editor-command`; do not reuse it in another Pi session. The command is built as a Zathura argv template so `%{input}` is substituted as one file-path argument, including paths with quotes, spaces, or shell metacharacters.
 
+Manual patterns:
+
+```bash
+# One PDF opened by you; pass the returned command as one argument.
+callback_command="<paste command returned by get_synctex_callback_command>"
+zathura --synctex-editor-command="$callback_command" path/to/file.pdf
+```
+
+```conf
+# ~/.config/zathura/zathurarc, managed and refreshed by you for each Pi session.
+set synctex true
+set synctex-editor-command "<paste command returned by get_synctex_callback_command>"
+```
+
+The extension does not write or update `zathurarc`; if you use a persistent config entry, replace it when starting a new Pi session because the socket path/token change.
+
 In headless/non-interactive sessions the callback never submits a message automatically. If a PDF click arrives while the agent is busy/streaming, it only pastes into the editor.
 
 ## Development
@@ -69,11 +91,14 @@ Install dev dependencies once with `npm install`, then run `npm run verify` to t
 `show_latex` and `compile_latex_file` both accept an optional `compiler` parameter. The default is `lualatex`.
 Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk` (which runs latexmk with LuaLaTeX).
 
+Both snippet previews and file compiles pass `-synctex=1` to the selected LaTeX command by default, so generated PDFs have SyncTeX sidecars when the compiler succeeds.
+
 For `compile_latex_file`, the selected compiler is spawned with the source file's directory as the
 working directory, using the original file name as the job input. The resulting `<name>.pdf` stays
-next to the source file. By default, successful output is a single short `ok: <pdf>` line. With
-`open_pdf=true`, the tool opens/tracks the PDF after a successful compile and returns both `pdf`
-and `pdf_id` in its details.
+next to the source file. By default, successful output is a single short `ok: <pdf>` line and no
+viewer state changes, so the tool remains useful as a compile/check operation. With `open_pdf=true`,
+the tool opens/tracks the PDF after a successful compile and returns both `pdf` and `pdf_id` in its
+details.
 
 Both `show_latex` and `compile_latex_file` report only a short error on failure and write diagnostic
 details to `/tmp/codex-show-latex/*.log`.
