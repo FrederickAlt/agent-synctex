@@ -1,21 +1,25 @@
 # pdf-preview
 
-Pi extension that exposes five tools:
+Pi extension that exposes six tools:
 
-- `show_latex` — compile LaTeX source and trigger the fixed preview pipeline.
+- `show_latex` — compile LaTeX source and trigger the preview pipeline.
 - `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
 - `jump_pdf` — perform a line-based Zathura forward SyncTeX jump in a tracked PDF by `pdf_id`.
+- `get_synctex_callback_command` — print the current session's exact Zathura inverse SyncTeX callback command for manual configuration.
 - `compile_latex_file` — compile a local LaTeX source file in place, optionally opening/tracking the resulting PDF.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
 Snippet previews communicate with an MCP-style stdio service (`show_latex_mcp.py`) and forward
-`tools/call` with `show_latex`. File compiles are spawned directly by the extension so normal
-LaTeX project-relative includes/assets resolve without using the backend service.
+`tools/call` with `show_latex`. Each successful preview writes an operation-scoped PDF and an
+atomic ready descriptor that pairs that PDF with the session's SyncTeX callback command. File
+compiles are spawned directly by the extension so normal LaTeX project-relative includes/assets
+resolve without using the backend service.
 
 ## Files
 
 - `index.ts` — Pi extension entry point.
 - `pdf_tracking.ts` — PDF validation, Zathura opening, and in-memory session tracking helpers.
+- `synctex.ts` and `scripts/pi_synctex_callback.mjs` — session-scoped inverse SyncTeX IPC and Zathura callback forwarding.
 - `scripts/show_latex_mcp.py` — copied service bridge used by the extension.
 - `scripts/show_latex_viewer.py` and `systemd/codex-show-latex-viewer.service` — same helper service files from the original implementation.
 
@@ -37,6 +41,24 @@ Tracked PDFs also remember a default source file when possible. `compile_latex_f
 `jump_pdf(pdf_id, line, source_file?)` performs a forward SyncTeX jump with Zathura using the tracked numeric `pdf_id`; it does not accept arbitrary PDF paths. The public tool is line-based, so callers do not pass a column. If the default source is unknown, call it again with `source_file`. If the tracked Zathura window was closed or is unavailable, the tool tries to reopen the same tracked PDF before retrying the jump.
 
 Open and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
+
+## Inverse SyncTeX PDF clicks
+
+Each Pi session starts a private Unix-socket callback endpoint with a random token; session switches and shutdowns close the old endpoint so older callback commands stop working. PDFs opened through `open_pdf` and LaTeX previews opened by `scripts/show_latex_viewer.py` are launched with Zathura's `--synctex-editor-command=<command>` already set to the correct session-specific callback.
+
+When Zathura invokes the callback, the extension pastes this block at the current interactive editor cursor and does not submit it or trigger/steer an agent turn:
+
+```text
+PDF click: relative/path/main.tex:123
+<source line>
+
+```
+
+The path is relative to the Pi session cwd. The source line is included when the clicked source file is readable; otherwise the block still ends with the blank line.
+
+For manual Zathura configuration, call `get_synctex_callback_command` or run the `/synctex_callback_command` slash command in the current Pi session. The returned command is exact for that session only and should be configured as Zathura's `synctex-editor-command`; do not reuse it in another Pi session. The command is built as a Zathura argv template so `%{input}` is substituted as one file-path argument, including paths with quotes, spaces, or shell metacharacters.
+
+In headless/non-interactive sessions the callback never submits a message automatically. If a PDF click arrives while the agent is busy/streaming, it only pastes into the editor.
 
 ## Development
 

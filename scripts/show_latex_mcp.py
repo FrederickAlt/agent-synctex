@@ -2,9 +2,9 @@
 """Dependency-free stdio MCP server for LaTeX previews.
 
 Security model:
-- This process compiles LaTeX and writes fixed files under /tmp/codex-show-latex.
+- This process compiles LaTeX into operation-scoped files under /tmp/codex-show-latex.
 - It never launches a GUI application.
-- A separate desktop-session helper watches show-latex.ready and opens the fixed PDF path.
+- A separate desktop-session helper watches show-latex.ready and opens the descriptor PDF.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ PDF_NAME = "show-latex.pdf"
 LOG_NAME = "show-latex.log"
 READY_NAME = "show-latex.ready"
 MCP_DEBUG_NAME = "mcp-debug.log"
+RUNS_DIR_NAME = "runs"
 
 MAX_RETURN_CHARS = 3000
 DEFAULT_TIMEOUT_SEC = 45
@@ -64,6 +65,28 @@ def path_ready() -> Path:
 
 def path_debug() -> Path:
     return tmpdir() / MCP_DEBUG_NAME
+
+
+def path_runs() -> Path:
+    return tmpdir() / RUNS_DIR_NAME
+
+
+def operation_id() -> str:
+    return f"{time.time_ns()}-{os.getpid()}"
+
+
+def ready_descriptor_pdf_path() -> Optional[Path]:
+    try:
+        data = json.loads(path_ready().read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    pdf = data.get("pdf")
+    if not isinstance(pdf, str) or not pdf:
+        return None
+    path = Path(pdf)
+    return path if path.is_absolute() else tmpdir() / path
 
 
 def ensure_secure_tmpdir(create: bool = True) -> Path:
@@ -170,9 +193,9 @@ def read_tail(path: Path, limit: int = MAX_RETURN_CHARS) -> str:
     return tail_text(data, limit)
 
 
-def compiler_error_message(reason: str, compiler_output: str) -> str:
+def compiler_error_message(reason: str, compiler_output: str, log_path: Optional[Path] = None) -> str:
     reason = reason.strip()
-    log_tail = read_tail(path_log()).strip()
+    log_tail = read_tail(log_path or path_log()).strip()
     if log_tail:
         return reason + "\n\nlog tail:\n" + log_tail
     output_tail = tail_text(compiler_output.strip())
@@ -212,15 +235,26 @@ def normalize_latex_source(latex_source: str) -> str:
     ])
 
 
-def compile_latex(latex_source: str, compiler: Optional[str] = None) -> str:
+def compile_latex(
+    latex_source: str,
+    compiler: Optional[str] = None,
+    synctex_editor_command: Optional[str] = None,
+) -> str:
     d = ensure_secure_tmpdir(create=True)
     safe_unlink(path_ready())
-    safe_unlink(path_pdf())
-    atomic_write_text(path_tex(), normalize_latex_source(latex_source))
+
+    run_id = operation_id()
+    run_dir = path_runs() / run_id
+    run_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+    os.chmod(run_dir, 0o700)
+    tex_path = run_dir / TEX_NAME
+    pdf_path = run_dir / PDF_NAME
+    log_path = run_dir / LOG_NAME
+    atomic_write_text(tex_path, normalize_latex_source(latex_source))
 
     compiler_name, cmd = choose_compiler(compiler)
     timeout_sec = DEFAULT_TIMEOUT_SEC
-    debug(f"compile start compiler={compiler_name} timeout={timeout_sec}s cwd={d}")
+    debug(f"compile start id={run_id} compiler={compiler_name} timeout={timeout_sec}s cwd={run_dir}")
 
     env = os.environ.copy()
     env.setdefault("HOME", str(Path.home()))
@@ -228,34 +262,43 @@ def compile_latex(latex_source: str, compiler: Optional[str] = None) -> str:
 
     try:
         proc = subprocess.run(
-            cmd, cwd=str(d), env=env, text=True,
+            cmd, cwd=str(run_dir), env=env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=timeout_sec, check=False,
         )
     except subprocess.TimeoutExpired as e:
         output = e.stdout if isinstance(e.stdout, str) else ""
-        raise RuntimeError(compiler_error_message(f"compiler timed out after {timeout_sec}s", output))
+        raise RuntimeError(compiler_error_message(f"compiler timed out after {timeout_sec}s", output, log_path))
 
     output = proc.stdout or ""
     if proc.returncode != 0:
-        debug(f"compile failed returncode={proc.returncode}")
-        raise RuntimeError(compiler_error_message(f"compiler exited nonzero: {proc.returncode}", output))
+        debug(f"compile failed id={run_id} returncode={proc.returncode}")
+        raise RuntimeError(compiler_error_message(f"compiler exited nonzero: {proc.returncode}", output, log_path))
 
-    if not is_regular_file_owned_by_user(path_pdf()):
-        debug("compile command succeeded but pdf missing/invalid")
-        raise RuntimeError(compiler_error_message(f"PDF was not created at {path_pdf()}", output))
+    if not is_regular_file_owned_by_user(pdf_path):
+        debug(f"compile command succeeded but pdf missing/invalid id={run_id}")
+        raise RuntimeError(compiler_error_message(f"PDF was not created at {pdf_path}", output, log_path))
 
-    atomic_write_text(path_ready(), f"{time.time_ns()}\n", mode=0o600)
-    debug("compile ok; ready marker updated")
+    descriptor = {
+        "version": 1,
+        "operation_id": run_id,
+        "timestamp_ns": time.time_ns(),
+        "pdf": str(pdf_path.relative_to(d)),
+        "synctex_editor_command": synctex_editor_command or "",
+    }
+    atomic_write_text(path_ready(), json.dumps(descriptor, separators=(",", ":")) + "\n", mode=0o600)
+    debug(f"compile ok id={run_id}; ready marker updated")
     return "ok"
 
 
 def status_text() -> str:
+    current_pdf = ready_descriptor_pdf_path() or path_pdf()
     lines = [f"tmpdir={tmpdir()}"]
     for name, path in [
-        ("tex", path_tex()),
-        ("pdf", path_pdf()),
+        ("pdf", current_pdf),
         ("ready", path_ready()),
+        ("tex", path_tex()),
+        ("fixed_pdf", path_pdf()),
         ("log", path_log()),
         ("mcp_debug", path_debug()),
     ]:
@@ -276,14 +319,15 @@ def tool_schema() -> list[Json]:
         {
             "name": "show_latex",
             "description": (
-                "Compile LaTeX source to /tmp/codex-show-latex/show-latex.pdf. "
-                "Returns only 'ok' on success. A separate desktop helper opens the fixed PDF."
+                "Compile LaTeX source to an operation-scoped PDF under /tmp/codex-show-latex. "
+                "Returns only 'ok' on success. A separate desktop helper opens the ready descriptor PDF."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "latex_source": {"type": "string", "description": "LaTeX source. Full documents compile as-is; fragments are wrapped automatically."},
-                    "compiler": {"type": "string", "enum": list(SUPPORTED_COMPILERS), "default": DEFAULT_COMPILER, "description": "Optional LaTeX compiler to use. Defaults to lualatex."}
+                    "compiler": {"type": "string", "enum": list(SUPPORTED_COMPILERS), "default": DEFAULT_COMPILER, "description": "Optional LaTeX compiler to use. Defaults to lualatex."},
+                    "synctex_editor_command": {"type": "string", "description": "Session-specific Zathura inverse SyncTeX callback command for this preview operation."}
                 },
                 "required": ["latex_source"],
                 "additionalProperties": False,
@@ -310,14 +354,17 @@ def validate_no_extra(args: Json, allowed: Iterable[str]) -> None:
 def call_tool(name: str, arguments: Any) -> Json:
     args = arguments if isinstance(arguments, dict) else {}
     if name == "show_latex":
-        validate_no_extra(args, ["latex_source", "compiler"])
+        validate_no_extra(args, ["latex_source", "compiler", "synctex_editor_command"])
         latex_source = args.get("latex_source")
         if not isinstance(latex_source, str) or not latex_source.strip():
             raise RuntimeError("show_latex requires a non-empty string parameter: latex_source")
         compiler = args.get("compiler")
         if compiler is not None and not isinstance(compiler, str):
             raise RuntimeError("show_latex compiler must be a string when provided")
-        return result_text(compile_latex(latex_source, compiler), is_error=False)
+        synctex_editor_command = args.get("synctex_editor_command")
+        if synctex_editor_command is not None and not isinstance(synctex_editor_command, str):
+            raise RuntimeError("show_latex synctex_editor_command must be a string when provided")
+        return result_text(compile_latex(latex_source, compiler, synctex_editor_command), is_error=False)
     if name == "show_latex_status":
         validate_no_extra(args, [])
         return result_text(status_text(), is_error=False)

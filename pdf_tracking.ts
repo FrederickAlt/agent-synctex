@@ -23,6 +23,7 @@ interface PdfOpenProcessResult {
 interface ZathuraOpenOptions {
 	command?: string;
 	timeoutMs?: number;
+	synctexEditorCommand?: string;
 }
 
 interface ZathuraJumpOptions extends ZathuraOpenOptions {
@@ -280,8 +281,12 @@ export async function openPdfInZathura(
 	const command = options.command ?? "zathura";
 	const timeoutMs = options.timeoutMs ?? ZATHURA_OPEN_TIMEOUT_MS;
 	let result: PdfOpenProcessResult;
+	const args = options.synctexEditorCommand
+		? [`--synctex-editor-command=${options.synctexEditorCommand}`, "--fork", pdfFilePath]
+		: ["--fork", pdfFilePath];
+
 	try {
-		result = await runPdfOpenProcess(command, ["--fork", pdfFilePath], timeoutMs, signal);
+		result = await runPdfOpenProcess(command, args, timeoutMs, signal);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Failed to start zathura: ${message}`);

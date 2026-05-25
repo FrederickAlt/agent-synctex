@@ -2,13 +2,15 @@
 """Desktop-session helper for codex-show-latex-secure-split.
 
 Runs outside the Codex sandbox, normally as a systemd --user service.
-Watches the fixed ready marker and opens the fixed PDF path in Zathura.
-Accepts no commands, paths, shell snippets, JSON, sockets, or network traffic.
+Watches the fixed ready marker and opens the ready descriptor's PDF path in Zathura.
+The descriptor atomically pairs each preview PDF with that operation's optional
+session callback command under the private fixed temp directory.
 """
 
 from __future__ import annotations
 
 import glob
+import json
 import os
 import signal
 import stat
@@ -16,7 +18,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 # Keep generated preview/log files private to the user.
 os.umask(0o077)
@@ -44,6 +46,12 @@ def ready_path() -> Path:
 
 def log_path() -> Path:
     return tmpdir() / ZATHURA_LOG_NAME
+
+
+class ReadyOperation(NamedTuple):
+    signature: tuple[int, int]
+    pdf: Path
+    synctex_command: Optional[str]
 
 
 def ensure_secure_tmpdir(create: bool = True) -> Path:
@@ -78,6 +86,67 @@ def log(message: str) -> None:
             f.write(f"[{ts}] helper: {message}\n")
     except Exception:
         pass
+
+
+def pdf_from_ready_value(value: object) -> Optional[Path]:
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = tmpdir() / candidate
+    try:
+        root = tmpdir().resolve(strict=True)
+        parent = candidate.parent.resolve(strict=True)
+    except Exception as e:
+        log(f"ignoring ready pdf path with unsafe parent {candidate}: {e}")
+        return None
+    if parent != root and root not in parent.parents:
+        log(f"ignoring ready pdf path outside preview tmpdir: {candidate}")
+        return None
+    return candidate
+
+
+def read_ready_operation() -> Optional[ReadyOperation]:
+    path = ready_path()
+    try:
+        st_l = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode):
+        log(f"ignoring unsafe ready marker: {path}")
+        return None
+    if st_l.st_uid != os.geteuid():
+        log(f"ignoring ready marker not owned by uid {os.geteuid()}: {path}")
+        return None
+
+    signature = (st_l.st_mtime_ns, st_l.st_size)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as e:
+        log(f"failed to read ready marker: {e}")
+        return None
+
+    pdf = pdf_path()
+    synctex_command: Optional[str] = None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        descriptor_pdf = pdf_from_ready_value(data.get("pdf"))
+        if descriptor_pdf is None:
+            log("ignoring ready marker without a valid operation PDF")
+            return None
+        pdf = descriptor_pdf
+        command = data.get("synctex_editor_command")
+        if isinstance(command, str) and command:
+            synctex_command = command
+    return ReadyOperation(signature, pdf, synctex_command)
+
+
+def marker_signature() -> tuple[int, int] | None:
+    operation = read_ready_operation()
+    return operation.signature if operation is not None else None
 
 
 def regular_pdf_is_safe_enough(path: Path) -> bool:
@@ -155,7 +224,7 @@ def gui_env() -> dict[str, str]:
     return env
 
 
-def process_has_zathura_pdf(pid: int, pdf: Path) -> bool:
+def process_has_zathura_pdf(pid: int, pdf: Path, synctex_command: Optional[str] = None) -> bool:
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except Exception:
@@ -169,10 +238,14 @@ def process_has_zathura_pdf(pid: int, pdf: Path) -> bool:
     if "zathura" not in exe:
         return False
     wanted = str(pdf)
-    return any(arg == wanted for arg in args[1:])
+    if not any(arg == wanted for arg in args[1:]):
+        return False
+    if synctex_command is None:
+        return True
+    return any(arg == f"--synctex-editor-command={synctex_command}" for arg in args[1:])
 
 
-def zathura_already_open(pdf: Path) -> bool:
+def zathura_already_open(pdf: Path, synctex_command: Optional[str] = None) -> bool:
     for child in Path("/proc").iterdir():
         if not child.name.isdigit():
             continue
@@ -180,7 +253,7 @@ def zathura_already_open(pdf: Path) -> bool:
             pid = int(child.name)
         except ValueError:
             continue
-        if process_has_zathura_pdf(pid, pdf):
+        if process_has_zathura_pdf(pid, pdf, synctex_command):
             return True
     return False
 
@@ -197,22 +270,30 @@ def find_viewer() -> str:
     return "zathura"
 
 
-def open_pdf_if_needed(last_proc: Optional[subprocess.Popen]) -> Optional[subprocess.Popen]:
-    pdf = pdf_path()
+def open_pdf_if_needed(
+    last_proc: Optional[subprocess.Popen],
+    pdf: Path,
+    synctex_command: Optional[str],
+) -> Optional[subprocess.Popen]:
     if not regular_pdf_is_safe_enough(pdf):
         return last_proc
 
     if last_proc is not None and last_proc.poll() is None:
-        log("zathura already tracked; relying on auto-reload")
-        return last_proc
+        if process_has_zathura_pdf(last_proc.pid, pdf, synctex_command):
+            log("zathura already tracked with current SyncTeX command; relying on auto-reload")
+            return last_proc
+        log("tracked zathura lacks current SyncTeX command; launching configured viewer")
 
-    if zathura_already_open(pdf):
-        log("zathura already open for fixed pdf; relying on auto-reload")
+    if zathura_already_open(pdf, synctex_command):
+        log("zathura already open for ready pdf with current SyncTeX command; relying on auto-reload")
         return None
 
     env = gui_env()
     viewer = find_viewer()
-    cmd = [viewer, str(pdf)]
+    cmd = [viewer]
+    if synctex_command:
+        cmd.append(f"--synctex-editor-command={synctex_command}")
+    cmd.append(str(pdf))
     log(
         "launching "
         + " ".join(cmd)
@@ -233,31 +314,21 @@ def open_pdf_if_needed(last_proc: Optional[subprocess.Popen]) -> Optional[subpro
     return proc
 
 
-def marker_signature() -> tuple[int, int] | None:
-    try:
-        st = os.lstat(ready_path())
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        log(f"ignoring unsafe ready marker: {ready_path()}")
-        return None
-    if st.st_uid != os.geteuid():
-        log(f"ignoring ready marker not owned by uid {os.geteuid()}: {ready_path()}")
-        return None
-    return (st.st_mtime_ns, st.st_size)
-
-
 def run_check() -> int:
     ensure_secure_tmpdir(create=True)
-    ok = regular_pdf_is_safe_enough(pdf_path())
+    operation = read_ready_operation()
+    pdf = operation.pdf if operation is not None else pdf_path()
+    ok = regular_pdf_is_safe_enough(pdf)
     print("ok" if ok else "not-ready")
     return 0 if ok else 1
 
 
 def status_text() -> str:
     ensure_secure_tmpdir(create=True)
+    operation = read_ready_operation()
+    pdf = operation.pdf if operation is not None else pdf_path()
     lines = [f"tmpdir={tmpdir()}"]
-    for name, path in (("pdf", pdf_path()), ("ready", ready_path()), ("log", log_path())):
+    for name, path in (("pdf", pdf), ("ready", ready_path()), ("fixed_pdf", pdf_path()), ("log", log_path())):
         try:
             st = os.lstat(path)
             kind = "symlink" if stat.S_ISLNK(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "other"
@@ -289,18 +360,19 @@ def main() -> int:
 
     ensure_secure_tmpdir(create=True)
     log("viewer helper started")
-    last_sig = marker_signature()
+    initial_operation = read_ready_operation()
+    last_sig = initial_operation.signature if initial_operation is not None else None
     last_open_at = 0.0
     last_proc: Optional[subprocess.Popen] = None
 
     while not stop:
-        sig = marker_signature()
-        if sig is not None and sig != last_sig:
-            last_sig = sig
+        operation = read_ready_operation()
+        if operation is not None and operation.signature != last_sig:
+            last_sig = operation.signature
             now = time.monotonic()
             if now - last_open_at >= MIN_REOPEN_INTERVAL_SEC:
                 try:
-                    last_proc = open_pdf_if_needed(last_proc)
+                    last_proc = open_pdf_if_needed(last_proc, operation.pdf, operation.synctex_command)
                     last_open_at = now
                 except Exception as e:
                     log(f"open failed: {e}")
