@@ -6,6 +6,7 @@ import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
+import { normalizePdfFilePath, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;
@@ -1007,6 +1008,7 @@ class ShowLatexMcpClient {
 
 const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
+const pdfTracker = new PdfTracker();
 
 const LatexCompilerParam = Type.Optional(Type.Union([
 	Type.Literal("lualatex"),
@@ -1036,6 +1038,16 @@ const CompileLatexFileParams = Type.Object(
 			minLength: 1,
 		}),
 		compiler: LatexCompilerParam,
+	},
+	{ additionalProperties: false },
+);
+
+const OpenPdfParams = Type.Object(
+	{
+		pdf_file_path: Type.String({
+			description: "Path to an existing local PDF file to open in Zathura and track for later SyncTeX actions.",
+			minLength: 1,
+		}),
 	},
 	{ additionalProperties: false },
 );
@@ -1090,6 +1102,41 @@ export default function (pi: ExtensionAPI) {
 					compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
 					latex_source_length: latexSource.length,
 					latex_source_tail: tailText(latexSource, 30000),
+				}, error);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "open_pdf",
+		label: "Open PDF",
+		description: "Open an existing local PDF in Zathura and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same normalized PDF path again reuses its existing ID where practical.",
+		promptSnippet: "Open and track a local PDF in Zathura",
+		promptGuidelines: [
+			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
+			"Pass an existing local PDF path. The returned pdf_id is short-lived and valid only in the current Pi session.",
+		],
+		parameters: OpenPdfParams,
+		async execute(_toolCallId, params, signal) {
+			let requestedPath = "";
+			let pdfPath = "";
+			try {
+				requestedPath = String(params.pdf_file_path ?? "");
+				if (!requestedPath.trim()) {
+					throw new Error("pdf_file_path must be a non-empty string");
+				}
+
+				pdfPath = normalizePdfFilePath(requestedPath);
+				await openPdfInZathura(pdfPath, signal);
+				const trackedPdf = pdfTracker.trackOpenedPdf(pdfPath);
+				return {
+					content: [{ type: "text", text: `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}` }],
+					details: { pdf_id: trackedPdf.id, pdf: trackedPdf.path },
+				};
+			} catch (error) {
+				throw latexToolFailure("open-pdf", "Open PDF failed", {
+					requested_path: requestedPath,
+					pdf: pdfPath,
 				}, error);
 			}
 		},
@@ -1156,6 +1203,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		pdfTracker.clear();
 		await mcpClient.shutdown();
 	});
 }

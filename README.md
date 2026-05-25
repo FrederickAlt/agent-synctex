@@ -1,8 +1,9 @@
 # pdf-preview
 
-Pi extension that exposes three tools:
+Pi extension that exposes four tools:
 
 - `show_latex` — compile LaTeX source and trigger the fixed preview pipeline.
+- `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
 - `compile_latex_file` — compile a local LaTeX source file in place without opening or publishing a preview.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
@@ -13,6 +14,7 @@ LaTeX project-relative includes/assets resolve without using the backend service
 ## Files
 
 - `index.ts` — Pi extension entry point.
+- `pdf_tracking.ts` — PDF validation, Zathura opening, and in-memory session tracking helpers.
 - `scripts/show_latex_mcp.py` — copied service bridge used by the extension.
 - `scripts/show_latex_viewer.py` and `systemd/codex-show-latex-viewer.service` — same helper service files from the original implementation.
 
@@ -24,6 +26,16 @@ pi -e /path/to/pdf-preview
 # or (for testing only)
 # pi -e /path/to/pdf-preview/index.ts
 ```
+
+## PDF tracking
+
+`open_pdf(pdf_file_path)` validates that the path exists, is readable, is a regular PDF file, then launches Zathura with `--fork`. Successful calls return `ok: pdf_id=<id> pdf=<path>` and include `pdf_id` in tool details. IDs are short-lived, session-local values; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID within that session where practical, while distinct PDFs receive distinct IDs.
+
+Open failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
+
+## Development
+
+Install dev dependencies once with `npm install`, then run `npm run verify` to typecheck and execute the Node built-in test suite. Unit tests avoid real Zathura/LaTeX dependencies by using temp files and fake helper commands.
 
 ## Compiler selection
 
