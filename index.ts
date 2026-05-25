@@ -6,7 +6,7 @@ import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { openAndTrackPdf, PdfTracker } from "./pdf_tracking.ts";
+import { jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./pdf_tracking.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;
@@ -1056,6 +1056,24 @@ const OpenPdfParams = Type.Object(
 	{ additionalProperties: false },
 );
 
+const JumpPdfParams = Type.Object(
+	{
+		pdf_id: Type.Number({
+			description: "Tracked numeric PDF ID returned by open_pdf or compile_latex_file(..., open_pdf=true). Arbitrary PDF paths are not accepted.",
+			minimum: 1,
+		}),
+		line: Type.Number({
+			description: "1-based source line to jump to. The tool supplies the SyncTeX column automatically.",
+			minimum: 1,
+		}),
+		source_file: Type.Optional(Type.String({
+			description: "Optional source file for the SyncTeX jump. Omit when the tracked PDF has a known default source; pass it for included-file or ambiguous SyncTeX cases.",
+			minLength: 1,
+		})),
+	},
+	{ additionalProperties: false },
+);
+
 const SetLatexPreambleParams = Type.Object(
 	{
 		latex_preamble: Type.String({
@@ -1075,6 +1093,14 @@ async function compileAndPreviewLatex(latexSource: string, compiler?: LatexCompi
 	}
 
 	return mcpClient.callShowLatex(applyLatexPreamble(latexSource, readLatexPreambleFromTmpdir()), compiler, signal);
+}
+
+function resolvePositiveInteger(value: unknown, name: string): number {
+	const numberValue = typeof value === "number" ? value : Number(value);
+	if (!Number.isInteger(numberValue) || numberValue < 1) {
+		throw new Error(`${name} must be a positive integer`);
+	}
+	return numberValue;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1134,12 +1160,50 @@ export default function (pi: ExtensionAPI) {
 				pdfPath = trackedPdf.path;
 				return {
 					content: [{ type: "text", text: `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}` }],
-					details: { pdf_id: trackedPdf.id, pdf: trackedPdf.path },
+					details: { pdf_id: trackedPdf.id, pdf: trackedPdf.path, source: trackedPdf.sourceFile },
 				};
 			} catch (error) {
 				throw latexToolFailure("open-pdf", "Open PDF failed", {
 					requested_path: requestedPath,
 					pdf: pdfPath,
+				}, error);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "jump_pdf",
+		label: "Jump PDF",
+		description: "Perform a line-based Zathura forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. Uses the tracked default source file when known, or pass source_file for ambiguous/included-file jumps.",
+		promptSnippet: "Jump to a source line in a tracked PDF",
+		promptGuidelines: [
+			"Use jump_pdf to move an already tracked Zathura PDF to a source line via forward SyncTeX.",
+			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); do not pass arbitrary PDF paths.",
+			"Omit source_file when the tracked PDF has a known default source. If the tool asks for source_file, retry with the relevant .tex file, especially for included files.",
+		],
+		parameters: JumpPdfParams,
+		async execute(_toolCallId, params, signal) {
+			let pdfId = 0;
+			let line = 0;
+			let sourceFile: string | undefined;
+			try {
+				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
+				line = resolvePositiveInteger(params.line, "line");
+				sourceFile = params.source_file === undefined ? undefined : String(params.source_file);
+				if (sourceFile !== undefined && !sourceFile.trim()) {
+					throw new Error("source_file must be a non-empty string when provided");
+				}
+
+				const result = await jumpToTrackedPdf(pdfId, line, sourceFile, pdfTracker, signal);
+				return {
+					content: [{ type: "text", text: `ok: pdf_id=${pdfId} line=${line} source=${result.sourceFile} pdf=${result.pdf}${result.reopened ? " reopened=true" : ""}` }],
+					details: { pdf_id: pdfId, line, source: result.sourceFile, pdf: result.pdf, reopened: result.reopened },
+				};
+			} catch (error) {
+				throw latexToolFailure("jump-pdf", "PDF jump failed", {
+					pdf_id: pdfId || params.pdf_id,
+					line: line || params.line,
+					source_file: sourceFile ?? params.source_file,
 				}, error);
 			}
 		},
@@ -1181,7 +1245,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				try {
-					const trackedPdf = await openAndTrackPdf(pdfPath, pdfTracker, signal);
+					const trackedPdf = await openAndTrackPdf(pdfPath, pdfTracker, signal, undefined, latexFilePath);
 					return {
 						content: [{ type: "text", text: `ok: pdf_id=${trackedPdf.id} pdf=${trackedPdf.path}` }],
 						details: { source: latexFilePath, pdf: trackedPdf.path, pdf_id: trackedPdf.id },

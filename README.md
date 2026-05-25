@@ -1,9 +1,10 @@
 # pdf-preview
 
-Pi extension that exposes four tools:
+Pi extension that exposes five tools:
 
 - `show_latex` — compile LaTeX source and trigger the fixed preview pipeline.
 - `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
+- `jump_pdf` — perform a line-based Zathura forward SyncTeX jump in a tracked PDF by `pdf_id`.
 - `compile_latex_file` — compile a local LaTeX source file in place, optionally opening/tracking the resulting PDF.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
@@ -27,11 +28,15 @@ pi -e /path/to/pdf-preview
 # pi -e /path/to/pdf-preview/index.ts
 ```
 
-## PDF tracking
+## PDF tracking and jumps
 
 `open_pdf(pdf_file_path)` validates that the path exists, is readable, is a regular PDF file, then launches Zathura with `--fork`. Successful calls return `ok: pdf_id=<id> pdf=<path>` and include `pdf_id` in tool details. IDs are short-lived, session-local values; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID within that session where practical, while distinct PDFs receive distinct IDs.
 
-Open failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
+Tracked PDFs also remember a default source file when possible. `compile_latex_file(..., open_pdf=true)` stores the compiled source path exactly. `open_pdf(existing.pdf)` attempts to infer a default source from `<basename>.tex` next to the normalized PDF and from available `.synctex`/`.synctex.gz` input records.
+
+`jump_pdf(pdf_id, line, source_file?)` performs a forward SyncTeX jump with Zathura using the tracked numeric `pdf_id`; it does not accept arbitrary PDF paths. The public tool is line-based, so callers do not pass a column. If the default source is unknown, call it again with `source_file`. If the tracked Zathura window was closed or is unavailable, the tool tries to reopen the same tracked PDF before retrying the jump.
+
+Open and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
 
 ## Development
 
