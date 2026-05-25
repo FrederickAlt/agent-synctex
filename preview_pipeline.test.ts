@@ -33,19 +33,39 @@ class Result:
     stdout = ""
 
 def fake_run(cmd, cwd, env, text, stdout, stderr, timeout, check):
-    Path(cwd, mcp.PDF_NAME).write_bytes(b"%PDF-1.4\n")
+    tex = Path(cwd, mcp.TEX_NAME).read_text(encoding="utf-8")
+    Path(cwd, mcp.PDF_NAME).write_bytes(("%PDF-1.4\n" + tex).encode("utf-8"))
+    Path(cwd, mcp.SYNCTEX_GZ_NAME).write_bytes(b"synctex")
     return Result()
 
 mcp.subprocess.run = fake_run
 mcp.compile_latex("first", synctex_editor_command="cmd-A")
 first = json.loads(mcp.path_ready().read_text(encoding="utf-8"))
+first_fixed_pdf = mcp.path_pdf().read_bytes().decode("utf-8")
+first_fixed_tex = mcp.path_tex().read_text(encoding="utf-8")
+first_fixed_synctex = mcp.path_synctex_gz().read_bytes().decode("utf-8")
 mcp.compile_latex("second", synctex_editor_command="cmd-B")
 second = json.loads(mcp.path_ready().read_text(encoding="utf-8"))
-print(json.dumps({"first": first, "second": second}))
+second_fixed_pdf = mcp.path_pdf().read_bytes().decode("utf-8")
+second_fixed_tex = mcp.path_tex().read_text(encoding="utf-8")
+print(json.dumps({
+    "first": first,
+    "second": second,
+    "first_fixed_pdf": first_fixed_pdf,
+    "first_fixed_tex": first_fixed_tex,
+    "first_fixed_synctex": first_fixed_synctex,
+    "second_fixed_pdf": second_fixed_pdf,
+    "second_fixed_tex": second_fixed_tex,
+}))
 `);
 	const descriptors = JSON.parse(output) as {
 		first: { pdf: string; synctex_editor_command: string; operation_id: string };
 		second: { pdf: string; synctex_editor_command: string; operation_id: string };
+		first_fixed_pdf: string;
+		first_fixed_tex: string;
+		first_fixed_synctex: string;
+		second_fixed_pdf: string;
+		second_fixed_tex: string;
 	};
 
 	assert.equal(descriptors.first.synctex_editor_command, "cmd-A");
@@ -54,6 +74,11 @@ print(json.dumps({"first": first, "second": second}))
 	assert.notEqual(descriptors.first.pdf, descriptors.second.pdf);
 	assert.match(descriptors.first.pdf, /^runs\/.+\/show-latex\.pdf$/);
 	assert.match(descriptors.second.pdf, /^runs\/.+\/show-latex\.pdf$/);
+	assert.ok(descriptors.first_fixed_pdf.includes("first"));
+	assert.ok(descriptors.first_fixed_tex.includes("first"));
+	assert.equal(descriptors.first_fixed_synctex, "synctex");
+	assert.ok(descriptors.second_fixed_pdf.includes("second"));
+	assert.ok(descriptors.second_fixed_tex.includes("second"));
 });
 
 test("viewer opens interleaved ready operations with their own PDF and SyncTeX command", () => {

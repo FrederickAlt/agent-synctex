@@ -11,9 +11,11 @@ Pi extension that exposes seven tools:
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
 Snippet previews communicate with an MCP-style stdio service (`show_latex_mcp.py`) and forward
-`tools/call` with `show_latex`. Each successful preview writes an operation-scoped PDF and an
-atomic ready descriptor that pairs that PDF with the session's SyncTeX callback command. File
-compiles are spawned directly by the extension so normal LaTeX project-relative includes/assets
+`tools/call` with `show_latex`. Each successful preview writes an operation-scoped PDF, refreshes
+a fixed `/tmp/codex-show-latex/show-latex.pdf` compatibility copy, and atomically writes a ready
+descriptor that pairs the operation PDF with the session's SyncTeX callback command. The extension
+also falls back to opening the fixed preview PDF itself if no viewer helper opens the new preview.
+File compiles are spawned directly by the extension so normal LaTeX project-relative includes/assets
 resolve without using the backend service.
 
 ## Files

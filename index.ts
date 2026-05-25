@@ -6,7 +6,7 @@ import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { closeTrackedPdf, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
+import { closeTrackedPdf, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker, zathuraAlreadyOpen } from "./pdf_tracking.ts";
 import { SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
@@ -27,6 +27,7 @@ interface PendingRequest {
 }
 
 interface PipelineArtifactStatus {
+	path: string;
 	exists: boolean;
 	size: number;
 	mtime: number;
@@ -35,6 +36,11 @@ interface PipelineArtifactStatus {
 interface PipelineStatusSnapshot {
 	pdf: PipelineArtifactStatus;
 	ready: PipelineArtifactStatus;
+}
+
+interface ShowLatexPreviewResult {
+	text: string;
+	pdfPath: string;
 }
 
 interface LatexCommandSpec {
@@ -59,6 +65,7 @@ class LoggedToolError extends Error {
 }
 
 const MCP_TMPDIR = "/tmp/codex-show-latex";
+const MCP_FIXED_PREVIEW_PDF_PATH = resolve(MCP_TMPDIR, "show-latex.pdf");
 const LATEX_PREAMBLE_FILE_NAMES = ["preamble.tex", "praeamble.tex"] as const;
 const LATEX_PREAMBLE_PATH = resolve(MCP_TMPDIR, "preamble.tex");
 const DEFAULT_LATEX_COMPILER = "lualatex";
@@ -609,7 +616,7 @@ class ShowLatexMcpClient {
 		compiler?: LatexCompiler,
 		synctexEditorCommand?: string,
 		signal?: AbortSignal,
-	): Promise<string> {
+	): Promise<ShowLatexPreviewResult> {
 		await this.initialize();
 		const requestStartedMs = Date.now();
 		let beforeStatus: PipelineStatusSnapshot | null = null;
@@ -655,7 +662,7 @@ class ShowLatexMcpClient {
 		}
 		this.verifyPreviewArtifactsUpdated(beforeStatus, afterStatus, requestStartedMs);
 
-		return text;
+		return { text, pdfPath: afterStatus.pdf.path };
 	}
 
 	private async getShowLatexStatus(signal?: AbortSignal): Promise<PipelineStatusSnapshot | null> {
@@ -709,8 +716,14 @@ class ShowLatexMcpClient {
 			throw new Error(`show_latex_status output missing ${artifact} line`);
 		}
 
+		const pathMatch = line.match(/^[^=]+=(.*?)(?: exists| missing)(?: |$)/);
+		if (!pathMatch) {
+			throw new Error(`Could not parse ${artifact} path from status line: ${line}`);
+		}
+		const artifactPath = pathMatch[1];
+
 		if (line.includes(" missing")) {
-			return { exists: false, size: 0, mtime: 0 };
+			return { path: artifactPath, exists: false, size: 0, mtime: 0 };
 		}
 
 		const sizeMatch = line.match(/size=(\d+)/);
@@ -725,7 +738,7 @@ class ShowLatexMcpClient {
 			throw new Error(`Could not parse numeric values from ${artifact} status line: ${line}`);
 		}
 
-		return { exists: true, size, mtime };
+		return { path: artifactPath, exists: true, size, mtime };
 	}
 
 	private verifyPreviewArtifactsUpdated(
@@ -1180,7 +1193,7 @@ async function compileAndPreviewLatex(
 	compiler?: LatexCompiler,
 	synctexEditorCommand?: string,
 	signal?: AbortSignal,
-): Promise<string> {
+): Promise<ShowLatexPreviewResult> {
 	if (!latexSource.trim()) {
 		throw new Error("latex_source must be a non-empty string");
 	}
@@ -1195,6 +1208,33 @@ async function compileAndPreviewLatex(
 		synctexEditorCommand,
 		signal,
 	);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolvePromise, reject) => {
+		if (signal?.aborted) {
+			reject(new Error("operation aborted"));
+			return;
+		}
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolvePromise();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(new Error("operation aborted"));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+async function previewAlreadyOpen(paths: string[], signal?: AbortSignal): Promise<boolean> {
+	const deadline = Date.now() + 1_000;
+	while (true) {
+		if (paths.some((path) => path && zathuraAlreadyOpen(path))) return true;
+		if (Date.now() >= deadline) return false;
+		await sleep(100, signal);
+	}
 }
 
 function resolvePositiveInteger(value: unknown, name: string): number {
@@ -1239,6 +1279,7 @@ export default function (pi: ExtensionAPI) {
 			let latexSource = "";
 			let compiler: LatexCompiler | undefined;
 			let synctexCommand = "";
+			let previewPdfPath = "";
 			try {
 				latexSource = String(params.latex_source ?? "");
 				compiler = resolveLatexCompiler(params.compiler);
@@ -1246,16 +1287,35 @@ export default function (pi: ExtensionAPI) {
 					const server = await ensureSynctexCallbacks(ctx);
 					synctexCommand = server.command;
 				}
-				const text = await compileAndPreviewLatex(latexSource, compiler, synctexCommand, signal);
+				const preview = await compileAndPreviewLatex(latexSource, compiler, synctexCommand, signal);
+				previewPdfPath = preview.pdfPath;
+
+				let trackedPdfId: number | undefined;
+				let openedPdfPath: string | undefined;
+				if (!(await previewAlreadyOpen([preview.pdfPath, MCP_FIXED_PREVIEW_PDF_PATH], signal))) {
+					const trackedPdf = await openAndTrackPdf(
+						MCP_FIXED_PREVIEW_PDF_PATH,
+						pdfTracker,
+						signal,
+						synctexCommand
+							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand })
+							: undefined,
+					);
+					trackedPdfId = trackedPdf.id;
+					openedPdfPath = trackedPdf.path;
+				}
+
 				return {
-					content: [{ type: "text", text }],
-					details: {},
+					content: [{ type: "text", text: preview.text }],
+					details: { pdf: openedPdfPath ?? preview.pdfPath, pdf_id: trackedPdfId, operation_pdf: preview.pdfPath, synctex_callback_command: synctexCommand },
 				};
 			} catch (error) {
 				throw latexToolFailure("show-latex", "LaTeX preview failed", {
 					compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
 					latex_source_length: latexSource.length,
 					latex_source_tail: tailText(latexSource, 30000),
+					pdf: previewPdfPath,
+					fixed_preview_pdf: MCP_FIXED_PREVIEW_PDF_PATH,
 					synctex_callback_command: synctexCommand,
 				}, error);
 			}

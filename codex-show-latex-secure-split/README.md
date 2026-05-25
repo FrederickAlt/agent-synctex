@@ -6,6 +6,7 @@ This version separates the two jobs:
 MCP server inside Codex/sandbox:
   compile LaTeX only
   write an operation-scoped PDF under /tmp/codex-show-latex/runs/
+  refresh fixed compatibility copies under /tmp/codex-show-latex/
   atomically write /tmp/codex-show-latex/show-latex.ready on success
 
 Desktop helper outside Codex/sandbox:
@@ -49,6 +50,9 @@ Debug-only status tool.
 /tmp/codex-show-latex/runs/<operation-id>/show-latex.tex
 /tmp/codex-show-latex/runs/<operation-id>/show-latex.pdf
 /tmp/codex-show-latex/runs/<operation-id>/show-latex.log
+/tmp/codex-show-latex/show-latex.pdf
+/tmp/codex-show-latex/show-latex.tex
+/tmp/codex-show-latex/show-latex.synctex.gz
 /tmp/codex-show-latex/show-latex.ready
 /tmp/codex-show-latex/mcp-debug.log
 /tmp/codex-show-latex/zathura.log

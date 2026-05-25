@@ -30,6 +30,8 @@ DEFAULT_TMPDIR = "/tmp/codex-show-latex"
 TEX_NAME = "show-latex.tex"
 PDF_NAME = "show-latex.pdf"
 LOG_NAME = "show-latex.log"
+SYNCTEX_NAME = "show-latex.synctex"
+SYNCTEX_GZ_NAME = "show-latex.synctex.gz"
 READY_NAME = "show-latex.ready"
 MCP_DEBUG_NAME = "mcp-debug.log"
 RUNS_DIR_NAME = "runs"
@@ -57,6 +59,14 @@ def path_pdf() -> Path:
 
 def path_log() -> Path:
     return tmpdir() / LOG_NAME
+
+
+def path_synctex() -> Path:
+    return tmpdir() / SYNCTEX_NAME
+
+
+def path_synctex_gz() -> Path:
+    return tmpdir() / SYNCTEX_GZ_NAME
 
 
 def path_ready() -> Path:
@@ -133,6 +143,23 @@ def atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def atomic_copy_file(source: Path, destination: Path, mode: int = 0o600) -> None:
+    tmp = destination.parent / f".{destination.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with source.open("rb") as src, os.fdopen(fd, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp, destination)
     finally:
         try:
             if tmp.exists():
@@ -278,6 +305,26 @@ def compile_latex(
     if not is_regular_file_owned_by_user(pdf_path):
         debug(f"compile command succeeded but pdf missing/invalid id={run_id}")
         raise RuntimeError(compiler_error_message(f"PDF was not created at {pdf_path}", output, log_path))
+
+    # Keep a fixed-path copy for older viewer helpers and for the Pi extension's
+    # single-window "current preview" fallback.  The ready marker is written only
+    # after these files are in place so legacy helpers never observe a fresh
+    # marker with a missing fixed PDF.
+    atomic_copy_file(pdf_path, path_pdf())
+    atomic_copy_file(tex_path, path_tex())
+    fixed_log_path = path_log()
+    if log_path.exists():
+        atomic_copy_file(log_path, fixed_log_path)
+    else:
+        safe_unlink(fixed_log_path)
+    for run_synctex, fixed_synctex in [
+        (run_dir / SYNCTEX_NAME, path_synctex()),
+        (run_dir / SYNCTEX_GZ_NAME, path_synctex_gz()),
+    ]:
+        if run_synctex.exists():
+            atomic_copy_file(run_synctex, fixed_synctex)
+        else:
+            safe_unlink(fixed_synctex)
 
     descriptor = {
         "version": 1,
