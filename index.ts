@@ -1103,7 +1103,7 @@ const LatexCompilerParam = Type.Optional(Type.Union([
 const ShowLatexParams = Type.Object(
 	{
 		latex_source: Type.String({
-			description: "LaTeX source code to compile. If a temp preamble is used, that file contains the code before \\begin{document}; provide only the document body or the \\begin{document}...\\end{document} block for preview.",
+			description: "LaTeX source code to compile. Snippets can rely on the temp preamble; for those, provide only the document body or the \\begin{document}...\\end{document} block. Full documents with their own \\documentclass can also be compiled.",
 			minLength: 1,
 		}),
 		compiler: LatexCompilerParam,
@@ -1147,7 +1147,7 @@ const JumpPdfParams = Type.Object(
 			minimum: 1,
 		}),
 		source_file: Type.Optional(Type.String({
-			description: "Optional source file for the SyncTeX jump. Omit when the tracked PDF has a known default source; pass it for included-file or ambiguous SyncTeX cases.",
+			description: "Optional source file for the SyncTeX jump. Omit when the tracked PDF has a known default source; pass it when no default source was inferred or when jumping to a line in an included .tex file.",
 			minLength: 1,
 		})),
 	},
@@ -1157,7 +1157,7 @@ const JumpPdfParams = Type.Object(
 const SetLatexPreambleParams = Type.Object(
 	{
 		latex_preamble: Type.String({
-			description: "LaTeX preamble lines to write to /tmp/codex-show-latex/preamble.tex and include before \\begin{document} for show_latex snippet compiles; this is for documentclass/usepackage/macros, not document body content. Use an empty string to clear it.",
+			description: "LaTeX preamble lines to write to /tmp/codex-show-latex/preamble.tex and include before \\begin{document} for show_latex snippet compiles. This is for pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. Use an empty string to clear it.",
 		}),
 	},
 	{ additionalProperties: false },
@@ -1218,11 +1218,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "show_latex",
 		label: "Show LaTeX",
-		description: "Compile LaTeX source and refresh the shared preview pipeline. Calling this tool again overwrites the same preview view; the user will only see the most recent preview. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. The extension loads its preamble from /tmp/codex-show-latex/preamble.tex (or praeamble.tex there, if present). At startup, ./preamble.tex or ./praeamble.tex from the current working directory is copied to that fixed temp path as the default. When using a preamble file, provide only the document body or the \\begin{document}...\\end{document} block for preview.",
+		description: "Compile LaTeX source and refresh the PDF preview. Calling this tool again overwrites the current preview; the user will only see the most recent preview. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. The extension loads its snippet preamble from /tmp/codex-show-latex/preamble.tex, falling back to /tmp/codex-show-latex/praeamble.tex if preamble.tex is absent. At startup, ./preamble.tex or ./praeamble.tex from the current working directory is copied to that fixed temp path as the default. For snippets that rely on this preamble, provide only the document body or the \\begin{document}...\\end{document} block; full documents with their own \\documentclass can also be compiled.",
 		promptSnippet: "Compile and preview LaTeX as PDF",
 		promptGuidelines: [
 			"Use show_latex when the user asks for a LaTeX PDF preview. Omit compiler for the lualatex default, or set compiler when a different engine is needed.",
-			"If you would otherwise repeat the same LaTeX packages, macros, or style setup, write them with set_latex_preamble or put them in ./preamble.tex or ./praeamble.tex before startup; those files are for pre-\\begin{document} code only, so the preview input should be just the document body or \\begin{document}...\\end{document}.",
+			"If you would otherwise repeat the same LaTeX packages, macros, or style setup, write them with set_latex_preamble or place them in ./preamble.tex or ./praeamble.tex before starting the Pi session. Those files are for pre-\\begin{document} code only. For snippet previews that rely on them, pass just the document body or \\begin{document}...\\end{document}; full documents with their own \\documentclass can also be compiled.",
 		],
 		parameters: ShowLatexParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -1306,12 +1306,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "jump_pdf",
 		label: "Jump PDF",
-		description: "Perform a line-based Zathura forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. Uses the tracked default source file when known, or pass source_file for ambiguous/included-file jumps.",
+		description: "Perform a line-based Zathura forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. The PDF must have SyncTeX data, and the source file must be readable. Uses the tracked default source file when known, or pass source_file when no default source was inferred or when jumping to an included .tex file.",
 		promptSnippet: "Jump to a source line in a tracked PDF",
 		promptGuidelines: [
 			"Use jump_pdf to move an already tracked Zathura PDF to a source line via forward SyncTeX.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); do not pass arbitrary PDF paths.",
-			"Omit source_file when the tracked PDF has a known default source. If the tool asks for source_file, retry with the relevant .tex file, especially for included files.",
+			"Omit source_file when the tracked PDF has a known default source. If the tool asks for source_file, retry with the relevant readable .tex file, especially for included files.",
 		],
 		parameters: JumpPdfParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -1462,11 +1462,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "set_latex_preamble",
 		label: "Set LaTeX Preamble",
-		description: "Set LaTeX preamble lines inserted before \\begin{document} in subsequent show_latex snippet compiles. This writes the hardcoded temp preamble file /tmp/codex-show-latex/preamble.tex. It should contain documentclass/usepackage/macros, not document body content. compile_latex_file compiles complete files directly and does not inject this preamble.",
+		description: "Set LaTeX preamble lines inserted before \\begin{document} in subsequent show_latex snippet compiles. This writes the hardcoded temp preamble file /tmp/codex-show-latex/preamble.tex. It should contain pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. compile_latex_file compiles complete files directly and does not inject this preamble.",
 		promptSnippet: "Set a LaTeX preamble for future PDF previews",
 		promptGuidelines: [
 			"Use set_latex_preamble when a user wants packages/macros/options included in every preview.",
-			"For reusable project defaults, write pre-\\begin{document} code to ./preamble.tex or ./praeamble.tex before startup so it is copied into /tmp/codex-show-latex/preamble.tex.",
+			"For reusable project defaults, write pre-\\begin{document} code to ./preamble.tex or ./praeamble.tex before starting the Pi session so it is copied into /tmp/codex-show-latex/preamble.tex.",
 		],
 		parameters: SetLatexPreambleParams,
 		async execute(_toolCallId, params) {
