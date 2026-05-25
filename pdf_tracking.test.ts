@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	assertReadablePdfFile,
 	normalizePdfFilePath,
+	openAndTrackPdf,
 	openPdfInZathura,
 	PdfTracker,
 } from "./pdf_tracking.ts";
@@ -65,6 +66,42 @@ test("PdfTracker clear drops session state and resets IDs", () => {
 	const nextSessionPdf = tracker.trackOpenedPdf("/tmp/one.pdf");
 	assert.equal(nextSessionPdf.id, 1);
 	assert.notEqual(nextSessionPdf, first);
+});
+
+test("openAndTrackPdf normalizes, opens, and tracks a PDF", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const link = join(dir, "paper-link.pdf");
+	writeMinimalPdf(pdf);
+	symlinkSync(pdf, link);
+
+	const tracker = new PdfTracker();
+	const openedPaths: string[] = [];
+	const trackedPdf = await openAndTrackPdf(link, tracker, undefined, async (pdfPath) => {
+		openedPaths.push(pdfPath);
+	});
+
+	const realPdfPath = realpathSync(pdf);
+	assert.deepEqual(openedPaths, [realPdfPath]);
+	assert.equal(trackedPdf.id, 1);
+	assert.equal(trackedPdf.path, realPdfPath);
+	assert.equal(tracker.getByPath(realPdfPath), trackedPdf);
+});
+
+test("openAndTrackPdf does not track when opening fails", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	writeMinimalPdf(pdf);
+
+	const tracker = new PdfTracker();
+	await assert.rejects(
+		() => openAndTrackPdf(pdf, tracker, undefined, async () => {
+			throw new Error("no display");
+		}),
+		/no display/,
+	);
+
+	assert.equal(tracker.getByPath(realpathSync(pdf)), undefined);
 });
 
 test("openPdfInZathura launches zathura with --fork and the PDF path", async () => {

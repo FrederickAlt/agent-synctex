@@ -4,7 +4,7 @@ Pi extension that exposes four tools:
 
 - `show_latex` — compile LaTeX source and trigger the fixed preview pipeline.
 - `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
-- `compile_latex_file` — compile a local LaTeX source file in place without opening or publishing a preview.
+- `compile_latex_file` — compile a local LaTeX source file in place, optionally opening/tracking the resulting PDF.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
 Snippet previews communicate with an MCP-style stdio service (`show_latex_mcp.py`) and forward
@@ -44,7 +44,9 @@ Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk` (which run
 
 For `compile_latex_file`, the selected compiler is spawned with the source file's directory as the
 working directory, using the original file name as the job input. The resulting `<name>.pdf` stays
-next to the source file. Successful output is a single short `ok: <pdf>` line.
+next to the source file. By default, successful output is a single short `ok: <pdf>` line. With
+`open_pdf=true`, the tool opens/tracks the PDF after a successful compile and returns both `pdf`
+and `pdf_id` in its details.
 
 Both `show_latex` and `compile_latex_file` report only a short error on failure and write diagnostic
 details to `/tmp/codex-show-latex/*.log`.

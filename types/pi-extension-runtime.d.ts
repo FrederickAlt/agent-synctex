@@ -32,5 +32,6 @@ declare module "typebox" {
 		Literal(value: unknown, options?: Record<string, unknown>): unknown;
 		Object(properties: Record<string, unknown>, options?: Record<string, unknown>): unknown;
 		String(options?: Record<string, unknown>): unknown;
+		Boolean(options?: Record<string, unknown>): unknown;
 	};
 }

@@ -185,6 +185,8 @@ export async function openPdfInZathura(
 	}
 }
 
+type PdfOpener = (pdfFilePath: string, signal?: AbortSignal) => Promise<void>;
+
 export class PdfTracker {
 	private readonly trackedPdfsByPath = new Map<string, TrackedPdf>();
 	private readonly trackedPdfsById = new Map<number, TrackedPdf>();
@@ -223,4 +225,15 @@ export class PdfTracker {
 		this.trackedPdfsById.clear();
 		this.nextPdfId = 1;
 	}
+}
+
+export async function openAndTrackPdf(
+	pdfFilePath: string,
+	tracker: PdfTracker,
+	signal?: AbortSignal,
+	opener: PdfOpener = openPdfInZathura,
+): Promise<TrackedPdf> {
+	const pdfPath = normalizePdfFilePath(pdfFilePath);
+	await opener(pdfPath, signal);
+	return tracker.trackOpenedPdf(pdfPath);
 }
