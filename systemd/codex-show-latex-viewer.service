@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Show LaTeX desktop viewer helper
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

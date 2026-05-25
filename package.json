@@ -1,0 +1,21 @@
+{
+  "name": "pdf-preview",
+  "version": "0.1.0",
+  "description": "Pi extension providing LaTeX preview and local file compile tools",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "keywords": [
+    "pi-extension",
+    "pdf",
+    "latex",
+    "show-latex"
+  ]
+}
