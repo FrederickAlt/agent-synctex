@@ -13,7 +13,7 @@ Desktop helper outside Codex/sandbox:
   open the PDF named in that ready descriptor in Zathura
 ```
 
-The MCP process no longer needs `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, D-Bus, or Wayland/X11 socket access.
+The MCP process no longer needs `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, D-Bus, or Wayland/X11 socket access. Compiles are SyncTeX-enabled by default (`-synctex=1`), and each ready descriptor can carry an operation-scoped Zathura inverse SyncTeX callback command.
 
 ## Tool parameters
 
@@ -72,7 +72,9 @@ installs and starts codex-show-latex-viewer.service as a systemd --user service
 creates /tmp/codex-show-latex with mode 0700
 ```
 
-Restart Codex fully after installing.
+The service only runs `scripts/show_latex_viewer.py`; it does not install a global SyncTeX receiver and does not edit `~/.config/zathura/zathurarc`. When a ready descriptor includes `synctex_editor_command`, the viewer passes it to Zathura with `--synctex-editor-command=...` for that opened preview.
+
+Restart Codex fully after installing. If you already installed an older copy, rerun `./install.sh` or restart `codex-show-latex-viewer.service` so the viewer helper can read the new ready descriptor fields.
 
 ## Debug commands
 
@@ -86,7 +88,7 @@ cat /tmp/codex-show-latex/zathura.log
 
 ## Security notes
 
-The unsandboxed helper does not accept commands, JSON requests, socket messages, or shell snippets. It only reacts to the fixed ready marker and opens the operation PDF named there.
+The unsandboxed helper does not accept JSON requests, socket messages, or arbitrary shell snippets. It only reacts to the fixed ready marker and opens the operation PDF named there. The optional `synctex_editor_command` field is passed to Zathura as its inverse SyncTeX editor command for the current preview operation.
 
 It refuses unsafe temp/PDF paths such as symlinks, non-regular PDF files, files outside `/tmp/codex-show-latex`, or files not owned by the current user.
 
