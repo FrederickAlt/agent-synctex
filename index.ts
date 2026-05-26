@@ -11,7 +11,7 @@ import { rasterizePdfPage, type InlinePreviewArtifact } from "./inline_preview.t
 import { buildKittyPlaceholderImageRender, KittyImageRefreshRegistry } from "./kitty_placeholder_image.ts";
 import { closeTrackedPdf, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
-import { SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
+import { readSourceLine, SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;
@@ -1671,7 +1671,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "jump_pdf",
 		label: "Jump PDF",
-		description: "Perform a line-based Zathura forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. The PDF must have SyncTeX data, and the source file must be readable. Uses the tracked default source file when known, or pass source_file when no default source was inferred or when jumping to an included .tex file.",
+		description: "Perform a line-based Zathura forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. The PDF must have SyncTeX data, and the source file must be readable. Uses the tracked default source file when known, or pass source_file when no default source was inferred or when jumping to an included .tex file. On success, the text result names the jumped line and then shows the verbatim LaTeX source line.",
 		promptSnippet: "Jump to a source line in a tracked PDF",
 		promptGuidelines: [
 			"Use jump_pdf to move an already tracked Zathura PDF to a source line via forward SyncTeX.",
@@ -1679,6 +1679,8 @@ export default function (pi: ExtensionAPI) {
 			"Reuse the same pdf_id for repeated jumps within one tracked PDF.",
 			"source_file is optional only when the target line is in the tracked default source file; provide it whenever the target is in another source file or needs disambiguation.",
 			"When the target content is in a file included by \\input, \\include, or similar, pass source_file as the included .tex file and use the line number from that included file. Do not jump to the parent file's \\input/\\include line unless that directive itself is the target.",
+			"Mental model: pdf_id = viewer/PDF; source_file = TeX file containing the target line. For multi-file LaTeX, compile/open main.tex once, keep its pdf_id, and use jump_pdf(pdf_id, line, source_file=<included file>) for all fragments. Never open a new PDF merely because the target line is in another included file.",
+			"After a successful jump, the tool result text names the jumped line and then shows the source line's verbatim LaTeX. Use it to verify that edits did not shift the intended target row.",
 			"After a successful jump, do not tell the user which line you jumped to unless they explicitly ask for the exact line; the user will see the line in the PDF viewer.",
 		],
 		parameters: JumpPdfParams,
@@ -1707,9 +1709,10 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					synctexCommand ? { synctexEditorCommand: synctexCommand } : {},
 				);
+				const sourceLine = readSourceLine(result.sourceFile, result.line, process.cwd()) ?? "";
 				return {
-					content: [{ type: "text", text: `ok: pdf_id=${pdfId} line=${line} source=${result.sourceFile} pdf=${result.pdf}${result.reopened ? " reopened=true" : ""}` }],
-					details: { pdf_id: pdfId, line, source: result.sourceFile, pdf: result.pdf, reopened: result.reopened },
+					content: [{ type: "text", text: `line ${result.line} contains:\n${sourceLine}` }],
+					details: { pdf_id: pdfId, line, source: result.sourceFile, pdf: result.pdf, reopened: result.reopened, source_line: sourceLine },
 				};
 			} catch (error) {
 				throw latexToolFailure("jump-pdf", "PDF jump failed", {
@@ -1757,6 +1760,7 @@ export default function (pi: ExtensionAPI) {
 			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
 			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without opening a window; set open_pdf=true only when the user wants the compiled PDF opened/tracked immediately.",
 			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
+			"For multi-file LaTeX projects, compile/open the root file that produces the PDF, such as main.tex. The returned pdf_id identifies the resulting PDF/viewer and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
 			"On failure this tool returns only a short error message and writes details to a temporary log file.",
 		],
 		parameters: CompileLatexFileParams,
