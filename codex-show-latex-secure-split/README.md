@@ -26,6 +26,8 @@ compiler: string, optional; default lualatex; one of lualatex, pdflatex, xelatex
 synctex_editor_command: string, optional; operation-scoped Zathura inverse SyncTeX callback
 ```
 
+`show_latex` uses the active `/tmp/codex-show-latex/preamble.tex`, which is initialized from any `./preamble.tex` or `./praeamble.tex` in the working directory when present. Do not repeat that preamble in `latex_source` unless you intentionally want to override it.
+
 `latexmk` runs latexmk with LuaLaTeX.
 
 On success, the tool returns only:

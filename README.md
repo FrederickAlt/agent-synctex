@@ -2,7 +2,7 @@
 
 Pi extension that exposes seven tools:
 
-- `show_latex` — compile LaTeX source and render page 1 inline by default; pass `inline=false` for the external Zathura preview.
+- `show_latex` — compile LaTeX source and render page 1 inline by default; pass `inline=false` for the external Zathura preview. It automatically loads `./preamble.tex` or `./praeamble.tex` from the current working directory when present, so do not repeat that preamble in the snippet.
 - `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
 - `close_pdf` — close a tracked Zathura PDF window by `pdf_id`.
 - `jump_pdf` — perform a line-based Zathura forward SyncTeX jump in a tracked PDF by `pdf_id`.
@@ -117,12 +117,14 @@ details to `/tmp/codex-show-latex/*.log`.
 
 ## Preamble behavior
 
+`show_latex` always applies a preamble, even when the caller does not specify one.
+
 There are no environment-variable configuration knobs for this extension. Runtime paths are hardcoded:
 
 - Preview temp directory: `/tmp/codex-show-latex`
 - Active preamble file: `/tmp/codex-show-latex/preamble.tex`
 
-At extension initialization, `./preamble.tex` or `./praeamble.tex` in the Pi agent's current working directory is searched in that order. If one exists, its contents are copied to `/tmp/codex-show-latex/preamble.tex` and become the default preamble. During `show_latex` snippet compilation, the extension loads the preamble from `/tmp/codex-show-latex/preamble.tex`; `/tmp/codex-show-latex/praeamble.tex` is also accepted as a fallback if no canonical preamble exists.
+At extension initialization, `./preamble.tex` or `./praeamble.tex` in the Pi agent's current working directory is searched in that order. If one exists, its contents are copied to `/tmp/codex-show-latex/preamble.tex` and become the default preamble. During `show_latex` snippet compilation, the extension loads the preamble from `/tmp/codex-show-latex/preamble.tex`; `/tmp/codex-show-latex/praeamble.tex` is also accepted as a fallback if no canonical preamble exists. This means the model should assume the preamble is already in effect and provide only the body unless it intentionally wants to override those definitions.
 
 The preamble can also be changed at runtime with `set_latex_preamble`, which writes `/tmp/codex-show-latex/preamble.tex`. Preamble files should contain only pre-`\begin{document}` code such as `\documentclass`, `\usepackage`, and macro definitions. `show_latex` inputs should then contain only the document body, or the `\begin{document}`...`\end{document}` block. `compile_latex_file` compiles complete files directly and does not inject this temp preamble.
 

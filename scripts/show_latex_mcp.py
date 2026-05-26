@@ -373,12 +373,15 @@ def tool_schema() -> list[Json]:
             "name": "show_latex",
             "description": (
                 "Compile LaTeX source to an operation-scoped PDF under /tmp/codex-show-latex. "
-                "Returns only 'ok' on success. A separate desktop helper opens the ready descriptor PDF."
+                "It uses the active preamble from /tmp/codex-show-latex/preamble.tex, which is initialized from "
+                "any existing ./preamble.tex or ./praeamble.tex in the working directory, so fragments should not "
+                "repeat those definitions. Returns only 'ok' on success. A separate desktop helper opens the ready "
+                "descriptor PDF."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "latex_source": {"type": "string", "description": "LaTeX source. Full documents compile as-is; fragments are wrapped automatically."},
+                    "latex_source": {"type": "string", "description": "LaTeX source. Full documents compile as-is; fragments are wrapped automatically. The active preamble from /tmp/codex-show-latex/preamble.tex is applied automatically."},
                     "compiler": {"type": "string", "enum": list(SUPPORTED_COMPILERS), "default": DEFAULT_COMPILER, "description": "Optional LaTeX compiler to use. Defaults to lualatex."},
                     "synctex_editor_command": {"type": "string", "description": "Session-specific Zathura inverse SyncTeX callback command for this preview operation."},
                     "write_ready": {"type": "boolean", "default": True, "description": "Whether to write the ready descriptor consumed by external preview helpers."},

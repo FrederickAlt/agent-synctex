@@ -111,6 +111,7 @@ Viewer helper service:
 
 Model-facing tools:
   show_latex(latex_source: string, compiler?: lualatex|pdflatex|xelatex|latexmk)
+  note: auto-loads ./preamble.tex or ./praeamble.tex when present
   show_latex_status()
 
 Restart Codex fully, then check /mcp.
