@@ -1330,6 +1330,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
 			"Pass an existing local PDF path. The returned pdf_id is short-lived and valid only in the current Pi session.",
+			"If you need to show multiple source lines at once, open one viewer per line/location so each can be jumped to separately with jump_pdf.",
 			"Extension-opened Zathura PDFs are wired to paste inverse SyncTeX clicks into the current interactive editor without triggering an agent turn.",
 		],
 		parameters: OpenPdfParams,
@@ -1410,6 +1411,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use jump_pdf to move an already tracked Zathura PDF to a source line via forward SyncTeX.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); do not pass arbitrary PDF paths.",
+			"If you need to show multiple lines at once, open a separate PDF viewer for each line/location and call jump_pdf on each viewer's pdf_id.",
 			"source_file is optional only when the target line is in the tracked default source file; provide it whenever the target is in another source file or needs disambiguation.",
 			"When the target content is in a file included by \\input, \\include, or similar, pass source_file as the included .tex file and use the line number from that included file. Do not jump to the parent file's \\input/\\include line unless that directive itself is the target.",
 			"After a successful jump, do not tell the user which line you jumped to unless they explicitly ask for the exact line; the user will see the line in the PDF viewer.",
