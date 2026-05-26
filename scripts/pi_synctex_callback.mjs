@@ -56,6 +56,23 @@ function sendClick(socketPath, message) {
 	});
 }
 
+function piPidFromSocketPath(socketPath) {
+	const match = /(?:^|\/)pi-synctex-(\d+)-[0-9a-f]+\.sock$/.exec(socketPath);
+	if (!match) return undefined;
+	const pid = Number(match[1]);
+	return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+function requestPiRedraw(socketPath) {
+	const pid = piPidFromSocketPath(socketPath);
+	if (pid === undefined) return;
+	try {
+		process.kill(pid, "SIGWINCH");
+	} catch {
+		// Best-effort redraw nudge only. The socket response already confirmed paste delivery.
+	}
+}
+
 try {
 	const args = parseArgs(process.argv.slice(2));
 	const line = Number(args.line);
@@ -72,6 +89,7 @@ try {
 	if (!response.ok) {
 		throw new Error(response.error || "SyncTeX callback rejected");
 	}
+	requestPiRedraw(args.socket);
 } catch (error) {
 	const message = error instanceof Error ? error.message : String(error);
 	console.error(`pi SyncTeX callback failed: ${message}`);

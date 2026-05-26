@@ -18,6 +18,45 @@ export interface KittyPlaceholderRenderOptions {
 	cellDimensions: CellDimensions;
 }
 
+export interface KittyPlaceholderImageRender {
+	lines: string[];
+	refreshSequence: string;
+	columns: number;
+	rows: number;
+}
+
+export class KittyImageRefreshRegistry {
+	private readonly sequences = new Map<number, string>();
+	private readonly maxEntries: number;
+
+	constructor(maxEntries = 8) {
+		this.maxEntries = maxEntries;
+	}
+
+	remember(imageId: number, sequence: string): void {
+		this.sequences.delete(imageId);
+		this.sequences.set(imageId, sequence);
+		while (this.sequences.size > this.maxEntries) {
+			const oldest = this.sequences.keys().next().value;
+			if (oldest === undefined) break;
+			this.sequences.delete(oldest);
+		}
+	}
+
+	refresh(write: (sequence: string) => void = (sequence) => process.stdout.write(sequence)): void {
+		if (this.sequences.size === 0) return;
+		write([...this.sequences.values()].join(""));
+	}
+
+	clear(): void {
+		this.sequences.clear();
+	}
+
+	get size(): number {
+		return this.sequences.size;
+	}
+}
+
 const KITTY_PLACEHOLDER = "\u{10EEEE}";
 const KITTY_CHUNK_SIZE = 4096;
 const ROW_COLUMN_DIACRITICS = [
@@ -83,13 +122,18 @@ export function kittyPlaceholderLine(imageId: number, row: number, columns: numb
 	return Array.from({ length: columns }, (_value, column) => kittyPlaceholderCell(imageId, row, column)).join("");
 }
 
-export function renderKittyPlaceholderImageLines(options: KittyPlaceholderRenderOptions): string[] {
+export function buildKittyPlaceholderImageRender(options: KittyPlaceholderRenderOptions): KittyPlaceholderImageRender {
 	const maxCoordinate = ROW_COLUMN_DIACRITICS.length;
 	const columns = Math.max(1, Math.min(options.width - 2, options.maxWidthCells, maxCoordinate));
 	const rows = Math.min(calculateImageRows(options.imageDimensions, columns, options.cellDimensions), maxCoordinate);
-	const setup = wrapKittySequenceForTmux(
+	const refreshSequence = wrapKittySequenceForTmux(
 		kittyTransmitVirtualPlacementCommand(options.base64Data, options.imageId, columns, rows),
 	);
-	const imageLines = Array.from({ length: rows }, (_value, row) => `${row === 0 ? setup : ""}${kittyPlaceholderLine(options.imageId, row, columns)}`);
-	return [options.title, ...imageLines];
+	const imageLines = Array.from({ length: rows }, (_value, row) => `${row === 0 ? refreshSequence : ""}${kittyPlaceholderLine(options.imageId, row, columns)}`);
+	return { lines: [options.title, ...imageLines], refreshSequence, columns, rows };
 }
+
+export function renderKittyPlaceholderImageLines(options: KittyPlaceholderRenderOptions): string[] {
+	return buildKittyPlaceholderImageRender(options).lines;
+}
+

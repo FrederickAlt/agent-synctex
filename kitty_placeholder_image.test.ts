@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+	KittyImageRefreshRegistry,
 	kittyPlaceholderCell,
 	kittyPlaceholderLine,
 	kittyTransmitVirtualPlacementCommand,
@@ -53,4 +54,22 @@ test("wrapKittySequenceForTmux escapes nested escape bytes", () => {
 	const wrapped = wrapKittySequenceForTmux("\x1b_Ga=t;data\x1b\\");
 
 	assert.equal(wrapped, "\x1bPtmux;\x1b\x1b_Ga=t;data\x1b\x1b\\\x1b\\");
+});
+
+test("KittyImageRefreshRegistry refreshes recent image setup sequences without timers", () => {
+	const registry = new KittyImageRefreshRegistry(2);
+	const writes: string[] = [];
+
+	registry.remember(1, "one");
+	registry.remember(2, "two");
+	registry.remember(1, "one-again");
+	registry.remember(3, "three");
+	registry.refresh((sequence) => writes.push(sequence));
+
+	assert.equal(registry.size, 2);
+	assert.deepEqual(writes, ["one-againthree"]);
+
+	registry.clear();
+	registry.refresh((sequence) => writes.push(sequence));
+	assert.deepEqual(writes, ["one-againthree"]);
 });

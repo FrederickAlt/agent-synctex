@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import { gzipSync } from "node:zlib";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,6 +29,25 @@ function writeMinimalPdf(path: string): void {
 function activeChildProcessHandles(): number {
 	const getActiveHandles = (process as typeof process & { _getActiveHandles: () => Array<{ constructor?: { name?: string } }> })._getActiveHandles;
 	return getActiveHandles().filter((handle: { constructor?: { name?: string } }) => handle.constructor?.name === "ChildProcess").length;
+}
+
+async function waitForProcessArgs(pid: number, needle: string, timeoutMs = 1000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			if (readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(needle)) return;
+		} catch {
+			// Retry until the process exits or /proc catches up.
+		}
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	throw new Error(`process ${pid} did not expose expected args`);
+}
+
+async function stopProcess(child: ChildProcess): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	child.kill("SIGTERM");
+	await new Promise((resolve) => child.once("exit", resolve));
 }
 
 test("assertReadablePdfFile rejects missing, directory, and non-PDF paths clearly", () => {
@@ -198,6 +218,67 @@ test("openAndTrackPdf stores a zathura PID returned by the opener", async () => 
 	const trackedPdf = await openAndTrackPdf(pdf, tracker, undefined, async () => 4321);
 
 	assert.equal(trackedPdf.pid, 4321);
+});
+
+test("openAndTrackPdf reuses an existing tracked PDF for the same normalized path", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const link = join(dir, "paper-link.pdf");
+	writeMinimalPdf(pdf);
+	symlinkSync(pdf, link);
+
+	const tracker = new PdfTracker();
+	const openedPaths: string[] = [];
+	const opener = async (pdfPath: string) => {
+		openedPaths.push(pdfPath);
+	};
+	const first = await openAndTrackPdf(pdf, tracker, undefined, opener);
+	const second = await openAndTrackPdf(link, tracker, undefined, opener);
+
+	assert.equal(second, first);
+	assert.equal(second.id, first.id);
+	assert.deepEqual(openedPaths, [realpathSync(pdf)]);
+	assert.deepEqual(tracker.getAllByPath(realpathSync(pdf)).map((entry) => entry.id), [first.id]);
+});
+
+test("openAndTrackPdf shares concurrent opens for the same PDF", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	writeMinimalPdf(pdf);
+
+	const tracker = new PdfTracker();
+	let openCalls = 0;
+	const opener = async () => {
+		openCalls += 1;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	};
+	const [first, second] = await Promise.all([
+		openAndTrackPdf(pdf, tracker, undefined, opener),
+		openAndTrackPdf(pdf, tracker, undefined, opener),
+	]);
+
+	assert.equal(second, first);
+	assert.equal(openCalls, 1);
+	assert.deepEqual(tracker.getAllByPath(realpathSync(pdf)).map((entry) => entry.id), [first.id]);
+});
+
+test("openAndTrackPdf reopens a stale tracked PDF using the existing ID", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	writeMinimalPdf(pdf);
+
+	const tracker = new PdfTracker();
+	const stale = tracker.trackOpenedPdf(realpathSync(pdf), undefined, 987654321);
+	let openCalls = 0;
+	const reopened = await openAndTrackPdf(pdf, tracker, undefined, async () => {
+		openCalls += 1;
+		return 1234;
+	});
+
+	assert.equal(reopened.id, stale.id);
+	assert.equal(reopened.pid, 1234);
+	assert.equal(openCalls, 1);
+	assert.deepEqual(tracker.getAllByPath(realpathSync(pdf)).map((entry) => entry.id), [stale.id]);
 });
 
 test("openAndTrackPdf does not track when opening fails", async () => {
@@ -379,6 +460,73 @@ test("openPdfInZathura wires an inverse SyncTeX editor command when provided", a
 		"--fork",
 		pdf,
 	]);
+});
+
+test("openPdfInZathura does not reuse an existing viewer that lacks the current SyncTeX command", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const argsFile = join(dir, "args.txt");
+	const fakeZathura = join(dir, "zathura");
+	const synctexCommand = "node callback.mjs --file '%{input}' --line '%{line}'";
+	writeMinimalPdf(pdf);
+	writeFileSync(fakeZathura, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	const staleViewer = spawn("bash", ["-c", "exec -a zathura bash -c 'sleep 30' dummy --fork \"$1\"", "bash", pdf], {
+		stdio: "ignore",
+	});
+	try {
+		await waitForProcessArgs(staleViewer.pid!, pdf);
+
+		await openPdfInZathura(pdf, undefined, {
+			command: fakeZathura,
+			timeoutMs: 1000,
+			synctexEditorCommand: synctexCommand,
+			reuseExisting: true,
+		});
+
+		assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), [
+			`--synctex-editor-command=${synctexCommand}`,
+			"--fork",
+			pdf,
+		]);
+	} finally {
+		await stopProcess(staleViewer);
+	}
+});
+
+test("openPdfInZathura reuses an existing viewer that already has the current SyncTeX command", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const argsFile = join(dir, "args.txt");
+	const fakeZathura = join(dir, "zathura");
+	const synctexCommand = "node callback.mjs --file '%{input}' --line '%{line}'";
+	writeMinimalPdf(pdf);
+	writeFileSync(fakeZathura, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	const currentViewer = spawn("bash", [
+		"-c",
+		"exec -a zathura bash -c 'sleep 30' dummy \"--synctex-editor-command=$2\" --fork \"$1\"",
+		"bash",
+		pdf,
+		synctexCommand,
+	], { stdio: "ignore" });
+	try {
+		await waitForProcessArgs(currentViewer.pid!, synctexCommand);
+
+		const reusedPid = await openPdfInZathura(pdf, undefined, {
+			command: fakeZathura,
+			timeoutMs: 1000,
+			synctexEditorCommand: synctexCommand,
+			reuseExisting: true,
+		});
+
+		assert.equal(reusedPid, currentViewer.pid);
+		assert.equal(existsSync(argsFile), false);
+	} finally {
+		await stopProcess(currentViewer);
+	}
 });
 
 test("openPdfInZathura surfaces zathura launch failures", async () => {

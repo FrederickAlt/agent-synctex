@@ -11,6 +11,8 @@ export interface SynctexPasteTarget {
 		pasteToEditor(text: string): void;
 		setEditorText?(text: string): void;
 		getEditorText?(): string;
+		requestRender?(): void;
+		setWidget?(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
 	};
 }
 
@@ -99,6 +101,18 @@ export function createSynctexCallbackCommand(options: {
 }): string {
 	// Zathura parses this command into argv before replacing placeholders, then spawns argv directly.
 	return createSynctexCallbackArgv(options).map(shellQuote).join(" ");
+}
+
+function requestEditorRender(ui: NonNullable<SynctexPasteTarget["ui"]>): void {
+	if (typeof ui.requestRender === "function") {
+		ui.requestRender();
+		return;
+	}
+	// Pi's public extension UI does not currently expose requestRender(), but
+	// setWidget(undefined) is a visual no-op that still schedules a redraw.
+	if (typeof ui.setWidget === "function") {
+		ui.setWidget("pdf-preview-synctex-refresh", undefined);
+	}
 }
 
 export class SynctexCallbackServer {
@@ -233,6 +247,7 @@ export class SynctexCallbackServer {
 		if (typeof target.ui.setEditorText === "function" && typeof target.ui.getEditorText === "function") {
 			target.ui.setEditorText(target.ui.getEditorText());
 		}
+		requestEditorRender(target.ui);
 		return { ok: true, pasted: true };
 	}
 }

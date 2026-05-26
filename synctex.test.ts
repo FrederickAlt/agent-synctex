@@ -231,6 +231,58 @@ test("callback server refreshes the editor immediately after a click when the UI
 	}
 });
 
+test("callback server requests a UI render immediately after an external PDF click", async () => {
+	const dir = tempDir();
+	const cwd = join(dir, "project");
+	const source = join(cwd, "main.tex");
+	mkdirSync(cwd, { recursive: true });
+	writeFileSync(source, "alpha\nbeta\n", { flag: "wx" });
+
+	let editorText = "";
+	let renderRequests = 0;
+	const server = new SynctexCallbackServer({
+		tmpDir: dir,
+		callbackScriptPath: resolve("scripts/pi_synctex_callback.mjs"),
+		nodePath: process.execPath,
+	});
+	await server.ensureStarted({
+		cwd,
+		hasUI: true,
+		ui: {
+			pasteToEditor(text: string) {
+				editorText += text;
+			},
+			getEditorText() {
+				return editorText;
+			},
+			setEditorText(text: string) {
+				editorText = text;
+			},
+			setWidget(_key: string, _content: string[] | undefined) {
+				renderRequests += 1;
+			},
+		},
+	});
+
+	try {
+		const result = await runCallbackScript([
+			"--socket",
+			server.socketPath,
+			"--token",
+			server.token,
+			"--file",
+			source,
+			"--line",
+			"2",
+		]);
+		assert.equal(result.exitCode, 0, result.stderr);
+		assert.equal(editorText, "PDF click: main.tex:2\nbeta\n\n");
+		assert.equal(renderRequests, 1);
+	} finally {
+		await server.close();
+	}
+});
+
 test("callback invocation handles substituted paths containing quotes, spaces, and shell metacharacters", async () => {
 	const dir = tempDir();
 	const cwd = join(dir, "project with spaces");

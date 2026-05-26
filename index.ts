@@ -1,5 +1,5 @@
 import { createInterface, type Interface } from "node:readline";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, resolve } from "node:path";
@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Container, getCapabilities, getCellDimensions, getPngDimensions, Image, Text, type Component } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { rasterizePdfPage, type InlinePreviewArtifact } from "./inline_preview.ts";
-import { renderKittyPlaceholderImageLines } from "./kitty_placeholder_image.ts";
+import { buildKittyPlaceholderImageRender, KittyImageRefreshRegistry } from "./kitty_placeholder_image.ts";
 import { closeTrackedPdf, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
 import { SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
@@ -1144,7 +1144,10 @@ const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
 const pdfTracker = new PdfTracker();
+const tmuxKittyImageRefreshRegistry = new KittyImageRefreshRegistry();
 const synctexCallbacksByContext = new WeakMap<ExtensionContext, SynctexCallbackServer>();
+let cleanupTmuxKittyRefreshHooks: (() => void) | undefined;
+let cleanupTerminalFocusRefresh: (() => void) | undefined;
 const synctexCallbackServers = new Set<SynctexCallbackServer>();
 
 function createSynctexCallbackServer(): SynctexCallbackServer {
@@ -1313,6 +1316,93 @@ function isTmuxKittyTerminal(): boolean {
 	return Boolean(process.env.TMUX) && (Boolean(process.env.KITTY_WINDOW_ID) || process.env.TERM_PROGRAM?.toLowerCase() === "kitty");
 }
 
+function tmuxHookName(name: string): string {
+	return `${name}[pi-pdf-preview-${process.pid}]`;
+}
+
+function runTmux(args: string[]): void {
+	if (!process.env.TMUX) return;
+	spawnSync("tmux", args, { stdio: "ignore" });
+}
+
+function refreshTmuxKittyImages(): void {
+	if (!isTmuxKittyTerminal()) return;
+	tmuxKittyImageRefreshRegistry.refresh();
+}
+
+function installTmuxKittyRefreshHooks(): () => void {
+	if (!isTmuxKittyTerminal()) return () => {};
+
+	const onRefreshSignal = () => refreshTmuxKittyImages();
+	process.on("SIGWINCH", onRefreshSignal);
+	process.on("SIGUSR1", onRefreshSignal);
+
+	const signalCommand = `run-shell -b "kill -USR1 ${process.pid} 2>/dev/null || true"`;
+	runTmux(["set-hook", "-p", tmuxHookName("pane-focus-in"), signalCommand]);
+	runTmux(["set-hook", "-p", tmuxHookName("window-layout-changed"), signalCommand]);
+
+	return () => {
+		process.off("SIGWINCH", onRefreshSignal);
+		process.off("SIGUSR1", onRefreshSignal);
+		runTmux(["set-hook", "-up", tmuxHookName("pane-focus-in")]);
+		runTmux(["set-hook", "-up", tmuxHookName("window-layout-changed")]);
+	};
+}
+
+const TERMINAL_FOCUS_IN = "\x1b[I";
+const TERMINAL_FOCUS_OUT = "\x1b[O";
+
+function stripAll(text: string, search: string): string {
+	return text.split(search).join("");
+}
+
+function installTerminalFocusRefresh(ctx: ExtensionContext): () => void {
+	if (!ctx.hasUI) return () => {};
+	const ui = ctx.ui as ExtensionContext["ui"] & {
+		onTerminalInput?: (handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void;
+	};
+	if (typeof ui.onTerminalInput !== "function") {
+		ctx.ui.notify("pdf-preview: terminal focus refresh unavailable; ctx.ui.onTerminalInput is missing", "warning");
+		return () => {};
+	}
+
+	// Request terminal focus reporting. With `set -g focus-events on`, tmux forwards
+	// these as raw input sequences when the pane/window gains or loses focus.
+	process.stdout.write("\x1b[?1004h");
+
+	const timers = new Set<ReturnType<typeof setTimeout>>();
+	const scheduleRefresh = (delayMs: number) => {
+		const timer = setTimeout(() => {
+			timers.delete(timer);
+			refreshTmuxKittyImages();
+		}, delayMs);
+		timers.add(timer);
+	};
+
+	const unsubscribe = ui.onTerminalInput((data) => {
+		const sawFocusIn = data.includes(TERMINAL_FOCUS_IN);
+		const sawFocusOut = data.includes(TERMINAL_FOCUS_OUT);
+		if (!sawFocusIn && !sawFocusOut) return undefined;
+
+		if (sawFocusIn) {
+			// Give tmux/Kitty a moment to finish making the pane visible, then
+			// retransmit the latest Kitty virtual-placement image payloads.
+			scheduleRefresh(50);
+			scheduleRefresh(200);
+		}
+
+		const remaining = stripAll(stripAll(data, TERMINAL_FOCUS_IN), TERMINAL_FOCUS_OUT);
+		return remaining.length > 0 ? { data: remaining } : { consume: true };
+	});
+
+	return () => {
+		unsubscribe();
+		for (const timer of timers) clearTimeout(timer);
+		timers.clear();
+		process.stdout.write("\x1b[?1004l");
+	};
+}
+
 class TmuxKittyPlaceholderImage implements Component {
 	private cachedLines?: string[];
 	private cachedWidth?: number;
@@ -1332,8 +1422,7 @@ class TmuxKittyPlaceholderImage implements Component {
 	render(width: number): string[] {
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
 
-		this.cachedWidth = width;
-		this.cachedLines = renderKittyPlaceholderImageLines({
+		const rendered = buildKittyPlaceholderImageRender({
 			title: this.title,
 			base64Data: this.base64Data,
 			imageId: this.imageId,
@@ -1342,6 +1431,10 @@ class TmuxKittyPlaceholderImage implements Component {
 			imageDimensions: getPngDimensions(this.base64Data) ?? { widthPx: 800, heightPx: 600 },
 			cellDimensions: getCellDimensions(),
 		});
+
+		tmuxKittyImageRefreshRegistry.remember(this.imageId, rendered.refreshSequence);
+		this.cachedWidth = width;
+		this.cachedLines = rendered.lines;
 		return this.cachedLines;
 	}
 }
@@ -1386,6 +1479,11 @@ export default function (pi: ExtensionAPI) {
 	initializeLatexPreambleFile();
 
 	pi.on("session_start", (_event, ctx) => {
+		cleanupTmuxKittyRefreshHooks?.();
+		cleanupTmuxKittyRefreshHooks = installTmuxKittyRefreshHooks();
+		cleanupTerminalFocusRefresh?.();
+		cleanupTerminalFocusRefresh = installTerminalFocusRefresh(ctx);
+
 		void rotateSynctexCallbacks(ctx).catch((error) => {
 			if (ctx.hasUI) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -1465,7 +1563,7 @@ export default function (pi: ExtensionAPI) {
 						pdfTracker,
 						signal,
 						synctexCommand
-							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand })
+							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
 							: undefined,
 					);
 					trackedPdfId = trackedPdf.id;
@@ -1492,12 +1590,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "open_pdf",
 		label: "Open PDF",
-		description: "Open an existing local PDF in Zathura and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same PDF path multiple times creates independently tracked Zathura windows where supported, so jump_pdf can target each pdf_id separately. Zathura is launched with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
+		description: "Open an existing local PDF in Zathura and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same PDF path again reuses the existing tracked or visible viewer where practical. Zathura is launched with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
 		promptSnippet: "Open and track a local PDF in Zathura",
 		promptGuidelines: [
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
 			"Pass an existing local PDF path. The returned pdf_id is short-lived and valid only in the current Pi session.",
-			"If you need to show multiple source lines at once, open one viewer per line/location so each can be jumped to separately with jump_pdf.",
+			"Opening the same normalized PDF path again should return the existing pdf_id instead of creating a duplicate viewer where practical.",
 			"Extension-opened Zathura PDFs are wired to paste inverse SyncTeX clicks into the current interactive editor without triggering an agent turn.",
 		],
 		parameters: OpenPdfParams,
@@ -1520,7 +1618,7 @@ export default function (pi: ExtensionAPI) {
 					pdfTracker,
 					signal,
 					synctexCommand
-						? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand })
+						? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
 						: undefined,
 				);
 				pdfPath = trackedPdf.path;
@@ -1578,7 +1676,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use jump_pdf to move an already tracked Zathura PDF to a source line via forward SyncTeX.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); do not pass arbitrary PDF paths.",
-			"If you need to show multiple lines at once, open a separate PDF viewer for each line/location and call jump_pdf on each viewer's pdf_id.",
+			"Reuse the same pdf_id for repeated jumps within one tracked PDF.",
 			"source_file is optional only when the target line is in the tracked default source file; provide it whenever the target is in another source file or needs disambiguation.",
 			"When the target content is in a file included by \\input, \\include, or similar, pass source_file as the included .tex file and use the line number from that included file. Do not jump to the parent file's \\input/\\include line unless that directive itself is the target.",
 			"After a successful jump, do not tell the user which line you jumped to unless they explicitly ask for the exact line; the user will see the line in the PDF viewer.",
@@ -1696,7 +1794,7 @@ export default function (pi: ExtensionAPI) {
 						pdfTracker,
 						signal,
 						synctexCommand
-							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand })
+							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
 							: undefined,
 						latexFilePath,
 					);
@@ -1753,6 +1851,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		cleanupTmuxKittyRefreshHooks?.();
+		cleanupTmuxKittyRefreshHooks = undefined;
+		cleanupTerminalFocusRefresh?.();
+		cleanupTerminalFocusRefresh = undefined;
+		tmuxKittyImageRefreshRegistry.clear();
 		pdfTracker.clear();
 		await shutdownSynctexCallbacks(ctx);
 		await mcpClient.shutdown();

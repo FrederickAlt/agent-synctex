@@ -10,6 +10,7 @@ declare module "@mariozechner/pi-coding-agent" {
 
 	export interface ExtensionUIContext {
 		notify(message: string, type?: "info" | "warning" | "error"): void;
+		onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
 		pasteToEditor(text: string): void;
 		setEditorText(text: string): void;
 		getEditorText(): string;
