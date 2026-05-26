@@ -81,6 +81,127 @@ print(json.dumps({
 	assert.ok(descriptors.second_fixed_tex.includes("second"));
 });
 
+test("show_latex can suppress ready descriptor while still producing PDFs", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+from pathlib import Path
+
+script = Path("scripts/show_latex_mcp.py")
+mcp = types.ModuleType("show_latex_mcp")
+mcp.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), mcp.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-mcp-write-ready-test-"))
+mcp.DEFAULT_TMPDIR = str(tmp)
+mcp.choose_compiler = lambda compiler=None: ("fake", ["fake-compiler"])
+
+class Result:
+    returncode = 0
+    stdout = ""
+
+def fake_run(cmd, cwd, env, text, stdout, stderr, timeout, check):
+    tex = Path(cwd, mcp.TEX_NAME).read_text(encoding="utf-8")
+    Path(cwd, mcp.PDF_NAME).write_bytes(("%PDF-1.4\n" + tex).encode("utf-8"))
+    return Result()
+
+mcp.subprocess.run = fake_run
+mcp.path_pdf().write_bytes(b"%PDF-1.4\nstale fixed")
+mcp.path_ready().write_text('{"pdf":"stale"}\n', encoding="utf-8")
+suppressed_pdf = mcp.compile_latex("inline", write_ready=False, write_fixed=False)
+suppressed_ready_text = mcp.path_ready().read_text(encoding="utf-8")
+fixed_pdf_after_suppressed = mcp.path_pdf().read_bytes().decode("utf-8")
+ready_result = mcp.compile_latex("zathura", write_ready=True)
+ready = json.loads(mcp.path_ready().read_text(encoding="utf-8"))
+print(json.dumps({
+    "suppressed_pdf": str(suppressed_pdf),
+    "suppressed_ready_text": suppressed_ready_text,
+    "fixed_pdf_after_suppressed": fixed_pdf_after_suppressed,
+    "ready_pdf": str(ready_result),
+    "ready_descriptor_pdf": ready["pdf"],
+    "fixed_pdf_after_ready": mcp.path_pdf().read_bytes().decode("utf-8"),
+}))
+`);
+	const result = JSON.parse(output) as {
+		suppressed_pdf: string;
+		suppressed_ready_text: string;
+		fixed_pdf_after_suppressed: string;
+		ready_pdf: string;
+		ready_descriptor_pdf: string;
+		fixed_pdf_after_ready: string;
+	};
+
+	assert.equal(result.suppressed_ready_text, '{"pdf":"stale"}\n');
+	assert.match(result.suppressed_pdf, /\/runs\/.+\/show-latex\.pdf$/);
+	assert.equal(result.fixed_pdf_after_suppressed, "%PDF-1.4\nstale fixed");
+	assert.match(result.ready_pdf, /\/runs\/.+\/show-latex\.pdf$/);
+	assert.match(result.ready_descriptor_pdf, /^runs\/.+\/show-latex\.pdf$/);
+	assert.ok(result.fixed_pdf_after_ready.includes("zathura"));
+});
+
+test("MCP show_latex accepts write_ready false and returns PDF details", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+from pathlib import Path
+
+script = Path("scripts/show_latex_mcp.py")
+mcp = types.ModuleType("show_latex_mcp")
+mcp.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), mcp.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-mcp-call-tool-test-"))
+mcp.DEFAULT_TMPDIR = str(tmp)
+mcp.choose_compiler = lambda compiler=None: ("fake", ["fake-compiler"])
+
+class Result:
+    returncode = 0
+    stdout = ""
+
+def fake_run(cmd, cwd, env, text, stdout, stderr, timeout, check):
+    Path(cwd, mcp.PDF_NAME).write_bytes(b"%PDF-1.4\n")
+    return Result()
+
+mcp.subprocess.run = fake_run
+schema = mcp.tool_schema()[0]["inputSchema"]["properties"]
+result = mcp.call_tool("show_latex", {"latex_source": "inline", "write_ready": False, "write_fixed": False})
+print(json.dumps({
+    "has_write_ready": "write_ready" in schema,
+    "write_ready_default": schema["write_ready"]["default"],
+    "has_write_fixed": "write_fixed" in schema,
+    "write_fixed_default": schema["write_fixed"]["default"],
+    "text": result["content"][0]["text"],
+    "is_error": result["isError"],
+    "pdf": result["details"]["pdf"],
+    "ready_exists": mcp.path_ready().exists(),
+    "fixed_exists": mcp.path_pdf().exists(),
+}))
+`);
+	const result = JSON.parse(output) as {
+		has_write_ready: boolean;
+		write_ready_default: boolean;
+		has_write_fixed: boolean;
+		write_fixed_default: boolean;
+		text: string;
+		is_error: boolean;
+		pdf: string;
+		ready_exists: boolean;
+		fixed_exists: boolean;
+	};
+
+	assert.equal(result.has_write_ready, true);
+	assert.equal(result.write_ready_default, true);
+	assert.equal(result.has_write_fixed, true);
+	assert.equal(result.write_fixed_default, true);
+	assert.equal(result.text, "ok");
+	assert.equal(result.is_error, false);
+	assert.match(result.pdf, /\/runs\/.+\/show-latex\.pdf$/);
+	assert.equal(result.ready_exists, false);
+	assert.equal(result.fixed_exists, false);
+});
+
 test("viewer opens interleaved ready operations with their own PDF and SyncTeX command", () => {
 	const output = runPython(String.raw`
 import json

@@ -1,8 +1,7 @@
 declare module "@mariozechner/pi-coding-agent" {
-	export interface ToolResponseContent {
-		type: "text";
-		text: string;
-	}
+	export type ToolResponseContent =
+		| { type: "text"; text: string }
+		| { type: "image"; data: string; mimeType: string };
 
 	export interface ToolResponse {
 		content: ToolResponseContent[];
@@ -30,6 +29,9 @@ declare module "@mariozechner/pi-coding-agent" {
 		description: string;
 		promptSnippet?: string;
 		promptGuidelines?: string[];
+		renderShell?: "default" | "self";
+		renderCall?: (...args: any[]) => any;
+		renderResult?: (...args: any[]) => any;
 		parameters: unknown;
 		execute(
 			toolCallId: string,
@@ -63,6 +65,53 @@ declare module "@mariozechner/pi-coding-agent" {
 		registerCommand(name: string, options: RegisteredCommandOptions): void;
 		on(event: "session_start", handler: (event: SessionStartEvent, ctx: ExtensionContext) => unknown): void;
 		on(event: "session_shutdown", handler: (event: SessionShutdownEvent, ctx: ExtensionContext) => unknown): void;
+	}
+}
+
+declare module "@mariozechner/pi-tui" {
+	export interface Component {
+		render(width: number): string[];
+		invalidate(): void;
+	}
+
+	export class Text implements Component {
+		constructor(text: string, paddingX?: number, paddingY?: number, bgFn?: (s: string) => string);
+		setText(text: string): void;
+		render(width: number): string[];
+		invalidate(): void;
+	}
+
+	export class Container implements Component {
+		addChild(child: Component): void;
+		removeChild(child: Component): void;
+		render(width: number): string[];
+		invalidate(): void;
+	}
+
+	export interface ImageDimensions {
+		widthPx: number;
+		heightPx: number;
+	}
+
+	export interface CellDimensions {
+		widthPx: number;
+		heightPx: number;
+	}
+
+	export function getCapabilities(): { images: "kitty" | "iterm2" | null; trueColor: boolean; hyperlinks: boolean };
+	export function getCellDimensions(): CellDimensions;
+	export function getPngDimensions(base64Data: string): ImageDimensions | null;
+	export function calculateImageRows(imageDimensions: ImageDimensions, targetWidthCells: number, cellDimensions?: CellDimensions): number;
+
+	export class Image implements Component {
+		constructor(
+			base64Data: string,
+			mimeType: string,
+			theme: { fallbackColor: (s: string) => string },
+			options?: { maxWidthCells?: number; maxHeightCells?: number; filename?: string; imageId?: number },
+		);
+		render(width: number): string[];
+		invalidate(): void;
 	}
 }
 

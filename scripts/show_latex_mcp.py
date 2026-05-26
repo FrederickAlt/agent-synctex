@@ -266,9 +266,12 @@ def compile_latex(
     latex_source: str,
     compiler: Optional[str] = None,
     synctex_editor_command: Optional[str] = None,
-) -> str:
+    write_ready: bool = True,
+    write_fixed: bool = True,
+) -> Path:
     d = ensure_secure_tmpdir(create=True)
-    safe_unlink(path_ready())
+    if write_ready:
+        safe_unlink(path_ready())
 
     run_id = operation_id()
     run_dir = path_runs() / run_id
@@ -306,25 +309,25 @@ def compile_latex(
         debug(f"compile command succeeded but pdf missing/invalid id={run_id}")
         raise RuntimeError(compiler_error_message(f"PDF was not created at {pdf_path}", output, log_path))
 
-    # Keep a fixed-path copy for older viewer helpers and for the Pi extension's
-    # single-window "current preview" fallback.  The ready marker is written only
-    # after these files are in place so legacy helpers never observe a fresh
-    # marker with a missing fixed PDF.
-    atomic_copy_file(pdf_path, path_pdf())
-    atomic_copy_file(tex_path, path_tex())
-    fixed_log_path = path_log()
-    if log_path.exists():
-        atomic_copy_file(log_path, fixed_log_path)
-    else:
-        safe_unlink(fixed_log_path)
-    for run_synctex, fixed_synctex in [
-        (run_dir / SYNCTEX_NAME, path_synctex()),
-        (run_dir / SYNCTEX_GZ_NAME, path_synctex_gz()),
-    ]:
-        if run_synctex.exists():
-            atomic_copy_file(run_synctex, fixed_synctex)
+    if write_fixed:
+        # Keep a fixed-path copy for older viewer helpers and for the Pi extension's
+        # single-window "current preview" fallback.  Inline previews disable this
+        # so existing Zathura windows do not auto-reload another agent's compile.
+        atomic_copy_file(pdf_path, path_pdf())
+        atomic_copy_file(tex_path, path_tex())
+        fixed_log_path = path_log()
+        if log_path.exists():
+            atomic_copy_file(log_path, fixed_log_path)
         else:
-            safe_unlink(fixed_synctex)
+            safe_unlink(fixed_log_path)
+        for run_synctex, fixed_synctex in [
+            (run_dir / SYNCTEX_NAME, path_synctex()),
+            (run_dir / SYNCTEX_GZ_NAME, path_synctex_gz()),
+        ]:
+            if run_synctex.exists():
+                atomic_copy_file(run_synctex, fixed_synctex)
+            else:
+                safe_unlink(fixed_synctex)
 
     descriptor = {
         "version": 1,
@@ -333,9 +336,12 @@ def compile_latex(
         "pdf": str(pdf_path.relative_to(d)),
         "synctex_editor_command": synctex_editor_command or "",
     }
-    atomic_write_text(path_ready(), json.dumps(descriptor, separators=(",", ":")) + "\n", mode=0o600)
-    debug(f"compile ok id={run_id}; ready marker updated")
-    return "ok"
+    if write_ready:
+        atomic_write_text(path_ready(), json.dumps(descriptor, separators=(",", ":")) + "\n", mode=0o600)
+        debug(f"compile ok id={run_id}; ready marker updated")
+    else:
+        debug(f"compile ok id={run_id}; ready marker suppressed")
+    return pdf_path
 
 
 def status_text() -> str:
@@ -374,7 +380,9 @@ def tool_schema() -> list[Json]:
                 "properties": {
                     "latex_source": {"type": "string", "description": "LaTeX source. Full documents compile as-is; fragments are wrapped automatically."},
                     "compiler": {"type": "string", "enum": list(SUPPORTED_COMPILERS), "default": DEFAULT_COMPILER, "description": "Optional LaTeX compiler to use. Defaults to lualatex."},
-                    "synctex_editor_command": {"type": "string", "description": "Session-specific Zathura inverse SyncTeX callback command for this preview operation."}
+                    "synctex_editor_command": {"type": "string", "description": "Session-specific Zathura inverse SyncTeX callback command for this preview operation."},
+                    "write_ready": {"type": "boolean", "default": True, "description": "Whether to write the ready descriptor consumed by external preview helpers."},
+                    "write_fixed": {"type": "boolean", "default": True, "description": "Whether to refresh fixed-path compatibility preview files."}
                 },
                 "required": ["latex_source"],
                 "additionalProperties": False,
@@ -388,8 +396,11 @@ def tool_schema() -> list[Json]:
     ]
 
 
-def result_text(text: str, is_error: bool = False) -> Json:
-    return {"content": [{"type": "text", "text": text}], "isError": bool(is_error)}
+def result_text(text: str, is_error: bool = False, details: Optional[Json] = None) -> Json:
+    result: Json = {"content": [{"type": "text", "text": text}], "isError": bool(is_error)}
+    if details is not None:
+        result["details"] = details
+    return result
 
 
 def validate_no_extra(args: Json, allowed: Iterable[str]) -> None:
@@ -401,7 +412,7 @@ def validate_no_extra(args: Json, allowed: Iterable[str]) -> None:
 def call_tool(name: str, arguments: Any) -> Json:
     args = arguments if isinstance(arguments, dict) else {}
     if name == "show_latex":
-        validate_no_extra(args, ["latex_source", "compiler", "synctex_editor_command"])
+        validate_no_extra(args, ["latex_source", "compiler", "synctex_editor_command", "write_ready", "write_fixed"])
         latex_source = args.get("latex_source")
         if not isinstance(latex_source, str) or not latex_source.strip():
             raise RuntimeError("show_latex requires a non-empty string parameter: latex_source")
@@ -411,7 +422,14 @@ def call_tool(name: str, arguments: Any) -> Json:
         synctex_editor_command = args.get("synctex_editor_command")
         if synctex_editor_command is not None and not isinstance(synctex_editor_command, str):
             raise RuntimeError("show_latex synctex_editor_command must be a string when provided")
-        return result_text(compile_latex(latex_source, compiler, synctex_editor_command), is_error=False)
+        write_ready = args.get("write_ready", True)
+        if not isinstance(write_ready, bool):
+            raise RuntimeError("show_latex write_ready must be a boolean when provided")
+        write_fixed = args.get("write_fixed", True)
+        if not isinstance(write_fixed, bool):
+            raise RuntimeError("show_latex write_fixed must be a boolean when provided")
+        pdf_path = compile_latex(latex_source, compiler, synctex_editor_command, write_ready=write_ready, write_fixed=write_fixed)
+        return result_text("ok", is_error=False, details={"pdf": str(pdf_path)})
     if name == "show_latex_status":
         validate_no_extra(args, [])
         return result_text(status_text(), is_error=False)

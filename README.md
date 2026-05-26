@@ -2,7 +2,7 @@
 
 Pi extension that exposes seven tools:
 
-- `show_latex` — compile LaTeX source and trigger the preview pipeline.
+- `show_latex` — compile LaTeX source and render page 1 inline by default; pass `inline=false` for the external Zathura preview.
 - `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
 - `close_pdf` — close a tracked Zathura PDF window by `pdf_id`.
 - `jump_pdf` — perform a line-based Zathura forward SyncTeX jump in a tracked PDF by `pdf_id`.
@@ -11,10 +11,13 @@ Pi extension that exposes seven tools:
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
 Snippet previews communicate with an MCP-style stdio service (`show_latex_mcp.py`) and forward
-`tools/call` with `show_latex`. Each successful preview writes an operation-scoped PDF, refreshes
-a fixed `/tmp/codex-show-latex/show-latex.pdf` compatibility copy, and atomically writes a ready
-descriptor that pairs the operation PDF with the session's SyncTeX callback command. The extension
-also falls back to opening the fixed preview PDF itself if no viewer helper opens the new preview.
+`tools/call` with `show_latex`. Each successful preview writes an operation-scoped PDF and refreshes
+a fixed `/tmp/codex-show-latex/show-latex.pdf` compatibility copy only for external preview calls.
+By default, `show_latex` leaves the ready descriptor and fixed preview files untouched, wraps the
+inline compile in LaTeX's tight `preview` environment to crop to content, rasterizes page 1 to a PNG
+with `mutool` or `pdftoppm`, and renders that PNG inline in Pi chat. With `inline=false`, it atomically
+writes a ready descriptor that pairs the operation PDF with the session's SyncTeX callback command,
+refreshes fixed compatibility files, then uses the existing Zathura helper/fallback path.
 File compiles are spawned directly by the extension so normal LaTeX project-relative includes/assets
 resolve without using the backend service.
 
@@ -89,12 +92,16 @@ In headless/non-interactive sessions the callback never submits a message automa
 
 ## Development
 
-Install dev dependencies once with `npm install`, then run `npm run verify` to typecheck and execute the Node built-in test suite. Unit tests avoid real Zathura/LaTeX dependencies by using temp files and fake helper commands.
+Install dev dependencies once with `npm install`, then run `npm run verify` to typecheck and execute the Node built-in test suite. Unit tests avoid real Zathura/LaTeX dependencies by using temp files and fake helper commands. Inline previews require either `mutool` (from `mupdf-tools`) or `pdftoppm` (from `poppler-utils`) at runtime; optional whitespace trimming uses ImageMagick's `magick` when available. Actual terminal image display requires Pi/TUI image support in the current terminal (Kitty, Ghostty, WezTerm, or iTerm2; tmux/screen generally disable it).
 
 ## Compiler selection
 
 `show_latex` and `compile_latex_file` both accept an optional `compiler` parameter. The default is `lualatex`.
+`show_latex` also accepts `inline` (default `true`). Use `inline=false` when you specifically want the external Zathura preview workflow.
 Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk` (which runs latexmk with LuaLaTeX).
+
+Prefer `compile_latex_file` over invoking a bare compiler directly when you already have a `.tex` file to build.
+It can compile without opening a window: leave `open_pdf` unset/false for a build/check only run.
 
 Both snippet previews and file compiles pass `-synctex=1` to the selected LaTeX command by default, so generated PDFs have SyncTeX sidecars when the compiler succeeds.
 
