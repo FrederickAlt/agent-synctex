@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { rename } from "node:fs/promises";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -7,6 +8,13 @@ import { randomUUID } from "node:crypto";
 const MCP_TMPDIR = "/tmp/codex-show-latex";
 const INLINE_PREVIEW_DIR = resolve(MCP_TMPDIR, "inline");
 const INLINE_PREVIEW_MISSING_RENDERER_MESSAGE = "Inline preview requires mutool or pdftoppm. Install mupdf-tools or poppler-utils, or call show_latex with inline=false.";
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const DEFAULT_INLINE_PREVIEW_DIMENSION_PX = 1;
+
+interface PngDimensions {
+	widthPx: number;
+	heightPx: number;
+}
 
 export interface InlinePreviewArtifact {
 	pngPath: string;
@@ -14,6 +22,10 @@ export interface InlinePreviewArtifact {
 	dpi: number;
 	renderer: "mutool" | "pdftoppm";
 	trimmed: boolean;
+	fullPageWidthPx: number;
+	fullPageHeightPx: number;
+	widthPx: number;
+	heightPx: number;
 }
 
 interface CommandResult {
@@ -23,6 +35,47 @@ interface CommandResult {
 
 function ensureInlinePreviewDir(): void {
 	mkdirSync(INLINE_PREVIEW_DIR, { recursive: true, mode: 0o700 });
+}
+
+function parsePngDimensions(buffer: Buffer): PngDimensions | null {
+	if (buffer.length < 24) return null;
+	if (!buffer.subarray(0, 8).equals(PNG_SIGNATURE)) return null;
+	const chunkType = buffer.toString("ascii", 12, 16);
+	if (chunkType !== "IHDR") return null;
+	const width = buffer.readUInt32BE(16);
+	const height = buffer.readUInt32BE(20);
+	if (width <= 0 || height <= 0 || !Number.isFinite(width) || !Number.isFinite(height)) {
+		return null;
+	}
+	return { widthPx: width, heightPx: height };
+}
+
+async function readPngDimensions(pngPath: string, signal?: AbortSignal): Promise<PngDimensions | null> {
+	try {
+		const data = await readFile(pngPath, { signal });
+		return parsePngDimensions(data);
+	} catch {
+		return null;
+	}
+}
+
+function dimensionFallback(): PngDimensions {
+	return { widthPx: DEFAULT_INLINE_PREVIEW_DIMENSION_PX, heightPx: DEFAULT_INLINE_PREVIEW_DIMENSION_PX };
+}
+
+function normalizeDimensions(dimensions: PngDimensions | null | undefined): PngDimensions {
+	if (!dimensions || dimensions.widthPx <= 0 || dimensions.heightPx <= 0 || !Number.isFinite(dimensions.widthPx) || !Number.isFinite(dimensions.heightPx)) {
+		return dimensionFallback();
+	}
+	return dimensions;
+}
+
+function parsePageCountFromOutput(output: string): number | undefined {
+	const match = /^\s*Pages?\s*:\s*(\d+)\s*$/im.exec(output);
+	if (!match) return undefined;
+	const value = Number.parseInt(match[1], 10);
+	if (!Number.isFinite(value) || value <= 0) return undefined;
+	return value;
 }
 
 async function commandExists(command: string, signal?: AbortSignal): Promise<boolean> {
@@ -79,6 +132,33 @@ async function tryTrimPng(pngPath: string, signal?: AbortSignal): Promise<string
 	}
 }
 
+async function detectPdfPageCount(pdfPath: string, signal?: AbortSignal): Promise<number | undefined> {
+	if (await commandExists("pdfinfo", signal)) {
+		const result = await runCommand("pdfinfo", [pdfPath], signal);
+		if (result.exitCode === 0) {
+			const count = parsePageCountFromOutput(result.output);
+			if (count !== undefined) return count;
+		}
+	}
+
+	if (await commandExists("mutool", signal)) {
+		const result = await runCommand("mutool", ["info", pdfPath], signal);
+		if (result.exitCode === 0) {
+			const count = parsePageCountFromOutput(result.output);
+			if (count !== undefined) return count;
+		}
+	}
+
+	return undefined;
+}
+
+export function calculateInlineDisplayColumns(availableColumns: number, artifact: Pick<InlinePreviewArtifact, "fullPageWidthPx" | "widthPx">): number {
+	const safeAvailable = Number.isFinite(availableColumns) ? Math.max(1, Math.floor(availableColumns)) : 1;
+	if (artifact.fullPageWidthPx <= 0 || !Number.isFinite(artifact.fullPageWidthPx)) return safeAvailable;
+	if (artifact.widthPx <= 0 || !Number.isFinite(artifact.widthPx)) return safeAvailable;
+	return Math.max(1, Math.min(safeAvailable, Math.ceil((safeAvailable * artifact.widthPx) / artifact.fullPageWidthPx)));
+}
+
 export async function rasterizePdfPage(
 	pdfPath: string,
 	options: { page?: number; dpi?: number; signal?: AbortSignal } = {},
@@ -103,12 +183,33 @@ export async function rasterizePdfPage(
 		throw new Error(INLINE_PREVIEW_MISSING_RENDERER_MESSAGE);
 	}
 
+	const rawFullPageDimensions = await readPngDimensions(pngPath, options.signal);
+	const fullPageDimensions = normalizeDimensions(rawFullPageDimensions);
 	const trimmedPath = await tryTrimPng(pngPath, options.signal);
+	const finalPngPath = trimmedPath ?? pngPath;
+	const finalDimensions = normalizeDimensions(await readPngDimensions(finalPngPath, options.signal));
+
 	return {
-		pngPath: trimmedPath ?? pngPath,
+		pngPath: finalPngPath,
 		page,
 		dpi,
 		renderer,
 		trimmed: Boolean(trimmedPath),
+		fullPageWidthPx: rawFullPageDimensions ? fullPageDimensions.widthPx : finalDimensions.widthPx,
+		fullPageHeightPx: rawFullPageDimensions ? fullPageDimensions.heightPx : finalDimensions.heightPx,
+		widthPx: finalDimensions.widthPx,
+		heightPx: finalDimensions.heightPx,
 	};
+}
+
+export async function rasterizePdfPages(
+	pdfPath: string,
+	options: { dpi?: number; signal?: AbortSignal } = {},
+): Promise<InlinePreviewArtifact[]> {
+	const pageCount = (await detectPdfPageCount(pdfPath, options.signal)) ?? 1;
+	const artifacts: InlinePreviewArtifact[] = [];
+	for (let page = 1; page <= pageCount; page++) {
+		artifacts.push(await rasterizePdfPage(pdfPath, { page, dpi: options.dpi ?? 150, signal: options.signal }));
+	}
+	return artifacts;
 }

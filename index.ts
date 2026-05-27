@@ -3,11 +3,16 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolResponse } from "@mariozechner/pi-coding-agent";
 import { Container, getCapabilities, getCellDimensions, getPngDimensions, Image, Text, type Component } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
-import { rasterizePdfPage, type InlinePreviewArtifact } from "./inline_preview.ts";
+import {
+	calculateInlineDisplayColumns,
+	rasterizePdfPages,
+	type InlinePreviewArtifact,
+} from "./inline_preview.ts";
 import { buildKittyPlaceholderImageRender, KittyImageRefreshRegistry } from "./kitty_placeholder_image.ts";
 import { closeTrackedPdf, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
@@ -51,6 +56,7 @@ interface ShowLatexCallOptions {
 	writeReady?: boolean;
 	writeFixed?: boolean;
 	cropToContent?: boolean;
+	suppressPageNumbers?: boolean;
 }
 
 interface LatexCommandSpec {
@@ -93,6 +99,11 @@ const DEFAULT_SNIPPET_PREAMBLE = [
 const INLINE_PREVIEW_SETUP = [
 	String.raw`\usepackage[active,tightpage]{preview}`,
 	String.raw`\setlength\PreviewBorder{8pt}`,
+].join("\n");
+const INLINE_PAGE_STYLE_SETUP = [
+	String.raw`\makeatletter`,
+	String.raw`\AtBeginDocument{\pagestyle{empty}\thispagestyle{empty}\let\ps@plain\ps@empty}`,
+	String.raw`\makeatother`,
 ].join("\n");
 const REQUEST_TIMEOUT_DEFAULT_MS = 60_000;
 const STARTUP_TIMEOUT_DEFAULT_MS = 5_000;
@@ -188,6 +199,11 @@ function addInlinePreviewSetup(preamble: string): string {
 	return [preamble, INLINE_PREVIEW_SETUP].filter(Boolean).join("\n");
 }
 
+function addInlinePageStyleSetup(preamble: string): string {
+	if (/\\AtBeginDocument\s*\{[^}]*\\pagestyle\s*\{empty\}/s.test(preamble) && /\\ps@plain\b/.test(preamble)) return preamble;
+	return [preamble, INLINE_PAGE_STYLE_SETUP].filter(Boolean).join("\n");
+}
+
 function wrapLatexPreviewBody(body: string): string {
 	if (/\\begin\s*\{preview\}/.test(body)) return body;
 	return [String.raw`\begin{preview}`, body.trim(), String.raw`\end{preview}`].join("\n");
@@ -208,15 +224,20 @@ function wrapDocumentBody(latexSource: string, beginDocument: RegExpExecArray): 
 	].join("");
 }
 
-function applyLatexPreamble(latexSource: string, latexPreamble: string, options: { cropToContent?: boolean } = {}): string {
+function applyLatexPreamble(latexSource: string, latexPreamble: string, options: { cropToContent?: boolean; suppressPageNumbers?: boolean } = {}): string {
 	const preamble = latexPreamble.trim();
 	const beginDocument = /\\begin\s*\{document\}/.exec(latexSource);
 	const sourceHasDocumentClass = hasDocumentClass(latexSource);
 	const cropToContent = options.cropToContent === true;
+	const suppressPageNumbers = options.suppressPageNumbers === true;
+	const preparePreamble = (basePreamble: string): string => {
+		const withCropSetup = cropToContent ? addInlinePreviewSetup(basePreamble) : basePreamble;
+		return suppressPageNumbers ? addInlinePageStyleSetup(withCropSetup) : withCropSetup;
+	};
 
 	if (sourceHasDocumentClass) {
 		const insertablePreamble = hasDocumentClass(preamble) ? removeDocumentClass(preamble) : preamble;
-		const combinedPreamble = cropToContent ? addInlinePreviewSetup(insertablePreamble) : insertablePreamble;
+		const combinedPreamble = preparePreamble(insertablePreamble);
 		if (!combinedPreamble && !cropToContent) return latexSource;
 		if (!beginDocument || beginDocument.index < 0) {
 			return `${latexSource.trimEnd()}\n\n${combinedPreamble}\n`;
@@ -237,7 +258,7 @@ function applyLatexPreamble(latexSource: string, latexPreamble: string, options:
 
 	if (beginDocument && beginDocument.index >= 0) {
 		const sourceWithPreamble = [
-			cropToContent ? addInlinePreviewSetup(defaultPreambleFor(preamble)) : defaultPreambleFor(preamble),
+			preparePreamble(defaultPreambleFor(preamble)),
 			latexSource.slice(beginDocument.index).trimStart(),
 			"",
 		].filter((part) => part.length > 0).join("\n");
@@ -247,10 +268,10 @@ function applyLatexPreamble(latexSource: string, latexPreamble: string, options:
 		return adjustedBeginDocument ? wrapDocumentBody(sourceWithPreamble, adjustedBeginDocument) ?? sourceWithPreamble : sourceWithPreamble;
 	}
 
-	if (!preamble && !cropToContent) return latexSource;
+	if (!preamble && !cropToContent && !suppressPageNumbers) return latexSource;
 
 	return [
-		cropToContent ? addInlinePreviewSetup(defaultPreambleFor(preamble)) : defaultPreambleFor(preamble),
+		preparePreamble(defaultPreambleFor(preamble)),
 		String.raw`\begin{document}`,
 		cropToContent ? wrapLatexPreviewBody(latexSource) : latexSource,
 		String.raw`\end{document}`,
@@ -1145,24 +1166,78 @@ class ShowLatexMcpClient {
 const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
-const pdfTrackersByContext = new WeakMap<ExtensionContext, PdfTracker>();
+const pdfTrackersByContext = new Map<string, PdfTracker>();
 const tmuxKittyImageRefreshRegistry = new KittyImageRefreshRegistry();
-const synctexCallbacksByContext = new WeakMap<ExtensionContext, SynctexCallbackServer>();
+interface InlinePreviewRenderState {
+	pdf: string;
+	previews: InlinePreviewArtifact[];
+}
+const inlinePreviewRenderStates = new Map<string, InlinePreviewRenderState>();
+const MAX_INLINE_PREVIEW_RENDER_STATES = 8;
+const synctexCallbacksByContext = new Map<string, SynctexCallbackServer>();
 let cleanupTmuxKittyRefreshHooks: (() => void) | undefined;
 let cleanupTerminalFocusRefresh: (() => void) | undefined;
 const synctexCallbackServers = new Set<SynctexCallbackServer>();
+const contextUiIds = new WeakMap<object, string>();
+let nextContextUiId = 1;
 
-function pdfTrackerForContext(ctx?: ExtensionContext): PdfTracker {
+function rememberInlinePreviewRenderState(state: InlinePreviewRenderState): string {
+	const id = randomUUID();
+	inlinePreviewRenderStates.set(id, state);
+	while (inlinePreviewRenderStates.size > MAX_INLINE_PREVIEW_RENDER_STATES) {
+		const oldest = inlinePreviewRenderStates.keys().next().value;
+		if (oldest === undefined) break;
+		inlinePreviewRenderStates.delete(oldest);
+	}
+	return id;
+}
+
+function inlinePreviewRenderStateFromDetails(details: Record<string, unknown>): InlinePreviewRenderState | null {
+	const previewId = typeof details.preview_id === "string" ? details.preview_id : undefined;
+	if (previewId) {
+		const state = inlinePreviewRenderStates.get(previewId);
+		if (state) return state;
+	}
+
+	const legacyPreviews = Array.isArray(details.inline_previews)
+		? (details.inline_previews as InlinePreviewArtifact[])
+		: details.inline_preview
+			? [details.inline_preview as InlinePreviewArtifact]
+			: [];
+	if (legacyPreviews.length === 0) return null;
+	return {
+		pdf: typeof details.pdf === "string" ? details.pdf : "",
+		previews: legacyPreviews,
+	};
+}
+
+function contextSessionKey(ctx?: ExtensionContext): string {
 	if (!ctx) {
 		throw new Error("PDF tracking is only available inside a Pi agent session");
 	}
 
-	let tracker = pdfTrackersByContext.get(ctx);
+	const ui = ctx.ui as object;
+	let uiId = contextUiIds.get(ui);
+	if (!uiId) {
+		uiId = `ui-${nextContextUiId++}`;
+		contextUiIds.set(ui, uiId);
+	}
+
+	return `${ctx.cwd}|${uiId}`;
+}
+
+function pdfTrackerForContext(ctx?: ExtensionContext): PdfTracker {
+	const key = contextSessionKey(ctx);
+	let tracker = pdfTrackersByContext.get(key);
 	if (!tracker) {
 		tracker = new PdfTracker();
-		pdfTrackersByContext.set(ctx, tracker);
+		pdfTrackersByContext.set(key, tracker);
 	}
 	return tracker;
+}
+
+function callbackKeyForContext(ctx: ExtensionContext): string {
+	return contextSessionKey(ctx);
 }
 
 function createSynctexCallbackServer(): SynctexCallbackServer {
@@ -1170,9 +1245,10 @@ function createSynctexCallbackServer(): SynctexCallbackServer {
 }
 
 async function rotateSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCallbackServer> {
-	const previous = synctexCallbacksByContext.get(ctx);
+	const key = callbackKeyForContext(ctx);
+	const previous = synctexCallbacksByContext.get(key);
 	const next = createSynctexCallbackServer();
-	synctexCallbacksByContext.set(ctx, next);
+	synctexCallbacksByContext.set(key, next);
 	synctexCallbackServers.add(next);
 	if (previous) synctexCallbackServers.delete(previous);
 	await previous?.close();
@@ -1181,10 +1257,11 @@ async function rotateSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCal
 }
 
 async function ensureSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCallbackServer> {
-	let server = synctexCallbacksByContext.get(ctx);
+	const key = callbackKeyForContext(ctx);
+	let server = synctexCallbacksByContext.get(key);
 	if (!server) {
 		server = createSynctexCallbackServer();
-		synctexCallbacksByContext.set(ctx, server);
+		synctexCallbacksByContext.set(key, server);
 		synctexCallbackServers.add(server);
 	}
 	await server.ensureStarted(synctexPasteTarget(ctx));
@@ -1193,9 +1270,10 @@ async function ensureSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCal
 
 async function shutdownSynctexCallbacks(ctx?: ExtensionContext): Promise<void> {
 	if (ctx) {
-		const server = synctexCallbacksByContext.get(ctx);
+		const key = callbackKeyForContext(ctx);
+		const server = synctexCallbacksByContext.get(key);
 		if (!server) return;
-		synctexCallbacksByContext.delete(ctx);
+		synctexCallbacksByContext.delete(key);
 		synctexCallbackServers.delete(server);
 		await server.close();
 		return;
@@ -1218,8 +1296,8 @@ const LatexCompilerParam = Type.Optional(Type.Union([
 
 const ShowLatexParams = Type.Object(
 	{
-		latex_source: Type.String({
-			description: "LaTeX source code to compile. Snippets can rely on the active temp preamble; for those, provide only the document body or the \\begin{document}...\\end{document} block. In existing LaTeX projects, that temp preamble may already be a copy of the project preamble, so do not add a standalone \\documentclass unless intentionally testing independent LaTeX.",
+		source: Type.String({
+			description: "Raw LaTeX source code to compile. Prefer passing this tool as FREEFORM/raw text. Optional leading front matter can set compiler and inline, for example: ---\ncompiler: lualatex\ninline: false\n---",
 			minLength: 1,
 		}),
 		compiler: LatexCompilerParam,
@@ -1295,6 +1373,92 @@ const SetLatexPreambleParams = Type.Object(
 
 const SynctexCallbackCommandParams = Type.Object({}, { additionalProperties: false });
 
+interface ParsedShowLatexInput {
+	latexSource: string;
+	compiler?: LatexCompiler;
+	inline?: boolean;
+}
+
+function unquoteFrontMatterScalar(value: string): string {
+	const trimmed = value.trim();
+	if (trimmed.length >= 2) {
+		const first = trimmed[0];
+		const last = trimmed[trimmed.length - 1];
+		if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+			return trimmed.slice(1, -1);
+		}
+	}
+	return trimmed;
+}
+
+function parseFrontMatterBoolean(key: string, value: string): boolean {
+	const normalized = unquoteFrontMatterScalar(value).toLowerCase();
+	if (["true", "yes", "on", "1"].includes(normalized)) return true;
+	if (["false", "no", "off", "0"].includes(normalized)) return false;
+	throw new Error(`Invalid show_latex front matter value for ${key}: expected true or false`);
+}
+
+function parseShowLatexInput(rawInput: string): ParsedShowLatexInput {
+	const input = rawInput.replace(/^\uFEFF/, "");
+	const frontMatter = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(input);
+	if (!frontMatter) {
+		return { latexSource: input };
+	}
+
+	const parsed: ParsedShowLatexInput = {
+		latexSource: input.slice(frontMatter[0].length),
+	};
+
+	for (const rawLine of frontMatter[1].split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (!line || line.startsWith("#")) continue;
+		const separator = line.indexOf(":");
+		if (separator < 0) {
+			throw new Error(`Invalid show_latex front matter line: ${rawLine}`);
+		}
+
+		const key = line.slice(0, separator).trim();
+		const value = line.slice(separator + 1).trim();
+		switch (key) {
+			case "compiler":
+				parsed.compiler = resolveLatexCompiler(unquoteFrontMatterScalar(value));
+				break;
+			case "inline":
+				parsed.inline = parseFrontMatterBoolean(key, value);
+				break;
+			default:
+				throw new Error(`Unsupported show_latex front matter key: ${key}`);
+		}
+	}
+
+	return parsed;
+}
+
+function compactShowLatexArguments(parsed: ParsedShowLatexInput): Record<string, unknown> {
+	const result: Record<string, unknown> = { source: parsed.latexSource };
+	if (parsed.compiler !== undefined) result.compiler = parsed.compiler;
+	if (parsed.inline !== undefined) result.inline = parsed.inline;
+	return result;
+}
+
+function prepareShowLatexArguments(args: unknown): Record<string, unknown> {
+	if (typeof args === "string") {
+		return compactShowLatexArguments(parseShowLatexInput(args));
+	}
+
+	if (args && typeof args === "object" && !Array.isArray(args)) {
+		const record = args as Record<string, unknown>;
+		const source = record.source ?? record.latex_source ?? record.latex ?? record.body ?? record.content ?? record.text ?? record.input;
+		const result: Record<string, unknown> = {};
+		if (source !== undefined) result.source = source;
+		if (record.compiler !== undefined) result.compiler = record.compiler;
+		if (record.inline !== undefined) result.inline = record.inline;
+		return Object.keys(result).length ? result : record;
+	}
+
+	return args as Record<string, unknown>;
+}
+
 async function compileAndPreviewLatex(
 	latexSource: string,
 	compiler?: LatexCompiler,
@@ -1311,12 +1475,83 @@ async function compileAndPreviewLatex(
 	}
 
 	return mcpClient.callShowLatex(
-		applyLatexPreamble(latexSource, readLatexPreambleFromTmpdir(), { cropToContent: options.cropToContent }),
+		applyLatexPreamble(latexSource, readLatexPreambleFromTmpdir(), { cropToContent: options.cropToContent, suppressPageNumbers: options.suppressPageNumbers }),
 		compiler,
 		synctexEditorCommand,
 		signal,
 		options,
 	);
+}
+
+async function executeShowLatexPreviewTool(
+	toolName: string,
+	latexSourceInput: string,
+	compilerParam: unknown,
+	inlineParam: unknown,
+	signal: AbortSignal | undefined,
+	ctx: ExtensionContext | undefined,
+): Promise<ToolResponse> {
+	let latexSource = "";
+	let compiler: LatexCompiler | undefined;
+	let synctexCommand = "";
+	let previewPdfPath = "";
+	let inline = true;
+	try {
+		latexSource = latexSourceInput;
+		compiler = resolveLatexCompiler(compilerParam);
+		inline = inlineParam !== false;
+		if (!inline && ctx) {
+			const server = await ensureSynctexCallbacks(ctx);
+			synctexCommand = server.command;
+		}
+		const viewerLogBefore = inline ? undefined : fileSnapshot(MCP_VIEWER_LOG_PATH);
+		const preview = await compileAndPreviewLatex(latexSource, compiler, inline ? undefined : synctexCommand, signal, { writeReady: !inline, writeFixed: !inline, cropToContent: false, suppressPageNumbers: inline });
+		previewPdfPath = preview.pdfPath;
+
+		if (inline) {
+			const artifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
+			const previewId = rememberInlinePreviewRenderState({ pdf: preview.pdfPath, previews: artifacts });
+			return {
+				content: [{ type: "text", text: "✓ LaTeX preview rendered locally" }],
+				details: {
+					inline: true,
+					preview_id: previewId,
+				},
+			};
+		}
+
+		let trackedPdfId: number | undefined;
+		let openedPdfPath: string | undefined;
+		if (!(await previewAlreadyOpen([preview.pdfPath, MCP_FIXED_PREVIEW_PDF_PATH], signal, { viewerLogPath: MCP_VIEWER_LOG_PATH, viewerLogBefore }))) {
+			const pdfTracker = pdfTrackerForContext(ctx);
+			const trackedPdf = await openAndTrackPdf(
+				MCP_FIXED_PREVIEW_PDF_PATH,
+				pdfTracker,
+				signal,
+				synctexCommand
+					? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
+					: undefined,
+				undefined,
+				synctexCommand || undefined,
+			);
+			trackedPdfId = trackedPdf.id;
+			openedPdfPath = trackedPdf.path;
+		}
+
+		return {
+			content: [{ type: "text", text: preview.text }],
+			details: { pdf: openedPdfPath ?? preview.pdfPath, pdf_id: trackedPdfId, operation_pdf: preview.pdfPath, inline: false, synctex_callback_command: synctexCommand },
+		};
+	} catch (error) {
+		throw latexToolFailure(toolName, "LaTeX preview failed", {
+			compiler: compiler ?? compilerParam ?? DEFAULT_LATEX_COMPILER,
+			latex_source_length: latexSource.length,
+			latex_source_tail: tailText(latexSource, 30000),
+			pdf: previewPdfPath,
+			fixed_preview_pdf: MCP_FIXED_PREVIEW_PDF_PATH,
+			synctex_callback_command: synctexCommand,
+		}, error);
+	}
 }
 
 function resolvePositiveInteger(value: unknown, name: string): number {
@@ -1418,15 +1653,15 @@ function installTerminalFocusRefresh(ctx: ExtensionContext): () => void {
 	};
 }
 
-class TmuxKittyPlaceholderImage implements Component {
+class InlineLatexPreviewImage implements Component {
 	private cachedLines?: string[];
 	private cachedWidth?: number;
-	private readonly imageId = Math.floor(Math.random() * 0xfffffe) + 1;
 
 	constructor(
-		private readonly title: string,
 		private readonly base64Data: string,
-		private readonly maxWidthCells: number,
+		private readonly artifact: InlinePreviewArtifact,
+		private readonly fallbackColor: (text: string) => string,
+		private readonly filename: string,
 	) {}
 
 	invalidate(): void {
@@ -1437,13 +1672,45 @@ class TmuxKittyPlaceholderImage implements Component {
 	render(width: number): string[] {
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
 
+		const maxWidthCells = calculateInlineDisplayColumns(width, this.artifact);
+		const image = new Image(this.base64Data, "image/png", { fallbackColor: this.fallbackColor }, {
+			maxWidthCells,
+			filename: this.filename,
+		});
+
+		this.cachedWidth = width;
+		this.cachedLines = image.render(width);
+		return this.cachedLines;
+	}
+}
+
+class TmuxKittyPlaceholderImage implements Component {
+	private cachedLines?: string[];
+	private cachedWidth?: number;
+	private readonly imageId = Math.floor(Math.random() * 0xfffffe) + 1;
+
+	constructor(
+		private readonly title: string,
+		private readonly base64Data: string,
+		private readonly artifact: InlinePreviewArtifact,
+	) {}
+
+	invalidate(): void {
+		this.cachedLines = undefined;
+		this.cachedWidth = undefined;
+	}
+
+	render(width: number): string[] {
+		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+
+		const maxWidthCells = calculateInlineDisplayColumns(width, this.artifact);
 		const rendered = buildKittyPlaceholderImageRender({
 			title: this.title,
 			base64Data: this.base64Data,
 			imageId: this.imageId,
 			width,
-			maxWidthCells: this.maxWidthCells,
-			imageDimensions: getPngDimensions(this.base64Data) ?? { widthPx: 800, heightPx: 600 },
+			maxWidthCells,
+			imageDimensions: getPngDimensions(this.base64Data) ?? this.artifact,
 			cellDimensions: getCellDimensions(),
 		});
 
@@ -1456,9 +1723,9 @@ class TmuxKittyPlaceholderImage implements Component {
 
 function renderInlineLatexPreview(result: { content?: Array<{ type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown }>; details?: Record<string, unknown> }, theme: unknown, context: unknown): Component {
 	const details = result.details ?? {};
-	const preview = details.inline_preview as InlinePreviewArtifact | undefined;
-	const pdf = typeof details.pdf === "string" ? details.pdf : "";
-	const pngPath = preview?.pngPath;
+	const renderState = inlinePreviewRenderStateFromDetails(details);
+	const inlinePreviews = renderState?.previews ?? [];
+	const pdf = renderState?.pdf ?? "";
 	const canShowImages = !(typeof context === "object" && context !== null && "showImages" in context && (context as { showImages?: unknown }).showImages === false);
 
 	const fg = (role: string, text: string) => {
@@ -1468,26 +1735,51 @@ function renderInlineLatexPreview(result: { content?: Array<{ type?: unknown; te
 		return text;
 	};
 
-	if (!pngPath || !canShowImages) {
-		return new Text(`ok: ${pdf}\nInline preview: ${pngPath ?? "unavailable"}`, 0, 0);
+	if (inlinePreviews.length === 0 || !canShowImages) {
+		const pngPaths = inlinePreviews.map((preview) => preview.pngPath).filter(Boolean);
+		if (pngPaths.length === 0) {
+			return new Text(`ok: ${pdf}\nInline preview: unavailable`, 0, 0);
+		}
+
+		const label = pngPaths.length === 1 ? `PNG: ${pngPaths[0]}` : `PNGs:\n${pngPaths.join("\n")}`;
+		return new Text(`${fg("success", "ok")}: ${pdf}\n${fg("muted", `Inline image display is not supported by this terminal. ${label}`)}`, 0, 0);
 	}
 
-	const title = `${fg("success", "✓ LaTeX preview")}${preview ? fg("dim", ` page ${preview.page}`) : ""}`;
-	const imageBlock = result.content?.find((entry) => entry.type === "image" && typeof entry.data === "string" && entry.mimeType === "image/png");
-	const base64 = typeof imageBlock?.data === "string" ? imageBlock.data : readFileSync(pngPath).toString("base64");
+	const getImageData = (index: number): string => readFileSync(inlinePreviews[index]?.pngPath ?? "").toString("base64");
+
+	const title = `${fg("success", "✓ LaTeX preview")}`;
+	const container = new Container();
+	container.addChild(new Text(title, 0, 0));
 
 	if (isTmuxKittyTerminal()) {
-		return new TmuxKittyPlaceholderImage(title, base64, 100);
+		for (const [index, preview] of inlinePreviews.entries()) {
+			const base64 = getImageData(index);
+			container.addChild(new TmuxKittyPlaceholderImage("", base64, preview));
+		}
+		return container;
 	}
 
 	if (!getCapabilities().images) {
-		return new Text(`${title}\n${fg("muted", `Inline image display is not supported by this terminal. PNG: ${pngPath}`)}`, 0, 0);
+		const label = inlinePreviews.map((preview) => preview.pngPath).join("\n");
+		return new Text(`ok: ${pdf}\n${fg("muted", `Inline image display is not supported by this terminal. PNGs:\n${label}`)}`, 0, 0);
 	}
 
-	const container = new Container();
-	container.addChild(new Text(title, 0, 0));
-	container.addChild(new Image(base64, "image/png", { fallbackColor: (text) => fg("muted", text) }, { maxWidthCells: 100, filename: pngPath }));
+	for (const [index, preview] of inlinePreviews.entries()) {
+		const base64 = getImageData(index);
+		container.addChild(new InlineLatexPreviewImage(base64, preview, (text) => fg("muted", text), preview.pngPath));
+	}
+
 	return container;
+}
+
+function renderShowLatexResult(result: { content?: Array<{ type?: string; text?: string }>; details?: Record<string, unknown> }, _options: unknown, theme: unknown, context: unknown): Component {
+	const details = result.details as Record<string, unknown> | undefined;
+	if (details?.inline === true || details?.inline_previews || details?.inline_preview) {
+		return renderInlineLatexPreview(result, theme, context);
+	}
+
+	const text = result.content?.map((entry) => entry.text ?? "").filter(Boolean).join("\n") ?? "ok";
+	return new Text(text, 0, 0);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1518,93 +1810,23 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "show_latex",
 		label: "Show LaTeX",
-		description: "Compile LaTeX source and render page 1 inline by default. Pass inline=false to refresh/open the external Zathura preview instead. Calling this tool again overwrites the current preview; the user will only see the most recent preview. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. The extension loads its snippet preamble from /tmp/codex-show-latex/preamble.tex, falling back to /tmp/codex-show-latex/praeamble.tex if preamble.tex is absent. At startup, ./preamble.tex or ./praeamble.tex from the current working directory is copied to that fixed temp path as the default. In existing LaTeX projects, treat that active temp preamble as project preview state: pass only the document body or the \\begin{document}...\\end{document} block for snippets using project macros, and do not replace it with a minimal preamble to make one snippet compile. Full documents with their own \\documentclass can still be compiled when intentionally testing independent LaTeX.",
-		promptSnippet: "Compile and preview LaTeX as PDF",
+		description: "FREEFORM/raw LaTeX preview. Pass LaTeX code directly; optional YAML-like front matter may set compiler and inline. Example: ---\ncompiler: lualatex\ninline: true\n---\n\\begin{equation}\nx\n\\end{equation}\nThe \\begin{document}...\\end{document} wrapper is accepted but not required. Defaults to inline preview with lualatex; set inline=false to open/refresh the viewer instead.",
+		promptSnippet: "FREEFORM LaTeX preview; optional front matter can set compiler and inline",
 		promptGuidelines: [
-			"Use show_latex when the user asks for a LaTeX PDF preview. It renders inline by default; pass inline=false only when the user wants an external Zathura window. Omit compiler for the lualatex default, or set compiler when a different engine is needed.",
-			"Do not use verbatim-like LaTeX constructs (for example, \\begin{verbatim}, lstlisting, minted, or \\verb) to bypass or disable compilation; provide real LaTeX that compiles and renders the requested content.",
-			"In an existing LaTeX project, assume ./preamble.tex or ./praeamble.tex has already been copied into /tmp/codex-show-latex/preamble.tex. For snippets using project macros, pass just the body or \\begin{document}...\\end{document}; do not wrap them in a standalone \\documentclass unless intentionally testing independent LaTeX.",
+			"Use show_latex when the user asks for a LaTeX PDF preview. Prefer passing only the LaTeX body, for example \\[x\\]; \\begin{document}...\\end{document} is accepted but usually unnecessary.",
+			"Use optional front matter only when changing options, for example: ---\ncompiler: xelatex\ninline: false\n---",
+			"show_latex renders inline by default; set inline=false only when the user wants an external viewer.",
+			"Do not use verbatim-like LaTeX constructs (for example, \\begin{verbatim}, lstlisting, minted, or \\verb) to show the user LaTeX code; provide real LaTeX that compiles and renders the requested content.",
+			"In an existing LaTeX project, assume ./preamble.tex or ./praeamble.tex has already been copied into /tmp/codex-show-latex/preamble.tex. Do not add a standalone \\documentclass or repeat the project preamble unless the user explicitly asks.",
 			"If a project snippet preview fails, inspect the log and project preamble, or restore the project preamble in /tmp/codex-show-latex/preamble.tex. Do not call set_latex_preamble with a minimal preamble as a workaround unless the user explicitly asks to change the active preview preamble.",
-			"For new non-project defaults, put pre-\\begin{document} setup in ./preamble.tex or ./praeamble.tex before starting the Pi session. Use set_latex_preamble only when the user explicitly wants to change the active session preview preamble.",
 		],
 		renderShell: "self",
 		parameters: ShowLatexParams,
-		renderResult(result: { content?: Array<{ type: string; text?: string }>; details?: Record<string, unknown> }, _options: unknown, theme: unknown, context: unknown) {
-			const details = result.details as Record<string, unknown> | undefined;
-			if (details?.inline_preview) {
-				return renderInlineLatexPreview(result, theme, context);
-			}
-
-			const text = result.content?.map((entry) => entry.text ?? "").filter(Boolean).join("\n") ?? "ok";
-			return new Text(text, 0, 0);
-		},
+		prepareArguments: prepareShowLatexArguments,
+		renderResult: renderShowLatexResult,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			let latexSource = "";
-			let compiler: LatexCompiler | undefined;
-			let synctexCommand = "";
-			let previewPdfPath = "";
-			let inline = true;
-			try {
-				latexSource = String(params.latex_source ?? "");
-				compiler = resolveLatexCompiler(params.compiler);
-				inline = params.inline !== false;
-				if (!inline && ctx) {
-					const server = await ensureSynctexCallbacks(ctx);
-					synctexCommand = server.command;
-				}
-				const viewerLogBefore = inline ? undefined : fileSnapshot(MCP_VIEWER_LOG_PATH);
-				const preview = await compileAndPreviewLatex(latexSource, compiler, inline ? undefined : synctexCommand, signal, { writeReady: !inline, writeFixed: !inline, cropToContent: inline });
-				previewPdfPath = preview.pdfPath;
-
-				if (inline) {
-					const artifact = await rasterizePdfPage(preview.pdfPath, { page: 1, dpi: 150, signal });
-					const pngBase64 = readFileSync(artifact.pngPath).toString("base64");
-					return {
-						content: [
-							{ type: "text", text: `✓ LaTeX preview page ${artifact.page}` },
-							{ type: "image", data: pngBase64, mimeType: "image/png" },
-						],
-						details: {
-							pdf: preview.pdfPath,
-							operation_pdf: preview.pdfPath,
-							inline: true,
-							inline_preview: artifact,
-						},
-					};
-				}
-
-				let trackedPdfId: number | undefined;
-				let openedPdfPath: string | undefined;
-				if (!(await previewAlreadyOpen([preview.pdfPath, MCP_FIXED_PREVIEW_PDF_PATH], signal, { viewerLogPath: MCP_VIEWER_LOG_PATH, viewerLogBefore }))) {
-					const pdfTracker = pdfTrackerForContext(ctx);
-					const trackedPdf = await openAndTrackPdf(
-						MCP_FIXED_PREVIEW_PDF_PATH,
-						pdfTracker,
-						signal,
-						synctexCommand
-							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
-							: undefined,
-						undefined,
-						synctexCommand || undefined,
-					);
-					trackedPdfId = trackedPdf.id;
-					openedPdfPath = trackedPdf.path;
-				}
-
-				return {
-					content: [{ type: "text", text: preview.text }],
-					details: { pdf: openedPdfPath ?? preview.pdfPath, pdf_id: trackedPdfId, operation_pdf: preview.pdfPath, inline: false, synctex_callback_command: synctexCommand },
-				};
-			} catch (error) {
-				throw latexToolFailure("show-latex", "LaTeX preview failed", {
-					compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
-					latex_source_length: latexSource.length,
-					latex_source_tail: tailText(latexSource, 30000),
-					pdf: previewPdfPath,
-					fixed_preview_pdf: MCP_FIXED_PREVIEW_PDF_PATH,
-					synctex_callback_command: synctexCommand,
-				}, error);
-			}
+			const parsed = parseShowLatexInput(String(params.source ?? ""));
+			return executeShowLatexPreviewTool("show-latex", parsed.latexSource, params.compiler ?? parsed.compiler, params.inline ?? parsed.inline, signal, ctx);
 		},
 	});
 
@@ -1894,8 +2116,9 @@ export default function (pi: ExtensionAPI) {
 		cleanupTerminalFocusRefresh = undefined;
 		tmuxKittyImageRefreshRegistry.clear();
 		if (ctx) {
-			pdfTrackersByContext.get(ctx)?.clear();
-			pdfTrackersByContext.delete(ctx);
+			const key = contextSessionKey(ctx);
+			pdfTrackersByContext.get(key)?.clear();
+			pdfTrackersByContext.delete(key);
 		}
 		await shutdownSynctexCallbacks(ctx);
 		await mcpClient.shutdown();

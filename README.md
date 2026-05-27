@@ -2,7 +2,7 @@
 
 Pi extension that exposes seven tools:
 
-- `show_latex` — compile LaTeX source and render page 1 inline by default; pass `inline=false` for the external Zathura preview. It automatically loads `./preamble.tex` or `./praeamble.tex` from the current working directory when present, so do not repeat that preamble in the snippet.
+- `show_latex` — FREEFORM/raw LaTeX preview with optional front matter for `compiler` and `inline`; renders inline by default, or pass `inline=false` for the external Zathura preview. It automatically loads `./preamble.tex` or `./praeamble.tex` from the current working directory when present, so do not repeat that preamble in the snippet.
 - `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
 - `close_pdf` — close a tracked Zathura PDF window by `pdf_id`.
 - `jump_pdf` — perform a line-based Zathura forward SyncTeX jump in a tracked PDF by `pdf_id`, returning a short “line N contains:” header followed by the jumped-to LaTeX source line.
@@ -13,9 +13,23 @@ Pi extension that exposes seven tools:
 Snippet previews communicate with an MCP-style stdio service (`show_latex_mcp.py`) and forward
 `tools/call` with `show_latex`. Each successful preview writes an operation-scoped PDF and refreshes
 a fixed `/tmp/codex-show-latex/show-latex.pdf` compatibility copy only for external preview calls.
-By default, `show_latex` leaves the ready descriptor and fixed preview files untouched, wraps the
-inline compile in LaTeX's tight `preview` environment to crop to content, rasterizes page 1 to a PNG
-with `mutool` or `pdftoppm`, and renders that PNG inline in Pi chat. With `inline=false`, it atomically
+For example:
+
+```tex
+---
+compiler: lualatex
+inline: true
+---
+\[
+x
+\]
+```
+
+By default, `show_latex` leaves the ready descriptor and fixed preview files untouched, rasterizes each
+PDF page to a local PNG with `mutool` or `pdftoppm`, trims image whitespace when ImageMagick is available,
+and renders the PNGs sequentially inline in Pi chat without returning image bytes in the tool result. Inline image width is proportional to the cropped
+content width relative to the full PDF page width, so small symbols stay small while wide formulas use
+more of the TUI. With `inline=false`, it atomically
 writes a ready descriptor that pairs the operation PDF with the session's SyncTeX callback command,
 refreshes fixed compatibility files, then uses the existing Zathura helper/fallback path.
 File compiles are spawned directly by the extension so normal LaTeX project-relative includes/assets

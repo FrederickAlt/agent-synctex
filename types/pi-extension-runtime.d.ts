@@ -34,6 +34,7 @@ declare module "@mariozechner/pi-coding-agent" {
 		renderCall?: (...args: any[]) => any;
 		renderResult?: (...args: any[]) => any;
 		parameters: unknown;
+		prepareArguments?: (args: unknown) => Record<string, unknown>;
 		execute(
 			toolCallId: string,
 			params: Record<string, unknown>,
