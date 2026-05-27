@@ -372,10 +372,12 @@ function errorDetails(error: unknown): string {
 	return String(error);
 }
 
+const LATEX_ERROR_TAIL_LINES = 20;
+
 function shortFailureMessage(shortMessage: string, logPath: string, tail: string): string {
-	const tailLines = lastLines(tail, 5);
+	const tailLines = lastLines(tail, LATEX_ERROR_TAIL_LINES);
 	return tailLines
-		? `${shortMessage}. Log: ${logPath}\nLast 5 lines:\n${tailLines}`
+		? `${shortMessage}. Log: ${logPath}\nLast ${LATEX_ERROR_TAIL_LINES} lines:\n${tailLines}`
 		: `${shortMessage}. Log: ${logPath}`;
 }
 
@@ -410,7 +412,7 @@ function latexToolFailure(
 
 	try {
 		const tempLogPath = writeLatexToolErrorLog(toolName, shortMessage, context, error);
-		const tail = lastLines(errorMessage(error), 5);
+		const tail = lastLines(errorMessage(error), LATEX_ERROR_TAIL_LINES);
 		return new LoggedToolError(shortFailureMessage(shortMessage, tempLogPath, tail), tempLogPath, tail);
 	} catch (logError) {
 		const message = logError instanceof Error ? logError.message : String(logError);
@@ -421,7 +423,7 @@ function latexToolFailure(
 function latexCompileErrorTail(latexFilePath: string, reason: string, compilerOutput: string): string {
 	const projectLogTail = readTail(latexLogPath(latexFilePath), 30000).trim();
 	const outputTail = tailText(compilerOutput.trim(), 30000).trim();
-	return lastLines(projectLogTail || outputTail || reason, 5);
+	return lastLines(projectLogTail || outputTail || reason, LATEX_ERROR_TAIL_LINES);
 }
 
 function latexCompileFailure(
@@ -1143,12 +1145,25 @@ class ShowLatexMcpClient {
 const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
-const pdfTracker = new PdfTracker();
+const pdfTrackersByContext = new WeakMap<ExtensionContext, PdfTracker>();
 const tmuxKittyImageRefreshRegistry = new KittyImageRefreshRegistry();
 const synctexCallbacksByContext = new WeakMap<ExtensionContext, SynctexCallbackServer>();
 let cleanupTmuxKittyRefreshHooks: (() => void) | undefined;
 let cleanupTerminalFocusRefresh: (() => void) | undefined;
 const synctexCallbackServers = new Set<SynctexCallbackServer>();
+
+function pdfTrackerForContext(ctx?: ExtensionContext): PdfTracker {
+	if (!ctx) {
+		throw new Error("PDF tracking is only available inside a Pi agent session");
+	}
+
+	let tracker = pdfTrackersByContext.get(ctx);
+	if (!tracker) {
+		tracker = new PdfTracker();
+		pdfTrackersByContext.set(ctx, tracker);
+	}
+	return tracker;
+}
 
 function createSynctexCallbackServer(): SynctexCallbackServer {
 	return new SynctexCallbackServer({ callbackScriptPath: SYNCTEX_CALLBACK_SCRIPT_PATH });
@@ -1204,7 +1219,7 @@ const LatexCompilerParam = Type.Optional(Type.Union([
 const ShowLatexParams = Type.Object(
 	{
 		latex_source: Type.String({
-			description: "LaTeX source code to compile. Snippets can rely on the temp preamble; for those, provide only the document body or the \\begin{document}...\\end{document} block. Full documents with their own \\documentclass can also be compiled.",
+			description: "LaTeX source code to compile. Snippets can rely on the active temp preamble; for those, provide only the document body or the \\begin{document}...\\end{document} block. In existing LaTeX projects, that temp preamble may already be a copy of the project preamble, so do not add a standalone \\documentclass unless intentionally testing independent LaTeX.",
 			minLength: 1,
 		}),
 		compiler: LatexCompilerParam,
@@ -1272,7 +1287,7 @@ const JumpPdfParams = Type.Object(
 const SetLatexPreambleParams = Type.Object(
 	{
 		latex_preamble: Type.String({
-			description: "LaTeX preamble lines to write to /tmp/codex-show-latex/preamble.tex and include before \\begin{document} for show_latex snippet compiles. This is for pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. Use an empty string to clear it.",
+			description: "LaTeX preamble lines to write to /tmp/codex-show-latex/preamble.tex and include before \\begin{document} for show_latex snippet compiles. This overwrites the active temp preamble; if a project preamble was copied there at startup, this makes the active preview preamble diverge from the project's real ./preamble.tex. Use only for pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. Use an empty string to clear it only when intentionally clearing the active preview preamble.",
 		}),
 	},
 	{ additionalProperties: false },
@@ -1503,11 +1518,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "show_latex",
 		label: "Show LaTeX",
-		description: "Compile LaTeX source and render page 1 inline by default. Pass inline=false to refresh/open the external Zathura preview instead. Calling this tool again overwrites the current preview; the user will only see the most recent preview. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. The extension loads its snippet preamble from /tmp/codex-show-latex/preamble.tex, falling back to /tmp/codex-show-latex/praeamble.tex if preamble.tex is absent. At startup, ./preamble.tex or ./praeamble.tex from the current working directory is copied to that fixed temp path as the default. For snippets that rely on this preamble, provide only the document body or the \\begin{document}...\\end{document} block; full documents with their own \\documentclass can also be compiled.",
+		description: "Compile LaTeX source and render page 1 inline by default. Pass inline=false to refresh/open the external Zathura preview instead. Calling this tool again overwrites the current preview; the user will only see the most recent preview. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. The extension loads its snippet preamble from /tmp/codex-show-latex/preamble.tex, falling back to /tmp/codex-show-latex/praeamble.tex if preamble.tex is absent. At startup, ./preamble.tex or ./praeamble.tex from the current working directory is copied to that fixed temp path as the default. In existing LaTeX projects, treat that active temp preamble as project preview state: pass only the document body or the \\begin{document}...\\end{document} block for snippets using project macros, and do not replace it with a minimal preamble to make one snippet compile. Full documents with their own \\documentclass can still be compiled when intentionally testing independent LaTeX.",
 		promptSnippet: "Compile and preview LaTeX as PDF",
 		promptGuidelines: [
 			"Use show_latex when the user asks for a LaTeX PDF preview. It renders inline by default; pass inline=false only when the user wants an external Zathura window. Omit compiler for the lualatex default, or set compiler when a different engine is needed.",
-			"If you would otherwise repeat the same LaTeX packages, macros, or style setup, write them with set_latex_preamble or place them in ./preamble.tex or ./praeamble.tex before starting the Pi session. Those files are for pre-\\begin{document} code only. For snippet previews that rely on them, pass just the document body or \\begin{document}...\\end{document}; full documents with their own \\documentclass can also be compiled.",
+			"Do not use verbatim-like LaTeX constructs (for example, \\begin{verbatim}, lstlisting, minted, or \\verb) to bypass or disable compilation; provide real LaTeX that compiles and renders the requested content.",
+			"In an existing LaTeX project, assume ./preamble.tex or ./praeamble.tex has already been copied into /tmp/codex-show-latex/preamble.tex. For snippets using project macros, pass just the body or \\begin{document}...\\end{document}; do not wrap them in a standalone \\documentclass unless intentionally testing independent LaTeX.",
+			"If a project snippet preview fails, inspect the log and project preamble, or restore the project preamble in /tmp/codex-show-latex/preamble.tex. Do not call set_latex_preamble with a minimal preamble as a workaround unless the user explicitly asks to change the active preview preamble.",
+			"For new non-project defaults, put pre-\\begin{document} setup in ./preamble.tex or ./praeamble.tex before starting the Pi session. Use set_latex_preamble only when the user explicitly wants to change the active session preview preamble.",
 		],
 		renderShell: "self",
 		parameters: ShowLatexParams,
@@ -1558,6 +1576,7 @@ export default function (pi: ExtensionAPI) {
 				let trackedPdfId: number | undefined;
 				let openedPdfPath: string | undefined;
 				if (!(await previewAlreadyOpen([preview.pdfPath, MCP_FIXED_PREVIEW_PDF_PATH], signal, { viewerLogPath: MCP_VIEWER_LOG_PATH, viewerLogBefore }))) {
+					const pdfTracker = pdfTrackerForContext(ctx);
 					const trackedPdf = await openAndTrackPdf(
 						MCP_FIXED_PREVIEW_PDF_PATH,
 						pdfTracker,
@@ -1565,6 +1584,8 @@ export default function (pi: ExtensionAPI) {
 						synctexCommand
 							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
 							: undefined,
+						undefined,
+						synctexCommand || undefined,
 					);
 					trackedPdfId = trackedPdf.id;
 					openedPdfPath = trackedPdf.path;
@@ -1609,10 +1630,12 @@ export default function (pi: ExtensionAPI) {
 					throw new Error("pdf_file_path must be a non-empty string");
 				}
 
-				if (ctx) {
-					const server = await ensureSynctexCallbacks(ctx);
-					synctexCommand = server.command;
+				if (!ctx) {
+					throw new Error("open_pdf requires a Pi agent session context");
 				}
+				const server = await ensureSynctexCallbacks(ctx);
+				synctexCommand = server.command;
+				const pdfTracker = pdfTrackerForContext(ctx);
 				const trackedPdf = await openAndTrackPdf(
 					requestedPath,
 					pdfTracker,
@@ -1620,6 +1643,8 @@ export default function (pi: ExtensionAPI) {
 					synctexCommand
 						? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
 						: undefined,
+					undefined,
+					synctexCommand,
 				);
 				pdfPath = trackedPdf.path;
 				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
@@ -1650,10 +1675,11 @@ export default function (pi: ExtensionAPI) {
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true).",
 		],
 		parameters: ClosePdfParams,
-		execute(_toolCallId, params) {
+		execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			let pdfId = 0;
 			try {
 				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
+				const pdfTracker = pdfTrackerForContext(ctx);
 				const result = closeTrackedPdf(pdfId, pdfTracker);
 				const closedText = result.closedPids.length ? `closed_pids=${result.closedPids.join(",")}` : "closed_pids=none";
 				return {
@@ -1696,10 +1722,12 @@ export default function (pi: ExtensionAPI) {
 				if (sourceFile !== undefined && !sourceFile.trim()) {
 					throw new Error("source_file must be a non-empty string when provided");
 				}
-				if (ctx) {
-					const server = await ensureSynctexCallbacks(ctx);
-					synctexCommand = server.command;
+				if (!ctx) {
+					throw new Error("jump_pdf requires a Pi agent session context");
 				}
+				const server = await ensureSynctexCallbacks(ctx);
+				synctexCommand = server.command;
+				const pdfTracker = pdfTrackerForContext(ctx);
 
 				const result = await jumpToTrackedPdf(
 					pdfId,
@@ -1789,10 +1817,12 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				try {
-					if (ctx) {
-						const server = await ensureSynctexCallbacks(ctx);
-						synctexCommand = server.command;
+					if (!ctx) {
+						throw new Error("compile_latex_file with open_pdf=true requires a Pi agent session context");
 					}
+					const server = await ensureSynctexCallbacks(ctx);
+					synctexCommand = server.command;
+					const pdfTracker = pdfTrackerForContext(ctx);
 					const trackedPdf = await openAndTrackPdf(
 						pdfPath,
 						pdfTracker,
@@ -1801,6 +1831,7 @@ export default function (pi: ExtensionAPI) {
 							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
 							: undefined,
 						latexFilePath,
+						synctexCommand,
 					);
 					const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
 					const text = synctexCommand
@@ -1835,10 +1866,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "set_latex_preamble",
 		label: "Set LaTeX Preamble",
-		description: "Set LaTeX preamble lines inserted before \\begin{document} in subsequent show_latex snippet compiles. This writes the hardcoded temp preamble file /tmp/codex-show-latex/preamble.tex. It should contain pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. compile_latex_file compiles complete files directly and does not inject this preamble.",
+		description: "Set LaTeX preamble lines inserted before \\begin{document} in subsequent show_latex snippet compiles. This overwrites the active temp preamble at /tmp/codex-show-latex/preamble.tex. If a project preamble was copied there at startup, this changes the active preview preamble for the rest of the session and can make it diverge from the project's real ./preamble.tex or ./praeamble.tex. It should contain pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. compile_latex_file compiles complete files directly and does not inject this preamble.",
 		promptSnippet: "Set a LaTeX preamble for future PDF previews",
 		promptGuidelines: [
-			"Use set_latex_preamble when a user wants packages/macros/options included in every preview.",
+			"Use set_latex_preamble only when the user explicitly wants to change packages/macros/options for every subsequent snippet preview.",
+			"In an existing LaTeX project, remember that this overwrites the already-copied active temp preamble, not just an isolated one-off preview setting. Do not use it after a failed preview unless the user explicitly wants to replace the active session preamble.",
+			"Do not install a minimal standalone preamble inside an existing LaTeX project as a workaround for a failed show_latex compile. Inspect the log and project preamble first, and restore the project preamble into /tmp/codex-show-latex/preamble.tex if it diverged.",
 			"For reusable project defaults, write pre-\\begin{document} code to ./preamble.tex or ./praeamble.tex before starting the Pi session so it is copied into /tmp/codex-show-latex/preamble.tex.",
 		],
 		parameters: SetLatexPreambleParams,
@@ -1860,7 +1893,10 @@ export default function (pi: ExtensionAPI) {
 		cleanupTerminalFocusRefresh?.();
 		cleanupTerminalFocusRefresh = undefined;
 		tmuxKittyImageRefreshRegistry.clear();
-		pdfTracker.clear();
+		if (ctx) {
+			pdfTrackersByContext.get(ctx)?.clear();
+			pdfTrackersByContext.delete(ctx);
+		}
 		await shutdownSynctexCallbacks(ctx);
 		await mcpClient.shutdown();
 	});
