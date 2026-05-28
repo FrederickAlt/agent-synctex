@@ -1,1 +1,5 @@
 node_modules/
+
+tmux-client-*.log
+tmux-server-*.log
+tmux-out-*.log
