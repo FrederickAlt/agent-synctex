@@ -1,8 +1,8 @@
 import { createInterface, type Interface } from "node:readline";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, extname, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, ToolResponse } from "@mariozechner/pi-coding-agent";
@@ -10,12 +10,13 @@ import { Container, getCapabilities, getCellDimensions, getPngDimensions, Image,
 import { Type } from "typebox";
 import {
 	calculateInlineDisplayColumns,
+	INLINE_PREVIEW_DIR,
 	mergeInlinePreviewArtifacts,
 	rasterizePdfPages,
 	type InlinePreviewArtifact,
 } from "./inline_preview.ts";
-import { buildKittyPlaceholderImageRender, KittyImageRefreshRegistry } from "./kitty_placeholder_image.ts";
-import { closeTrackedPdf, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
+import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
+import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
 import { readSourceLine, SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
 interface McpEnvelope {
@@ -562,13 +563,14 @@ function runLatexCommand(spec: LatexCommandSpec, cwd: string, signal?: AbortSign
 	});
 }
 
-async function compileLatexFile(latexFilePath: string, compiler?: LatexCompiler, signal?: AbortSignal): Promise<string> {
+async function compileLatexFile(latexFilePath: string, compiler?: LatexCompiler, signal?: AbortSignal, clean = false): Promise<{ pdfPath: string; cleanedArtifacts: string[] }> {
 	assertReadableLatexFile(latexFilePath);
 
+	const cleanedArtifacts = clean ? cleanLatexFileArtifacts(latexFilePath) : [];
 	const outputPdfPath = latexOutputPdfPath(latexFilePath);
 	const spec = latexCommandForFile(latexFilePath, compiler);
 
-	debugLog(`compile file start compiler=${spec.displayName} cwd=${dirname(latexFilePath)} file=${basename(latexFilePath)}`);
+	debugLog(`compile file start compiler=${spec.displayName} cwd=${dirname(latexFilePath)} file=${basename(latexFilePath)} clean=${clean} cleaned=${cleanedArtifacts.length}`);
 	let result: LatexCommandResult;
 	try {
 		result = await runLatexCommand(spec, dirname(latexFilePath), signal);
@@ -598,7 +600,7 @@ async function compileLatexFile(latexFilePath: string, compiler?: LatexCompiler,
 	}
 
 	debugLog(`compile file ok; wrote ${outputPdfPath}`);
-	return outputPdfPath;
+	return { pdfPath: outputPdfPath, cleanedArtifacts };
 }
 
 function resolveMcpScriptPath(): string {
@@ -1168,13 +1170,23 @@ const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
 const pdfTrackersByContext = new Map<string, PdfTracker>();
-const tmuxKittyImageRefreshRegistry = new KittyImageRefreshRegistry();
+const tmuxKittyPreviewInvalidationRegistry = new KittyPreviewInvalidationRegistry();
+interface InlinePreviewArtifactMetadata {
+	pngPath: string;
+	fullPageWidthPx: number;
+	fullPageHeightPx: number;
+	widthPx: number;
+	heightPx: number;
+}
+
 interface InlinePreviewRenderState {
 	pdf: string;
 	previews: InlinePreviewArtifact[];
 }
+
 const inlinePreviewRenderStates = new Map<string, InlinePreviewRenderState>();
 const MAX_INLINE_PREVIEW_RENDER_STATES = 8;
+const INLINE_PREVIEW_MAX_IMAGE_SIZE_BYTES = 25 * 1024 * 1024;
 const synctexCallbacksByContext = new Map<string, SynctexCallbackServer>();
 let cleanupTmuxKittyRefreshHooks: (() => void) | undefined;
 let cleanupTerminalFocusRefresh: (() => void) | undefined;
@@ -1193,6 +1205,73 @@ function rememberInlinePreviewRenderState(state: InlinePreviewRenderState): stri
 	return id;
 }
 
+function numberFromUnknown(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return 1;
+	return Math.max(1, Math.floor(value));
+}
+
+function inlinePreviewPdfPathFromDetails(pdfPath: unknown): string {
+	if (typeof pdfPath !== "string") return "";
+	if (!isAbsolute(pdfPath)) return "";
+	return resolve(pdfPath);
+}
+
+function isInlinePreviewPngPathValue(absolutePath: string, inlinePreviewDir = INLINE_PREVIEW_DIR): boolean {
+	const delta = relative(inlinePreviewDir, absolutePath);
+	if (delta === "" || delta === ".") return false;
+	if (delta === ".." || delta.startsWith(`..${sep}`)) return false;
+	return !isAbsolute(delta);
+}
+
+function safeInlinePreviewPngPath(rawPngPath: unknown): string {
+	if (typeof rawPngPath !== "string") return "";
+	if (!isAbsolute(rawPngPath)) return "";
+	const pngPath = resolve(rawPngPath);
+	if (extname(pngPath).toLowerCase() !== ".png") return "";
+
+	try {
+		const inlinePreviewDir = realpathSync(INLINE_PREVIEW_DIR);
+		const realPngPath = realpathSync(pngPath);
+		if (!isInlinePreviewPngPathValue(realPngPath, inlinePreviewDir)) return "";
+		if (extname(realPngPath).toLowerCase() !== ".png") return "";
+		const status = statSync(realPngPath);
+		if (!status.isFile()) return "";
+		if (status.size <= 0 || status.size > INLINE_PREVIEW_MAX_IMAGE_SIZE_BYTES) return "";
+		accessSync(realPngPath, constants.R_OK);
+		return realPngPath;
+	} catch {
+		return "";
+	}
+}
+
+function inlinePreviewMetadataFromUnknown(value: unknown): InlinePreviewArtifactMetadata | null {
+	if (!value || typeof value !== "object") return null;
+	const candidate = value as Record<string, unknown>;
+	const pngPath = safeInlinePreviewPngPath(candidate.pngPath);
+	if (!pngPath) return null;
+	return {
+		pngPath,
+		fullPageWidthPx: numberFromUnknown(candidate.fullPageWidthPx),
+		fullPageHeightPx: numberFromUnknown(candidate.fullPageHeightPx),
+		widthPx: numberFromUnknown(candidate.widthPx),
+		heightPx: numberFromUnknown(candidate.heightPx),
+	};
+}
+
+function inlinePreviewArtifactFromMetadata(metadata: InlinePreviewArtifactMetadata): InlinePreviewArtifact {
+	return {
+		pngPath: metadata.pngPath,
+		page: 1,
+		dpi: 150,
+		renderer: "mutool",
+		trimmed: false,
+		fullPageWidthPx: metadata.fullPageWidthPx,
+		fullPageHeightPx: metadata.fullPageHeightPx,
+		widthPx: metadata.widthPx,
+		heightPx: metadata.heightPx,
+	};
+}
+
 function inlinePreviewRenderStateFromDetails(details: Record<string, unknown>): InlinePreviewRenderState | null {
 	const previewId = typeof details.preview_id === "string" ? details.preview_id : undefined;
 	if (previewId) {
@@ -1200,15 +1279,19 @@ function inlinePreviewRenderStateFromDetails(details: Record<string, unknown>): 
 		if (state) return state;
 	}
 
-	const legacyPreviews = Array.isArray(details.inline_previews)
-		? (details.inline_previews as InlinePreviewArtifact[])
+	const rawPreviews = Array.isArray(details.inline_previews)
+		? details.inline_previews
 		: details.inline_preview
-			? [details.inline_preview as InlinePreviewArtifact]
+			? [details.inline_preview]
 			: [];
-	if (legacyPreviews.length === 0) return null;
+	const metadataPreviews = rawPreviews
+		.map((entry) => inlinePreviewMetadataFromUnknown(entry))
+		.filter((entry): entry is InlinePreviewArtifactMetadata => entry !== null);
+	if (metadataPreviews.length === 0) return null;
+
 	return {
-		pdf: typeof details.pdf === "string" ? details.pdf : "",
-		previews: legacyPreviews,
+		pdf: inlinePreviewPdfPathFromDetails(details.pdf),
+		previews: metadataPreviews.map((metadata) => inlinePreviewArtifactFromMetadata(metadata)),
 	};
 }
 
@@ -1285,6 +1368,49 @@ async function shutdownSynctexCallbacks(ctx?: ExtensionContext): Promise<void> {
 	await Promise.all(servers.map((server) => server.close()));
 }
 
+const LATEX_FILE_ARTIFACT_EXTENSIONS = [
+	".aux",
+	".bbl",
+	".bcf",
+	".blg",
+	".dvi",
+	".fdb_latexmk",
+	".fls",
+	".idx",
+	".ilg",
+	".ind",
+	".lof",
+	".log",
+	".lot",
+	".nav",
+	".out",
+	".pdf",
+	".ps",
+	".run.xml",
+	".snm",
+	".synctex",
+	".synctex.gz",
+	".toc",
+	".vrb",
+	".xdv",
+] as const;
+
+function latexFileArtifactPaths(latexFilePath: string): string[] {
+	const dir = dirname(latexFilePath);
+	const base = basename(latexFilePath, extname(latexFilePath));
+	return LATEX_FILE_ARTIFACT_EXTENSIONS.map((extension) => join(dir, `${base}${extension}`));
+}
+
+function cleanLatexFileArtifacts(latexFilePath: string): string[] {
+	const removed: string[] = [];
+	for (const artifactPath of latexFileArtifactPaths(latexFilePath)) {
+		if (!existsSync(artifactPath)) continue;
+		rmSync(artifactPath, { force: true });
+		removed.push(artifactPath);
+	}
+	return removed;
+}
+
 const LatexCompilerParam = Type.Optional(Type.Union([
 	Type.Literal("lualatex"),
 	Type.Literal("pdflatex"),
@@ -1319,6 +1445,10 @@ const CompileLatexFileParams = Type.Object(
 		compiler: LatexCompilerParam,
 		open_pdf: Type.Optional(Type.Boolean({
 			description: "When true, open and track the compiled PDF after successful compilation. Defaults to false.",
+			default: false,
+		})),
+		clean: Type.Optional(Type.Boolean({
+			description: "When true, remove common LaTeX artifacts for this source file's basename before compiling, including the previous PDF and SyncTeX sidecar. Defaults to false.",
 			default: false,
 		})),
 	},
@@ -1513,11 +1643,25 @@ async function executeShowLatexPreviewTool(
 			const pageArtifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
 			const artifacts = await mergeInlinePreviewArtifacts(pageArtifacts, { signal });
 			const previewId = rememberInlinePreviewRenderState({ pdf: preview.pdfPath, previews: artifacts });
+			const inlinePreviews = artifacts.map((artifact) => ({
+				pngPath: artifact.pngPath,
+				fullPageWidthPx: artifact.fullPageWidthPx,
+				fullPageHeightPx: artifact.fullPageHeightPx,
+				widthPx: artifact.widthPx,
+				heightPx: artifact.heightPx,
+			}));
+			const primaryImagePath = inlinePreviews[0]?.pngPath ?? "";
+			const text = primaryImagePath
+				? `✓ LaTeX preview rendered locally\nimage_path=${primaryImagePath}`
+				: "✓ LaTeX preview rendered locally";
 			return {
-				content: [{ type: "text", text: "✓ LaTeX preview rendered locally" }],
+				content: [{ type: "text", text }],
 				details: {
 					inline: true,
 					preview_id: previewId,
+					pdf: preview.pdfPath,
+					image_path: primaryImagePath,
+					inline_previews: inlinePreviews,
 				},
 			};
 		}
@@ -1531,7 +1675,7 @@ async function executeShowLatexPreviewTool(
 				pdfTracker,
 				signal,
 				synctexCommand
-					? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
+					? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true, requirePersistentViewer: true })
 					: undefined,
 				undefined,
 				synctexCommand || undefined,
@@ -1577,15 +1721,15 @@ function runTmux(args: string[]): void {
 	spawnSync("tmux", args, { stdio: "ignore" });
 }
 
-function refreshTmuxKittyImages(): void {
+function refreshTmuxKittyPreviews(): void {
 	if (!isTmuxKittyTerminal()) return;
-	tmuxKittyImageRefreshRegistry.refresh();
+	tmuxKittyPreviewInvalidationRegistry.refresh();
 }
 
 function installTmuxKittyRefreshHooks(): () => void {
 	if (!isTmuxKittyTerminal()) return () => {};
 
-	const onRefreshSignal = () => refreshTmuxKittyImages();
+	const onRefreshSignal = () => refreshTmuxKittyPreviews();
 	process.on("SIGWINCH", onRefreshSignal);
 	process.on("SIGUSR1", onRefreshSignal);
 
@@ -1626,7 +1770,7 @@ function installTerminalFocusRefresh(ctx: ExtensionContext): () => void {
 	const scheduleRefresh = (delayMs: number) => {
 		const timer = setTimeout(() => {
 			timers.delete(timer);
-			refreshTmuxKittyImages();
+			refreshTmuxKittyPreviews();
 		}, delayMs);
 		timers.add(timer);
 	};
@@ -1638,7 +1782,9 @@ function installTerminalFocusRefresh(ctx: ExtensionContext): () => void {
 
 		if (sawFocusIn) {
 			// Give tmux/Kitty a moment to finish making the pane visible, then
-			// retransmit the latest Kitty virtual-placement image payloads.
+			// ask Pi to redraw the latest placeholder rows. This re-emits the
+			// Kitty setup command together with the placeholder text instead of
+			// sending a raw graphics command that can blank existing placeholders.
 			scheduleRefresh(50);
 			scheduleRefresh(200);
 		}
@@ -1653,6 +1799,15 @@ function installTerminalFocusRefresh(ctx: ExtensionContext): () => void {
 		timers.clear();
 		process.stdout.write("\x1b[?1004l");
 	};
+}
+
+function rememberTmuxKittyPreviewInvalidator(context: unknown): void {
+	if (!isTmuxKittyTerminal() || typeof context !== "object" || context === null) return;
+	const candidate = context as { toolCallId?: unknown; invalidate?: unknown };
+	if (typeof candidate.invalidate !== "function") return;
+	const invalidate = candidate.invalidate;
+	const key = typeof candidate.toolCallId === "string" ? candidate.toolCallId : randomUUID();
+	tmuxKittyPreviewInvalidationRegistry.remember(key, () => invalidate());
 }
 
 class InlineLatexPreviewImage implements Component {
@@ -1716,7 +1871,6 @@ class TmuxKittyPlaceholderImage implements Component {
 			cellDimensions: getCellDimensions(),
 		});
 
-		tmuxKittyImageRefreshRegistry.remember(this.imageId, rendered.refreshSequence);
 		this.cachedWidth = width;
 		this.cachedLines = rendered.lines;
 		return this.cachedLines;
@@ -1737,37 +1891,77 @@ function renderInlineLatexPreview(result: { content?: Array<{ type?: unknown; te
 		return text;
 	};
 
-	if (inlinePreviews.length === 0 || !canShowImages) {
-		const pngPaths = inlinePreviews.map((preview) => preview.pngPath).filter(Boolean);
-		if (pngPaths.length === 0) {
-			return new Text(`ok: ${pdf}\nInline preview: unavailable`, 0, 0);
+	const labelForPaths = (paths: string[]): string =>
+		paths.length === 1 ? `PNG: ${paths[0]}` : `PNGs:\n${paths.join("\n")}`;
+
+	const validatedPreviews: InlinePreviewArtifact[] = [];
+	const unavailablePngPaths: string[] = [];
+	for (const preview of inlinePreviews) {
+		const safePath = safeInlinePreviewPngPath(preview.pngPath);
+		if (!safePath) {
+			if (preview.pngPath) unavailablePngPaths.push(preview.pngPath);
+			continue;
 		}
 
-		const label = pngPaths.length === 1 ? `PNG: ${pngPaths[0]}` : `PNGs:\n${pngPaths.join("\n")}`;
-		return new Text(`${fg("success", "ok")}: ${pdf}\n${fg("muted", `Inline image display is not supported by this terminal. ${label}`)}`, 0, 0);
+		validatedPreviews.push(safePath === preview.pngPath ? preview : { ...preview, pngPath: safePath });
 	}
 
-	const getImageData = (index: number): string => readFileSync(inlinePreviews[index]?.pngPath ?? "").toString("base64");
+	if (validatedPreviews.length === 0) {
+		if (unavailablePngPaths.length > 0) {
+			return new Text(`ok: ${pdf}\n${fg("muted", `Inline preview unavailable: ${labelForPaths(unavailablePngPaths)}`)}`, 0, 0);
+		}
+		return new Text(`ok: ${pdf}\nInline preview: unavailable`, 0, 0);
+	}
+
+	if (unavailablePngPaths.length > 0) {
+		return new Text(`ok: ${pdf}\n${fg("muted", `Inline preview unavailable: ${labelForPaths(unavailablePngPaths)}`)}`, 0, 0);
+	}
+
+	if (!canShowImages) {
+		const label = validatedPreviews.map((preview) => preview.pngPath);
+		return new Text(
+			`${fg("success", "ok")}: ${pdf}\n${fg("muted", `Inline image display is not supported by this terminal. ${labelForPaths(label)}`)}`,
+			0,
+			0,
+		);
+	}
 
 	const title = `${fg("success", "✓ LaTeX preview")}`;
 	const container = new Container();
 	container.addChild(new Text(title, 0, 0));
 
+	const readImageData = (preview: InlinePreviewArtifact): string | null => {
+		const safePath = safeInlinePreviewPngPath(preview.pngPath);
+		if (!safePath) return null;
+		try {
+			return readFileSync(safePath).toString("base64");
+		} catch {
+			return null;
+		}
+	};
+
 	if (isTmuxKittyTerminal()) {
-		for (const [index, preview] of inlinePreviews.entries()) {
-			const base64 = getImageData(index);
+		rememberTmuxKittyPreviewInvalidator(context);
+		for (const preview of validatedPreviews) {
+			const base64 = readImageData(preview);
+			if (base64 === null) {
+				return new Text(`ok: ${pdf}\n${fg("muted", `Inline preview unavailable: ${labelForPaths([preview.pngPath])}`)}`, 0, 0);
+			}
 			container.addChild(new TmuxKittyPlaceholderImage("", base64, preview));
 		}
 		return container;
 	}
 
 	if (!getCapabilities().images) {
-		const label = inlinePreviews.map((preview) => preview.pngPath).join("\n");
-		return new Text(`ok: ${pdf}\n${fg("muted", `Inline image display is not supported by this terminal. PNGs:\n${label}`)}`, 0, 0);
+		const label = validatedPreviews.map((preview) => preview.pngPath);
+		return new Text(`${fg("success", "ok")}: ${pdf}\n${fg("muted", `Inline image display is not supported by this terminal. ${labelForPaths(label)}`)}`, 0, 0);
 	}
 
-	for (const [index, preview] of inlinePreviews.entries()) {
-		const base64 = getImageData(index);
+	for (const preview of validatedPreviews) {
+		const base64 = readImageData(preview);
+		if (base64 === null) {
+			return new Text(`ok: ${pdf}\n${fg("muted", `Inline preview unavailable: ${labelForPaths([preview.pngPath])}`)}`, 0, 0);
+		}
 		container.addChild(new InlineLatexPreviewImage(base64, preview, (text) => fg("muted", text), preview.pngPath));
 	}
 
@@ -1865,7 +2059,7 @@ export default function (pi: ExtensionAPI) {
 					pdfTracker,
 					signal,
 					synctexCommand
-						? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
+						? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true, requirePersistentViewer: true })
 						: undefined,
 					undefined,
 					synctexCommand,
@@ -1967,12 +2161,16 @@ export default function (pi: ExtensionAPI) {
 					details: { pdf_id: pdfId, line, source: result.sourceFile, pdf: result.pdf, reopened: result.reopened, source_line: sourceLine },
 				};
 			} catch (error) {
-				throw latexToolFailure("jump-pdf", "PDF jump failed", {
+				const failureContext: Record<string, unknown> = {
 					pdf_id: pdfId || params.pdf_id,
 					line: line || params.line,
 					source_file: sourceFile ?? params.source_file,
 					synctex_callback_command: synctexCommand,
-				}, error);
+				};
+				if (ctx && pdfId > 0) {
+					failureContext.jump_failure_context = describePdfJumpFailureContext(pdfId, pdfTrackerForContext(ctx), synctexCommand || undefined);
+				}
+				throw latexToolFailure("jump-pdf", "PDF jump failed", failureContext, error);
 			}
 		},
 	});
@@ -2006,11 +2204,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "compile_latex_file",
 		label: "Compile LaTeX File",
-		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set open_pdf=true to open and track the successfully compiled PDF; leave it false (the default) to compile without opening a viewer window. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles.",
+		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to open and track the successfully compiled PDF; leave it false (the default) to compile without opening a viewer window. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles.",
 		promptSnippet: "Compile a local LaTeX file as PDF",
 		promptGuidelines: [
 			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
 			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without opening a window; set open_pdf=true only when the user wants the compiled PDF opened/tracked immediately.",
+			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling.",
 			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
 			"For multi-file LaTeX projects, compile/open the root file that produces the PDF, such as main.tex. The returned pdf_id identifies the resulting PDF/viewer and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
 			"On failure this tool returns only a short error message and writes details to a temporary log file.",
@@ -2022,6 +2221,8 @@ export default function (pi: ExtensionAPI) {
 			let pdfPath = "";
 			let compiler: LatexCompiler | undefined;
 			let shouldOpenPdf = false;
+			let shouldClean = false;
+			let cleanedArtifacts: string[] = [];
 			let synctexCommand = "";
 			try {
 				requestedPath = String(params.latex_file_path ?? "");
@@ -2032,11 +2233,14 @@ export default function (pi: ExtensionAPI) {
 				latexFilePath = resolveLatexFilePath(requestedPath);
 				compiler = resolveLatexCompiler(params.compiler);
 				shouldOpenPdf = params.open_pdf === true;
-				pdfPath = await compileLatexFile(latexFilePath, compiler, signal);
+				shouldClean = params.clean === true;
+				const compileResult = await compileLatexFile(latexFilePath, compiler, signal, shouldClean);
+				pdfPath = compileResult.pdfPath;
+				cleanedArtifacts = compileResult.cleanedArtifacts;
 				if (!shouldOpenPdf) {
 					return {
 						content: [{ type: "text", text: `ok: ${pdfPath}` }],
-						details: { source: latexFilePath, pdf: pdfPath },
+						details: { source: latexFilePath, pdf: pdfPath, clean: shouldClean, cleaned_artifacts: cleanedArtifacts },
 					};
 				}
 
@@ -2052,7 +2256,7 @@ export default function (pi: ExtensionAPI) {
 						pdfTracker,
 						signal,
 						synctexCommand
-							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true })
+							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true, requirePersistentViewer: true })
 							: undefined,
 						latexFilePath,
 						synctexCommand,
@@ -2063,13 +2267,15 @@ export default function (pi: ExtensionAPI) {
 						: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
 					return {
 						content: [{ type: "text", text }],
-						details: { source: latexFilePath, pdf: trackedPdf.path, pdf_id: trackedPdf.id, pid: trackedPdf.pid, synctex_callback_command: synctexCommand },
+						details: { source: latexFilePath, pdf: trackedPdf.path, pdf_id: trackedPdf.id, pid: trackedPdf.pid, clean: shouldClean, cleaned_artifacts: cleanedArtifacts, synctex_callback_command: synctexCommand },
 					};
 				} catch (error) {
 					throw latexToolFailure("compile-latex-file", "LaTeX compile succeeded but opening failed", {
 						requested_path: requestedPath,
 						source: latexFilePath,
 						compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
+						clean: shouldClean,
+						cleaned_artifacts: cleanedArtifacts,
 						pdf: pdfPath,
 						synctex_callback_command: synctexCommand,
 					}, error);
@@ -2080,6 +2286,8 @@ export default function (pi: ExtensionAPI) {
 					source: latexFilePath,
 					compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
 					open_pdf: shouldOpenPdf,
+					clean: shouldClean,
+					cleaned_artifacts: cleanedArtifacts,
 					pdf: pdfPath,
 					synctex_callback_command: synctexCommand,
 				}, error);
@@ -2116,7 +2324,7 @@ export default function (pi: ExtensionAPI) {
 		cleanupTmuxKittyRefreshHooks = undefined;
 		cleanupTerminalFocusRefresh?.();
 		cleanupTerminalFocusRefresh = undefined;
-		tmuxKittyImageRefreshRegistry.clear();
+		tmuxKittyPreviewInvalidationRegistry.clear();
 		if (ctx) {
 			const key = contextSessionKey(ctx);
 			pdfTrackersByContext.get(key)?.clear();

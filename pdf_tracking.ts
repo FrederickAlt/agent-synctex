@@ -29,6 +29,7 @@ interface ZathuraOpenOptions {
 	synctexEditorCommand?: string;
 	isAlreadyOpen?: (pdfFilePath: string) => boolean;
 	reuseExisting?: boolean;
+	requirePersistentViewer?: boolean;
 }
 
 interface ZathuraJumpOptions extends ZathuraOpenOptions {
@@ -137,6 +138,56 @@ function zathuraPidsForPdfWithSynctexCommand(pdfFilePath: string, synctexEditorC
 		}
 	}
 	return pids;
+}
+
+function describeZathuraProcessesForPdf(pdfFilePath: string, synctexEditorCommand?: string, procRoot = PROC_ROOT): string {
+	let entries: string[];
+	try {
+		entries = readdirSync(procRoot);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return `Could not inspect ${procRoot}: ${message}`;
+	}
+
+	const normalizedPdfPath = normalizePdfFilePath(pdfFilePath);
+	const processLines: string[] = [];
+	for (const entry of entries) {
+		if (!/^\d+$/.test(entry)) continue;
+		const args = readProcessArgs(entry, procRoot);
+		if (!args || !processArgsMatchZathuraPdf(args, normalizedPdfPath)) continue;
+		const callbackMatch = synctexEditorCommand ? processArgsMatchSynctexEditorCommand(args, synctexEditorCommand) : undefined;
+		const callbackText = callbackMatch === undefined ? "" : ` callback_match=${callbackMatch}`;
+		processLines.push(`pid=${entry}${callbackText} args=${args.map((arg) => JSON.stringify(arg)).join(" ")}`);
+	}
+
+	return processLines.length
+		? `Zathura processes for ${normalizedPdfPath}:\n${processLines.join("\n")}`
+		: `No Zathura process in ${procRoot} matched PDF ${normalizedPdfPath}`;
+}
+
+export function describePdfJumpFailureContext(pdfId: number, tracker: PdfTracker, currentSynctexEditorCommand?: string): string {
+	const trackedPdf = tracker.getById(pdfId);
+	if (!trackedPdf) return `No tracked PDF found for pdf_id=${pdfId}`;
+
+	const trackedPidArgs = trackedPdf.pid === undefined ? undefined : readProcessArgs(String(trackedPdf.pid));
+	const effectiveSynctexCommand = currentSynctexEditorCommand ?? trackedPdf.synctexEditorCommand;
+	const lines = [
+		`tracked_pdf_id=${trackedPdf.id}`,
+		`tracked_pdf_path=${trackedPdf.path}`,
+		`tracked_source_file=${trackedPdf.sourceFile ?? "<unknown>"}`,
+		`tracked_pid=${trackedPdf.pid ?? "<unknown>"}`,
+		`tracked_pid_args=${trackedPidArgs ? trackedPidArgs.map((arg) => JSON.stringify(arg)).join(" ") : "<unavailable>"}`,
+		`tracked_synctex_callback_command=${trackedPdf.synctexEditorCommand ?? "<none>"}`,
+		`current_synctex_callback_command=${currentSynctexEditorCommand ?? "<none>"}`,
+		`callback_command_changed=${trackedPdf.synctexEditorCommand !== undefined && currentSynctexEditorCommand !== undefined && trackedPdf.synctexEditorCommand !== currentSynctexEditorCommand}`,
+		`effective_callback_process_snapshot=${describeZathuraProcessesForPdf(trackedPdf.path, effectiveSynctexCommand)}`,
+	];
+
+	if (trackedPdf.synctexEditorCommand && currentSynctexEditorCommand && trackedPdf.synctexEditorCommand !== currentSynctexEditorCommand) {
+		lines.push(`tracked_callback_process_snapshot=${describeZathuraProcessesForPdf(trackedPdf.path, trackedPdf.synctexEditorCommand)}`);
+	}
+
+	return lines.join("\n");
 }
 
 export function zathuraAlreadyOpen(pdfFilePath: string): boolean {
@@ -457,12 +508,15 @@ async function waitForNewZathuraPid(
 	signal?: AbortSignal,
 ): Promise<number | undefined> {
 	const deadline = Date.now() + Math.max(0, Math.min(timeoutMs, ZATHURA_PID_DETECTION_TIMEOUT_MS));
+	const normalizedPdfPath = normalizePdfFilePath(pdfFilePath);
 	while (true) {
 		const newPids = zathuraPidsForPdf(pdfFilePath).filter((pid) => !beforePids.has(pid));
 		if (newPids.length) {
 			const pid = Math.max(...newPids);
 			await waitForZathuraDbusReady(pid, timeoutMs, signal);
-			return pid;
+			const args = readProcessArgs(String(pid));
+			if (args && processArgsMatchZathuraPdf(args, normalizedPdfPath)) return pid;
+			beforePids.add(pid);
 		}
 		if (signal?.aborted || Date.now() >= deadline) return undefined;
 		await delay(ZATHURA_PID_POLL_MS);
@@ -513,7 +567,11 @@ export async function openPdfInZathura(
 			throw new Error(`zathura failed to open ${pdfFilePath}: exited ${status}${details}`);
 		}
 
-		return waitForNewZathuraPid(pdfFilePath, beforePids, timeoutMs, signal);
+		const pid = await waitForNewZathuraPid(pdfFilePath, beforePids, timeoutMs, signal);
+		if (options.requirePersistentViewer && pid === undefined) {
+			throw new Error(`zathura exited before a persistent viewer was available for ${pdfFilePath}. The viewer may have crashed while opening this PDF.`);
+		}
+		return pid;
 	};
 
 	if (!options.reuseExisting) return launch(existingPids);
@@ -784,7 +842,7 @@ export async function jumpToTrackedPdf(
 	}
 	assertReadableSourceFile(resolvedSourceFile);
 
-	const trackedSynctexCommand = trackedPdf.synctexEditorCommand ?? options.synctexEditorCommand;
+	const trackedSynctexCommand = options.synctexEditorCommand ?? trackedPdf.synctexEditorCommand;
 	const hasTrackedCommand = trackedSynctexCommand !== undefined;
 
 	const resolveOwnedPid = (): number | undefined => {
@@ -833,7 +891,16 @@ export async function jumpToTrackedPdf(
 		tracker.markReopened(pdfId, reopenedPid, trackedPdf.sourceFile, trackedSynctexCommand);
 		const ownedPid = resolveOwnedPid();
 		if (ownedPid === undefined) {
-			throw new Error(`Tracked PDF pdf_id=${pdfId} at ${trackedPdf.path} reopened without an identifiable Zathura window matching callback command ${trackedSynctexCommand}.`);
+			if (reopenedPid !== undefined) {
+				throw new Error(`Tracked PDF pdf_id=${pdfId} at ${trackedPdf.path} reopened as pid=${reopenedPid}, but that process exited before the SyncTeX jump. Zathura may have crashed while opening this PDF.\n${describeZathuraProcessesForPdf(trackedPdf.path, trackedSynctexCommand)}`);
+			}
+			try {
+				await jumpWithPid(undefined);
+				return { pdf: trackedPdf.path, sourceFile: resolvedSourceFile, line, reopened: true };
+			} catch (jumpError) {
+				const message = jumpError instanceof Error ? jumpError.message : String(jumpError);
+				throw new Error(`Tracked PDF pdf_id=${pdfId} at ${trackedPdf.path} reopened without an identifiable Zathura window matching callback command ${trackedSynctexCommand}, and an unpinned SyncTeX jump also failed: ${message}\n${describeZathuraProcessesForPdf(trackedPdf.path, trackedSynctexCommand)}`);
+			}
 		}
 
 		await jumpWithPid(ownedPid);

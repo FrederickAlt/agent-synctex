@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-	KittyImageRefreshRegistry,
+	buildKittyPlaceholderImageRender,
+	KittyPreviewInvalidationRegistry,
 	kittyPlaceholderCell,
 	kittyPlaceholderLine,
 	kittyTransmitVirtualPlacementCommand,
@@ -50,26 +51,41 @@ test("kitty transmit virtual placement command chunks large payloads", () => {
 	assert.match(command, /\x1b_Gm=0;/);
 });
 
+test("kitty placeholder render does not expose setup commands as focus-refresh payloads", () => {
+	const rendered = buildKittyPlaceholderImageRender({
+		title: "preview",
+		base64Data: PNG_BASE64,
+		imageId: 42,
+		width: 12,
+		maxWidthCells: 100,
+		imageDimensions: { widthPx: 100, heightPx: 20 },
+		cellDimensions: { widthPx: 10, heightPx: 10 },
+	});
+
+	assert.deepEqual(Object.keys(rendered).sort(), ["columns", "lines", "rows"]);
+});
+
 test("wrapKittySequenceForTmux escapes nested escape bytes", () => {
 	const wrapped = wrapKittySequenceForTmux("\x1b_Ga=t;data\x1b\\");
 
 	assert.equal(wrapped, "\x1bPtmux;\x1b\x1b_Ga=t;data\x1b\x1b\\\x1b\\");
 });
 
-test("KittyImageRefreshRegistry refreshes recent image setup sequences without timers", () => {
-	const registry = new KittyImageRefreshRegistry(2);
-	const writes: string[] = [];
+test("KittyPreviewInvalidationRegistry refreshes recent tool row invalidators", () => {
+	const registry = new KittyPreviewInvalidationRegistry(2);
+	const calls: string[] = [];
 
-	registry.remember(1, "one");
-	registry.remember(2, "two");
-	registry.remember(1, "one-again");
-	registry.remember(3, "three");
-	registry.refresh((sequence) => writes.push(sequence));
+	registry.remember("a", () => calls.push("a"));
+	registry.remember("b", () => calls.push("b"));
+	registry.remember("a", () => calls.push("a-again"));
+	registry.remember("c", () => calls.push("c"));
+	registry.refresh();
 
 	assert.equal(registry.size, 2);
-	assert.deepEqual(writes, ["one-againthree"]);
+	assert.deepEqual(calls, ["a-again", "c"]);
 
 	registry.clear();
-	registry.refresh((sequence) => writes.push(sequence));
-	assert.deepEqual(writes, ["one-againthree"]);
+	registry.refresh();
+	assert.deepEqual(calls, ["a-again", "c"]);
 });
+

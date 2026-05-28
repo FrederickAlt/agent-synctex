@@ -368,6 +368,69 @@ test("jumpToTrackedPdf reopens a tracked PDF and retries when the first jump fai
 	]);
 });
 
+test("jumpToTrackedPdf does not launch an unpinned fallback when the reopened PID already exited", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	const callsFile = join(dir, "calls.txt");
+	const fakeZathura = join(dir, "zathura");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+	writeFileSync(fakeZathura, `#!/bin/sh\nprintf '%s|' "$@" >> ${JSON.stringify(callsFile)}\nprintf '\\n' >> ${JSON.stringify(callsFile)}\nexit 0\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, undefined, "current callback command");
+	let reopenCalls = 0;
+	await assert.rejects(
+		() => jumpToTrackedPdf(trackedPdf.id, 15, undefined, tracker, undefined, {
+			command: fakeZathura,
+			timeoutMs: 1000,
+			synctexEditorCommand: "current callback command",
+			opener: async () => {
+				reopenCalls += 1;
+				return 987654321;
+			},
+		}),
+		/reopened as pid=987654321, but that process exited before the SyncTeX jump/,
+	);
+
+	assert.equal(reopenCalls, 1);
+	assert.equal(existsSync(callsFile), false);
+});
+
+test("jumpToTrackedPdf falls back to an unpinned jump when callback PID cannot be identified after reopen", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	const callsFile = join(dir, "calls.txt");
+	const fakeZathura = join(dir, "zathura");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+	writeFileSync(fakeZathura, `#!/bin/sh\nprintf '%s|' "$@" >> ${JSON.stringify(callsFile)}\nprintf '\\n' >> ${JSON.stringify(callsFile)}\nexit 0\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, undefined, "old callback command");
+	let reopenCalls = 0;
+	const result = await jumpToTrackedPdf(trackedPdf.id, 15, undefined, tracker, undefined, {
+		command: fakeZathura,
+		timeoutMs: 1000,
+		synctexEditorCommand: "current callback command",
+		opener: async () => {
+			reopenCalls += 1;
+			return undefined;
+		},
+	});
+
+	assert.equal(reopenCalls, 1);
+	assert.deepEqual(readFileSync(callsFile, "utf8").trim().split("\n"), [
+		`--synctex-forward|15:1:${source}|${pdf}|`,
+	]);
+	assert.deepEqual(result, { pdf, sourceFile: source, line: 15, reopened: true });
+	assert.equal(tracker.getById(trackedPdf.id)?.synctexEditorCommand, "current callback command");
+});
+
 test("jumpToTrackedPdf reports a clear error when reopening fails", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");
@@ -472,7 +535,7 @@ test("openPdfInZathura does not reuse an existing viewer that lacks the current 
 	writeFileSync(fakeZathura, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\n`);
 	chmodSync(fakeZathura, 0o700);
 
-	const staleViewer = spawn("bash", ["-c", "exec -a zathura bash -c 'sleep 30' dummy --fork \"$1\"", "bash", pdf], {
+	const staleViewer = spawn("bash", ["-c", "exec -a zathura bash -c 'while true; do sleep 30; done' dummy --fork \"$1\"", "bash", pdf], {
 		stdio: "ignore",
 	});
 	try {
@@ -507,7 +570,7 @@ test("openPdfInZathura reuses an existing viewer that already has the current Sy
 
 	const currentViewer = spawn("bash", [
 		"-c",
-		"exec -a zathura bash -c 'sleep 30' dummy \"--synctex-editor-command=$2\" --fork \"$1\"",
+		"exec -a zathura bash -c 'while true; do sleep 30; done' dummy \"--synctex-editor-command=$2\" --fork \"$1\"",
 		"bash",
 		pdf,
 		synctexCommand,
@@ -527,6 +590,20 @@ test("openPdfInZathura reuses an existing viewer that already has the current Sy
 	} finally {
 		await stopProcess(currentViewer);
 	}
+});
+
+test("openPdfInZathura reports when a required persistent viewer exits immediately", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const fakeZathura = join(dir, "zathura");
+	writeMinimalPdf(pdf);
+	writeFileSync(fakeZathura, "#!/bin/sh\nexit 0\n");
+	chmodSync(fakeZathura, 0o700);
+
+	await assert.rejects(
+		() => openPdfInZathura(pdf, undefined, { command: fakeZathura, timeoutMs: 1000, requirePersistentViewer: true }),
+		/zathura exited before a persistent viewer was available/,
+	);
 });
 
 test("openPdfInZathura surfaces zathura launch failures", async () => {

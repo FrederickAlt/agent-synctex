@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const MCP_TMPDIR = "/tmp/codex-show-latex";
-const INLINE_PREVIEW_DIR = resolve(MCP_TMPDIR, "inline");
+export const INLINE_PREVIEW_DIR = resolve(MCP_TMPDIR, "inline");
 const INLINE_PREVIEW_MISSING_RENDERER_MESSAGE = "Inline preview requires mutool or pdftoppm. Install mupdf-tools or poppler-utils, or call show_latex with inline=false.";
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const DEFAULT_INLINE_PREVIEW_DIMENSION_PX = 1;

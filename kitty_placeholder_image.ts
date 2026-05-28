@@ -20,40 +20,38 @@ export interface KittyPlaceholderRenderOptions {
 
 export interface KittyPlaceholderImageRender {
 	lines: string[];
-	refreshSequence: string;
 	columns: number;
 	rows: number;
 }
 
-export class KittyImageRefreshRegistry {
-	private readonly sequences = new Map<number, string>();
+export class KittyPreviewInvalidationRegistry {
+	private readonly invalidators = new Map<string, () => void>();
 	private readonly maxEntries: number;
 
 	constructor(maxEntries = 8) {
 		this.maxEntries = maxEntries;
 	}
 
-	remember(imageId: number, sequence: string): void {
-		this.sequences.delete(imageId);
-		this.sequences.set(imageId, sequence);
-		while (this.sequences.size > this.maxEntries) {
-			const oldest = this.sequences.keys().next().value;
+	remember(key: string, invalidate: () => void): void {
+		this.invalidators.delete(key);
+		this.invalidators.set(key, invalidate);
+		while (this.invalidators.size > this.maxEntries) {
+			const oldest = this.invalidators.keys().next().value;
 			if (oldest === undefined) break;
-			this.sequences.delete(oldest);
+			this.invalidators.delete(oldest);
 		}
 	}
 
-	refresh(write: (sequence: string) => void = (sequence) => process.stdout.write(sequence)): void {
-		if (this.sequences.size === 0) return;
-		write([...this.sequences.values()].join(""));
+	refresh(): void {
+		for (const invalidate of [...this.invalidators.values()]) invalidate();
 	}
 
 	clear(): void {
-		this.sequences.clear();
+		this.invalidators.clear();
 	}
 
 	get size(): number {
-		return this.sequences.size;
+		return this.invalidators.size;
 	}
 }
 
@@ -126,11 +124,16 @@ export function buildKittyPlaceholderImageRender(options: KittyPlaceholderRender
 	const maxCoordinate = ROW_COLUMN_DIACRITICS.length;
 	const columns = Math.max(1, Math.min(options.width - 2, options.maxWidthCells, maxCoordinate));
 	const rows = Math.min(calculateImageRows(options.imageDimensions, columns, options.cellDimensions), maxCoordinate);
-	const refreshSequence = wrapKittySequenceForTmux(
+	// This setup command must stay coupled to the placeholder cells below.
+	// Re-emitting it later for the same image id deletes/replaces Kitty's
+	// existing image/virtual placement, which can leave already-drawn
+	// placeholders blank until the terminal dirties those rows (for example by
+	// scrolling). See the regression test before exposing this as a refresh hook.
+	const setupSequence = wrapKittySequenceForTmux(
 		kittyTransmitVirtualPlacementCommand(options.base64Data, options.imageId, columns, rows),
 	);
-	const imageLines = Array.from({ length: rows }, (_value, row) => `${row === 0 ? refreshSequence : ""}${kittyPlaceholderLine(options.imageId, row, columns)}`);
-	return { lines: [options.title, ...imageLines], refreshSequence, columns, rows };
+	const imageLines = Array.from({ length: rows }, (_value, row) => `${row === 0 ? setupSequence : ""}${kittyPlaceholderLine(options.imageId, row, columns)}`);
+	return { lines: [options.title, ...imageLines], columns, rows };
 }
 
 export function renderKittyPlaceholderImageLines(options: KittyPlaceholderRenderOptions): string[] {

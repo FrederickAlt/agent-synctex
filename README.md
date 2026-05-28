@@ -29,10 +29,15 @@ By default, `show_latex` leaves the ready descriptor and fixed preview files unt
 PDF page to a local PNG with `mutool` or `pdftoppm`, trims image whitespace when ImageMagick is available,
 and, for multi-page PDFs, merges the page PNGs into one vertical image when ImageMagick is available
 (falling back to sequential PNGs otherwise). It renders inline in Pi chat without returning image bytes in
-the tool result. Inline image width is proportional to the cropped content width relative to the full PDF
+the tool result; the text result includes an `image_path=<png>` field for the primary local preview image.
+Inline image width is proportional to the cropped content width relative to the full PDF
 page width, so small symbols stay small while wide formulas use more of the TUI. With `inline=false`, it atomically
 writes a ready descriptor that pairs the operation PDF with the session's SyncTeX callback command,
 refreshes fixed compatibility files, then uses the existing Zathura helper/fallback path.
+Inline preview details persist metadata locally in the tool result (`image_path`, `inline_previews`, and `pdf`), containing only
+safe artifact paths plus dimensions, so repeated renders in the same process can reuse an in-memory preview ID while a
+`/reload` can still recover images from the persisted metadata as long as `/tmp/codex-show-latex/inline` artifacts
+remain on disk.
 File compiles are spawned directly by the extension so normal LaTeX project-relative includes/assets
 resolve without using the backend service.
 
@@ -117,6 +122,7 @@ Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk` (which run
 
 Prefer `compile_latex_file` over invoking a bare compiler directly when you already have a `.tex` file to build.
 It can compile without opening a window: leave `open_pdf` unset/false for a build/check only run.
+Pass `clean=true` to remove common same-basename LaTeX artifacts before compiling, including the previous PDF and SyncTeX sidecars.
 
 Both snippet previews and file compiles pass `-synctex=1` to the selected LaTeX command by default, so generated PDFs have SyncTeX sidecars when the compiler succeeds.
 
