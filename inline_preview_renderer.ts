@@ -12,9 +12,14 @@ export interface InlinePreviewRenderContainer extends InlinePreviewRenderCompone
 	addChild(child: InlinePreviewRenderComponent): void;
 }
 
+export interface InlinePreviewImagePolicy {
+	canShowImages(context: unknown): boolean;
+	terminalSupportsImages(): boolean;
+}
+
 export interface InlinePreviewRenderEnvironment {
 	readState(details: Record<string, unknown>): InlinePreviewRenderState | null;
-	canShowImages(context: unknown): boolean;
+	imagePolicy: InlinePreviewImagePolicy;
 	isTmuxKittyTerminal(): boolean;
 	readImageBase64(pngPath: string): string | null;
 	makeText(text: string): InlinePreviewRenderComponent;
@@ -42,6 +47,18 @@ export type InlinePreviewRenderBranch =
 	| "tmux-embedded"
 	| "generic-image";
 
+export type InlinePreviewRenderCacheEventType =
+	| "cache-hit"
+	| "cache-miss"
+	| "cache-width-recalculation"
+	| "cache-invalidation";
+
+export interface InlinePreviewRenderCacheEvent {
+	type: InlinePreviewRenderCacheEventType;
+	imageKind: "inline" | "tmux-placeholder";
+	width?: number;
+}
+
 export interface InlinePreviewRenderDiagnostics {
 	terminalKind: InlinePreviewTerminalKind;
 	branch: InlinePreviewRenderBranch;
@@ -49,6 +66,7 @@ export interface InlinePreviewRenderDiagnostics {
 	missingPngPaths: string[];
 	fallbackReason?: string;
 	imageIds: number[];
+	cacheLog: InlinePreviewRenderCacheEvent[];
 }
 
 export interface InlinePreviewRenderResult {
@@ -74,22 +92,41 @@ class InlineLatexPreviewImageComponent implements InlinePreviewRenderComponent {
 	private readonly fallbackColor: (text: string) => string;
 	private readonly filename: string;
 	private readonly env: InlinePreviewRenderEnvironment;
+	private readonly cacheLog: InlinePreviewRenderCacheEvent[];
 
-	constructor(base64Data: string, artifact: InlinePreviewArtifact, fallbackColor: (text: string) => string, filename: string, env: InlinePreviewRenderEnvironment) {
+	constructor(
+		base64Data: string,
+		artifact: InlinePreviewArtifact,
+		fallbackColor: (text: string) => string,
+		filename: string,
+		env: InlinePreviewRenderEnvironment,
+		cacheLog: InlinePreviewRenderCacheEvent[],
+	) {
 		this.base64Data = base64Data;
 		this.artifact = artifact;
 		this.fallbackColor = fallbackColor;
 		this.filename = filename;
 		this.env = env;
+		this.cacheLog = cacheLog;
 	}
 
 	invalidate(): void {
+		this.cacheLog.push({ type: "cache-invalidation", imageKind: "inline" });
 		this.cachedLines = undefined;
 		this.cachedWidth = undefined;
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+		if (this.cachedLines && this.cachedWidth === width) {
+			this.cacheLog.push({ type: "cache-hit", imageKind: "inline", width });
+			return this.cachedLines;
+		}
+
+		if (this.cachedWidth !== undefined) {
+			this.cacheLog.push({ type: "cache-width-recalculation", imageKind: "inline", width });
+		} else {
+			this.cacheLog.push({ type: "cache-miss", imageKind: "inline", width });
+		}
 
 		const maxWidthCells = this.env.calculateDisplayColumns(width, this.artifact);
 		const image = this.env.makeInlineImage({
@@ -112,22 +149,34 @@ class TmuxKittyPlaceholderImageComponent implements InlinePreviewRenderComponent
 	private readonly artifact: InlinePreviewArtifact;
 	private readonly imageId: number;
 	private readonly env: InlinePreviewRenderEnvironment;
+	private readonly cacheLog: InlinePreviewRenderCacheEvent[];
 
-	constructor(title: string, base64Data: string, artifact: InlinePreviewArtifact, imageId: number, env: InlinePreviewRenderEnvironment) {
+	constructor(title: string, base64Data: string, artifact: InlinePreviewArtifact, imageId: number, env: InlinePreviewRenderEnvironment, cacheLog: InlinePreviewRenderCacheEvent[]) {
 		this.title = title;
 		this.base64Data = base64Data;
 		this.artifact = artifact;
 		this.imageId = imageId;
 		this.env = env;
+		this.cacheLog = cacheLog;
 	}
 
 	invalidate(): void {
+		this.cacheLog.push({ type: "cache-invalidation", imageKind: "tmux-placeholder" });
 		this.cachedLines = undefined;
 		this.cachedWidth = undefined;
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+		if (this.cachedLines && this.cachedWidth === width) {
+			this.cacheLog.push({ type: "cache-hit", imageKind: "tmux-placeholder", width });
+			return this.cachedLines;
+		}
+
+		if (this.cachedWidth !== undefined) {
+			this.cacheLog.push({ type: "cache-width-recalculation", imageKind: "tmux-placeholder", width });
+		} else {
+			this.cacheLog.push({ type: "cache-miss", imageKind: "tmux-placeholder", width });
+		}
 
 		const maxWidthCells = this.env.calculateDisplayColumns(width, this.artifact);
 		const imageDimensions = this.env.getPngDimensions(this.base64Data) ?? {
@@ -150,14 +199,14 @@ class TmuxKittyPlaceholderImageComponent implements InlinePreviewRenderComponent
 	}
 }
 
-export function createInlinePreviewRenderer(env: InlinePreviewRenderEnvironment): InlinePreviewRenderer {
-	const fgFromTheme = (theme: unknown, role: string, text: string): string => {
-		if (typeof theme === "object" && theme !== null && "fg" in theme && typeof (theme as { fg?: unknown }).fg === "function") {
-			return (theme as { fg: (role: string, text: string) => string }).fg(role, text);
-		}
-		return text;
-	};
+function fgFromTheme(theme: unknown, role: string, text: string): string {
+	if (typeof theme === "object" && theme !== null && "fg" in theme && typeof (theme as { fg?: unknown }).fg === "function") {
+		return (theme as { fg: (role: string, text: string) => string }).fg(role, text);
+	}
+	return text;
+}
 
+export function createInlinePreviewRenderer(env: InlinePreviewRenderEnvironment): InlinePreviewRenderer {
 	const labelForPaths = (paths: string[]): string =>
 		paths.length === 1 ? `PNG: ${paths[0]}` : `PNGs:\n${paths.join("\n")}`;
 
@@ -167,22 +216,26 @@ export function createInlinePreviewRenderer(env: InlinePreviewRenderEnvironment)
 			const renderState = env.readState(details);
 			const inlinePreviews = renderState?.previews ?? [];
 			const pdf = renderState?.pdf ?? "";
+			const canShowByContext = env.imagePolicy.canShowImages(context);
+			const canShowByTerminal = env.imagePolicy.terminalSupportsImages();
+			const cacheLog: InlinePreviewRenderCacheEvent[] = [];
 
-			const fg = (text: string, role = "muted") => fgFromTheme(theme, role, text);
 			const diagnostics: InlinePreviewRenderDiagnostics = {
 				terminalKind: env.isTmuxKittyTerminal()
 					? "tmux-kitty"
-					: env.canShowImages(context)
+					: canShowByTerminal
 						? "generic-capability"
 						: "images-unsupported",
-					branch: "no-previews",
-					previewCount: inlinePreviews.length,
-					missingPngPaths: [],
-					imageIds: [],
+				branch: "no-previews",
+				previewCount: inlinePreviews.length,
+				missingPngPaths: [],
+				imageIds: [],
+				cacheLog,
 			};
 
+			const fg = (role: string, text: string) => fgFromTheme(theme, role, text);
 			const makeUnavailableFallback = () =>
-				env.makeText(`ok: ${pdf}\n${fg(`Inline preview unavailable: ${labelForPaths(diagnostics.missingPngPaths)}`)}`);
+				env.makeText(`ok: ${pdf}\n${fg("muted", `Inline preview unavailable: ${labelForPaths(diagnostics.missingPngPaths)}`)}`);
 
 			if (inlinePreviews.length === 0) {
 				diagnostics.fallbackReason = pdf ? "no-previews" : "missing-preview-state";
@@ -203,6 +256,18 @@ export function createInlinePreviewRenderer(env: InlinePreviewRenderEnvironment)
 				return base64;
 			};
 
+			if (!canShowByContext) {
+				diagnostics.branch = "images-disabled";
+				diagnostics.fallbackReason = "images-disabled-by-context";
+				const label = inlinePreviews.map((preview) => preview.pngPath);
+				return {
+					component: env.makeText(
+						`${fg("success", "ok")}: ${pdf}\n${fg("muted", `Inline image display is not supported by this terminal. ${labelForPaths(label)}`)}`,
+					),
+					diagnostics,
+				};
+			}
+
 			if (env.isTmuxKittyTerminal()) {
 				diagnostics.branch = "tmux-embedded";
 				env.rememberInvalidator(context);
@@ -215,18 +280,14 @@ export function createInlinePreviewRenderer(env: InlinePreviewRenderEnvironment)
 					}
 					const imageId = env.allocateImageId();
 					diagnostics.imageIds.push(imageId);
-					container.addChild(new TmuxKittyPlaceholderImageComponent(
-						"",
-						base64,
-						preview,
-						imageId,
-						env,
-					));
+					container.addChild(
+						new TmuxKittyPlaceholderImageComponent("", base64, preview, imageId, env, cacheLog),
+					);
 				}
 				return { component: container, diagnostics };
 			}
 
-			if (!env.canShowImages(context)) {
+			if (!canShowByTerminal) {
 				diagnostics.branch = "images-disabled";
 				diagnostics.fallbackReason = "images-disabled-by-terminal";
 				const label = inlinePreviews.map((preview) => preview.pngPath);
@@ -253,11 +314,12 @@ export function createInlinePreviewRenderer(env: InlinePreviewRenderEnvironment)
 						(text) => fg("muted", text),
 						preview.pngPath,
 						env,
+						cacheLog,
 					),
 				);
 			}
 
 			return { component: container, diagnostics };
-			},
-		};
-	}
+		},
+	};
+}

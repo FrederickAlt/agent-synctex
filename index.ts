@@ -1499,11 +1499,14 @@ function runTmux(args: string[]): void {
 
 const inlinePreviewRenderer = createInlinePreviewRenderer({
 	readState: (details) => lookupInlinePreviewRenderStateFromDetails(details, (previewId) => inlinePreviewRenderStates.get(previewId)),
-	canShowImages: (context) => {
-		if (typeof context === "object" && context !== null && "showImages" in context && (context as { showImages?: unknown }).showImages === false) {
-			return false;
-		}
-		return Boolean(getCapabilities().images);
+	imagePolicy: {
+		canShowImages: (context) => {
+			if (typeof context === "object" && context !== null && "showImages" in context && (context as { showImages?: unknown }).showImages === false) {
+				return false;
+			}
+			return true;
+		},
+		terminalSupportsImages: () => Boolean(getCapabilities().images),
 	},
 	isTmuxKittyTerminal,
 	readImageBase64: (pngPath) => {

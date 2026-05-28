@@ -1,15 +1,15 @@
 import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-	buildKittyPlaceholderImageRender,
-} from "./kitty_placeholder_image.ts";
+import { buildKittyPlaceholderImageRender } from "./kitty_placeholder_image.ts";
 import { KittyPlaceholderOracle } from "./kitty_placeholder_oracle.ts";
 import { INLINE_PREVIEW_DIR } from "./inline_preview.ts";
 import { inlinePreviewRenderStateFromDetails, type InlinePreviewRenderState } from "./inline_preview_metadata.ts";
 import {
 	createInlinePreviewRenderer,
+	type InlinePreviewRenderCacheEvent,
 	type InlinePreviewRenderContainer,
 	type InlinePreviewRenderComponent,
 	type InlinePreviewRenderEnvironment,
@@ -56,7 +56,10 @@ function mkRenderer(
 
 	return createInlinePreviewRenderer({
 		readState: (details) => inlinePreviewRenderStateFromDetails(details, (previewId) => stateMap.get(previewId)),
-		canShowImages: () => true,
+		imagePolicy: {
+			canShowImages: () => true,
+			terminalSupportsImages: () => true,
+		},
 		isTmuxKittyTerminal: () => false,
 		readImageBase64: () => null,
 		makeText: (text) => ({ render: () => [text], invalidate: () => {} }),
@@ -89,14 +92,36 @@ function runRenderer(
 		result: {
 			content: [],
 			details: {
-				preview_id: previewId,
 				...targetPreviews,
+				...(previewId ? { preview_id: previewId } : {}),
 			},
 		},
 		theme: {},
 		context,
 	});
 	return result;
+}
+
+function persistMetadataStateFromDetails(details: { inline_previews?: unknown[]; pdf?: unknown }): { pdf: string; previews: InlinePreviewRenderState["previews"] } {
+	const previewEntries = Array.isArray(details.inline_previews) ? details.inline_previews : [];
+	return {
+		pdf: typeof details.pdf === "string" ? details.pdf : "",
+		previews: previewEntries
+			.filter((entry): entry is { pngPath?: unknown; fullPageWidthPx?: unknown; fullPageHeightPx?: unknown; widthPx?: unknown; heightPx?: unknown } =>
+				typeof entry === "object" && entry !== null,
+			)
+			.map((entry) => ({
+				pngPath: String(entry.pngPath ?? ""),
+				page: 1,
+				dpi: 150,
+				renderer: "mutool",
+				trimmed: false,
+				fullPageWidthPx: typeof entry.fullPageWidthPx === "number" ? Math.max(1, Math.floor(entry.fullPageWidthPx)) : 1,
+				fullPageHeightPx: typeof entry.fullPageHeightPx === "number" ? Math.max(1, Math.floor(entry.fullPageHeightPx)) : 1,
+				widthPx: typeof entry.widthPx === "number" ? Math.max(1, Math.floor(entry.widthPx)) : 1,
+				heightPx: typeof entry.heightPx === "number" ? Math.max(1, Math.floor(entry.heightPx)) : 1,
+			})),
+	};
 }
 
 
@@ -183,7 +208,7 @@ test("generic image capability branch renders inline image output", () => {
 	assert.match(outputLines.join("\n"), /inline:.*generic/);
 });
 
-test("generic image capability branch falls back when terminal image support is disabled", () => {
+test("generic image branch falls back when context disables images", () => {
 	const stateMap = new Map<string, InlinePreviewRenderState>();
 	const detail = {
 		inline_previews: [mkArtifactMetadata(createPngPath("unsupported"))],
@@ -192,14 +217,41 @@ test("generic image capability branch falls back when terminal image support is 
 	stateMap.set("state-no-support", inlinePreviewRenderStateFromDetails(detail, () => undefined)!);
 
 	const renderer = mkRenderer({
-		canShowImages: () => false,
+		imagePolicy: {
+			canShowImages: () => false,
+			terminalSupportsImages: () => true,
+		},
+		readImageBase64: () => "c3R1Yg==",
+	}, stateMap);
+
+	const rendered = runRenderer(renderer, "state-no-support", detail, {});
+	assert.equal(rendered.diagnostics.branch, "images-disabled");
+	assert.equal(rendered.diagnostics.fallbackReason, "images-disabled-by-context");
+	assert.equal(rendered.diagnostics.terminalKind, "generic-capability");
+	assert.match(rendered.component.render(80).join("\n"), /not supported by this terminal/);
+});
+
+test("generic image branch falls back when terminal image support is disabled", () => {
+	const stateMap = new Map<string, InlinePreviewRenderState>();
+	const detail = {
+		inline_previews: [mkArtifactMetadata(createPngPath("terminal-unsupported"))],
+		pdf: "/tmp/terminal-unsupported.pdf",
+	};
+	stateMap.set("state-no-support", inlinePreviewRenderStateFromDetails(detail, () => undefined)!);
+
+	const renderer = mkRenderer({
+		imagePolicy: {
+			canShowImages: () => true,
+			terminalSupportsImages: () => false,
+		},
 		readImageBase64: () => "c3R1Yg==",
 	}, stateMap);
 
 	const rendered = runRenderer(renderer, "state-no-support", detail, {});
 	assert.equal(rendered.diagnostics.branch, "images-disabled");
 	assert.equal(rendered.diagnostics.fallbackReason, "images-disabled-by-terminal");
-	assert.match(rendered.component.render(80).join("\n"), /muted/);
+	assert.equal(rendered.diagnostics.terminalKind, "images-unsupported");
+	assert.match(rendered.component.render(80).join("\n"), /not supported by this terminal/);
 });
 
 test("fallback diagnostics fire when inline PNG data cannot be read", () => {
@@ -213,13 +265,47 @@ test("fallback diagnostics fire when inline PNG data cannot be read", () => {
 
 	const renderer = mkRenderer({
 		isTmuxKittyTerminal: () => false,
-		canShowImages: () => true,
+		imagePolicy: {
+			canShowImages: () => true,
+			terminalSupportsImages: () => true,
+		},
 		readImageBase64: () => null,
 	}, stateMap);
 
 	const rendered = runRenderer(renderer, "state-missing", detail, {});
 	assert.equal(rendered.diagnostics.branch, "missing-image-data");
 	assert.equal(rendered.diagnostics.fallbackReason, `missing-image:${path}`);
+	assert.match(rendered.component.render(80).join("\n"), /Inline preview unavailable/);
+});
+
+test("invalid persisted png metadata outside preview directory falls back to unavailable text", () => {
+	const stateMap = new Map<string, InlinePreviewRenderState>();
+	const outsidePngPath = join(dirname(INLINE_PREVIEW_DIR), `outside-preview-${randomUUID()}.png`);
+	writeFileSync(outsidePngPath, "not-a-real-in-preview-png");
+
+	const detail = {
+		inline_previews: [mkArtifactMetadata(outsidePngPath)],
+		pdf: "/tmp/outside-preview.pdf",
+	};
+	const renderer = mkRenderer({
+		readState: (details) => {
+			const metadataState = persistMetadataStateFromDetails(details as { inline_previews?: unknown[]; pdf?: unknown });
+			return metadataState.previews.length === 0 ? null : {
+				pdf: metadataState.pdf,
+				previews: metadataState.previews,
+			};
+		},
+		imagePolicy: {
+			canShowImages: () => true,
+			terminalSupportsImages: () => true,
+		},
+		readImageBase64: () => null,
+	}, stateMap);
+
+	const rendered = runRenderer(renderer, undefined, detail, {});
+	assert.equal(rendered.diagnostics.branch, "missing-image-data");
+	assert.equal(rendered.diagnostics.fallbackReason, `missing-image:${outsidePngPath}`);
+	assert.deepEqual(rendered.diagnostics.missingPngPaths, [outsidePngPath]);
 	assert.match(rendered.component.render(80).join("\n"), /Inline preview unavailable/);
 });
 
@@ -235,7 +321,10 @@ test("width changes and invalidation clear cached render output", () => {
 	const renderer = mkRenderer({
 		isTmuxKittyTerminal: () => false,
 		readImageBase64: () => "ZmFrZS1pbWFnZS1kYXRh",
-		canShowImages: () => true,
+		imagePolicy: {
+			canShowImages: () => true,
+			terminalSupportsImages: () => true,
+		},
 		calculateDisplayColumns: (available, artifact) => Math.min(available, artifact.widthPx),
 		makeInlineImage: (options) => {
 			imageRenders += 1;
@@ -249,14 +338,42 @@ test("width changes and invalidation clear cached render output", () => {
 	const rendered = runRenderer(renderer, "state-cache", detail, {});
 	const output = rendered.component;
 
-	assert.equal(output.render(120).join("\n"), "success\nwidth:100");
-	assert.equal(output.render(120).join("\n"), "success\nwidth:100");
+	assert.equal(output.render(120).join("\n"), "\u2713 LaTeX preview\nwidth:100");
+	assert.deepEqual(
+		rendered.diagnostics.cacheLog.map((entry: InlinePreviewRenderCacheEvent) => `${entry.type}:${entry.width ?? ""}`),
+		["cache-miss:120"],
+	);
+
+	assert.equal(output.render(120).join("\n"), "\u2713 LaTeX preview\nwidth:100");
+	assert.deepEqual(
+		rendered.diagnostics.cacheLog.map((entry: InlinePreviewRenderCacheEvent) => `${entry.type}:${entry.width ?? ""}`),
+		["cache-miss:120", "cache-hit:120"],
+	);
 	assert.equal(imageRenders, 1);
 
-	assert.equal(output.render(40).join("\n"), "success\nwidth:40");
+	assert.equal(output.render(40).join("\n"), "\u2713 LaTeX preview\nwidth:40");
+	assert.deepEqual(
+		rendered.diagnostics.cacheLog.map((entry: InlinePreviewRenderCacheEvent) => `${entry.type}:${entry.width ?? ""}`),
+		["cache-miss:120", "cache-hit:120", "cache-width-recalculation:40"],
+	);
 	assert.equal(imageRenders, 2);
 
 	output.invalidate();
-	assert.equal(output.render(40).join("\n"), "success\nwidth:40");
+	assert.deepEqual(
+		rendered.diagnostics.cacheLog.map((entry: InlinePreviewRenderCacheEvent) => `${entry.type}:${entry.width ?? ""}`),
+		["cache-miss:120", "cache-hit:120", "cache-width-recalculation:40", "cache-invalidation:"],
+	);
+
+	assert.equal(output.render(40).join("\n"), "\u2713 LaTeX preview\nwidth:40");
+	assert.deepEqual(
+		rendered.diagnostics.cacheLog.map((entry: InlinePreviewRenderCacheEvent) => `${entry.type}:${entry.width ?? ""}`),
+		[
+			"cache-miss:120",
+			"cache-hit:120",
+			"cache-width-recalculation:40",
+			"cache-invalidation:",
+			"cache-miss:40",
+		],
+	);
 	assert.equal(imageRenders, 3);
 });
