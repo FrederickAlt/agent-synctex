@@ -13,7 +13,15 @@ import {
 	type TerminalRefreshPolicyEvent,
 	type TerminalRefreshInvalidationRegistry,
 } from "./terminal_refresh_policy.ts";
-import { KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
+import {
+	createInlinePreviewRenderer,
+	type InlinePreviewRenderCacheEvent,
+	type InlinePreviewRenderComponent,
+	type InlinePreviewRenderContainer,
+} from "./inline_preview_renderer.ts";
+import { KittyPlaceholderOracle } from "./kitty_placeholder_oracle.ts";
+import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
+import { inlinePreviewRenderStateFromDetails } from "./inline_preview_metadata.ts";
 import { INLINE_PREVIEW_DIR } from "./inline_preview.ts";
 
 const FOCUS_IN_SEQUENCE = "\x1b[I";
@@ -348,6 +356,68 @@ function flattenRenderedComponent(component: { render: (width: number) => string
 	return component.render(90);
 }
 
+function makeFixtureContainer(): InlinePreviewRenderContainer & { children: InlinePreviewRenderComponent[] } {
+	const children: InlinePreviewRenderComponent[] = [];
+	return {
+		children,
+		render(width: number): string[] {
+			return children.flatMap((child) => child.render(width));
+		},
+		invalidate(): void {
+			for (const child of children) {
+				child.invalidate();
+			}
+		},
+		addChild(child: InlinePreviewRenderComponent): void {
+			children.push(child);
+		},
+	};
+}
+
+function summarizeRefreshEvents(events: TerminalRefreshPolicyEvent[]): string {
+	return events
+		.map((event) => {
+			switch (event.type) {
+				case "refresh_scheduled":
+					return `refresh_scheduled:${event.delayMs}`;
+				case "input_processed":
+					return `input_processed:in=${event.hadFocusIn};out=${event.hadFocusOut};consumed=${event.consumed};remaining=${event.remainingLength}`;
+				case "invalidation_registered":
+					return `invalidation_registered:${event.key}[${event.context}]`;
+				case "invalidation_called":
+					return `invalidation_called:${event.count}(${event.keys.join(",")})`;
+				default:
+					return (event as { type: string }).type;
+			}
+		})
+		.join(" | ");
+}
+
+function summarizeCacheEvents(cacheLog: InlinePreviewRenderCacheEvent[]): string {
+	return cacheLog
+		.map((event) => `${event.type}:${event.imageKind}${event.width === undefined ? "" : `:${event.width}`}`)
+		.join(" | ");
+}
+
+function renderFixtureOracle(lines: string[], expectedImageIds: number[], label: string, extra: string): KittyPlaceholderOracle {
+	const oracle = new KittyPlaceholderOracle(lines.join("\n"), {
+		requireImageSetup: true,
+		requirePlaceholders: true,
+		expectedImageIds,
+		includeRawOutput: true,
+	});
+	const diagnostics = [
+		`${label}: ${oracle.summary}`,
+		`events: ${extra}`,
+		`commandImageIds=${oracle.getCommandImageIds().join(",")}`,
+		`placeholderImageIds=${oracle.getPlaceholderImageIds().join(",")}`,
+	].join("\n");
+	assert.equal(oracle.isValid, true, diagnostics);
+	assert.equal(oracle.diagnostics.orphanPlaceholders.length, 0, `${label}: orphan placeholders\n${diagnostics}`);
+	assert.equal(oracle.diagnostics.invalidCoordinatePlaceholders.length, 0, `${label}: invalid placeholders\n${diagnostics}`);
+	return oracle;
+}
+
 test("focus-in scheduling triggers delayed invalidations and preserves non-focus input", async () => {
 	const adapter = new FakeAdapter(true);
 	const registry = new FakeInvalidationRegistry();
@@ -629,4 +699,141 @@ test("invalidation diagnostics follow capped registry key set after overflow", a
 	assert.equal(registry.size, 2);
 
 	policy.cleanup();
+});
+
+
+test("tmux/kitty preview refresh fixture keeps ids and placeholder mappings stable across focus and resize invalidations", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const fixtureAdapter = new FakeAdapter(true);
+	const fixtureRegistry = new FakeInvalidationRegistry();
+	const fixtureInput = new FakeTerminalInput();
+	const fixtureEvents: TerminalRefreshPolicyEvent[] = [];
+	const fixturePolicy = createTerminalRefreshPolicy({
+		adapter: fixtureAdapter,
+		invalidatorRegistry: fixtureRegistry,
+		refreshDelayMs: [10, 20],
+		eventLog: (event) => fixtureEvents.push(event),
+	});
+	let nextImageId = 5200;
+	const cacheablePngs = [
+		{
+			path: createTemporaryPngFile("refresh-fixture-a"),
+			base64: "cmVmcmVzaC1maXh0dXJlLWFyY2hpdmUtMQ==",
+			imageDimensions: { widthPx: 100, heightPx: 20 },
+		},
+		{
+			path: createTemporaryPngFile("refresh-fixture-b"),
+			base64: "cmVmcmVzaC1maXh0dXJlLWFyY2hpdmUtMg==",
+			imageDimensions: { widthPx: 100, heightPx: 20 },
+		},
+	];
+	const imageDataByPath = new Map(cacheablePngs.map((entry) => [entry.path, entry.base64]));
+	const imageDimensionsByBase64 = new Map(cacheablePngs.map((entry) => [entry.base64, entry.imageDimensions]));
+
+	const fixtureRenderer = createInlinePreviewRenderer({
+		readState: (details) => inlinePreviewRenderStateFromDetails(details, () => undefined),
+		imagePolicy: {
+			canShowImages: () => true,
+			terminalSupportsImages: () => true,
+		},
+		isTmuxKittyTerminal: () => true,
+		readImageBase64: (pngPath) => imageDataByPath.get(pngPath) ?? null,
+		makeText: (text) => ({ render: () => [text], invalidate: () => {} }),
+		makeContainer: makeFixtureContainer,
+		makeInlineImage: (options) => ({ render: () => [`inline:${options.maxWidthCells}`], invalidate: () => {} }),
+		makeKittyPlaceholderImage: buildKittyPlaceholderImageRender,
+		calculateDisplayColumns: (availableColumns, artifact) => Math.min(Math.max(1, Math.min(availableColumns, artifact.widthPx)), 90),
+		getCellDimensions: () => ({ widthPx: 10, heightPx: 20 }),
+		getPngDimensions: (base64Data) => imageDimensionsByBase64.get(base64Data),
+		allocateImageId: () => {
+			const allocated = nextImageId;
+			nextImageId += 1;
+			return allocated;
+		},
+		rememberInvalidator: (context) => fixturePolicy.rememberInvalidator(context),
+	});
+
+	fixturePolicy.install({
+		hasUI: true,
+		ui: {
+			onTerminalInput: fixtureInput.setHandler.bind(fixtureInput),
+		},
+	});
+
+	const previewDetails = {
+		inline_previews: cacheablePngs.map((entry) => ({
+			pngPath: entry.path,
+			fullPageWidthPx: 200,
+			fullPageHeightPx: 20,
+			widthPx: 100,
+			heightPx: 20,
+		})),
+		pdf: "/tmp/refresh-fixture-preview.pdf",
+	};
+	let previewComponent: InlinePreviewRenderComponent;
+	let refreshInvalidateCalls = 0;
+	const renderContext = {
+		toolCallId: "fixture-inline-preview",
+		invalidate: () => {
+			refreshInvalidateCalls += 1;
+			previewComponent.invalidate();
+		},
+	};
+
+	try {
+		const { component, diagnostics } = fixtureRenderer.render({
+			result: {
+				details: previewDetails,
+				content: [{ type: "text", text: "" }],
+			},
+			theme: {},
+			context: renderContext,
+		});
+		previewComponent = component;
+		const expectedImageIds = diagnostics.imageIds;
+		const diagnosticsSummary = JSON.stringify(diagnostics);
+		const cacheLog: InlinePreviewRenderCacheEvent[] = diagnostics.cacheLog;
+
+		assert.equal(diagnostics.terminalKind, "tmux-kitty", `renderer branch mismatch\n${diagnosticsSummary}`);
+		assert.equal(diagnostics.branch, "tmux-embedded", `renderer branch mismatch\n${diagnosticsSummary}`);
+		assert.equal(diagnostics.imageIds.length, 2, `renderer image ids missing\n${diagnosticsSummary}`);
+		assert.deepEqual(fixtureRegistry.snapshot().map((entry) => entry.key), ["fixture-inline-preview"], `fixture registry keys missing\n${summarizeRefreshEvents(fixtureEvents)}`);
+
+		const initialWidth = 90;
+		const initialOutput = previewComponent.render(initialWidth);
+		assert.equal(initialOutput.length > 0, true, `initial output should contain placeholder commands\n${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
+		assert.match(initialOutput[0], /✓ LaTeX preview/);
+		const initialOracle = renderFixtureOracle(initialOutput, expectedImageIds, "initial render", `${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
+		assert.deepEqual(initialOracle.getCommandImageIds(), expectedImageIds, `initial command/image id mismatch\n${summarizeRefreshEvents(fixtureEvents)}`);
+		assert.deepEqual(initialOracle.getPlaceholderImageIds(), expectedImageIds, `initial placeholder/image id mismatch\n${summarizeRefreshEvents(fixtureEvents)}`);
+
+		const inputResult = fixtureInput.simulate(`before${FOCUS_IN_SEQUENCE}after`);
+		assert.deepEqual(inputResult, { data: "beforeafter" }, `focus input should preserve bytes\n${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
+		t.mock.timers.tick(30);
+		fixtureAdapter.signalBus.emit("SIGWINCH");
+
+		assert.equal(fixtureRegistry.refreshCount, 3, `refresh count should reflect focus(2 stages)+resize\n${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
+		assert.equal(refreshInvalidateCalls, 3, `invalidate callback should run once per refresh\n${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
+		const invalidationCallEvents = fixtureEvents.filter((entry) => entry.type === "invalidation_called");
+		assert.equal(invalidationCallEvents.length, 3, `refresh pipeline should schedule three invalidation calls\n${summarizeRefreshEvents(fixtureEvents)}`);
+		const cacheInvalidationEntries = cacheLog.filter((entry) => entry.type === "cache-invalidation");
+		assert.equal(cacheInvalidationEntries.length, refreshInvalidateCalls * expectedImageIds.length, `duplicate cache invalidations\n${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
+
+		const postFocusOutput = previewComponent.render(initialWidth);
+		const postFocusOracle = renderFixtureOracle(postFocusOutput, expectedImageIds, "post-focus render", `${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
+		assert.equal(postFocusOracle.commandCount, initialOracle.commandCount, `command count changed after focus refresh\n${postFocusOracle.summary}`);
+		assert.deepEqual(postFocusOracle.getCommandImageIds(), initialOracle.getCommandImageIds(), `command id drift after focus refresh\n${postFocusOracle.summary}`);
+		assert.deepEqual(postFocusOracle.getPlaceholderImageIds(), initialOracle.getPlaceholderImageIds(), `placeholder id drift after focus refresh\n${postFocusOracle.summary}`);
+		assert.equal(postFocusOutput.length, initialOutput.length, `output line count should remain bounded after refresh\n${postFocusOracle.summary}`);
+
+		const resizedWidth = 20;
+		const resizedOutput = previewComponent.render(resizedWidth);
+		const resizedOracle = renderFixtureOracle(resizedOutput, expectedImageIds, "resize-style re-render", `${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
+		assert.equal(resizedOracle.commandCount, initialOracle.commandCount, `command count changed after resize\n${resizedOracle.summary}`);
+		assert.deepEqual(resizedOracle.getCommandImageIds(), initialOracle.getCommandImageIds(), `command id drift after resize render\n${resizedOracle.summary}`);
+		assert.deepEqual(resizedOracle.getPlaceholderImageIds(), initialOracle.getPlaceholderImageIds(), `placeholder mismatch after resize render\n${resizedOracle.summary}`);
+		assert.ok(resizedOutput.length <= postFocusOutput.length, `expected resized output to be bounded by previous width\n${summarizeCacheEvents(cacheLog)}`);
+	} finally {
+		fixturePolicy.cleanup();
+	}
 });
