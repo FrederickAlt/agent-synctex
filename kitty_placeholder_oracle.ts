@@ -5,7 +5,19 @@ const ST = `${ESC}\\`;
 const DCS_PREFIX = `${ESC}_G`;
 const TMUX_WRAPPED_PREFIX = `${ESC}Ptmux;`;
 
+const DEFAULT_MAX_DIAGNOSTIC_ENTRIES = 80;
+
 const PLACEHOLDER_CELL_RE = new RegExp(`${ESC}\\[38;2;(\\d{1,3});(\\d{1,3});(\\d{1,3})m${KITTY_PLACEHOLDER}(..)`, "gu");
+
+type ChunkMode = "none" | "more" | "last" | "invalid";
+
+interface InternalImageState {
+	expectingMoreChunks: boolean;
+	livePlacement?: KittyPlaceholderPlacement;
+	chunkColumns?: number;
+	chunkRows?: number;
+	chunkCommand?: KittyGraphicsCommand;
+}
 
 export interface KittyGraphicsCommand {
 	raw: string;
@@ -60,6 +72,8 @@ export interface KittyPlaceholderOracleOptions {
 	includeRawOutput?: boolean;
 	/** Max number of characters for diagnostics. */
 	maxDiagnosticLength?: number;
+	/** Max number of diagnostic cell/placement entries to include before summarizing. */
+	maxDiagnosticEntries?: number;
 }
 
 export class KittyPlaceholderOracle {
@@ -75,35 +89,31 @@ export class KittyPlaceholderOracle {
 			requirePlaceholders: true,
 			includeRawOutput: false,
 			maxDiagnosticLength: 4000,
+			maxDiagnosticEntries: DEFAULT_MAX_DIAGNOSTIC_ENTRIES,
 			...this.options,
 		};
 
 		const commands = parseKittyCommands(output);
-		const placements = extractPlacements(commands);
+		const { placementsByImage, commandImageIds, failures } = analyzeImagePlacements(commands);
+		const placements = [...placementsByImage.values()];
 		const placeholders = extractPlaceholderCells(output);
-
-		const placementMap = new Map<number, KittyPlaceholderPlacement[]>();
-		for (const placement of placements) {
-			const list = placementMap.get(placement.imageId) ?? [];
-			list.push(placement);
-			placementMap.set(placement.imageId, list);
-		}
+		const placeholderImageIds = uniqueSorted(placeholders.map((placeholder) => placeholder.imageId));
 
 		const orphanPlaceholders: KittyPlaceholderCell[] = [];
 		const invalidCoordinatePlaceholders: InvalidKittyPlaceholderCoordinate[] = [];
+
 		for (const placeholder of placeholders) {
-			const relatedPlacements = placementMap.get(placeholder.imageId);
-			if (!relatedPlacements || relatedPlacements.length === 0) {
+			const placement = placementsByImage.get(placeholder.imageId);
+			if (!placement) {
 				orphanPlaceholders.push(placeholder);
 				invalidCoordinatePlaceholders.push({
 					cell: placeholder,
-					reason: "placeholder has no matching virtual placement",
+					reason: "placeholder has no matching live image placement",
 				});
 				continue;
 			}
 
-			const validInBounds = relatedPlacements.some((placement) => placeholder.row < placement.rows && placeholder.column < placement.columns);
-			if (!validInBounds || placeholder.row < 0 || placeholder.column < 0) {
+			if (placeholder.row < 0 || placeholder.column < 0 || placeholder.row >= placement.rows || placeholder.column >= placement.columns) {
 				invalidCoordinatePlaceholders.push({
 					cell: placeholder,
 					reason: "placeholder is outside declared placement dimensions",
@@ -111,25 +121,25 @@ export class KittyPlaceholderOracle {
 			}
 		}
 
-		const commandImageIds = uniqueSorted(placements.map((placement) => placement.imageId));
-		const placeholderImageIds = uniqueSorted(placeholders.map((placeholder) => placeholder.imageId));
-		const failures: string[] = [];
-
-		if (config.requireImageSetup && placements.length === 0) {
-			failures.push("Missing virtual Kitty placeholder placement command (a=T,q=2,i=?,c=?,r=?)." );
-		}
-
-		if (config.requirePlaceholders && placeholders.length === 0) {
-			failures.push("No Kitty placeholder cells were decoded from output.");
-		}
-
+		const livePlacementImageIds = uniqueSorted(placements.map((placement) => placement.imageId));
 		for (const imageId of config.expectedImageIds ?? []) {
 			if (!commandImageIds.includes(imageId)) {
 				failures.push(`Expected image id ${imageId} to appear in emitted Kitty setup commands.`);
 			}
-			if (config.requirePlaceholders && !placeholders.some((placeholder) => placeholder.imageId === imageId)) {
+			if (config.requirePlaceholders && !placeholderImageIds.includes(imageId)) {
 				failures.push(`Expected a placeholder cell for image id ${imageId}, but none were emitted.`);
 			}
+			if (config.requireImageSetup && !livePlacementImageIds.includes(imageId)) {
+				failures.push(`Expected image id ${imageId} to have a complete Kitty setup stream, but it was missing or incomplete.`);
+			}
+		}
+
+		if (config.requireImageSetup && livePlacementImageIds.length === 0) {
+			failures.push("Missing virtual Kitty placeholder placement command (a=T,q=2,i=?,c=?,r=?).");
+		}
+
+		if (config.requirePlaceholders && placeholders.length === 0) {
+			failures.push("No Kitty placeholder cells were decoded from output.");
 		}
 
 		for (const placeholder of orphanPlaceholders) {
@@ -163,6 +173,7 @@ export class KittyPlaceholderOracle {
 					invalidCoordinatePlaceholders,
 					rawOutput: config.includeRawOutput ? rawOutput : undefined,
 					maxDiagnosticLength: config.maxDiagnosticLength,
+					maxDiagnosticEntries: config.maxDiagnosticEntries,
 				});
 			},
 		};
@@ -208,8 +219,7 @@ function parseKittyCommands(output: string): KittyGraphicsCommand[] {
 
 			const wrappedPayload = output.slice(offset + TMUX_WRAPPED_PREFIX.length, wrapperEnd);
 			const unwrappedPayload = wrappedPayload.replaceAll(`${ESC}${ESC}`, ESC);
-			const command = parseSingleKittyCommand(unwrappedPayload, true);
-			if (command) commands.push(command);
+			commands.push(...parseKittyCommandsFromText(unwrappedPayload, true));
 
 			offset = wrapperEnd + ST.length;
 			continue;
@@ -220,8 +230,7 @@ function parseKittyCommands(output: string): KittyGraphicsCommand[] {
 			continue;
 		}
 
-		const remainder = output.slice(offset);
-		const command = parseSingleKittyCommand(remainder, false);
+		const command = parseSingleKittyCommand(output.slice(offset), false);
 		if (!command) {
 			offset += 1;
 			continue;
@@ -229,6 +238,26 @@ function parseKittyCommands(output: string): KittyGraphicsCommand[] {
 
 		commands.push(command);
 		offset += command.raw.length;
+	}
+
+	return commands;
+}
+
+function parseKittyCommandsFromText(text: string, wrappedInTmux: boolean): KittyGraphicsCommand[] {
+	const commands: KittyGraphicsCommand[] = [];
+	let offset = 0;
+	while (offset < text.length) {
+		const commandOffset = text.indexOf(DCS_PREFIX, offset);
+		if (commandOffset < 0) break;
+
+		const command = parseSingleKittyCommand(text.slice(commandOffset), wrappedInTmux);
+		if (!command) {
+			offset = commandOffset + DCS_PREFIX.length;
+			continue;
+		}
+
+		commands.push(command);
+		offset = commandOffset + command.raw.length;
 	}
 
 	return commands;
@@ -272,21 +301,181 @@ function parseSingleKittyCommand(text: string, wrappedInTmux: boolean): KittyGra
 	};
 }
 
-function extractPlacements(commands: KittyGraphicsCommand[]): KittyPlaceholderPlacement[] {
-	const placements: KittyPlaceholderPlacement[] = [];
+function parseChunkMode(value: string | undefined): ChunkMode {
+	const parsed = parseIntSafe(value);
+	if (parsed === undefined) return value === undefined ? "none" : "invalid";
+	if (parsed === 0) return "last";
+	if (parsed === 1) return "more";
+	return "invalid";
+}
+
+function analyzeImagePlacements(commands: KittyGraphicsCommand[]): {
+	placementsByImage: Map<number, KittyPlaceholderPlacement>;
+	commandImageIds: number[];
+	failures: string[];
+} {
+	const imageStates = new Map<number, InternalImageState>();
+	const commandImageIds = new Set<number>();
+	const failures: string[] = [];
+
 	for (const command of commands) {
 		const action = command.paramByName.get("a");
 		const mode = command.paramByName.get("q");
-		if (action !== "T" || mode !== "2") continue;
-
 		const imageId = parseIntSafe(command.paramByName.get("i"));
-		const columns = parseIntSafe(command.paramByName.get("c"));
-		const rows = parseIntSafe(command.paramByName.get("r"));
-		if (imageId === undefined || columns === undefined || rows === undefined) continue;
+		const chunkMode = parseChunkMode(command.paramByName.get("m"));
 
-		placements.push({ imageId, columns, rows, command });
+		if (action === "T" && mode === "2" && imageId !== undefined) {
+			commandImageIds.add(imageId);
+			const state = imageStates.get(imageId) ?? { expectingMoreChunks: false };
+			handleSetupStartCommand(imageId, command, state, failures);
+			imageStates.set(imageId, state);
+			continue;
+		}
+
+		if (chunkMode === "none") continue;
+
+		const continuationImageId = resolveChunkContinuationImageId(imageId, imageStates, failures, command);
+		if (continuationImageId === undefined) continue;
+
+		const state = imageStates.get(continuationImageId) ?? { expectingMoreChunks: false };
+		if (!state.expectingMoreChunks) {
+			failures.push(`Image id ${continuationImageId} has no active chunked setup to continue.`);
+			continue;
+		}
+
+		handleSetupChunkContinuation(continuationImageId, command, state, failures);
+		imageStates.set(continuationImageId, state);
 	}
-	return placements;
+
+	for (const [imageId, state] of imageStates.entries()) {
+		if (!state.expectingMoreChunks) continue;
+		failures.push(`Image id ${imageId} has an incomplete image transmission chain; missing terminal m=0 chunk.`);
+		resetChunkState(state);
+	}
+
+	const placementsByImage = new Map<number, KittyPlaceholderPlacement>();
+	for (const [imageId, state] of imageStates.entries()) {
+		if (state.livePlacement) placementsByImage.set(imageId, state.livePlacement);
+	}
+
+	return {
+		placementsByImage,
+		commandImageIds: uniqueSorted(Array.from(commandImageIds)),
+		failures,
+	};
+}
+
+function resolveChunkContinuationImageId(
+	explicitImageId: number | undefined,
+	imageStates: Map<number, InternalImageState>,
+	failures: string[],
+	command: KittyGraphicsCommand,
+): number | undefined {
+	if (explicitImageId !== undefined) {
+		const state = imageStates.get(explicitImageId);
+		if (state?.expectingMoreChunks) return explicitImageId;
+		failures.push(`Image id ${explicitImageId} chunk command has no active chunked setup to continue.`);
+		return undefined;
+	}
+
+	const pendingImageIds = [...imageStates.entries()].filter((entry) => entry[1].expectingMoreChunks).map((entry) => entry[0]);
+	if (pendingImageIds.length === 1) return pendingImageIds[0];
+	if (pendingImageIds.length === 0) {
+		failures.push("Chunked setup command has no image id and no active transmission is pending.");
+		return undefined;
+	}
+
+	const visibleParams = command.raw.slice(0, 80);
+	failures.push(`Chunked setup command ${visibleParams} is ambiguous across active transmissions: ${pendingImageIds.join(",")} pending.`);
+	return undefined;
+}
+
+function handleSetupStartCommand(imageId: number, command: KittyGraphicsCommand, state: InternalImageState, failures: string[]): void {
+	if (state.expectingMoreChunks) {
+		failures.push(`Image id ${imageId} started a new setup command before completing a previous chunked stream.`);
+		resetChunkState(state);
+	}
+
+	if (command.paramByName.get("U") !== "1") {
+		failures.push(`Image id ${imageId} setup command is missing required U=1.`);
+		return;
+	}
+
+	if (command.payload.length === 0) {
+		failures.push(`Image id ${imageId} setup command has no payload.`);
+		return;
+	}
+
+	const chunkMode = parseChunkMode(command.paramByName.get("m"));
+	const columns = parseIntSafe(command.paramByName.get("c"));
+	const rows = parseIntSafe(command.paramByName.get("r"));
+	const hasDimensions = columns !== undefined && rows !== undefined;
+
+	if (chunkMode === "invalid") {
+		failures.push(`Image id ${imageId} setup command has invalid m value ${command.paramByName.get("m")}.`);
+		return;
+	}
+
+	if (chunkMode === "more") {
+		if (!hasDimensions) {
+			failures.push(`Image id ${imageId} started a chunked setup command without placement dimensions (c,r).`);
+			return;
+		}
+		state.expectingMoreChunks = true;
+		state.chunkColumns = columns;
+		state.chunkRows = rows;
+		state.chunkCommand = command;
+		state.livePlacement = undefined;
+		return;
+	}
+
+	if (!hasDimensions) {
+		failures.push(`Image id ${imageId} setup command is missing placement dimensions (c,r).`);
+		return;
+	}
+
+	state.livePlacement = {
+		imageId,
+		columns,
+		rows,
+		command,
+	};
+}
+
+function handleSetupChunkContinuation(imageId: number, command: KittyGraphicsCommand, state: InternalImageState, failures: string[]): void {
+	if (command.payload.length === 0) {
+		failures.push(`Image id ${imageId} chunk command has no payload.`);
+		resetChunkState(state);
+		return;
+	}
+
+	const chunkMode = parseChunkMode(command.paramByName.get("m"));
+	if (chunkMode === "more") return;
+	if (chunkMode === "last") {
+		if (state.chunkColumns === undefined || state.chunkRows === undefined) {
+			failures.push(`Image id ${imageId} started a chunked setup without placement dimensions (c,r).`);
+			resetChunkState(state);
+			return;
+		}
+		state.livePlacement = {
+			imageId,
+			columns: state.chunkColumns,
+			rows: state.chunkRows,
+			command: state.chunkCommand ?? command,
+		};
+		resetChunkState(state);
+		return;
+	}
+
+	failures.push(`Image id ${imageId} chunk command has invalid m value ${command.paramByName.get("m")}.`);
+	resetChunkState(state);
+}
+
+function resetChunkState(state: InternalImageState): void {
+	state.expectingMoreChunks = false;
+	state.chunkColumns = undefined;
+	state.chunkRows = undefined;
+	state.chunkCommand = undefined;
 }
 
 function parseIntSafe(value: string | undefined): number | undefined {
@@ -340,6 +529,33 @@ function formatCell(cell: KittyPlaceholderCell): string {
 	return `image=${cell.imageId} row=${cell.row} col=${cell.column} (${cell.rowDiacritic} ${cell.columnDiacritic})`;
 }
 
+function formatInvalidCoordinate(invalid: InvalidKittyPlaceholderCoordinate): string {
+	return `image=${invalid.cell.imageId} row=${invalid.cell.row} col=${invalid.cell.column} reason=${invalid.reason}`;
+}
+
+function appendSummarizedEntries<T>(
+	lines: string[],
+	title: string,
+	values: T[],
+	formatter: (value: T) => string,
+	maxEntries: number,
+): void {
+	lines.push(title);
+	if (values.length === 0) {
+		lines.push("- <none>");
+		return;
+	}
+
+	const shown = values.slice(0, maxEntries);
+	for (const value of shown) {
+		lines.push(`- ${formatter(value)}`);
+	}
+
+	if (values.length > shown.length) {
+		lines.push(`- ... (+${values.length - shown.length} more entries)`);
+	}
+}
+
 function buildDiagnosticsMessage(params: {
 	failures: string[];
 	commandImageIds: number[];
@@ -350,6 +566,7 @@ function buildDiagnosticsMessage(params: {
 	invalidCoordinatePlaceholders: InvalidKittyPlaceholderCoordinate[];
 	rawOutput?: string;
 	maxDiagnosticLength?: number;
+	maxDiagnosticEntries?: number;
 }): string {
 	const lines: string[] = [];
 	if (params.failures.length === 0) {
@@ -363,35 +580,12 @@ function buildDiagnosticsMessage(params: {
 
 	lines.push(`decoded setup image ids: ${params.commandImageIds.join(", ") || "<none>"}`);
 	lines.push(`decoded placeholder image ids: ${params.placeholderImageIds.join(", ") || "<none>"}`);
-	lines.push("placements:");
-	for (const placement of params.placements) {
-		lines.push(`- ${formatPlacement(placement)}`);
-	}
-	if (params.placements.length === 0) {
-		lines.push("- <none>");
-	}
 
-	lines.push("placeholder cells:");
-	for (const cell of params.placeholders) {
-		lines.push(`- ${formatCell(cell)}`);
-	}
-	if (params.placeholders.length === 0) {
-		lines.push("- <none>");
-	}
-
-	if (params.orphanPlaceholders.length > 0) {
-		lines.push("orphan placeholders:");
-		for (const cell of params.orphanPlaceholders) {
-			lines.push(`- ${formatCell(cell)}`);
-		}
-	}
-
-	if (params.invalidCoordinatePlaceholders.length > 0) {
-		lines.push("invalid coordinates:");
-		for (const invalid of params.invalidCoordinatePlaceholders) {
-			lines.push(`- image=${invalid.cell.imageId} row=${invalid.cell.row} col=${invalid.cell.column} reason=${invalid.reason}`);
-		}
-	}
+	const maxEntries = params.maxDiagnosticEntries ?? DEFAULT_MAX_DIAGNOSTIC_ENTRIES;
+	appendSummarizedEntries(lines, "placements:", params.placements, formatPlacement, maxEntries);
+	appendSummarizedEntries(lines, "placeholder cells:", params.placeholders, formatCell, maxEntries);
+	appendSummarizedEntries(lines, "orphan placeholders:", params.orphanPlaceholders, formatCell, maxEntries);
+	appendSummarizedEntries(lines, "invalid coordinates:", params.invalidCoordinatePlaceholders, formatInvalidCoordinate, maxEntries);
 
 	if (params.rawOutput !== undefined) {
 		let raw = params.rawOutput.replaceAll(ESC, "\\x1b");
