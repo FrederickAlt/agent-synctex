@@ -1,7 +1,7 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, delimiter, resolve } from "node:path";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -219,9 +219,6 @@ const TYPEBOX_STUB_SOURCE = `export const Type = {
 
 let runtimeModulesInstalled = false;
 let runtimeModulesRoot: string | undefined;
-let runtimeModulesPath = process.env.NODE_PATH;
-
-const COMPILED_INDEX_MODULE_PATH = resolve(process.cwd(), ".show-latex-index-test.mjs");
 
 type CompiledShowLatexApi = {
 	registerTool: (tool: { name: string; [key: string]: unknown }) => void;
@@ -241,13 +238,6 @@ function cleanupRuntimeStubs(): void {
 	if (runtimeModulesRoot) {
 		rmSync(runtimeModulesRoot, { recursive: true, force: true });
 	}
-	if (runtimeModulesPath === undefined) {
-		delete process.env.NODE_PATH;
-	} else {
-		process.env.NODE_PATH = runtimeModulesPath;
-	}
-	rmSync(COMPILED_INDEX_MODULE_PATH, { force: true });
-
 	runtimeModulesInstalled = false;
 	runtimeModulesRoot = undefined;
 	compiledIndexModule = undefined;
@@ -280,9 +270,18 @@ function ensureRuntimeStubsInstalled(): void {
 	);
 	writeFileSync(resolve(typeboxRoot, "index.js"), TYPEBOX_STUB_SOURCE);
 
-	process.env.NODE_PATH = runtimeModulesRoot + (runtimeModulesPath ? `${delimiter}${runtimeModulesPath}` : "");
-
 	runtimeModulesInstalled = true;
+}
+
+function compiledIndexModulePath(): string {
+	if (!runtimeModulesRoot) throw new Error("runtime stubs must be installed before compiling index.ts");
+	return resolve(runtimeModulesRoot, "index.mjs");
+}
+
+function rewriteProjectRelativeImportsForTempModule(outputText: string): string {
+	return outputText.replace(/(from\s+["'])(\.\/[^"']+\.ts)(["'])/g, (_match, prefix: string, specifier: string, suffix: string) => {
+		return `${prefix}${pathToFileURL(resolve(process.cwd(), specifier)).href}${suffix}`;
+	});
 }
 
 async function loadCompiledShowLatexModule(): Promise<CompiledShowLatexModule> {
@@ -298,9 +297,9 @@ async function loadCompiledShowLatexModule(): Promise<CompiledShowLatexModule> {
 			fileName: "index.ts",
 		});
 
-		mkdirSync(dirname(COMPILED_INDEX_MODULE_PATH), { recursive: true });
-		writeFileSync(COMPILED_INDEX_MODULE_PATH, transpiled.outputText);
-		compiledIndexModule = import(pathToFileURL(COMPILED_INDEX_MODULE_PATH).href);
+		const compiledPath = compiledIndexModulePath();
+		writeFileSync(compiledPath, rewriteProjectRelativeImportsForTempModule(transpiled.outputText));
+		compiledIndexModule = import(pathToFileURL(compiledPath).href);
 	}
 
 	return compiledIndexModule;
