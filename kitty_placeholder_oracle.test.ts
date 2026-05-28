@@ -46,6 +46,38 @@ test("kitty placeholder oracle flags incomplete chunked setup", () => {
 	assert.equal(oracle.diagnostics.orphanPlaceholders.length, 4);
 });
 
+test("kitty placeholder oracle flags placeholders before setup completion", () => {
+	const output = `${kittyPlaceholderLine(14, 0, 2)}${kittyTransmitVirtualPlacementCommand(PNG_BASE64, 14, 2, 1)}`;
+	const oracle = new KittyPlaceholderOracle(output);
+
+	assert.equal(oracle.isValid, false);
+	assert.match(oracle.summary, /Orphan placeholder cell references image id 14/);
+	assert.deepEqual(oracle.getCommandImageIds(), [14]);
+	assert.equal(oracle.diagnostics.orphanPlaceholders.length, 2);
+});
+
+test("kitty placeholder oracle flags placeholder emitted while chunk stream is active", () => {
+	const full = kittyTransmitVirtualPlacementCommand("a".repeat(KITTY_CHUNK_SIZE + 1), 15, 4, 1);
+	const firstChunk = full.slice(0, full.indexOf("\x1b\\") + 2);
+	const terminalChunk = full.slice(firstChunk.length);
+	const output = `${firstChunk}${kittyPlaceholderLine(15, 0, 4)}${terminalChunk}`;
+	const oracle = new KittyPlaceholderOracle(output);
+
+	assert.equal(oracle.isValid, false);
+	assert.match(oracle.summary, /Orphan placeholder cell references image id 15/);
+	assert.equal(oracle.diagnostics.orphanPlaceholders.length, 4);
+});
+
+test("kitty placeholder oracle accepts placeholder after terminal chunked setup", () => {
+	const full = kittyTransmitVirtualPlacementCommand("a".repeat(KITTY_CHUNK_SIZE + 1), 16, 4, 1);
+	const output = `${full}${kittyPlaceholderLine(16, 0, 4)}`;
+	const oracle = new KittyPlaceholderOracle(output);
+
+	assert.equal(oracle.isValid, true, oracle.summary);
+	assert.equal(oracle.diagnostics.orphanPlaceholders.length, 0);
+	assert.equal(oracle.diagnostics.placeholders.length, 4);
+});
+
 test("kitty placeholder oracle rejects placeholders with no setup", () => {
 	const output = kittyPlaceholderLine(11, 0, 1);
 	const oracle = new KittyPlaceholderOracle(output, { includeRawOutput: true });
@@ -87,4 +119,19 @@ test("kitty placeholder oracle flags non-decorated coordinates", () => {
 	assert.equal(oracle.diagnostics.invalidCoordinatePlaceholders.length, 1);
 	assert.match(oracle.summary, /Invalid placeholder/);
 	assert.match(oracle.summary, /outside declared placement dimensions/);
+});
+
+test("kitty placeholder oracle caps failure entries and final diagnostics", () => {
+	const output = kittyPlaceholderLine(17, 0, 1).repeat(40);
+	const oracle = new KittyPlaceholderOracle(output, {
+		requireImageSetup: false,
+		requirePlaceholders: true,
+		maxDiagnosticEntries: 3,
+		maxDiagnosticLength: 240,
+	});
+
+	assert.equal(oracle.isValid, false);
+	assert.equal(oracle.diagnostics.orphanPlaceholders.length, 40);
+	assert.match(oracle.summary, /\(\+\d+ more/);
+	assert.ok(oracle.summary.length <= 240);
 });
