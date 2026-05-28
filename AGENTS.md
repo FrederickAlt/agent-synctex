@@ -9,4 +9,4 @@ Use this guide when touching:
 - `kitty_placeholder_oracle.ts`
 - `terminal_refresh_policy.ts`
 - `kitty_placeholder_image.ts`
-- preview-related tests in `index_rendering.test.ts`, `inline_preview_renderer.test.ts`, `kitty_placeholder_oracle.test.ts`
+- preview-related tests in `index_rendering.test.ts`, `inline_preview_renderer.test.ts`, `kitty_placeholder_image.test.ts`, `kitty_placeholder_oracle.test.ts`

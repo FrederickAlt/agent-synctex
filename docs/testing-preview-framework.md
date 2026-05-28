@@ -32,15 +32,14 @@ assert.deepEqual(oracle.getCommandImageIds(), [5200, 5201]);
 assert.deepEqual(oracle.getPlaceholderImageIds(), [5200, 5201]);
 ```
 
-Useful diagnostics to check (from `oracle.diagnostics` / `oracle.summary`):
+Useful diagnostics to check (from `oracle.diagnostics` / `oracle.summary`; use `oracle.commandCount` for the decoded command count):
 - `commandImageIds`
 - `placeholderImageIds`
 - `placements`
 - `placeholders`
 - `orphanPlaceholders`
 - `invalidCoordinatePlaceholders`
-- `commandCount`
-- rendered failure reasons
+- `failures`
 
 ### When to use
 
@@ -150,6 +149,7 @@ The fixture composes:
 - Full: `npm run verify`
 - Focused examples:
   - `node --test inline_preview_renderer.test.ts`
+  - `node --test kitty_placeholder_image.test.ts`
   - `node --test kitty_placeholder_oracle.test.ts`
   - `node --test index_rendering.test.ts`
 
