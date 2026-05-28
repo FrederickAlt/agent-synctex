@@ -1,13 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-	TERMINAL_FOCUS_IN,
-	TERMINAL_FOCUS_OUT,
 	createTerminalRefreshPolicy,
 	type TerminalInputResult,
 	type TerminalRefreshPolicyAdapter,
+	type TerminalRefreshPolicyEvent,
 	type TerminalRefreshInvalidationRegistry,
 } from "./terminal_refresh_policy.ts";
+
+const FOCUS_IN_SEQUENCE = "\x1b[I";
+const FOCUS_OUT_SEQUENCE = "\x1b[O";
 
 class FakeSignalBus {
 	private handlers = {
@@ -75,14 +77,14 @@ class FakeAdapter implements TerminalRefreshPolicyAdapter {
 }
 
 class FakeInvalidationRegistry implements TerminalRefreshInvalidationRegistry {
-	public rememberCalls: string[] = [];
+	public rememberCalls: Array<{ key: string; count: number }> = [];
 	public refreshCount = 0;
 	public invalidatorCalls: string[] = [];
 	public clearCount = 0;
 	private invalidators = new Map<string, () => void>();
 
 	remember(key: string, invalidate: () => void): void {
-		this.rememberCalls.push(key);
+		this.rememberCalls.push({ key, count: this.invalidators.size + 1 });
 		this.invalidators.set(key, invalidate);
 	}
 
@@ -104,11 +106,19 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getInputProcessedEvent(eventLog: TerminalRefreshPolicyEvent[]): TerminalRefreshPolicyEvent | undefined {
+	return eventLog.find((entry) => entry.type === "input_processed");
+}
+
+function getInvalidationCallEvent(eventLog: TerminalRefreshPolicyEvent[]): TerminalRefreshPolicyEvent | undefined {
+	return eventLog.find((entry) => entry.type === "invalidation_called");
+}
+
 test("focus-in scheduling triggers delayed invalidations and preserves non-focus input", async () => {
 	const adapter = new FakeAdapter(true);
 	const registry = new FakeInvalidationRegistry();
 	const terminalInput = new FakeTerminalInput();
-	const eventLog: Array<{ type: string; [key: string]: unknown }> = [];
+	const eventLog: TerminalRefreshPolicyEvent[] = [];
 	const policy = createTerminalRefreshPolicy({
 		adapter,
 		invalidatorRegistry: registry,
@@ -124,23 +134,28 @@ test("focus-in scheduling triggers delayed invalidations and preserves non-focus
 	};
 	policy.install(context);
 
-	const result = terminalInput.simulate(`before${TERMINAL_FOCUS_IN}live`);
+	const result = terminalInput.simulate(`before${FOCUS_IN_SEQUENCE}live`);
 	assert.deepEqual(result, { data: "beforelive" });
 
 	policy.rememberInvalidator({ toolCallId: "tool-1", invalidate: () => registry.invalidatorCalls.push("refresh") });
 
 	const scheduled = eventLog.filter((entry) => entry.type === "refresh_scheduled");
 	assert.equal(scheduled.length, 2);
-	assert.equal(scheduled[0].delayMs, 10);
-	assert.equal(scheduled[1].delayMs, 20);
+	assert.equal((scheduled[0] as { type: "refresh_scheduled"; delayMs: number }).delayMs, 10);
+	assert.equal((scheduled[1] as { type: "refresh_scheduled"; delayMs: number }).delayMs, 20);
 
 	await sleep(35);
 
 	assert.equal(registry.refreshCount, 2);
-	assert.equal(registry.invalidatorCalls.filter((entry) => entry === "tool-1").length, 2);
-	assert.equal(eventLog.filter((entry) => entry.type === "invalidation_called").length, 2);
-	assert.deepEqual(eventLog.find((entry) => entry.type === "input_processed")?.hasFocusIn, true);
-	assert.deepEqual(eventLog.find((entry) => entry.type === "input_processed")?.hasFocusOut, false);
+	assert.equal(registry.invalidatorCalls.filter((entry) => entry === "refresh").length, 2);
+	const invalidationCalled = getInvalidationCallEvent(eventLog);
+	assert.equal((invalidationCalled as { type: "invalidation_called"; count: number }).count, 1);
+	const inputProcessed = getInputProcessedEvent(eventLog);
+	assert.equal(inputProcessed?.type, "input_processed");
+	assert.equal((inputProcessed as { type: "input_processed"; hadFocusIn: boolean; hadFocusOut: boolean; consumed: boolean; remainingLength: number }).hadFocusIn, true);
+	assert.equal((inputProcessed as { type: "input_processed"; hadFocusIn: boolean; hadFocusOut: boolean; consumed: boolean; remainingLength: number }).hadFocusOut, false);
+	assert.equal((inputProcessed as { type: "input_processed"; hadFocusIn: boolean; hadFocusOut: boolean; consumed: boolean; remainingLength: number }).consumed, false);
+	assert.equal((inputProcessed as { type: "input_processed"; hadFocusIn: boolean; hadFocusOut: boolean; consumed: boolean; remainingLength: number }).remainingLength, "beforelive".length);
 
 	policy.cleanup();
 });
@@ -149,11 +164,10 @@ test("focus-out strips markers, preserves surrounding bytes", async () => {
 	const adapter = new FakeAdapter(true);
 	const registry = new FakeInvalidationRegistry();
 	const terminalInput = new FakeTerminalInput();
-	const eventLog: Array<{ type: string; [key: string]: unknown }> = [];
+	const eventLog: TerminalRefreshPolicyEvent[] = [];
 	const policy = createTerminalRefreshPolicy({
 		adapter,
 		invalidatorRegistry: registry,
-		refreshDelayMs: [1, 2],
 		eventLog: (event) => eventLog.push(event),
 	});
 
@@ -164,12 +178,17 @@ test("focus-out strips markers, preserves surrounding bytes", async () => {
 		},
 	});
 
-	const result = terminalInput.simulate(`before${TERMINAL_FOCUS_OUT}after`);
+	const result = terminalInput.simulate(`before${FOCUS_OUT_SEQUENCE}after`);
 	assert.deepEqual(result, { data: "beforeafter" });
 
 	await sleep(5);
 	assert.equal(eventLog.some((entry) => entry.type === "refresh_scheduled"), false);
 	assert.equal(registry.refreshCount, 0);
+
+	const inputProcessed = getInputProcessedEvent(eventLog);
+	assert.equal(inputProcessed?.type, "input_processed");
+	assert.equal((inputProcessed as { type: "input_processed"; consumed: boolean; remainingLength: number }).consumed, false);
+	assert.equal((inputProcessed as { type: "input_processed"; consumed: boolean; remainingLength: number }).remainingLength, "beforeafter".length);
 
 	policy.cleanup();
 });
@@ -191,7 +210,7 @@ test("cleanup clears timers, disables focus reporting, and removes tmux hooks", 
 		},
 	});
 
-	terminalInput.simulate(`x${TERMINAL_FOCUS_IN}y`);
+	terminalInput.simulate(`x${FOCUS_IN_SEQUENCE}y`);
 	await sleep(10);
 	policy.cleanup();
 
@@ -245,7 +264,7 @@ test("non-terminal mode skips hook installation and focus registration", () => {
 
 	assert.equal(adapter.tmuxHooks.length, 0);
 	assert.equal(adapter.outputWrites.length, 0);
-	terminalInput.simulate(`x${TERMINAL_FOCUS_IN}y`);
+	terminalInput.simulate(`x${FOCUS_IN_SEQUENCE}y`);
 	assert.equal(terminalInput.isActive(), false, "input handler is not registered outside tmux/kitty terminals");
 });
 
@@ -264,6 +283,38 @@ test("focus and signal events drive refresh through fake adapters", async () => 
 	await sleep(0);
 	assert.equal(registry.refreshCount, 1);
 	assert.deepEqual(invalidations, ["manual"]);
+
+	policy.cleanup();
+});
+
+
+test("invalidation registration logs key context metadata", async () => {
+	const adapter = new FakeAdapter(true);
+	const registry = new FakeInvalidationRegistry();
+	const eventLog: TerminalRefreshPolicyEvent[] = [];
+	const policy = createTerminalRefreshPolicy({
+		adapter,
+		invalidatorRegistry: registry,
+		eventLog: (event) => eventLog.push(event),
+	});
+
+	policy.rememberInvalidator({ toolCallId: "tool-inline", invalidate: () => {} });
+	const registration = eventLog.find((event) => event.type === "invalidation_registered") as {
+		type: "invalidation_registered";
+		key: string;
+		context: string;
+	} | undefined;
+	assert.equal(registration?.type, "invalidation_registered");
+	assert.equal(registration?.key, "tool-inline");
+	assert.equal(registration?.context, "tool-inline");
+
+	policy.install({ hasUI: false });
+	adapter.signalBus.emit("SIGWINCH");
+	await sleep(0);
+	const invalidationCalled = getInvalidationCallEvent(eventLog);
+	assert.equal(invalidationCalled?.type, "invalidation_called");
+	assert.equal((invalidationCalled as { type: "invalidation_called"; count: number }).count, 1);
+	assert.deepEqual((invalidationCalled as { type: "invalidation_called"; keys: string[] }).keys, ["tool-inline"]);
 
 	policy.cleanup();
 });
