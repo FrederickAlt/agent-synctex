@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { calculateInlineDisplayColumns, rasterizePdfPage, rasterizePdfPages } from "./inline_preview.ts";
+import { calculateInlineDisplayColumns, mergeInlinePreviewArtifacts, rasterizePdfPage, rasterizePdfPages } from "./inline_preview.ts";
 
 function tempDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));
@@ -60,6 +60,10 @@ function writePdfInfoCommand(path: string, output: string): void {
 
 function writeMagickTrim(path: string, pngBase64: string): void {
 	writeExecutable(path, `"${nodeBinary}" - "$@" <<'NODE'\nconst fs = require(\"node:fs\");\nconst args = process.argv.slice(2);\nconst positional = args.filter((arg) => !arg.startsWith(\"-\"));\nconst out = positional.at(-1);\nif (!out) process.exit(1);\nfs.writeFileSync(out, Buffer.from(\"${pngBase64}\", \"base64\"));\nNODE`);
+}
+
+function writeMagickAppend(path: string, pngBase64: string): void {
+	writeExecutable(path, `"${nodeBinary}" - "$@" <<'NODE'\nconst fs = require(\"node:fs\");\nconst out = process.argv.at(-1);\nif (!out) process.exit(1);\nfs.writeFileSync(out, Buffer.from(\"${pngBase64}\", \"base64\"));\nNODE`);
 }
 
 test("rasterizePdfPage uses mutool when available", async () => {
@@ -150,6 +154,39 @@ test("rasterizePdfPages falls back to a single page when page count is unavailab
 
 	assert.equal(artifacts.length, 1);
 	assert.equal(artifacts[0].page, 1);
+});
+
+test("mergeInlinePreviewArtifacts vertically appends multiple pages when ImageMagick is available", async () => {
+	const bin = tempDir("inline-preview-bin-");
+	const first = join(tempDir("inline-preview-pages-"), "p1.png");
+	const second = join(tempDir("inline-preview-pages-"), "p2.png");
+	writeFileSync(first, createMiniPng(100, 50));
+	writeFileSync(second, createMiniPng(120, 60));
+	writeMagickAppend(join(bin, "magick"), createMiniPng(120, 110).toString("base64"));
+
+	const artifacts = await withPath(bin, () => mergeInlinePreviewArtifacts([
+		{ pngPath: first, page: 1, dpi: 150, renderer: "mutool", trimmed: true, fullPageWidthPx: 200, fullPageHeightPx: 300, widthPx: 100, heightPx: 50 },
+		{ pngPath: second, page: 2, dpi: 150, renderer: "mutool", trimmed: false, fullPageWidthPx: 180, fullPageHeightPx: 300, widthPx: 120, heightPx: 60 },
+	]));
+
+	assert.equal(artifacts.length, 1);
+	assert.equal(artifacts[0].page, 1);
+	assert.equal(artifacts[0].trimmed, true);
+	assert.equal(artifacts[0].fullPageWidthPx, 200);
+	assert.equal(artifacts[0].fullPageHeightPx, 600);
+	assert.equal(artifacts[0].widthPx, 120);
+	assert.equal(artifacts[0].heightPx, 110);
+});
+
+test("mergeInlinePreviewArtifacts leaves pages separate without ImageMagick", async () => {
+	const artifacts = [
+		{ pngPath: "p1.png", page: 1, dpi: 150, renderer: "mutool" as const, trimmed: false, fullPageWidthPx: 100, fullPageHeightPx: 100, widthPx: 100, heightPx: 100 },
+		{ pngPath: "p2.png", page: 2, dpi: 150, renderer: "mutool" as const, trimmed: false, fullPageWidthPx: 100, fullPageHeightPx: 100, widthPx: 100, heightPx: 100 },
+	];
+
+	const merged = await withPath(tempDir("inline-preview-bin-"), () => mergeInlinePreviewArtifacts(artifacts));
+
+	assert.equal(merged, artifacts);
 });
 
 test("calculateInlineDisplayColumns scales relative to full page width", () => {

@@ -27,9 +27,10 @@ x
 
 By default, `show_latex` leaves the ready descriptor and fixed preview files untouched, rasterizes each
 PDF page to a local PNG with `mutool` or `pdftoppm`, trims image whitespace when ImageMagick is available,
-and renders the PNGs sequentially inline in Pi chat without returning image bytes in the tool result. Inline image width is proportional to the cropped
-content width relative to the full PDF page width, so small symbols stay small while wide formulas use
-more of the TUI. With `inline=false`, it atomically
+and, for multi-page PDFs, merges the page PNGs into one vertical image when ImageMagick is available
+(falling back to sequential PNGs otherwise). It renders inline in Pi chat without returning image bytes in
+the tool result. Inline image width is proportional to the cropped content width relative to the full PDF
+page width, so small symbols stay small while wide formulas use more of the TUI. With `inline=false`, it atomically
 writes a ready descriptor that pairs the operation PDF with the session's SyncTeX callback command,
 refreshes fixed compatibility files, then uses the existing Zathura helper/fallback path.
 File compiles are spawned directly by the extension so normal LaTeX project-relative includes/assets

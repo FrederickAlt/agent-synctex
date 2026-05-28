@@ -10,6 +10,7 @@ import { Container, getCapabilities, getCellDimensions, getPngDimensions, Image,
 import { Type } from "typebox";
 import {
 	calculateInlineDisplayColumns,
+	mergeInlinePreviewArtifacts,
 	rasterizePdfPages,
 	type InlinePreviewArtifact,
 } from "./inline_preview.ts";
@@ -1509,7 +1510,8 @@ async function executeShowLatexPreviewTool(
 		previewPdfPath = preview.pdfPath;
 
 		if (inline) {
-			const artifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
+			const pageArtifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
+			const artifacts = await mergeInlinePreviewArtifacts(pageArtifacts, { signal });
 			const previewId = rememberInlinePreviewRenderState({ pdf: preview.pdfPath, previews: artifacts });
 			return {
 				content: [{ type: "text", text: "✓ LaTeX preview rendered locally" }],

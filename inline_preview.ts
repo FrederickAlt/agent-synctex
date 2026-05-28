@@ -213,3 +213,43 @@ export async function rasterizePdfPages(
 	}
 	return artifacts;
 }
+
+export async function mergeInlinePreviewArtifacts(
+	artifacts: InlinePreviewArtifact[],
+	options: { signal?: AbortSignal } = {},
+): Promise<InlinePreviewArtifact[]> {
+	if (artifacts.length <= 1) return artifacts;
+	if (!(await commandExists("magick", options.signal))) return artifacts;
+
+	ensureInlinePreviewDir();
+	const mergedPath = resolve(INLINE_PREVIEW_DIR, `${Date.now()}-${process.pid}-${randomUUID()}-merged.png`);
+	try {
+		await runRequiredCommand("magick", [
+			...artifacts.map((artifact) => artifact.pngPath),
+			"-background",
+			"white",
+			"-alpha",
+			"remove",
+			"-alpha",
+			"off",
+			"-append",
+			mergedPath,
+		], options.signal);
+		if (!existsSync(mergedPath)) return artifacts;
+	} catch {
+		return artifacts;
+	}
+
+	const mergedDimensions = normalizeDimensions(await readPngDimensions(mergedPath, options.signal));
+	return [{
+		pngPath: mergedPath,
+		page: artifacts[0]?.page ?? 1,
+		dpi: artifacts[0]?.dpi ?? 150,
+		renderer: artifacts[0]?.renderer ?? "mutool",
+		trimmed: artifacts.some((artifact) => artifact.trimmed),
+		fullPageWidthPx: Math.max(...artifacts.map((artifact) => artifact.fullPageWidthPx)),
+		fullPageHeightPx: artifacts.reduce((sum, artifact) => sum + artifact.fullPageHeightPx, 0),
+		widthPx: mergedDimensions.widthPx,
+		heightPx: mergedDimensions.heightPx,
+	}];
+}
