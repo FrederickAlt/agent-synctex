@@ -9,6 +9,7 @@ import {
 	renderKittyPlaceholderImageLines,
 	wrapKittySequenceForTmux,
 } from "./kitty_placeholder_image.ts";
+import { KittyPlaceholderOracle } from "./kitty_placeholder_oracle.ts";
 
 const PNG_BASE64 = "iVBORw0KGgo=";
 
@@ -24,7 +25,7 @@ test("kitty placeholder lines encode every column coordinate", () => {
 	assert.match(line, /\u{10EEEE}\u0305\u030e/u);
 });
 
-test("renderKittyPlaceholderImageLines creates the virtual placement while transmitting the image", () => {
+test("renderKittyPlaceholderImageLines creates a valid oracle-checkable placeholder stream", () => {
 	const lines = renderKittyPlaceholderImageLines({
 		title: "preview",
 		base64Data: PNG_BASE64,
@@ -35,11 +36,17 @@ test("renderKittyPlaceholderImageLines creates the virtual placement while trans
 		cellDimensions: { widthPx: 10, heightPx: 10 },
 	});
 
+	const oracle = new KittyPlaceholderOracle(lines.join("\n"), { expectedImageIds: [42] });
+	assert.equal(oracle.isValid, true, oracle.summary);
 	assert.equal(lines.length, 3);
 	assert.equal(lines[0], "preview");
-	assert.match(lines[1], /a=T,U=1,f=100,q=2,i=42,c=10,r=2/);
-	assert.match(lines[1], /\u{10EEEE}\u0305\u0305/u);
-	assert.match(lines[2], /\u{10EEEE}\u030d\u0305/u);
+	assert.equal(oracle.commandCount, 1);
+	assert.deepEqual(oracle.getCommandImageIds(), [42]);
+	assert.equal(oracle.diagnostics.placements.length, 1);
+	assert.equal(oracle.diagnostics.placements[0].columns, 10);
+	assert.equal(oracle.diagnostics.placements[0].rows, 2);
+	assert.equal(oracle.diagnostics.placeholders.length, 20);
+	assert.equal(oracle.diagnostics.placements[0].command.wrappedInTmux, true);
 	assert.doesNotMatch(lines.join("\n"), /a=p/);
 	assert.doesNotMatch(lines.join("\n"), /\x1b\[\d+A/);
 });
@@ -49,6 +56,11 @@ test("kitty transmit virtual placement command chunks large payloads", () => {
 
 	assert.match(command, /a=T,U=1,f=100,q=2,i=9,c=80,r=4,m=1/);
 	assert.match(command, /\x1b_Gm=0;/);
+
+	const oracle = new KittyPlaceholderOracle(command, { requirePlaceholders: false, includeRawOutput: true });
+	assert.equal(oracle.isValid, true, oracle.summary);
+	assert.equal(oracle.commandCount, 2);
+	assert.deepEqual(oracle.getCommandImageIds(), [9]);
 });
 
 test("kitty placeholder render does not expose setup commands as focus-refresh payloads", () => {
@@ -71,7 +83,7 @@ test("wrapKittySequenceForTmux escapes nested escape bytes", () => {
 	assert.equal(wrapped, "\x1bPtmux;\x1b\x1b_Ga=t;data\x1b\x1b\\\x1b\\");
 });
 
-test("KittyPreviewInvalidationRegistry refreshes recent tool row invalidators", () => {
+test("KittyPlaceholderInvalidationRegistry refreshes recent tool row invalidators", () => {
 	const registry = new KittyPreviewInvalidationRegistry(2);
 	const calls: string[] = [];
 
@@ -88,4 +100,3 @@ test("KittyPreviewInvalidationRegistry refreshes recent tool row invalidators", 
 	registry.refresh();
 	assert.deepEqual(calls, ["a-again", "c"]);
 });
-
