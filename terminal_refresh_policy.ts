@@ -28,9 +28,18 @@ export interface TerminalRefreshPolicyContext {
 	};
 }
 
+export type TerminalRefreshReason = "focus" | "signal";
+
+export interface TerminalRefreshInvalidationOptions {
+	reason: TerminalRefreshReason;
+	onlyLatest?: boolean;
+}
+
+export const TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY = "__pdfPreviewTerminalFocusRefreshEpoch";
+
 export interface TerminalRefreshInvalidationRegistry {
-	remember(key: string, invalidate: () => void, context?: string): void;
-	refresh(): void;
+	remember(key: string, invalidate: (options?: TerminalRefreshInvalidationOptions) => void, context?: string): void;
+	refresh(options?: TerminalRefreshInvalidationOptions): void;
 	clear(): void;
 	snapshot(): readonly { key: string; context: string }[];
 }
@@ -76,6 +85,15 @@ function describeInvalidatorContext(context: unknown): string {
 	return context.constructor?.name ?? "object";
 }
 
+function bumpFocusRefreshEpoch(context: unknown): void {
+	if (typeof context !== "object" || context === null || !("state" in context)) return;
+	const state = (context as { state?: unknown }).state;
+	if (typeof state !== "object" || state === null) return;
+	const record = state as Record<string, unknown>;
+	const current = typeof record[TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY] === "number" ? record[TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY] : 0;
+	record[TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY] = current + 1;
+}
+
 export function createTerminalRefreshPolicy(options: TerminalRefreshPolicyOptions): TerminalRefreshPolicy {
 	const {
 		adapter,
@@ -101,19 +119,20 @@ export function createTerminalRefreshPolicy(options: TerminalRefreshPolicyOption
 		timers.clear();
 	};
 
-	const runInvalidators = () => {
+	const runInvalidators = (options: TerminalRefreshInvalidationOptions) => {
 		const activeInvalidators = invalidatorRegistry.snapshot();
-		const keys = activeInvalidators.map((entry) => entry.key);
-		const contextTypes = activeInvalidators.map((entry) => entry.context);
+		const selectedInvalidators = options.onlyLatest ? activeInvalidators.slice(-1) : activeInvalidators;
+		const keys = selectedInvalidators.map((entry) => entry.key);
+		const contextTypes = selectedInvalidators.map((entry) => entry.context);
 		emit({ type: "invalidation_called", count: keys.length, keys, contextTypes });
-		invalidatorRegistry.refresh();
+		invalidatorRegistry.refresh(options);
 	};
 
 	const scheduleRefresh = (delayMs: number) => {
 		emit({ type: "refresh_scheduled", delayMs });
 		const timer = setTimeout(() => {
 			timers.delete(timer);
-			runInvalidators();
+			runInvalidators({ reason: "focus", onlyLatest: true });
 		}, delayMs);
 		timers.add(timer);
 	};
@@ -152,8 +171,8 @@ export function createTerminalRefreshPolicy(options: TerminalRefreshPolicyOption
 			installed = true;
 			installTerminalHooks();
 
-			cleanupTasks.push(adapter.onSignal("SIGWINCH", () => runInvalidators()));
-			cleanupTasks.push(adapter.onSignal("SIGUSR1", () => runInvalidators()));
+			cleanupTasks.push(adapter.onSignal("SIGWINCH", () => runInvalidators({ reason: "signal" })));
+			cleanupTasks.push(adapter.onSignal("SIGUSR1", () => runInvalidators({ reason: "signal" })));
 
 			if (!context?.hasUI || !context.ui) return;
 			if (typeof context.ui.onTerminalInput !== "function") {
@@ -190,8 +209,12 @@ export function createTerminalRefreshPolicy(options: TerminalRefreshPolicyOption
 			const invalidate = candidate.invalidate as () => void;
 			const key = typeof candidate.toolCallId === "string" ? candidate.toolCallId : randomUUID();
 			const contextValue = describeInvalidatorContext(context);
+			const wrappedInvalidate = (options?: TerminalRefreshInvalidationOptions) => {
+				if (options?.reason === "focus") bumpFocusRefreshEpoch(context);
+				invalidate();
+			};
 			eventLog?.({ type: "invalidation_registered", key, context: contextValue });
-			invalidatorRegistry.remember(key, invalidate, contextValue);
+			invalidatorRegistry.remember(key, wrappedInvalidate, contextValue);
 		},
 		clearInvalidators() {
 			invalidatorRegistry.clear();

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { createConnection } from "node:net";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -324,6 +325,28 @@ test("callback invocation handles substituted paths containing quotes, spaces, a
 	} finally {
 		await server.close();
 	}
+});
+
+test("closing a callback server destroys open sockets and resolves", async () => {
+	const dir = tempDir();
+	const server = new SynctexCallbackServer({
+		tmpDir: dir,
+		callbackScriptPath: resolve("scripts/pi_synctex_callback.mjs"),
+		nodePath: process.execPath,
+	});
+	await server.ensureStarted({ cwd: dir, hasUI: false });
+
+	const socket = createConnection(server.socketPath);
+	await new Promise<void>((resolveConnect, rejectConnect) => {
+		socket.once("connect", resolveConnect);
+		socket.once("error", rejectConnect);
+	});
+	const socketClosed = new Promise<void>((resolveClose) => socket.once("close", () => resolveClose()));
+
+	await server.close();
+	await socketClosed;
+
+	assert.equal(socket.destroyed, true);
 });
 
 test("closing a callback server invalidates its command and new sessions rotate endpoints", async () => {

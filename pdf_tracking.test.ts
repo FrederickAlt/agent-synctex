@@ -502,6 +502,76 @@ test("openPdfInZathura returns after zathura --fork parent exits even if viewer 
 	assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), ["--fork", pdf]);
 });
 
+test("openPdfInZathura returns after detecting a persistent viewer even if zathura stays foreground", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const fakeZathura = join(dir, "zathura");
+	writeMinimalPdf(pdf);
+	writeFileSync(fakeZathura, `#!/bin/bash\nexec -a zathura bash -c 'while true; do sleep 30; done' dummy "$@"\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	const pid = await openPdfInZathura(pdf, undefined, {
+		command: fakeZathura,
+		timeoutMs: 1500,
+		requirePersistentViewer: true,
+	});
+	try {
+		assert.equal(typeof pid, "number");
+		assert.ok(pid! > 0);
+	} finally {
+		process.kill(pid!, "SIGTERM");
+	}
+});
+
+test("openPdfInZathura prefers the forked zathura child over the --fork launcher pid", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const launcherPidFile = join(dir, "launcher.pid");
+	const fakeZathura = join(dir, "zathura");
+	writeMinimalPdf(pdf);
+	writeFileSync(fakeZathura, `#!/bin/bash\necho "$$" > ${JSON.stringify(launcherPidFile)}\nnohup bash -c 'exec -a zathura bash -c "while true; do sleep 30; done" dummy --fork "$2"' _ "$1" "$2" >/dev/null 2>&1 < /dev/null &\nsleep 0.05\n`);
+	chmodSync(fakeZathura, 0o700);
+
+	let pid: number | undefined;
+	try {
+		pid = await openPdfInZathura(pdf, undefined, {
+			command: fakeZathura,
+			timeoutMs: 1500,
+			requirePersistentViewer: true,
+		});
+		assert.equal(typeof pid, "number");
+		assert.ok(pid! > 0);
+
+		let launcherPidText = "";
+		for (let i = 0; i < 50; i += 1) {
+			try {
+				launcherPidText = readFileSync(launcherPidFile, "utf8").trim();
+				if (launcherPidText) break;
+			} catch {
+				// Retry until the launcher writes the file.
+			}
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.ok(launcherPidText, "did not capture fake launcher PID");
+		const launcherPid = Number(launcherPidText);
+		assert.ok(Number.isFinite(launcherPid));
+		assert.notEqual(pid, launcherPid);
+		await waitForProcessArgs(pid!, pdf);
+	} finally {
+		if (pid !== undefined) {
+			process.kill(pid, "SIGTERM");
+		}
+		try {
+			const launcherPid = Number(readFileSync(launcherPidFile, "utf8").trim());
+			if (Number.isFinite(launcherPid) && launcherPid !== pid) {
+				process.kill(launcherPid, "SIGKILL");
+			}
+		} catch {
+			// Ignore cleanup failures.
+		}
+	}
+});
+
 test("openPdfInZathura wires an inverse SyncTeX editor command when provided", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");

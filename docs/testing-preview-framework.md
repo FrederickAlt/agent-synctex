@@ -144,6 +144,22 @@ The fixture composes:
   - bounded output shape after width changes
 - Oracle checks (`KittyPlaceholderOracle`) are applied to every render pass.
 
+## Headless Pi TUI repros
+
+For extension-triggered scroll, resize, or render bugs that need the real Pi TUI render loop, Pi's monorepo has a headless terminal helper:
+
+- `/home/frederick/projects/AI/pi_extensions/pi-mono/packages/tui/test/virtual-terminal.ts`
+
+`VirtualTerminal` wraps `@xterm/headless` and implements Pi's `Terminal` interface, so a throwaway repro can instantiate a real `TUI` without opening an interactive terminal. Useful patterns:
+
+- Subclass `VirtualTerminal` and override `write()` to capture raw ANSI output; this is often more diagnostic than viewport assertions alone.
+- Use `terminal.resize(cols, rows)` to exercise maximize / resize-handler behavior.
+- Await `terminal.waitForRender()` after `tui.start()`, `tui.requestRender()`, or `resize()`; TUI renders are deferred/throttled.
+- Use `getViewport()` for what the user sees, and captured writes or `getScrollBuffer()` to detect history replay.
+- To reproduce extension-driven tool rendering bugs, mimic Pi `ToolExecution.invalidate()` behavior: invalidate/rebuild the rendered tool component, then call `tui.requestRender()`.
+
+These Pi-internal imports are best for throwaway/debug repros unless this repo gains an explicit test dependency on Pi internals. Keep committed tests at the extension seams above when possible.
+
 ## Verification commands
 
 - Full: `npm run verify`

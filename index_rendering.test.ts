@@ -11,6 +11,8 @@ import {
 	type TerminalInputResult,
 	type TerminalRefreshPolicyAdapter,
 	type TerminalRefreshPolicyEvent,
+	TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY,
+	type TerminalRefreshInvalidationOptions,
 	type TerminalRefreshInvalidationRegistry,
 } from "./terminal_refresh_policy.ts";
 import {
@@ -97,17 +99,19 @@ class FakeInvalidationRegistry implements TerminalRefreshInvalidationRegistry {
 	public refreshCount = 0;
 	public invalidatorCalls: string[] = [];
 	public clearCount = 0;
-	private invalidators = new Map<string, { invalidate: () => void; context: string }>();
+	private invalidators = new Map<string, { invalidate: (options?: TerminalRefreshInvalidationOptions) => void; context: string }>();
 
-	remember(key: string, invalidate: () => void, context = ""): void {
+	remember(key: string, invalidate: (options?: TerminalRefreshInvalidationOptions) => void, context = ""): void {
 		this.rememberCalls.push({ key, count: this.invalidators.size + 1, context });
 		this.invalidators.set(key, { invalidate, context });
 	}
 
-	refresh(): void {
+	refresh(options?: TerminalRefreshInvalidationOptions): void {
 		this.refreshCount++;
-		for (const [key, entry] of this.invalidators) {
-			entry.invalidate();
+		const entries = [...this.invalidators.entries()];
+		const selectedEntries = options?.onlyLatest ? entries.slice(-1) : entries;
+		for (const [key, entry] of selectedEntries) {
+			entry.invalidate(options);
 			this.invalidatorCalls.push(key);
 		}
 	}
@@ -464,6 +468,41 @@ test("focus-in scheduling triggers delayed invalidations and preserves non-focus
 	policy.cleanup();
 });
 
+test("focus refresh invalidates only the latest preview and bumps its refresh epoch", async () => {
+	const adapter = new FakeAdapter(true);
+	const registry = new FakeInvalidationRegistry();
+	const terminalInput = new FakeTerminalInput();
+	const policy = createTerminalRefreshPolicy({
+		adapter,
+		invalidatorRegistry: registry,
+		refreshDelayMs: [10, 20],
+	});
+	const oldContext = { toolCallId: "old-preview", state: {}, invalidate: () => registry.invalidatorCalls.push("old-refresh") };
+	const latestContext = { toolCallId: "latest-preview", state: {}, invalidate: () => registry.invalidatorCalls.push("latest-refresh") };
+
+	policy.install({
+		hasUI: true,
+		ui: {
+			onTerminalInput: terminalInput.setHandler.bind(terminalInput),
+		},
+	});
+	policy.rememberInvalidator(oldContext);
+	policy.rememberInvalidator(latestContext);
+
+	terminalInput.simulate(FOCUS_IN_SEQUENCE);
+	await sleep(35);
+
+	assert.equal(registry.refreshCount, 2);
+	assert.equal(registry.invalidatorCalls.filter((entry) => entry === "old-preview").length, 0);
+	assert.equal(registry.invalidatorCalls.filter((entry) => entry === "latest-preview").length, 2);
+	assert.equal(registry.invalidatorCalls.filter((entry) => entry === "old-refresh").length, 0);
+	assert.equal(registry.invalidatorCalls.filter((entry) => entry === "latest-refresh").length, 2);
+	assert.equal((oldContext.state as Record<string, unknown>)[TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY], undefined);
+	assert.equal((latestContext.state as Record<string, unknown>)[TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY], 2);
+
+	policy.cleanup();
+});
+
 test("focus-out strips markers, preserves surrounding bytes", async () => {
 	const adapter = new FakeAdapter(true);
 	const registry = new FakeInvalidationRegistry();
@@ -667,6 +706,59 @@ test("show_latex renderResult chooses tmux/kitty rendering before generic capabi
 			delete process.env.TERM_PROGRAM;
 		} else {
 			process.env.TERM_PROGRAM = previousEnv.TERM_PROGRAM;
+		}
+	}
+});
+
+test("show_latex renderResult detects kitty under tmux when TMUX env is absent", async () => {
+	const previousEnv = {
+		TMUX: process.env.TMUX,
+		KITTY_WINDOW_ID: process.env.KITTY_WINDOW_ID,
+		TERM_PROGRAM: process.env.TERM_PROGRAM,
+		TERM: process.env.TERM,
+	};
+	const tool = await captureShowLatexTool();
+	delete process.env.TMUX;
+	process.env.KITTY_WINDOW_ID = "1";
+	process.env.TERM_PROGRAM = "tmux";
+	process.env.TERM = "tmux-256color";
+
+	try {
+		const pngPath = createTemporaryPngFile("tmux-no-env-preview");
+		const component = tool.renderResult({
+			details: {
+				inline_previews: [inlinePreviewArtifactMetadata(pngPath)],
+				pdf: "/tmp/fake-preview.pdf",
+			},
+		}, undefined, {}, {
+			toolCallId: "tmux-no-env-preview",
+			invalidate: () => {},
+			state: {},
+		});
+		const output = flattenRenderedComponent(component).join("\n");
+
+		assert.equal(output.includes("Inline image display is not supported by this terminal."), false);
+		assert.match(output, /\u001bPtmux;/);
+	} finally {
+		if (previousEnv.TMUX === undefined) {
+			delete process.env.TMUX;
+		} else {
+			process.env.TMUX = previousEnv.TMUX;
+		}
+		if (previousEnv.KITTY_WINDOW_ID === undefined) {
+			delete process.env.KITTY_WINDOW_ID;
+		} else {
+			process.env.KITTY_WINDOW_ID = previousEnv.KITTY_WINDOW_ID;
+		}
+		if (previousEnv.TERM_PROGRAM === undefined) {
+			delete process.env.TERM_PROGRAM;
+		} else {
+			process.env.TERM_PROGRAM = previousEnv.TERM_PROGRAM;
+		}
+		if (previousEnv.TERM === undefined) {
+			delete process.env.TERM;
+		} else {
+			process.env.TERM = previousEnv.TERM;
 		}
 	}
 });

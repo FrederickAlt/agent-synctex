@@ -432,6 +432,181 @@ function runPdfOpenProcess(
 	});
 }
 
+function pidExists(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") return false;
+		return true;
+	}
+}
+
+async function waitForPidToSurvive(pid: number, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+	const deadline = Date.now() + Math.max(0, timeoutMs);
+	while (!signal?.aborted && Date.now() < deadline) {
+		if (!pidExists(pid)) return false;
+		await delay(ZATHURA_PID_POLL_MS);
+	}
+	return !signal?.aborted && pidExists(pid);
+}
+
+async function isLikelyPersistentViewerPid(
+	pid: number,
+	normalizedPdfPath: string,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const processArgs = readProcessArgs(String(pid));
+	if (!processArgs || !processArgsMatchZathuraPdf(processArgs, normalizedPdfPath)) return false;
+
+	const ready = await waitForZathuraDbusReady(pid, ZATHURA_DBUS_READY_TIMEOUT_MS, signal);
+	if (signal?.aborted) return false;
+	if (ready === true) return true;
+	return waitForPidToSurvive(pid, ZATHURA_DBUS_FALLBACK_DELAY_MS, signal);
+}
+
+function runPdfOpenProcessUntilViewer(
+	command: string,
+	args: string[],
+	pdfFilePath: string,
+	beforePids: Set<number>,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<{ result: PdfOpenProcessResult; pid?: number }> {
+	return new Promise((resolvePromise, reject) => {
+		if (signal?.aborted) {
+			resolvePromise({ result: { exitCode: null, signal: null, output: "", timedOut: false, aborted: true } });
+			return;
+		}
+
+		let output = "";
+		let timedOut = false;
+		let aborted = false;
+		let settled = false;
+		let launcherResult: PdfOpenProcessResult | undefined;
+		let pidDetectionDeadline: number | undefined;
+		const normalizedPdfPath = normalizePdfFilePath(pdfFilePath);
+
+		const child = spawn(command, args, {
+			detached: true,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: {
+				...process.env,
+				HOME: process.env.HOME || homedir(),
+				PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+			},
+		});
+		const launcherPid = child.pid;
+
+		const appendOutput = (chunk: Buffer | string) => {
+			output += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+			output = tailText(output);
+		};
+
+		child.stdout.on("data", appendOutput);
+		child.stderr.on("data", appendOutput);
+		child.unref();
+
+		const cleanup = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			child.stdout.destroy();
+			child.stderr.destroy();
+			child.removeAllListeners("error");
+			child.removeAllListeners("exit");
+		};
+
+		const finish = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			callback();
+		};
+
+		const resultFromLauncher = (exitCode: number | null, closeSignal: NodeJS.Signals | null): PdfOpenProcessResult => ({
+			exitCode,
+			signal: closeSignal,
+			output,
+			timedOut,
+			aborted,
+		});
+
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGKILL");
+		}, timeoutMs);
+
+		const finishWithResult = () => {
+			if (!launcherResult) launcherResult = resultFromLauncher(null, null);
+			finish(() => resolvePromise({ result: launcherResult! }));
+		};
+
+		const onAbort = () => {
+			aborted = true;
+			child.kill("SIGTERM");
+			if (!launcherResult) {
+				launcherResult = resultFromLauncher(null, null);
+			}
+			finishWithResult();
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+
+		const pickPersistentPid = async () => {
+			const newPids = zathuraPidsForPdf(pdfFilePath).filter((pid) => !beforePids.has(pid));
+			if (!newPids.length) return undefined;
+
+			const sortedCandidates = [...newPids].sort((left, right) => right - left);
+			const nonLauncherCandidates = sortedCandidates.filter((pid) => pid !== launcherPid);
+			const candidatesToCheck = nonLauncherCandidates.length > 0 ? nonLauncherCandidates : sortedCandidates;
+
+			for (const pid of candidatesToCheck) {
+				if (beforePids.has(pid)) continue;
+				if (!(await isLikelyPersistentViewerPid(pid, normalizedPdfPath, signal))) {
+					beforePids.add(pid);
+					continue;
+				}
+				return pid;
+			}
+
+			return undefined;
+		};
+
+		const pollForViewer = async () => {
+			while (!settled && !signal?.aborted && !timedOut) {
+				if (pidDetectionDeadline !== undefined && Date.now() >= pidDetectionDeadline) {
+					finishWithResult();
+					return;
+				}
+
+				const pid = await pickPersistentPid();
+				if (pid !== undefined) {
+					finish(() => resolvePromise({ result: launcherResult ?? resultFromLauncher(null, null), pid }));
+					return;
+				}
+
+				await delay(ZATHURA_PID_POLL_MS);
+			}
+		};
+
+		child.on("error", (error) => {
+			finish(() => reject(error));
+		});
+
+		child.on("exit", (exitCode, closeSignal) => {
+			launcherResult = resultFromLauncher(exitCode, closeSignal);
+			if (timedOut || aborted || exitCode !== 0) {
+				clearTimeout(timer);
+				finishWithResult();
+				return;
+			}
+			clearTimeout(timer);
+			pidDetectionDeadline = Date.now() + ZATHURA_PID_DETECTION_TIMEOUT_MS;
+		});
+
+		void pollForViewer();
+	});
+}
+
 function delay(ms: number): Promise<void> {
 	return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
@@ -490,15 +665,15 @@ function zathuraDbusServiceReady(pid: number): boolean | undefined {
 	return result.status === 0;
 }
 
-async function waitForZathuraDbusReady(pid: number, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+async function waitForZathuraDbusReady(pid: number, timeoutMs: number, signal?: AbortSignal): Promise<boolean | undefined> {
 	const deadline = Date.now() + Math.max(0, Math.min(timeoutMs, ZATHURA_DBUS_READY_TIMEOUT_MS));
 	while (!signal?.aborted && Date.now() < deadline) {
 		const ready = zathuraDbusServiceReady(pid);
-		if (ready === true) return;
-		if (ready === undefined) break;
+		if (ready === true) return true;
+		if (ready === undefined) return undefined;
 		await delay(ZATHURA_PID_POLL_MS);
 	}
-	await delay(ZATHURA_DBUS_FALLBACK_DELAY_MS);
+	return false;
 }
 
 async function waitForNewZathuraPid(
@@ -542,32 +717,32 @@ export async function openPdfInZathura(
 	if (options.reuseExisting && isAlreadyOpen(pdfFilePath)) return reusableExistingPids.size ? Math.max(...reusableExistingPids) : undefined;
 
 	const launch = async (beforePids: Set<number>): Promise<number | undefined> => {
-		let result: PdfOpenProcessResult;
+		let openResult: { result: PdfOpenProcessResult; pid?: number };
 		const args = options.synctexEditorCommand
 			? [`--synctex-editor-command=${options.synctexEditorCommand}`, "--fork", pdfFilePath]
 			: ["--fork", pdfFilePath];
 
 		try {
-			result = await runPdfOpenProcess(command, args, timeoutMs, signal);
+			openResult = await runPdfOpenProcessUntilViewer(command, args, pdfFilePath, beforePids, timeoutMs, signal);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			throw new Error(`Failed to start zathura: ${message}`);
 		}
 
+		const { result, pid } = openResult;
 		if (result.aborted) {
 			throw new Error("PDF open aborted");
 		}
 		if (result.timedOut) {
 			throw new Error(`zathura did not finish launching ${pdfFilePath} within ${timeoutMs / 1000}s`);
 		}
-		if (result.exitCode !== 0) {
+		if (result.exitCode !== 0 && pid === undefined) {
 			const status = result.exitCode ?? result.signal ?? "unknown";
 			const output = result.output.trim();
 			const details = output ? `\n${output}` : "";
 			throw new Error(`zathura failed to open ${pdfFilePath}: exited ${status}${details}`);
 		}
 
-		const pid = await waitForNewZathuraPid(pdfFilePath, beforePids, timeoutMs, signal);
 		if (options.requirePersistentViewer && pid === undefined) {
 			throw new Error(`zathura exited before a persistent viewer was available for ${pdfFilePath}. The viewer may have crashed while opening this PDF.`);
 		}

@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:net";
+import { createServer, type Server, type Socket } from "node:net";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
@@ -41,6 +41,8 @@ const DEFAULT_SYNCTEX_TMPDIR = resolve(tmpdir(), "codex-show-latex");
 const SOCKET_NAME_PREFIX = "pi-synctex-";
 const ZATHURA_INPUT_PLACEHOLDER = "%{input}";
 const ZATHURA_LINE_PLACEHOLDER = "%{line}";
+const SYNCTEX_CALLBACK_SOCKET_IDLE_TIMEOUT_MS = 5_000;
+const SYNCTEX_CALLBACK_CLOSE_TIMEOUT_MS = 1_000;
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -115,10 +117,41 @@ function requestEditorRender(ui: NonNullable<SynctexPasteTarget["ui"]>): void {
 	}
 }
 
+function logSynctexShutdownTimeout(message: string): void {
+	console.error(`[pdf-preview] ${message}`);
+}
+
+function waitForWithTimeout(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+	return new Promise((resolveWait) => {
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			resolveWait(false);
+		}, timeoutMs);
+		timer.unref?.();
+		promise.then(
+			() => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolveWait(true);
+			},
+			() => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolveWait(true);
+			},
+		);
+	});
+}
+
 export class SynctexCallbackServer {
 	private server: Server | undefined;
 	private target: SynctexPasteTarget | undefined;
 	private startPromise: Promise<void> | undefined;
+	private readonly sockets = new Set<Socket>();
 	private closed = false;
 	readonly socketPath: string;
 	readonly token: string;
@@ -166,7 +199,18 @@ export class SynctexCallbackServer {
 		this.target = undefined;
 		this.startPromise = undefined;
 		if (server) {
-			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+			server.unref();
+			const closePromise = new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+			for (const socket of this.sockets) {
+				socket.destroy();
+			}
+			if (!(await waitForWithTimeout(closePromise, SYNCTEX_CALLBACK_CLOSE_TIMEOUT_MS))) {
+				logSynctexShutdownTimeout(`SyncTeX callback server close timed out after ${SYNCTEX_CALLBACK_CLOSE_TIMEOUT_MS}ms; destroying ${this.sockets.size} remaining socket(s)`);
+				for (const socket of this.sockets) {
+					socket.destroy();
+					socket.unref();
+				}
+			}
 		}
 		try {
 			unlinkSync(this.socketPath);
@@ -177,8 +221,13 @@ export class SynctexCallbackServer {
 
 	private createServer(): Server {
 		return createServer((socket) => {
+			this.sockets.add(socket);
 			let body = "";
 			socket.setEncoding("utf8");
+			socket.setTimeout(SYNCTEX_CALLBACK_SOCKET_IDLE_TIMEOUT_MS, () => {
+				logSynctexShutdownTimeout(`SyncTeX callback socket timed out after ${SYNCTEX_CALLBACK_SOCKET_IDLE_TIMEOUT_MS}ms; destroying stale connection`);
+				socket.destroy();
+			});
 			socket.on("data", (chunk) => {
 				body += chunk;
 			});
@@ -187,6 +236,9 @@ export class SynctexCallbackServer {
 				socket.end(`${JSON.stringify(response)}\n`);
 			});
 			socket.on("error", () => undefined);
+			socket.on("close", () => {
+				this.sockets.delete(socket);
+			});
 		});
 	}
 

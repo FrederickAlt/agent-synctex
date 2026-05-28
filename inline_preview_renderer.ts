@@ -2,6 +2,7 @@ import type { Component } from "@mariozechner/pi-tui";
 import type { InlinePreviewArtifact } from "./inline_preview.ts";
 import { inlinePreviewPdfPathFromDetails, type InlinePreviewRenderState } from "./inline_preview_metadata.ts";
 import type { KittyPlaceholderImageRender, KittyPlaceholderRenderOptions } from "./kitty_placeholder_image.ts";
+import { TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY } from "./terminal_refresh_policy.ts";
 
 export interface InlinePreviewRenderComponent extends Component {
 	render(width: number): string[];
@@ -206,6 +207,43 @@ function fgFromTheme(theme: unknown, role: string, text: string): string {
 	return text;
 }
 
+interface StableTmuxKittyImageId {
+	imageId: number;
+	focusRefreshEpoch: number;
+}
+
+interface InlinePreviewRendererState {
+	__pdfPreviewTmuxKittyImageIds?: Record<string, StableTmuxKittyImageId | number>;
+	[TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY]?: number;
+}
+
+function previewImageIdKey(preview: InlinePreviewArtifact): string {
+	return [preview.pngPath, preview.fullPageWidthPx, preview.fullPageHeightPx, preview.widthPx, preview.heightPx].join(":");
+}
+
+function persistentStateFromContext(context: unknown): InlinePreviewRendererState | undefined {
+	if (typeof context !== "object" || context === null || !("state" in context)) return undefined;
+	const state = (context as { state?: unknown }).state;
+	if (typeof state !== "object" || state === null) return undefined;
+	return state as InlinePreviewRendererState;
+}
+
+function stableTmuxKittyImageId(context: unknown, preview: InlinePreviewArtifact, allocateImageId: () => number): number {
+	const state = persistentStateFromContext(context);
+	if (!state) return allocateImageId();
+
+	state.__pdfPreviewTmuxKittyImageIds ??= {};
+	const key = previewImageIdKey(preview);
+	const focusRefreshEpoch = typeof state[TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY] === "number" ? state[TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY] : 0;
+	const existing = state.__pdfPreviewTmuxKittyImageIds[key];
+	if (typeof existing === "number" && Number.isInteger(existing) && existing > 0 && focusRefreshEpoch === 0) return existing;
+	if (typeof existing === "object" && existing !== null && existing.focusRefreshEpoch === focusRefreshEpoch) return existing.imageId;
+
+	const allocated = allocateImageId();
+	state.__pdfPreviewTmuxKittyImageIds[key] = { imageId: allocated, focusRefreshEpoch };
+	return allocated;
+}
+
 export function createInlinePreviewRenderer(env: InlinePreviewRenderEnvironment): InlinePreviewRenderer {
 	const labelForPaths = (paths: string[]): string =>
 		paths.length === 1 ? `PNG: ${paths[0]}` : `PNGs:\n${paths.join("\n")}`;
@@ -278,7 +316,7 @@ export function createInlinePreviewRenderer(env: InlinePreviewRenderEnvironment)
 						diagnostics.fallbackReason = `missing-image:${preview.pngPath}`;
 						return { component: makeUnavailableFallback(), diagnostics };
 					}
-					const imageId = env.allocateImageId();
+					const imageId = stableTmuxKittyImageId(context, preview, env.allocateImageId);
 					diagnostics.imageIds.push(imageId);
 					container.addChild(
 						new TmuxKittyPlaceholderImageComponent("", base64, preview, imageId, env, cacheLog),

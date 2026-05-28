@@ -100,9 +100,42 @@ type LatexCompiler = (typeof LATEX_COMPILERS)[number];
 const REQUEST_TIMEOUT_DEFAULT_MS = 60_000;
 const STARTUP_TIMEOUT_DEFAULT_MS = 5_000;
 const STARTUP_TIMEOUT_MAX_MS = 120_000;
+const MCP_SHUTDOWN_TERM_TIMEOUT_MS = 1_000;
+const MCP_SHUTDOWN_KILL_TIMEOUT_MS = 1_000;
+const TMUX_COMMAND_TIMEOUT_MS = 1_000;
 
 function debugLog(..._parts: unknown[]): void {
 	// Debug logging is intentionally disabled; this extension has no environment-driven configuration.
+}
+
+function logShutdownTimeout(message: string): void {
+	console.error(`[pdf-preview] ${message}`);
+}
+
+function waitForVoidWithTimeout(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+	return new Promise((resolveWait) => {
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			resolveWait(false);
+		}, timeoutMs);
+		timer.unref?.();
+		promise.then(
+			() => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolveWait(true);
+			},
+			() => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolveWait(true);
+			},
+		);
+	});
 }
 
 function expandHomePath(path: string): string {
@@ -785,13 +818,32 @@ class ShowLatexMcpClient {
 		child.removeAllListeners("error");
 		child.removeAllListeners("close");
 
-		debugLog(`shutting down MCP helper pid=${child.pid}`);
-		child.kill("SIGTERM");
-		setTimeout(() => {
-			if (!child.killed) {
-				child.kill("SIGKILL");
+		const closePromise = new Promise<void>((resolveClose) => {
+			if (child.exitCode !== null || child.signalCode !== null) {
+				resolveClose();
+				return;
 			}
-		}, 200);
+			child.once("close", () => resolveClose());
+		});
+
+		debugLog(`shutting down MCP helper pid=${child.pid}`);
+		try {
+			child.stdin.end();
+		} catch {
+			// Ignore best-effort stdin shutdown failures.
+		}
+		child.kill("SIGTERM");
+		if (await waitForVoidWithTimeout(closePromise, MCP_SHUTDOWN_TERM_TIMEOUT_MS)) return;
+
+		logShutdownTimeout(`MCP helper pid=${child.pid ?? "unknown"} did not exit within ${MCP_SHUTDOWN_TERM_TIMEOUT_MS}ms after SIGTERM; sending SIGKILL`);
+		child.kill("SIGKILL");
+		if (await waitForVoidWithTimeout(closePromise, MCP_SHUTDOWN_KILL_TIMEOUT_MS)) return;
+
+		logShutdownTimeout(`MCP helper pid=${child.pid ?? "unknown"} did not exit within ${MCP_SHUTDOWN_KILL_TIMEOUT_MS}ms after SIGKILL; destroying stdio handles`);
+		child.stdin.destroy();
+		child.stdout.destroy();
+		child.stderr.destroy();
+		child.unref();
 	}
 
 	private async ensureStarted(): Promise<void> {
@@ -1164,6 +1216,7 @@ async function shutdownSynctexCallbacks(ctx?: ExtensionContext): Promise<void> {
 	}
 
 	const servers = [...synctexCallbackServers];
+	synctexCallbacksByContext.clear();
 	synctexCallbackServers.clear();
 	await Promise.all(servers.map((server) => server.close()));
 }
@@ -1489,12 +1542,19 @@ function resolvePositiveInteger(value: unknown, name: string): number {
 }
 
 function isTmuxKittyTerminal(): boolean {
-	return Boolean(process.env.TMUX) && (Boolean(process.env.KITTY_WINDOW_ID) || process.env.TERM_PROGRAM?.toLowerCase() === "kitty");
+	const termProgram = process.env.TERM_PROGRAM?.toLowerCase();
+	const term = process.env.TERM?.toLowerCase();
+	const insideTmux = Boolean(process.env.TMUX) || termProgram === "tmux" || Boolean(term?.startsWith("tmux")) || Boolean(term?.startsWith("screen"));
+	return insideTmux && (Boolean(process.env.KITTY_WINDOW_ID) || termProgram === "kitty");
 }
 
 function runTmux(args: string[]): void {
 	if (!process.env.TMUX) return;
-	spawnSync("tmux", args, { stdio: "ignore" });
+	const result = spawnSync("tmux", args, { stdio: "ignore", timeout: TMUX_COMMAND_TIMEOUT_MS });
+	const error = result.error as (Error & { code?: string }) | undefined;
+	if (error?.code === "ETIMEDOUT") {
+		logShutdownTimeout(`tmux ${args.join(" ")} timed out after ${TMUX_COMMAND_TIMEOUT_MS}ms`);
+	}
 }
 
 const inlinePreviewRenderer = createInlinePreviewRenderer({
@@ -1893,7 +1953,7 @@ export default function (pi: ExtensionAPI) {
 			pdfTrackersByContext.get(key)?.clear();
 			pdfTrackersByContext.delete(key);
 		}
-		await shutdownSynctexCallbacks(ctx);
+		await shutdownSynctexCallbacks();
 		await mcpClient.shutdown();
 	});
 }

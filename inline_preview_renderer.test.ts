@@ -14,6 +14,7 @@ import {
 	type InlinePreviewRenderComponent,
 	type InlinePreviewRenderEnvironment,
 } from "./inline_preview_renderer.ts";
+import { TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY } from "./terminal_refresh_policy.ts";
 
 function makeFakeContainer(): InlinePreviewRenderContainer & { children: InlinePreviewRenderComponent[] } {
 	const children: InlinePreviewRenderComponent[] = [];
@@ -154,6 +155,38 @@ test("tmux/kitty path renders through placeholder protocol and is oracle-valid",
 	const output = rendered.component.render(120).join("\n");
 	const oracle = new KittyPlaceholderOracle(output, { expectedImageIds: [14], requireImageSetup: true, requirePlaceholders: true });
 	assert.equal(oracle.isValid, true);
+});
+
+test("tmux/kitty image ids stay stable when pi rebuilds renderResult for the same tool", () => {
+	const stateMap = new Map<string, InlinePreviewRenderState>();
+	const detail = {
+		inline_previews: [mkArtifactMetadata(createPngPath("kitty-stable"))],
+		pdf: "/tmp/kitty-stable.pdf",
+	};
+	stateMap.set("state-stable", inlinePreviewRenderStateFromDetails(detail, () => undefined)!);
+
+	const renderer = mkRenderer({
+		isTmuxKittyTerminal: () => true,
+		readImageBase64: () => "c3RhYmxlLWtpdHR5",
+	}, stateMap);
+	const context = { toolCallId: "tool-kitty-stable", state: {} };
+
+	const first = runRenderer(renderer, "state-stable", detail, context);
+	const firstOutput = first.component.render(120).join("\n");
+	const second = runRenderer(renderer, "state-stable", detail, context);
+	const secondOutput = second.component.render(120).join("\n");
+
+	assert.deepEqual(second.diagnostics.imageIds, first.diagnostics.imageIds);
+	assert.equal(secondOutput, firstOutput);
+
+	(context.state as Record<string, unknown>)[TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY] = 1;
+	const focusRefresh = runRenderer(renderer, "state-stable", detail, context);
+	const focusRefreshOutput = focusRefresh.component.render(120).join("\n");
+	assert.notDeepEqual(focusRefresh.diagnostics.imageIds, first.diagnostics.imageIds);
+	assert.notEqual(focusRefreshOutput, firstOutput);
+
+	const oracle = new KittyPlaceholderOracle(focusRefreshOutput, { expectedImageIds: focusRefresh.diagnostics.imageIds, requireImageSetup: true, requirePlaceholders: true });
+	assert.equal(oracle.isValid, true, oracle.summary);
 });
 
 test("generic image capability branch renders inline image output", () => {

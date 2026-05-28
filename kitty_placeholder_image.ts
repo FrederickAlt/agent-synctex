@@ -1,3 +1,5 @@
+import type { TerminalRefreshInvalidationOptions } from "./terminal_refresh_policy.ts";
+
 export interface ImageDimensions {
 	widthPx: number;
 	heightPx: number;
@@ -26,7 +28,7 @@ export interface KittyPlaceholderImageRender {
 
 interface InvalidatorEntry {
 	key: string;
-	invalidate: () => void;
+	invalidate: (options?: TerminalRefreshInvalidationOptions) => void;
 	context: string;
 }
 
@@ -38,7 +40,7 @@ export class KittyPreviewInvalidationRegistry {
 		this.maxEntries = maxEntries;
 	}
 
-	remember(key: string, invalidate: () => void, context = ""): void {
+	remember(key: string, invalidate: (options?: TerminalRefreshInvalidationOptions) => void, context = ""): void {
 		this.invalidators.delete(key);
 		this.invalidators.set(key, { key, invalidate, context });
 		while (this.invalidators.size > this.maxEntries) {
@@ -48,8 +50,10 @@ export class KittyPreviewInvalidationRegistry {
 		}
 	}
 
-	refresh(): void {
-		for (const invalidate of [...this.invalidators.values()].map((entry) => entry.invalidate)) invalidate();
+	refresh(options?: TerminalRefreshInvalidationOptions): void {
+		const entries = [...this.invalidators.values()];
+		const selectedEntries = options?.onlyLatest ? entries.slice(-1) : entries;
+		for (const invalidate of selectedEntries.map((entry) => entry.invalidate)) invalidate(options);
 	}
 
 	clear(): void {
