@@ -24,17 +24,23 @@ export interface KittyPlaceholderImageRender {
 	rows: number;
 }
 
+interface InvalidatorEntry {
+	key: string;
+	invalidate: () => void;
+	context: string;
+}
+
 export class KittyPreviewInvalidationRegistry {
-	private readonly invalidators = new Map<string, () => void>();
+	private readonly invalidators = new Map<string, InvalidatorEntry>();
 	private readonly maxEntries: number;
 
 	constructor(maxEntries = 8) {
 		this.maxEntries = maxEntries;
 	}
 
-	remember(key: string, invalidate: () => void): void {
+	remember(key: string, invalidate: () => void, context = ""): void {
 		this.invalidators.delete(key);
-		this.invalidators.set(key, invalidate);
+		this.invalidators.set(key, { key, invalidate, context });
 		while (this.invalidators.size > this.maxEntries) {
 			const oldest = this.invalidators.keys().next().value;
 			if (oldest === undefined) break;
@@ -43,11 +49,15 @@ export class KittyPreviewInvalidationRegistry {
 	}
 
 	refresh(): void {
-		for (const invalidate of [...this.invalidators.values()]) invalidate();
+		for (const invalidate of [...this.invalidators.values()].map((entry) => entry.invalidate)) invalidate();
 	}
 
 	clear(): void {
 		this.invalidators.clear();
+	}
+
+	snapshot(): readonly { key: string; context: string }[] {
+		return [...this.invalidators.values()].map(({ key, context }) => ({ key, context }));
 	}
 
 	get size(): number {

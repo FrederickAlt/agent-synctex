@@ -1,9 +1,5 @@
 import { randomUUID } from "node:crypto";
 
-interface InvalidatorRegistration {
-	key: string;
-	context: string;
-}
 
 const FOCUS_IN_SEQUENCE = "\x1b[I";
 const FOCUS_OUT_SEQUENCE = "\x1b[O";
@@ -33,9 +29,10 @@ export interface TerminalRefreshPolicyContext {
 }
 
 export interface TerminalRefreshInvalidationRegistry {
-	remember(key: string, invalidate: () => void): void;
+	remember(key: string, invalidate: () => void, context?: string): void;
 	refresh(): void;
 	clear(): void;
+	snapshot(): readonly { key: string; context: string }[];
 }
 
 export type TerminalRefreshPolicyEvent =
@@ -89,7 +86,6 @@ export function createTerminalRefreshPolicy(options: TerminalRefreshPolicyOption
 
 	const timers = new Set<ReturnType<typeof setTimeout>>();
 	const cleanupTasks: Array<() => void> = [];
-	const invalidatorRegistrations = new Map<string, InvalidatorRegistration>();
 	let focusInputUnsubscribe: (() => void) | undefined;
 	let installed = false;
 	let focusReportingEnabled = false;
@@ -106,8 +102,9 @@ export function createTerminalRefreshPolicy(options: TerminalRefreshPolicyOption
 	};
 
 	const runInvalidators = () => {
-		const keys = [...invalidatorRegistrations.keys()];
-		const contextTypes = keys.map((key) => invalidatorRegistrations.get(key)?.context ?? "");
+		const activeInvalidators = invalidatorRegistry.snapshot();
+		const keys = activeInvalidators.map((entry) => entry.key);
+		const contextTypes = activeInvalidators.map((entry) => entry.context);
 		emit({ type: "invalidation_called", count: keys.length, keys, contextTypes });
 		invalidatorRegistry.refresh();
 	};
@@ -193,13 +190,11 @@ export function createTerminalRefreshPolicy(options: TerminalRefreshPolicyOption
 			const invalidate = candidate.invalidate as () => void;
 			const key = typeof candidate.toolCallId === "string" ? candidate.toolCallId : randomUUID();
 			const contextValue = describeInvalidatorContext(context);
-			invalidatorRegistrations.set(key, { key, context: contextValue });
 			eventLog?.({ type: "invalidation_registered", key, context: contextValue });
-			invalidatorRegistry.remember(key, () => invalidate());
+			invalidatorRegistry.remember(key, invalidate, contextValue);
 		},
 		clearInvalidators() {
 			invalidatorRegistry.clear();
-			invalidatorRegistrations.clear();
 		},
 	};
 }

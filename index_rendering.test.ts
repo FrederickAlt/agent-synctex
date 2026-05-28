@@ -1,5 +1,11 @@
-import test from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, delimiter, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import * as ts from "typescript";
 import {
 	createTerminalRefreshPolicy,
 	type TerminalInputResult,
@@ -7,6 +13,8 @@ import {
 	type TerminalRefreshPolicyEvent,
 	type TerminalRefreshInvalidationRegistry,
 } from "./terminal_refresh_policy.ts";
+import { KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
+import { INLINE_PREVIEW_DIR } from "./inline_preview.ts";
 
 const FOCUS_IN_SEQUENCE = "\x1b[I";
 const FOCUS_OUT_SEQUENCE = "\x1b[O";
@@ -77,21 +85,21 @@ class FakeAdapter implements TerminalRefreshPolicyAdapter {
 }
 
 class FakeInvalidationRegistry implements TerminalRefreshInvalidationRegistry {
-	public rememberCalls: Array<{ key: string; count: number }> = [];
+	public rememberCalls: Array<{ key: string; count: number; context: string }> = [];
 	public refreshCount = 0;
 	public invalidatorCalls: string[] = [];
 	public clearCount = 0;
-	private invalidators = new Map<string, () => void>();
+	private invalidators = new Map<string, { invalidate: () => void; context: string }>();
 
-	remember(key: string, invalidate: () => void): void {
-		this.rememberCalls.push({ key, count: this.invalidators.size + 1 });
-		this.invalidators.set(key, invalidate);
+	remember(key: string, invalidate: () => void, context = ""): void {
+		this.rememberCalls.push({ key, count: this.invalidators.size + 1, context });
+		this.invalidators.set(key, { invalidate, context });
 	}
 
 	refresh(): void {
 		this.refreshCount++;
-		for (const [key, invalidate] of this.invalidators) {
-			invalidate();
+		for (const [key, entry] of this.invalidators) {
+			entry.invalidate();
 			this.invalidatorCalls.push(key);
 		}
 	}
@@ -99,6 +107,10 @@ class FakeInvalidationRegistry implements TerminalRefreshInvalidationRegistry {
 	clear(): void {
 		this.invalidators.clear();
 		this.clearCount++;
+	}
+
+	snapshot(): readonly { key: string; context: string }[] {
+		return [...this.invalidators.entries()].map(([key, entry]) => ({ key, context: entry.context }));
 	}
 }
 
@@ -112,6 +124,229 @@ function getInputProcessedEvent(eventLog: TerminalRefreshPolicyEvent[]): Termina
 
 function getInvalidationCallEvent(eventLog: TerminalRefreshPolicyEvent[]): TerminalRefreshPolicyEvent | undefined {
 	return eventLog.find((entry) => entry.type === "invalidation_called");
+}
+
+const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
+
+export const setImageCapability = (images) => {
+	capabilityState = { ...capabilityState, images };
+};
+
+export const getCapabilities = () => ({ ...capabilityState });
+
+export const getCellDimensions = () => ({
+	widthPx: 10,
+	heightPx: 20,
+});
+
+export const getPngDimensions = () => ({
+	widthPx: 40,
+	heightPx: 20,
+});
+
+export const calculateImageRows = (imageDimensions, targetWidthCells, cellDimensions = getCellDimensions()) => {
+	const targetWidthPx = targetWidthCells * cellDimensions.widthPx;
+	const scale = targetWidthPx / imageDimensions.widthPx;
+	const scaledHeightPx = imageDimensions.heightPx * scale;
+	return Math.max(1, Math.ceil(scaledHeightPx / cellDimensions.heightPx));
+};
+
+export class Text {
+	#text;
+
+	constructor(text) {
+		this.#text = String(text);
+	}
+
+	setText(text) {
+		this.#text = String(text);
+	}
+
+	render() {
+		return [this.#text];
+	}
+
+	invalidate() {}
+}
+
+export class Container {
+	#children = [];
+
+	addChild(child) {
+		this.#children.push(child);
+	}
+
+	removeChild(child) {
+		const index = this.#children.indexOf(child);
+		if (index >= 0) this.#children.splice(index, 1);
+	}
+
+	render(width) {
+		return this.#children.flatMap((child) => child.render(width));
+	}
+
+	invalidate() {
+		for (const child of this.#children) {
+			child.invalidate();
+		}
+	}
+}
+
+export class Image {
+	#base64Data;
+	constructor(base64Data) {
+		this.#base64Data = String(base64Data);
+	}
+
+	render() {
+		return ["<image:" + this.#base64Data.slice(0, 12) + ">"];
+	}
+
+	invalidate() {}
+}
+`;
+
+const TYPEBOX_STUB_SOURCE = `export const Type = {
+	Optional: (schema) => ({ kind: "optional", schema }),
+	Union: (schemas) => ({ kind: "union", schemas }),
+	Literal: (value) => ({ kind: "literal", value }),
+	Object: (properties) => ({ kind: "object", properties }),
+	String: (options) => ({ kind: "string", options }),
+	Number: (options) => ({ kind: "number", options }),
+	Boolean: (options) => ({ kind: "boolean", options }),
+};
+`;
+
+let runtimeModulesInstalled = false;
+let runtimeModulesRoot: string | undefined;
+let runtimeModulesPath = process.env.NODE_PATH;
+
+const COMPILED_INDEX_MODULE_PATH = resolve(process.cwd(), ".show-latex-index-test.mjs");
+
+type CompiledShowLatexApi = {
+	registerTool: (tool: { name: string; [key: string]: unknown }) => void;
+	registerCommand: () => void;
+	on: () => void;
+};
+
+type CompiledShowLatexModule = {
+	default: (api: CompiledShowLatexApi) => void;
+};
+
+let compiledIndexModule: Promise<CompiledShowLatexModule> | undefined;
+
+function cleanupRuntimeStubs(): void {
+	if (!runtimeModulesInstalled) return;
+
+	if (runtimeModulesRoot) {
+		rmSync(runtimeModulesRoot, { recursive: true, force: true });
+	}
+	if (runtimeModulesPath === undefined) {
+		delete process.env.NODE_PATH;
+	} else {
+		process.env.NODE_PATH = runtimeModulesPath;
+	}
+	rmSync(COMPILED_INDEX_MODULE_PATH, { force: true });
+
+	runtimeModulesInstalled = false;
+	runtimeModulesRoot = undefined;
+	compiledIndexModule = undefined;
+}
+
+after(() => {
+	cleanupRuntimeStubs();
+});
+
+function ensureRuntimeStubsInstalled(): void {
+	if (runtimeModulesInstalled) return;
+
+	runtimeModulesRoot = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-test-"));
+	const nodeModulesRoot = resolve(runtimeModulesRoot, "node_modules");
+	const piTuiRoot = resolve(nodeModulesRoot, "@mariozechner", "pi-tui");
+	const typeboxRoot = resolve(nodeModulesRoot, "typebox");
+
+	mkdirSync(nodeModulesRoot, { recursive: true });
+	mkdirSync(piTuiRoot, { recursive: true });
+	mkdirSync(typeboxRoot, { recursive: true });
+
+	writeFileSync(
+		resolve(piTuiRoot, "package.json"),
+		JSON.stringify({ name: "@mariozechner/pi-tui", type: "module", main: "./index.js" }),
+	);
+	writeFileSync(resolve(piTuiRoot, "index.js"), PI_TUI_STUB_SOURCE);
+	writeFileSync(
+		resolve(typeboxRoot, "package.json"),
+		JSON.stringify({ name: "typebox", type: "module", main: "./index.js" }),
+	);
+	writeFileSync(resolve(typeboxRoot, "index.js"), TYPEBOX_STUB_SOURCE);
+
+	process.env.NODE_PATH = runtimeModulesRoot + (runtimeModulesPath ? `${delimiter}${runtimeModulesPath}` : "");
+
+	runtimeModulesInstalled = true;
+}
+
+async function loadCompiledShowLatexModule(): Promise<CompiledShowLatexModule> {
+	ensureRuntimeStubsInstalled();
+	if (!compiledIndexModule) {
+		const source = readFileSync(resolve(process.cwd(), "index.ts"), "utf8");
+		const transpiled = ts.transpileModule(source, {
+			compilerOptions: {
+				module: ts.ModuleKind.ESNext,
+				target: ts.ScriptTarget.ES2024,
+				jsx: ts.JsxEmit.Preserve,
+			},
+			fileName: "index.ts",
+		});
+
+		mkdirSync(dirname(COMPILED_INDEX_MODULE_PATH), { recursive: true });
+		writeFileSync(COMPILED_INDEX_MODULE_PATH, transpiled.outputText);
+		compiledIndexModule = import(pathToFileURL(COMPILED_INDEX_MODULE_PATH).href);
+	}
+
+	return compiledIndexModule;
+}
+
+async function captureShowLatexTool(): Promise<{ renderResult: Function }> {
+	const extensionModule = await loadCompiledShowLatexModule();
+
+	let capturedTool: { renderResult: Function } | undefined;
+	extensionModule.default({
+		registerTool(tool: { name: string; [key: string]: unknown }) {
+			if (tool.name === "show_latex") {
+				capturedTool = tool as unknown as { renderResult: Function };
+			}
+		},
+		registerCommand() {},
+		on() {},
+	});
+
+	if (!capturedTool) {
+		throw new Error("show_latex tool not registered by extension module");
+	}
+
+	return capturedTool;
+}
+
+function createTemporaryPngFile(label: string): string {
+	mkdirSync(INLINE_PREVIEW_DIR, { recursive: true });
+	const safeLabel = label.trim() ? label : randomUUID();
+	const pngPath = resolve(INLINE_PREVIEW_DIR, `${safeLabel}.png`);
+	writeFileSync(pngPath, `fake-png-${safeLabel}`);
+	return pngPath;
+}
+
+function inlinePreviewArtifactMetadata(pngPath: string) {
+	return {
+		pngPath,
+		fullPageWidthPx: 80,
+		fullPageHeightPx: 40,
+		widthPx: 40,
+		heightPx: 20,
+	};
+}
+
+function flattenRenderedComponent(component: { render: (width: number) => string[] }): string[] {
+	return component.render(90);
 }
 
 test("focus-in scheduling triggers delayed invalidations and preserves non-focus input", async () => {
@@ -315,6 +550,84 @@ test("invalidation registration logs key context metadata", async () => {
 	assert.equal(invalidationCalled?.type, "invalidation_called");
 	assert.equal((invalidationCalled as { type: "invalidation_called"; count: number }).count, 1);
 	assert.deepEqual((invalidationCalled as { type: "invalidation_called"; keys: string[] }).keys, ["tool-inline"]);
+
+	policy.cleanup();
+});
+
+test("show_latex renderResult chooses tmux/kitty rendering before generic capability fallback", async () => {
+	const previousEnv = {
+		TMUX: process.env.TMUX,
+		KITTY_WINDOW_ID: process.env.KITTY_WINDOW_ID,
+		TERM_PROGRAM: process.env.TERM_PROGRAM,
+	};
+	const tool = await captureShowLatexTool();
+	process.env.TMUX = "1";
+	process.env.KITTY_WINDOW_ID = "tmux";
+	process.env.TERM_PROGRAM = "kitty";
+
+	try {
+		const pngPaths = [createTemporaryPngFile("tmux-preview-1"), createTemporaryPngFile("tmux-preview-2")];
+		const toolResult = {
+			details: {
+				inline_previews: pngPaths.map((pngPath) => inlinePreviewArtifactMetadata(pngPath)),
+				pdf: "/tmp/fake-preview.pdf",
+			},
+		};
+		const component = tool.renderResult(toolResult, undefined, {}, {
+			toolCallId: "tmux-preview",
+			invalidate: () => {},
+		});
+		const lines = flattenRenderedComponent(component);
+		const output = lines.join("\n");
+
+		assert.equal(lines.filter((line) => line.includes("\u2713 LaTeX preview")).length, 1);
+		assert.equal(output.includes("Inline image display is not supported by this terminal."), false);
+		assert.match(output, /\u001bPtmux;/);
+	} finally {
+		if (previousEnv.TMUX === undefined) {
+			delete process.env.TMUX;
+		} else {
+			process.env.TMUX = previousEnv.TMUX;
+		}
+		if (previousEnv.KITTY_WINDOW_ID === undefined) {
+			delete process.env.KITTY_WINDOW_ID;
+		} else {
+			process.env.KITTY_WINDOW_ID = previousEnv.KITTY_WINDOW_ID;
+		}
+		if (previousEnv.TERM_PROGRAM === undefined) {
+			delete process.env.TERM_PROGRAM;
+		} else {
+			process.env.TERM_PROGRAM = previousEnv.TERM_PROGRAM;
+		}
+	}
+});
+
+test("invalidation diagnostics follow capped registry key set after overflow", async () => {
+	const adapter = new FakeAdapter(true);
+	const registry = new KittyPreviewInvalidationRegistry(2);
+	const eventLog: TerminalRefreshPolicyEvent[] = [];
+	const policy = createTerminalRefreshPolicy({
+		adapter,
+		invalidatorRegistry: registry,
+		eventLog: (event) => eventLog.push(event),
+	});
+
+	policy.install({ hasUI: false });
+	policy.rememberInvalidator({ toolCallId: "tool-a", invalidate: () => {} });
+	policy.rememberInvalidator({ toolCallId: "tool-b", invalidate: () => {} });
+	policy.rememberInvalidator({ toolCallId: "tool-c", invalidate: () => {} });
+
+	adapter.signalBus.emit("SIGUSR1");
+	await sleep(0);
+
+	const invalidationCalled = getInvalidationCallEvent(eventLog);
+	assert.equal(invalidationCalled?.type, "invalidation_called");
+	const payload = invalidationCalled as { type: "invalidation_called"; count: number; keys: string[]; contextTypes: string[] };
+	const expectedKeys = registry.snapshot().map((entry) => entry.key);
+	assert.deepEqual(payload.keys, expectedKeys);
+	assert.equal(payload.count, expectedKeys.length);
+	assert.equal(payload.count, registry.size);
+	assert.equal(registry.size, 2);
 
 	policy.cleanup();
 });
