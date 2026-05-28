@@ -55,9 +55,9 @@ export class KittyPreviewInvalidationRegistry {
 	}
 }
 
-const KITTY_PLACEHOLDER = "\u{10EEEE}";
-const KITTY_CHUNK_SIZE = 4096;
-const ROW_COLUMN_DIACRITICS = [
+export const KITTY_PLACEHOLDER = "\u{10EEEE}";
+export const KITTY_CHUNK_SIZE = 4096;
+export const ROW_COLUMN_DIACRITICS = [
 	0x0305, 0x030d, 0x030e, 0x0310, 0x0312, 0x033d, 0x033e, 0x033f,
 	0x0346, 0x034a, 0x034b, 0x034c, 0x0350, 0x0351, 0x0352, 0x0357,
 	0x035b, 0x0363, 0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369,
