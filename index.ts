@@ -16,6 +16,7 @@ import {
 	type InlinePreviewArtifact,
 } from "./inline_preview.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
+import { createTerminalRefreshPolicy } from "./terminal_refresh_policy.ts";
 import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
 import { readSourceLine, SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
@@ -1171,6 +1172,20 @@ const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
 const pdfTrackersByContext = new Map<string, PdfTracker>();
 const tmuxKittyPreviewInvalidationRegistry = new KittyPreviewInvalidationRegistry();
+const terminalRefreshPolicy = createTerminalRefreshPolicy({
+	adapter: {
+		isTmuxKittyTerminal: isTmuxKittyTerminal,
+		runTmux: runTmux,
+		writeOutput: (sequence: string) => {
+			process.stdout.write(sequence);
+		},
+		onSignal: (signal, handler) => {
+			process.on(signal, handler);
+			return () => process.off(signal, handler);
+		},
+	},
+	invalidatorRegistry: tmuxKittyPreviewInvalidationRegistry,
+});
 interface InlinePreviewArtifactMetadata {
 	pngPath: string;
 	fullPageWidthPx: number;
@@ -1188,8 +1203,6 @@ const inlinePreviewRenderStates = new Map<string, InlinePreviewRenderState>();
 const MAX_INLINE_PREVIEW_RENDER_STATES = 8;
 const INLINE_PREVIEW_MAX_IMAGE_SIZE_BYTES = 25 * 1024 * 1024;
 const synctexCallbacksByContext = new Map<string, SynctexCallbackServer>();
-let cleanupTmuxKittyRefreshHooks: (() => void) | undefined;
-let cleanupTerminalFocusRefresh: (() => void) | undefined;
 const synctexCallbackServers = new Set<SynctexCallbackServer>();
 const contextUiIds = new WeakMap<object, string>();
 let nextContextUiId = 1;
@@ -1712,102 +1725,9 @@ function isTmuxKittyTerminal(): boolean {
 	return Boolean(process.env.TMUX) && (Boolean(process.env.KITTY_WINDOW_ID) || process.env.TERM_PROGRAM?.toLowerCase() === "kitty");
 }
 
-function tmuxHookName(name: string): string {
-	return `${name}[pi-pdf-preview-${process.pid}]`;
-}
-
 function runTmux(args: string[]): void {
 	if (!process.env.TMUX) return;
 	spawnSync("tmux", args, { stdio: "ignore" });
-}
-
-function refreshTmuxKittyPreviews(): void {
-	if (!isTmuxKittyTerminal()) return;
-	tmuxKittyPreviewInvalidationRegistry.refresh();
-}
-
-function installTmuxKittyRefreshHooks(): () => void {
-	if (!isTmuxKittyTerminal()) return () => {};
-
-	const onRefreshSignal = () => refreshTmuxKittyPreviews();
-	process.on("SIGWINCH", onRefreshSignal);
-	process.on("SIGUSR1", onRefreshSignal);
-
-	const signalCommand = `run-shell -b "kill -USR1 ${process.pid} 2>/dev/null || true"`;
-	runTmux(["set-hook", "-p", tmuxHookName("pane-focus-in"), signalCommand]);
-	runTmux(["set-hook", "-p", tmuxHookName("window-layout-changed"), signalCommand]);
-
-	return () => {
-		process.off("SIGWINCH", onRefreshSignal);
-		process.off("SIGUSR1", onRefreshSignal);
-		runTmux(["set-hook", "-up", tmuxHookName("pane-focus-in")]);
-		runTmux(["set-hook", "-up", tmuxHookName("window-layout-changed")]);
-	};
-}
-
-const TERMINAL_FOCUS_IN = "\x1b[I";
-const TERMINAL_FOCUS_OUT = "\x1b[O";
-
-function stripAll(text: string, search: string): string {
-	return text.split(search).join("");
-}
-
-function installTerminalFocusRefresh(ctx: ExtensionContext): () => void {
-	if (!ctx.hasUI) return () => {};
-	const ui = ctx.ui as ExtensionContext["ui"] & {
-		onTerminalInput?: (handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void;
-	};
-	if (typeof ui.onTerminalInput !== "function") {
-		ctx.ui.notify("pdf-preview: terminal focus refresh unavailable; ctx.ui.onTerminalInput is missing", "warning");
-		return () => {};
-	}
-
-	// Request terminal focus reporting. With `set -g focus-events on`, tmux forwards
-	// these as raw input sequences when the pane/window gains or loses focus.
-	process.stdout.write("\x1b[?1004h");
-
-	const timers = new Set<ReturnType<typeof setTimeout>>();
-	const scheduleRefresh = (delayMs: number) => {
-		const timer = setTimeout(() => {
-			timers.delete(timer);
-			refreshTmuxKittyPreviews();
-		}, delayMs);
-		timers.add(timer);
-	};
-
-	const unsubscribe = ui.onTerminalInput((data) => {
-		const sawFocusIn = data.includes(TERMINAL_FOCUS_IN);
-		const sawFocusOut = data.includes(TERMINAL_FOCUS_OUT);
-		if (!sawFocusIn && !sawFocusOut) return undefined;
-
-		if (sawFocusIn) {
-			// Give tmux/Kitty a moment to finish making the pane visible, then
-			// ask Pi to redraw the latest placeholder rows. This re-emits the
-			// Kitty setup command together with the placeholder text instead of
-			// sending a raw graphics command that can blank existing placeholders.
-			scheduleRefresh(50);
-			scheduleRefresh(200);
-		}
-
-		const remaining = stripAll(stripAll(data, TERMINAL_FOCUS_IN), TERMINAL_FOCUS_OUT);
-		return remaining.length > 0 ? { data: remaining } : { consume: true };
-	});
-
-	return () => {
-		unsubscribe();
-		for (const timer of timers) clearTimeout(timer);
-		timers.clear();
-		process.stdout.write("\x1b[?1004l");
-	};
-}
-
-function rememberTmuxKittyPreviewInvalidator(context: unknown): void {
-	if (!isTmuxKittyTerminal() || typeof context !== "object" || context === null) return;
-	const candidate = context as { toolCallId?: unknown; invalidate?: unknown };
-	if (typeof candidate.invalidate !== "function") return;
-	const invalidate = candidate.invalidate;
-	const key = typeof candidate.toolCallId === "string" ? candidate.toolCallId : randomUUID();
-	tmuxKittyPreviewInvalidationRegistry.remember(key, () => invalidate());
 }
 
 class InlineLatexPreviewImage implements Component {
@@ -1941,7 +1861,7 @@ function renderInlineLatexPreview(result: { content?: Array<{ type?: unknown; te
 	};
 
 	if (isTmuxKittyTerminal()) {
-		rememberTmuxKittyPreviewInvalidator(context);
+		terminalRefreshPolicy.rememberInvalidator(context);
 		for (const preview of validatedPreviews) {
 			const base64 = readImageData(preview);
 			if (base64 === null) {
@@ -1982,10 +1902,8 @@ export default function (pi: ExtensionAPI) {
 	initializeLatexPreambleFile();
 
 	pi.on("session_start", (_event, ctx) => {
-		cleanupTmuxKittyRefreshHooks?.();
-		cleanupTmuxKittyRefreshHooks = installTmuxKittyRefreshHooks();
-		cleanupTerminalFocusRefresh?.();
-		cleanupTerminalFocusRefresh = installTerminalFocusRefresh(ctx);
+		terminalRefreshPolicy.cleanup();
+		terminalRefreshPolicy.install({ hasUI: ctx.hasUI, ui: ctx.ui });
 
 		void rotateSynctexCallbacks(ctx).catch((error) => {
 			if (ctx.hasUI) {
@@ -2320,11 +2238,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		cleanupTmuxKittyRefreshHooks?.();
-		cleanupTmuxKittyRefreshHooks = undefined;
-		cleanupTerminalFocusRefresh?.();
-		cleanupTerminalFocusRefresh = undefined;
-		tmuxKittyPreviewInvalidationRegistry.clear();
+		terminalRefreshPolicy.cleanup();
+		terminalRefreshPolicy.clearInvalidators();
 		if (ctx) {
 			const key = contextSessionKey(ctx);
 			pdfTrackersByContext.get(key)?.clear();

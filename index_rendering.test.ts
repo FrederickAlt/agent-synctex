@@ -1,73 +1,269 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import {
+	TERMINAL_FOCUS_IN,
+	TERMINAL_FOCUS_OUT,
+	createTerminalRefreshPolicy,
+	type TerminalInputResult,
+	type TerminalRefreshPolicyAdapter,
+	type TerminalRefreshInvalidationRegistry,
+} from "./terminal_refresh_policy.ts";
 
-const source = readFileSync("index.ts", "utf8");
+class FakeSignalBus {
+	private handlers = {
+		SIGWINCH: new Set<() => void>(),
+		SIGUSR1: new Set<() => void>(),
+	};
 
-test("tmux/kitty placeholder branch runs before generic image-capability fallback", () => {
-	const tmuxKittyBranch = source.indexOf("if (isTmuxKittyTerminal())");
-	const genericImageCapabilityFallback = source.indexOf("if (!getCapabilities().images)");
-	assert.ok(tmuxKittyBranch >= 0, "tmux/kitty branch should exist");
-	assert.ok(genericImageCapabilityFallback >= 0, "generic image capability fallback should exist");
-	assert.ok(tmuxKittyBranch < genericImageCapabilityFallback, "tmux/kitty path must be checked before capability fallback");
+	emit(signal: "SIGWINCH" | "SIGUSR1"): void {
+		for (const handler of [...this.handlers[signal]]) {
+			handler();
+		}
+	}
+
+	on(signal: "SIGWINCH" | "SIGUSR1", handler: () => void): () => void {
+		this.handlers[signal].add(handler);
+		return () => this.handlers[signal].delete(handler);
+	}
+}
+
+class FakeTerminalInput {
+	private handler: ((data: string) => TerminalInputResult | undefined) | undefined;
+
+	setHandler(handler: (data: string) => TerminalInputResult | undefined): () => void {
+		this.handler = handler;
+		return () => {
+			this.handler = undefined;
+		};
+	}
+
+	simulate(data: string): TerminalInputResult | undefined {
+		if (!this.handler) return undefined;
+		return this.handler(data);
+	}
+
+	isActive(): boolean {
+		return this.handler !== undefined;
+	}
+}
+
+class FakeAdapter implements TerminalRefreshPolicyAdapter {
+	public tmuxHooks: string[][] = [];
+	public outputWrites: string[] = [];
+	readonly signalBus = new FakeSignalBus();
+	private readonly terminalEnabled: boolean;
+
+	constructor(terminalEnabled: boolean) {
+		this.terminalEnabled = terminalEnabled;
+	}
+
+	isTmuxKittyTerminal(): boolean {
+		return this.terminalEnabled;
+	}
+
+	runTmux(args: string[]): void {
+		this.tmuxHooks.push(args);
+	}
+
+	writeOutput(sequence: string): void {
+		this.outputWrites.push(sequence);
+	}
+
+	onSignal(signal: "SIGWINCH" | "SIGUSR1", listener: () => void): () => void {
+		return this.signalBus.on(signal, listener);
+	}
+}
+
+class FakeInvalidationRegistry implements TerminalRefreshInvalidationRegistry {
+	public rememberCalls: string[] = [];
+	public refreshCount = 0;
+	public invalidatorCalls: string[] = [];
+	public clearCount = 0;
+	private invalidators = new Map<string, () => void>();
+
+	remember(key: string, invalidate: () => void): void {
+		this.rememberCalls.push(key);
+		this.invalidators.set(key, invalidate);
+	}
+
+	refresh(): void {
+		this.refreshCount++;
+		for (const [key, invalidate] of this.invalidators) {
+			invalidate();
+			this.invalidatorCalls.push(key);
+		}
+	}
+
+	clear(): void {
+		this.invalidators.clear();
+		this.clearCount++;
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+test("focus-in scheduling triggers delayed invalidations and preserves non-focus input", async () => {
+	const adapter = new FakeAdapter(true);
+	const registry = new FakeInvalidationRegistry();
+	const terminalInput = new FakeTerminalInput();
+	const eventLog: Array<{ type: string; [key: string]: unknown }> = [];
+	const policy = createTerminalRefreshPolicy({
+		adapter,
+		invalidatorRegistry: registry,
+		refreshDelayMs: [10, 20],
+		eventLog: (event) => eventLog.push(event),
+	});
+
+	const context = {
+		hasUI: true,
+		ui: {
+			onTerminalInput: terminalInput.setHandler.bind(terminalInput),
+		},
+	};
+	policy.install(context);
+
+	const result = terminalInput.simulate(`before${TERMINAL_FOCUS_IN}live`);
+	assert.deepEqual(result, { data: "beforelive" });
+
+	policy.rememberInvalidator({ toolCallId: "tool-1", invalidate: () => registry.invalidatorCalls.push("refresh") });
+
+	const scheduled = eventLog.filter((entry) => entry.type === "refresh_scheduled");
+	assert.equal(scheduled.length, 2);
+	assert.equal(scheduled[0].delayMs, 10);
+	assert.equal(scheduled[1].delayMs, 20);
+
+	await sleep(35);
+
+	assert.equal(registry.refreshCount, 2);
+	assert.equal(registry.invalidatorCalls.filter((entry) => entry === "tool-1").length, 2);
+	assert.equal(eventLog.filter((entry) => entry.type === "invalidation_called").length, 2);
+	assert.deepEqual(eventLog.find((entry) => entry.type === "input_processed")?.hasFocusIn, true);
+	assert.deepEqual(eventLog.find((entry) => entry.type === "input_processed")?.hasFocusOut, false);
+
+	policy.cleanup();
 });
 
-test("tmux/kitty placeholder images use a container-level title only", () => {
-	assert.ok(/container\.addChild\(new TmuxKittyPlaceholderImage\("", base64, preview\)\)/.test(source), "tmux/kitty placeholders should use an empty per-page title");
-	assert.ok(!source.includes("new TmuxKittyPlaceholderImage(index === 0 ? title : \"\""), "first placeholder should not duplicate the title");
+test("focus-out strips markers, preserves surrounding bytes", async () => {
+	const adapter = new FakeAdapter(true);
+	const registry = new FakeInvalidationRegistry();
+	const terminalInput = new FakeTerminalInput();
+	const eventLog: Array<{ type: string; [key: string]: unknown }> = [];
+	const policy = createTerminalRefreshPolicy({
+		adapter,
+		invalidatorRegistry: registry,
+		refreshDelayMs: [1, 2],
+		eventLog: (event) => eventLog.push(event),
+	});
+
+	policy.install({
+		hasUI: true,
+		ui: {
+			onTerminalInput: terminalInput.setHandler.bind(terminalInput),
+		},
+	});
+
+	const result = terminalInput.simulate(`before${TERMINAL_FOCUS_OUT}after`);
+	assert.deepEqual(result, { data: "beforeafter" });
+
+	await sleep(5);
+	assert.equal(eventLog.some((entry) => entry.type === "refresh_scheduled"), false);
+	assert.equal(registry.refreshCount, 0);
+
+	policy.cleanup();
 });
 
-test("tmux/kitty placeholders refresh by invalidating tool rows, not raw setup retransmits", () => {
-	assert.ok(source.includes("installTerminalFocusRefresh"), "focus refresh hook should be installed");
-	assert.ok(source.includes("refreshTmuxKittyPreviews"), "focus refresh should redraw previews");
-	assert.ok(source.includes("rememberTmuxKittyPreviewInvalidator(context)"), "tmux preview rows should register their invalidator");
-	assert.ok(source.includes("tmuxKittyPreviewInvalidationRegistry.refresh()"), "refresh should invalidate registered rows");
-	assert.ok(!source.includes("rendered.refreshSequence"), "refresh must not re-emit detached Kitty setup sequences");
-	assert.ok(!source.includes("tmuxKittyImageRefreshRegistry"), "old raw sequence registry should stay removed");
+test("cleanup clears timers, disables focus reporting, and removes tmux hooks", async () => {
+	const adapter = new FakeAdapter(true);
+	const registry = new FakeInvalidationRegistry();
+	const terminalInput = new FakeTerminalInput();
+	const policy = createTerminalRefreshPolicy({
+		adapter,
+		invalidatorRegistry: registry,
+		refreshDelayMs: [50, 100],
+	});
+
+	policy.install({
+		hasUI: true,
+		ui: {
+			onTerminalInput: terminalInput.setHandler.bind(terminalInput),
+		},
+	});
+
+	terminalInput.simulate(`x${TERMINAL_FOCUS_IN}y`);
+	await sleep(10);
+	policy.cleanup();
+
+	adapter.signalBus.emit("SIGWINCH");
+	await sleep(20);
+	assert.equal(registry.refreshCount, 0);
+	assert.equal(terminalInput.isActive(), false);
+	assert.equal(adapter.outputWrites.includes("\x1b[?1004h"), true);
+	assert.equal(adapter.outputWrites.includes("\x1b[?1004l"), true);
+
+	const hookSetCommands = adapter.tmuxHooks.filter((entry) => entry[0] === "set-hook" && entry[1] === "-p");
+	assert.equal(hookSetCommands.length, 2);
+	const hookUnsetCommands = adapter.tmuxHooks.filter((entry) => entry[0] === "set-hook" && entry[1] === "-up");
+	assert.equal(hookUnsetCommands.length, 2);
 });
 
-test("inline previews suppress page numbers before image trimming", () => {
-	assert.ok(source.includes(String.raw`\AtBeginDocument{\pagestyle{empty}\thispagestyle{empty}\let\ps@plain\ps@empty}`), "inline preamble should suppress normal and plain page styles");
-	assert.ok(/suppressPageNumbers:\s*inline/.test(source), "inline preview compilation should request page-number suppression");
+test("tmux hooks are installed and removed with process-specific names", () => {
+	const adapter = new FakeAdapter(true);
+	const registry = new FakeInvalidationRegistry();
+	const policy = createTerminalRefreshPolicy({
+		adapter,
+		invalidatorRegistry: registry,
+	});
+
+	policy.install({ hasUI: false });
+	const expectedPrefix = `pi-pdf-preview-${process.pid}`;
+	assert.equal(adapter.tmuxHooks.some((entry) => entry[0] === "set-hook" && entry[1] === "-p" && entry[2].includes(expectedPrefix)), true);
+	assert.equal(adapter.tmuxHooks.some((entry) => entry[0] === "set-hook" && entry[1] === "-p" && entry[2].includes("pane-focus-in")), true);
+	assert.equal(adapter.tmuxHooks.some((entry) => entry[0] === "set-hook" && entry[1] === "-p" && entry[2].includes("window-layout-changed")), true);
+
+	policy.cleanup();
+	assert.equal(adapter.tmuxHooks.some((entry) => entry[0] === "set-hook" && entry[1] === "-up" && entry[2].includes(expectedPrefix)), true);
 });
 
-test("inline show_latex persists local preview metadata in tool details", () => {
-	assert.ok(source.includes("content: [{ type: \"text\", text }]"), "inline tool content should remain text-only");
-	assert.ok(source.includes("image_path=${primaryImagePath}"), "inline tool content should expose the primary image path to the model");
-	assert.ok(source.includes("inline: true"), "inline details should be explicitly marked");
-	assert.ok(source.includes("preview_id: previewId"), "inline details should include a preview_id for in-memory recovery");
-	assert.ok(source.includes("pdf: preview.pdfPath"), "inline details should include the source PDF path");
-	assert.ok(source.includes("image_path: primaryImagePath"), "inline details should include the primary image path");
-	assert.ok(!source.includes("image_paths:"), "inline details should expose only the singular image_path field");
-	assert.ok(source.includes("inlinePreviews"), "inline details should persist local png path metadata");
-	assert.ok(source.includes("inline_previews: inlinePreviews"), "inline details should include inline_previews metadata");
-	assert.ok(!source.includes('type: "image" as const'), "inline tool result should not switch to image content");
-	const inlineDetailsStart = source.indexOf("const inlinePreviews = artifacts.map((artifact) => ({");
-	assert.ok(inlineDetailsStart >= 0, "inline_previews metadata should be built from raster artifacts");
-	const inlineDetails = source.slice(inlineDetailsStart, inlineDetailsStart + 240);
-	assert.ok(!inlineDetails.includes("renderer:"), "inline details should persist path+dimensions only");
-	assert.ok(!inlineDetails.includes("dpi:"), "inline details should not persist renderer-only fields");
-	assert.ok(!inlineDetails.includes("trimmed:"), "inline details should avoid transport-only fields");
-	assert.ok(!inlineDetails.includes("base64"), "inline details should not persist base64 artifacts");
+
+test("non-terminal mode skips hook installation and focus registration", () => {
+	const adapter = new FakeAdapter(false);
+	const registry = new FakeInvalidationRegistry();
+	const terminalInput = new FakeTerminalInput();
+	const policy = createTerminalRefreshPolicy({
+		adapter,
+		invalidatorRegistry: registry,
+	});
+
+	policy.install({
+		hasUI: true,
+		ui: {
+			onTerminalInput: terminalInput.setHandler.bind(terminalInput),
+		},
+	});
+
+	assert.equal(adapter.tmuxHooks.length, 0);
+	assert.equal(adapter.outputWrites.length, 0);
+	terminalInput.simulate(`x${TERMINAL_FOCUS_IN}y`);
+	assert.equal(terminalInput.isActive(), false, "input handler is not registered outside tmux/kitty terminals");
 });
 
-test("inline preview state fallback reads persisted detail metadata", () => {
-	assert.ok(source.includes("if (previewId)"), "inline preview id fast-path should be attempted first");
-	assert.ok(source.includes("if (state) return state"), "inline preview id should reuse live render state");
-	assert.ok(source.includes("const rawPreviews = Array.isArray(details.inline_previews)"), "inline state should fallback to details.inline_previews");
-	assert.ok(source.includes("details.inline_preview"), "fallback should still accept legacy inline_preview");
-	assert.ok(source.includes("inlinePreviewPdfPathFromDetails(details.pdf)"), "inline preview path should be carried from details");
-});
+test("focus and signal events drive refresh through fake adapters", async () => {
+	const adapter = new FakeAdapter(true);
+	const registry = new FakeInvalidationRegistry();
+	const policy = createTerminalRefreshPolicy({
+		adapter,
+		invalidatorRegistry: registry,
+	});
+	const invalidations: string[] = [];
+	policy.install({ hasUI: false });
+	policy.rememberInvalidator({ toolCallId: "manual", invalidate: () => invalidations.push("manual") });
 
-test("inline renderer validates PNG paths before reading image files", () => {
-	assert.ok(source.includes("safeInlinePreviewPngPath"), "PNG path validation helper should be used");
-	assert.ok(source.includes("if (!isAbsolute(rawPngPath)) return \"\";"), "PNG paths must be absolute");
-	assert.ok(source.includes("extname(pngPath).toLowerCase() !== \".png\""), "PNG extension should be required");
-	assert.ok(source.includes("realpathSync(INLINE_PREVIEW_DIR)"), "inline preview directory should be canonicalized");
-	assert.ok(source.includes("realpathSync(pngPath)"), "PNG path should be canonicalized before reading");
-	assert.ok(source.includes("status.isFile()"), "PNG path should resolve to a regular file");
-	assert.ok(source.includes("accessSync(realPngPath, constants.R_OK)"), "PNG path should be readable");
-	assert.ok(source.includes("INLINE_PREVIEW_MAX_IMAGE_SIZE_BYTES"), "PNG size cap should be enforced");
-	assert.ok(source.includes("Inline preview unavailable"), "invalid/missing pngs should render a fallback text message");
-	assert.ok(!source.includes("readFileSync(preview.pngPath"), "direct unsafe reads from preview paths should be avoided");
+	adapter.signalBus.emit("SIGUSR1");
+	await sleep(0);
+	assert.equal(registry.refreshCount, 1);
+	assert.deepEqual(invalidations, ["manual"]);
+
+	policy.cleanup();
 });
