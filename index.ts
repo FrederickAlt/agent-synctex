@@ -1,8 +1,8 @@
 import { createInterface, type Interface } from "node:readline";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, ToolResponse } from "@mariozechner/pi-coding-agent";
@@ -10,11 +10,18 @@ import { Container, getCapabilities, getCellDimensions, getPngDimensions, Image,
 import { Type } from "typebox";
 import {
 	calculateInlineDisplayColumns,
-	INLINE_PREVIEW_DIR,
 	mergeInlinePreviewArtifacts,
 	rasterizePdfPages,
 	type InlinePreviewArtifact,
 } from "./inline_preview.ts";
+import { buildInlinePreviewToolPayload } from "./inline_preview_payload.ts";
+import {
+	safeInlinePreviewPngPath,
+	inlinePreviewRenderStateFromDetails as lookupInlinePreviewRenderStateFromDetails,
+	type InlinePreviewRenderState,
+} from "./inline_preview_metadata.ts";
+import { createTerminalRefreshPolicy } from "./terminal_refresh_policy.ts";
+import { applyLatexPreamble } from "./latex_preamble.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
 import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
@@ -90,23 +97,6 @@ const LATEX_PREAMBLE_PATH = resolve(MCP_TMPDIR, "preamble.tex");
 const DEFAULT_LATEX_COMPILER = "lualatex";
 const LATEX_COMPILERS = [DEFAULT_LATEX_COMPILER, "pdflatex", "xelatex", "latexmk"] as const;
 type LatexCompiler = (typeof LATEX_COMPILERS)[number];
-const DEFAULT_SNIPPET_PREAMBLE = [
-	String.raw`\documentclass{article}`,
-	String.raw`\usepackage[utf8]{inputenc}`,
-	String.raw`\usepackage[T1]{fontenc}`,
-	String.raw`\usepackage{amsmath,amssymb,mathtools}`,
-	String.raw`\usepackage{xcolor}`,
-	String.raw`\pagestyle{empty}`,
-].join("\n");
-const INLINE_PREVIEW_SETUP = [
-	String.raw`\usepackage[active,tightpage]{preview}`,
-	String.raw`\setlength\PreviewBorder{8pt}`,
-].join("\n");
-const INLINE_PAGE_STYLE_SETUP = [
-	String.raw`\makeatletter`,
-	String.raw`\AtBeginDocument{\pagestyle{empty}\thispagestyle{empty}\let\ps@plain\ps@empty}`,
-	String.raw`\makeatother`,
-].join("\n");
 const REQUEST_TIMEOUT_DEFAULT_MS = 60_000;
 const STARTUP_TIMEOUT_DEFAULT_MS = 5_000;
 const STARTUP_TIMEOUT_MAX_MS = 120_000;
@@ -178,107 +168,6 @@ function initializeLatexPreambleFile(): void {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Failed to copy cwd preamble ${cwdPreambleFile} to ${LATEX_PREAMBLE_PATH}: ${message}`);
 	}
-}
-
-function hasDocumentClass(latexSource: string): boolean {
-	return /\\documentclass(?:\s*\[[^\]]*\])?\s*\{/.test(latexSource);
-}
-
-function removeDocumentClass(latexSource: string): string {
-	return latexSource
-		.replace(/\s*\\documentclass(?:\s*\[[^\]]*\])?\s*\{[^}]+\}\s*/m, "\n")
-		.trim();
-}
-
-function defaultPreambleFor(latexPreamble: string): string {
-	return hasDocumentClass(latexPreamble)
-		? latexPreamble
-		: [DEFAULT_SNIPPET_PREAMBLE, latexPreamble].filter(Boolean).join("\n");
-}
-
-function addInlinePreviewSetup(preamble: string): string {
-	if (/\\usepackage(?:\s*\[[^\]]*\])?\s*\{preview\}/.test(preamble)) return preamble;
-	return [preamble, INLINE_PREVIEW_SETUP].filter(Boolean).join("\n");
-}
-
-function addInlinePageStyleSetup(preamble: string): string {
-	if (/\\AtBeginDocument\s*\{[^}]*\\pagestyle\s*\{empty\}/s.test(preamble) && /\\ps@plain\b/.test(preamble)) return preamble;
-	return [preamble, INLINE_PAGE_STYLE_SETUP].filter(Boolean).join("\n");
-}
-
-function wrapLatexPreviewBody(body: string): string {
-	if (/\\begin\s*\{preview\}/.test(body)) return body;
-	return [String.raw`\begin{preview}`, body.trim(), String.raw`\end{preview}`].join("\n");
-}
-
-function wrapDocumentBody(latexSource: string, beginDocument: RegExpExecArray): string | null {
-	const documentBodyStart = beginDocument.index + beginDocument[0].length;
-	const afterBegin = latexSource.slice(documentBodyStart);
-	const endDocument = /\\end\s*\{document\}/.exec(afterBegin);
-	if (!endDocument) return null;
-	const documentBodyEnd = documentBodyStart + endDocument.index;
-	return [
-		latexSource.slice(0, documentBodyStart),
-		"\n",
-		wrapLatexPreviewBody(latexSource.slice(documentBodyStart, documentBodyEnd)),
-		"\n",
-		latexSource.slice(documentBodyEnd),
-	].join("");
-}
-
-function applyLatexPreamble(latexSource: string, latexPreamble: string, options: { cropToContent?: boolean; suppressPageNumbers?: boolean } = {}): string {
-	const preamble = latexPreamble.trim();
-	const beginDocument = /\\begin\s*\{document\}/.exec(latexSource);
-	const sourceHasDocumentClass = hasDocumentClass(latexSource);
-	const cropToContent = options.cropToContent === true;
-	const suppressPageNumbers = options.suppressPageNumbers === true;
-	const preparePreamble = (basePreamble: string): string => {
-		const withCropSetup = cropToContent ? addInlinePreviewSetup(basePreamble) : basePreamble;
-		return suppressPageNumbers ? addInlinePageStyleSetup(withCropSetup) : withCropSetup;
-	};
-
-	if (sourceHasDocumentClass) {
-		const insertablePreamble = hasDocumentClass(preamble) ? removeDocumentClass(preamble) : preamble;
-		const combinedPreamble = preparePreamble(insertablePreamble);
-		if (!combinedPreamble && !cropToContent) return latexSource;
-		if (!beginDocument || beginDocument.index < 0) {
-			return `${latexSource.trimEnd()}\n\n${combinedPreamble}\n`;
-		}
-
-		const sourceWithPreamble = [
-			latexSource.slice(0, beginDocument.index).trimEnd(),
-			"",
-			combinedPreamble,
-			"",
-			latexSource.slice(beginDocument.index).trimStart(),
-		].join("\n");
-		if (!cropToContent) return sourceWithPreamble;
-
-		const adjustedBeginDocument = /\\begin\s*\{document\}/.exec(sourceWithPreamble);
-		return adjustedBeginDocument ? wrapDocumentBody(sourceWithPreamble, adjustedBeginDocument) ?? sourceWithPreamble : sourceWithPreamble;
-	}
-
-	if (beginDocument && beginDocument.index >= 0) {
-		const sourceWithPreamble = [
-			preparePreamble(defaultPreambleFor(preamble)),
-			latexSource.slice(beginDocument.index).trimStart(),
-			"",
-		].filter((part) => part.length > 0).join("\n");
-		if (!cropToContent) return sourceWithPreamble;
-
-		const adjustedBeginDocument = /\\begin\s*\{document\}/.exec(sourceWithPreamble);
-		return adjustedBeginDocument ? wrapDocumentBody(sourceWithPreamble, adjustedBeginDocument) ?? sourceWithPreamble : sourceWithPreamble;
-	}
-
-	if (!preamble && !cropToContent && !suppressPageNumbers) return latexSource;
-
-	return [
-		preparePreamble(defaultPreambleFor(preamble)),
-		String.raw`\begin{document}`,
-		cropToContent ? wrapLatexPreviewBody(latexSource) : latexSource,
-		String.raw`\end{document}`,
-		"",
-	].join("\n");
 }
 
 function resolveLatexCompiler(compiler: unknown): LatexCompiler | undefined {
@@ -1171,25 +1060,23 @@ const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
 const pdfTrackersByContext = new Map<string, PdfTracker>();
 const tmuxKittyPreviewInvalidationRegistry = new KittyPreviewInvalidationRegistry();
-interface InlinePreviewArtifactMetadata {
-	pngPath: string;
-	fullPageWidthPx: number;
-	fullPageHeightPx: number;
-	widthPx: number;
-	heightPx: number;
-}
-
-interface InlinePreviewRenderState {
-	pdf: string;
-	previews: InlinePreviewArtifact[];
-}
-
+const terminalRefreshPolicy = createTerminalRefreshPolicy({
+	adapter: {
+		isTmuxKittyTerminal: isTmuxKittyTerminal,
+		runTmux: runTmux,
+		writeOutput: (sequence: string) => {
+			process.stdout.write(sequence);
+		},
+		onSignal: (signal, handler) => {
+			process.on(signal, handler);
+			return () => process.off(signal, handler);
+		},
+	},
+	invalidatorRegistry: tmuxKittyPreviewInvalidationRegistry,
+});
 const inlinePreviewRenderStates = new Map<string, InlinePreviewRenderState>();
 const MAX_INLINE_PREVIEW_RENDER_STATES = 8;
-const INLINE_PREVIEW_MAX_IMAGE_SIZE_BYTES = 25 * 1024 * 1024;
 const synctexCallbacksByContext = new Map<string, SynctexCallbackServer>();
-let cleanupTmuxKittyRefreshHooks: (() => void) | undefined;
-let cleanupTerminalFocusRefresh: (() => void) | undefined;
 const synctexCallbackServers = new Set<SynctexCallbackServer>();
 const contextUiIds = new WeakMap<object, string>();
 let nextContextUiId = 1;
@@ -1205,96 +1092,9 @@ function rememberInlinePreviewRenderState(state: InlinePreviewRenderState): stri
 	return id;
 }
 
-function numberFromUnknown(value: unknown): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 1;
-	return Math.max(1, Math.floor(value));
-}
-
-function inlinePreviewPdfPathFromDetails(pdfPath: unknown): string {
-	if (typeof pdfPath !== "string") return "";
-	if (!isAbsolute(pdfPath)) return "";
-	return resolve(pdfPath);
-}
-
-function isInlinePreviewPngPathValue(absolutePath: string, inlinePreviewDir = INLINE_PREVIEW_DIR): boolean {
-	const delta = relative(inlinePreviewDir, absolutePath);
-	if (delta === "" || delta === ".") return false;
-	if (delta === ".." || delta.startsWith(`..${sep}`)) return false;
-	return !isAbsolute(delta);
-}
-
-function safeInlinePreviewPngPath(rawPngPath: unknown): string {
-	if (typeof rawPngPath !== "string") return "";
-	if (!isAbsolute(rawPngPath)) return "";
-	const pngPath = resolve(rawPngPath);
-	if (extname(pngPath).toLowerCase() !== ".png") return "";
-
-	try {
-		const inlinePreviewDir = realpathSync(INLINE_PREVIEW_DIR);
-		const realPngPath = realpathSync(pngPath);
-		if (!isInlinePreviewPngPathValue(realPngPath, inlinePreviewDir)) return "";
-		if (extname(realPngPath).toLowerCase() !== ".png") return "";
-		const status = statSync(realPngPath);
-		if (!status.isFile()) return "";
-		if (status.size <= 0 || status.size > INLINE_PREVIEW_MAX_IMAGE_SIZE_BYTES) return "";
-		accessSync(realPngPath, constants.R_OK);
-		return realPngPath;
-	} catch {
-		return "";
-	}
-}
-
-function inlinePreviewMetadataFromUnknown(value: unknown): InlinePreviewArtifactMetadata | null {
-	if (!value || typeof value !== "object") return null;
-	const candidate = value as Record<string, unknown>;
-	const pngPath = safeInlinePreviewPngPath(candidate.pngPath);
-	if (!pngPath) return null;
-	return {
-		pngPath,
-		fullPageWidthPx: numberFromUnknown(candidate.fullPageWidthPx),
-		fullPageHeightPx: numberFromUnknown(candidate.fullPageHeightPx),
-		widthPx: numberFromUnknown(candidate.widthPx),
-		heightPx: numberFromUnknown(candidate.heightPx),
-	};
-}
-
-function inlinePreviewArtifactFromMetadata(metadata: InlinePreviewArtifactMetadata): InlinePreviewArtifact {
-	return {
-		pngPath: metadata.pngPath,
-		page: 1,
-		dpi: 150,
-		renderer: "mutool",
-		trimmed: false,
-		fullPageWidthPx: metadata.fullPageWidthPx,
-		fullPageHeightPx: metadata.fullPageHeightPx,
-		widthPx: metadata.widthPx,
-		heightPx: metadata.heightPx,
-	};
-}
-
 function inlinePreviewRenderStateFromDetails(details: Record<string, unknown>): InlinePreviewRenderState | null {
-	const previewId = typeof details.preview_id === "string" ? details.preview_id : undefined;
-	if (previewId) {
-		const state = inlinePreviewRenderStates.get(previewId);
-		if (state) return state;
-	}
-
-	const rawPreviews = Array.isArray(details.inline_previews)
-		? details.inline_previews
-		: details.inline_preview
-			? [details.inline_preview]
-			: [];
-	const metadataPreviews = rawPreviews
-		.map((entry) => inlinePreviewMetadataFromUnknown(entry))
-		.filter((entry): entry is InlinePreviewArtifactMetadata => entry !== null);
-	if (metadataPreviews.length === 0) return null;
-
-	return {
-		pdf: inlinePreviewPdfPathFromDetails(details.pdf),
-		previews: metadataPreviews.map((metadata) => inlinePreviewArtifactFromMetadata(metadata)),
-	};
+	return lookupInlinePreviewRenderStateFromDetails(details, (previewId) => inlinePreviewRenderStates.get(previewId));
 }
-
 function contextSessionKey(ctx?: ExtensionContext): string {
 	if (!ctx) {
 		throw new Error("PDF tracking is only available inside a Pi agent session");
@@ -1643,27 +1443,7 @@ async function executeShowLatexPreviewTool(
 			const pageArtifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
 			const artifacts = await mergeInlinePreviewArtifacts(pageArtifacts, { signal });
 			const previewId = rememberInlinePreviewRenderState({ pdf: preview.pdfPath, previews: artifacts });
-			const inlinePreviews = artifacts.map((artifact) => ({
-				pngPath: artifact.pngPath,
-				fullPageWidthPx: artifact.fullPageWidthPx,
-				fullPageHeightPx: artifact.fullPageHeightPx,
-				widthPx: artifact.widthPx,
-				heightPx: artifact.heightPx,
-			}));
-			const primaryImagePath = inlinePreviews[0]?.pngPath ?? "";
-			const text = primaryImagePath
-				? `✓ LaTeX preview rendered locally\nimage_path=${primaryImagePath}`
-				: "✓ LaTeX preview rendered locally";
-			return {
-				content: [{ type: "text", text }],
-				details: {
-					inline: true,
-					preview_id: previewId,
-					pdf: preview.pdfPath,
-					image_path: primaryImagePath,
-					inline_previews: inlinePreviews,
-				},
-			};
+			return buildInlinePreviewToolPayload(preview.pdfPath, previewId, artifacts);
 		}
 
 		let trackedPdfId: number | undefined;
@@ -1712,102 +1492,9 @@ function isTmuxKittyTerminal(): boolean {
 	return Boolean(process.env.TMUX) && (Boolean(process.env.KITTY_WINDOW_ID) || process.env.TERM_PROGRAM?.toLowerCase() === "kitty");
 }
 
-function tmuxHookName(name: string): string {
-	return `${name}[pi-pdf-preview-${process.pid}]`;
-}
-
 function runTmux(args: string[]): void {
 	if (!process.env.TMUX) return;
 	spawnSync("tmux", args, { stdio: "ignore" });
-}
-
-function refreshTmuxKittyPreviews(): void {
-	if (!isTmuxKittyTerminal()) return;
-	tmuxKittyPreviewInvalidationRegistry.refresh();
-}
-
-function installTmuxKittyRefreshHooks(): () => void {
-	if (!isTmuxKittyTerminal()) return () => {};
-
-	const onRefreshSignal = () => refreshTmuxKittyPreviews();
-	process.on("SIGWINCH", onRefreshSignal);
-	process.on("SIGUSR1", onRefreshSignal);
-
-	const signalCommand = `run-shell -b "kill -USR1 ${process.pid} 2>/dev/null || true"`;
-	runTmux(["set-hook", "-p", tmuxHookName("pane-focus-in"), signalCommand]);
-	runTmux(["set-hook", "-p", tmuxHookName("window-layout-changed"), signalCommand]);
-
-	return () => {
-		process.off("SIGWINCH", onRefreshSignal);
-		process.off("SIGUSR1", onRefreshSignal);
-		runTmux(["set-hook", "-up", tmuxHookName("pane-focus-in")]);
-		runTmux(["set-hook", "-up", tmuxHookName("window-layout-changed")]);
-	};
-}
-
-const TERMINAL_FOCUS_IN = "\x1b[I";
-const TERMINAL_FOCUS_OUT = "\x1b[O";
-
-function stripAll(text: string, search: string): string {
-	return text.split(search).join("");
-}
-
-function installTerminalFocusRefresh(ctx: ExtensionContext): () => void {
-	if (!ctx.hasUI) return () => {};
-	const ui = ctx.ui as ExtensionContext["ui"] & {
-		onTerminalInput?: (handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void;
-	};
-	if (typeof ui.onTerminalInput !== "function") {
-		ctx.ui.notify("pdf-preview: terminal focus refresh unavailable; ctx.ui.onTerminalInput is missing", "warning");
-		return () => {};
-	}
-
-	// Request terminal focus reporting. With `set -g focus-events on`, tmux forwards
-	// these as raw input sequences when the pane/window gains or loses focus.
-	process.stdout.write("\x1b[?1004h");
-
-	const timers = new Set<ReturnType<typeof setTimeout>>();
-	const scheduleRefresh = (delayMs: number) => {
-		const timer = setTimeout(() => {
-			timers.delete(timer);
-			refreshTmuxKittyPreviews();
-		}, delayMs);
-		timers.add(timer);
-	};
-
-	const unsubscribe = ui.onTerminalInput((data) => {
-		const sawFocusIn = data.includes(TERMINAL_FOCUS_IN);
-		const sawFocusOut = data.includes(TERMINAL_FOCUS_OUT);
-		if (!sawFocusIn && !sawFocusOut) return undefined;
-
-		if (sawFocusIn) {
-			// Give tmux/Kitty a moment to finish making the pane visible, then
-			// ask Pi to redraw the latest placeholder rows. This re-emits the
-			// Kitty setup command together with the placeholder text instead of
-			// sending a raw graphics command that can blank existing placeholders.
-			scheduleRefresh(50);
-			scheduleRefresh(200);
-		}
-
-		const remaining = stripAll(stripAll(data, TERMINAL_FOCUS_IN), TERMINAL_FOCUS_OUT);
-		return remaining.length > 0 ? { data: remaining } : { consume: true };
-	});
-
-	return () => {
-		unsubscribe();
-		for (const timer of timers) clearTimeout(timer);
-		timers.clear();
-		process.stdout.write("\x1b[?1004l");
-	};
-}
-
-function rememberTmuxKittyPreviewInvalidator(context: unknown): void {
-	if (!isTmuxKittyTerminal() || typeof context !== "object" || context === null) return;
-	const candidate = context as { toolCallId?: unknown; invalidate?: unknown };
-	if (typeof candidate.invalidate !== "function") return;
-	const invalidate = candidate.invalidate;
-	const key = typeof candidate.toolCallId === "string" ? candidate.toolCallId : randomUUID();
-	tmuxKittyPreviewInvalidationRegistry.remember(key, () => invalidate());
 }
 
 class InlineLatexPreviewImage implements Component {
@@ -1941,7 +1628,7 @@ function renderInlineLatexPreview(result: { content?: Array<{ type?: unknown; te
 	};
 
 	if (isTmuxKittyTerminal()) {
-		rememberTmuxKittyPreviewInvalidator(context);
+		terminalRefreshPolicy.rememberInvalidator(context);
 		for (const preview of validatedPreviews) {
 			const base64 = readImageData(preview);
 			if (base64 === null) {
@@ -1982,10 +1669,8 @@ export default function (pi: ExtensionAPI) {
 	initializeLatexPreambleFile();
 
 	pi.on("session_start", (_event, ctx) => {
-		cleanupTmuxKittyRefreshHooks?.();
-		cleanupTmuxKittyRefreshHooks = installTmuxKittyRefreshHooks();
-		cleanupTerminalFocusRefresh?.();
-		cleanupTerminalFocusRefresh = installTerminalFocusRefresh(ctx);
+		terminalRefreshPolicy.cleanup();
+		terminalRefreshPolicy.install({ hasUI: ctx.hasUI, ui: ctx.ui });
 
 		void rotateSynctexCallbacks(ctx).catch((error) => {
 			if (ctx.hasUI) {
@@ -2320,11 +2005,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		cleanupTmuxKittyRefreshHooks?.();
-		cleanupTmuxKittyRefreshHooks = undefined;
-		cleanupTerminalFocusRefresh?.();
-		cleanupTerminalFocusRefresh = undefined;
-		tmuxKittyPreviewInvalidationRegistry.clear();
+		terminalRefreshPolicy.cleanup();
+		terminalRefreshPolicy.clearInvalidators();
 		if (ctx) {
 			const key = contextSessionKey(ctx);
 			pdfTrackersByContext.get(key)?.clear();
