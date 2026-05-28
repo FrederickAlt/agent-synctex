@@ -702,7 +702,8 @@ test("invalidation diagnostics follow capped registry key set after overflow", a
 });
 
 
-test("tmux/kitty preview refresh fixture keeps ids and placeholder mappings stable across focus and resize invalidations", async () => {
+test("tmux/kitty preview refresh fixture keeps ids and placeholder mappings stable across focus and resize invalidations", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const fixtureAdapter = new FakeAdapter(true);
 	const fixtureRegistry = new FakeInvalidationRegistry();
 	const fixtureInput = new FakeTerminalInput();
@@ -791,7 +792,7 @@ test("tmux/kitty preview refresh fixture keeps ids and placeholder mappings stab
 		previewComponent = component;
 		const expectedImageIds = diagnostics.imageIds;
 		const diagnosticsSummary = JSON.stringify(diagnostics);
-		let cacheLog: InlinePreviewRenderCacheEvent[] = diagnostics.cacheLog;
+		const cacheLog: InlinePreviewRenderCacheEvent[] = diagnostics.cacheLog;
 
 		assert.equal(diagnostics.terminalKind, "tmux-kitty", `renderer branch mismatch\n${diagnosticsSummary}`);
 		assert.equal(diagnostics.branch, "tmux-embedded", `renderer branch mismatch\n${diagnosticsSummary}`);
@@ -808,9 +809,8 @@ test("tmux/kitty preview refresh fixture keeps ids and placeholder mappings stab
 
 		const inputResult = fixtureInput.simulate(`before${FOCUS_IN_SEQUENCE}after`);
 		assert.deepEqual(inputResult, { data: "beforeafter" }, `focus input should preserve bytes\n${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
-		await sleep(30);
+		t.mock.timers.tick(30);
 		fixtureAdapter.signalBus.emit("SIGWINCH");
-		await sleep(0);
 
 		assert.equal(fixtureRegistry.refreshCount, 3, `refresh count should reflect focus(2 stages)+resize\n${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
 		assert.equal(refreshInvalidateCalls, 3, `invalidate callback should run once per refresh\n${summarizeRefreshEvents(fixtureEvents)}\n${summarizeCacheEvents(cacheLog)}`);
