@@ -12,7 +12,6 @@ import {
 	calculateInlineDisplayColumns,
 	mergeInlinePreviewArtifacts,
 	rasterizePdfPages,
-	type InlinePreviewArtifact,
 } from "./inline_preview.ts";
 import { buildInlinePreviewToolPayload } from "./inline_preview_payload.ts";
 import {
@@ -22,6 +21,7 @@ import {
 } from "./inline_preview_metadata.ts";
 import { createTerminalRefreshPolicy } from "./terminal_refresh_policy.ts";
 import { applyLatexPreamble } from "./latex_preamble.ts";
+import { createInlinePreviewRenderer } from "./inline_preview_renderer.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
 import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
@@ -1497,162 +1497,40 @@ function runTmux(args: string[]): void {
 	spawnSync("tmux", args, { stdio: "ignore" });
 }
 
-class InlineLatexPreviewImage implements Component {
-	private cachedLines?: string[];
-	private cachedWidth?: number;
-
-	constructor(
-		private readonly base64Data: string,
-		private readonly artifact: InlinePreviewArtifact,
-		private readonly fallbackColor: (text: string) => string,
-		private readonly filename: string,
-	) {}
-
-	invalidate(): void {
-		this.cachedLines = undefined;
-		this.cachedWidth = undefined;
-	}
-
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-
-		const maxWidthCells = calculateInlineDisplayColumns(width, this.artifact);
-		const image = new Image(this.base64Data, "image/png", { fallbackColor: this.fallbackColor }, {
-			maxWidthCells,
-			filename: this.filename,
-		});
-
-		this.cachedWidth = width;
-		this.cachedLines = image.render(width);
-		return this.cachedLines;
-	}
-}
-
-class TmuxKittyPlaceholderImage implements Component {
-	private cachedLines?: string[];
-	private cachedWidth?: number;
-	private readonly imageId = Math.floor(Math.random() * 0xfffffe) + 1;
-
-	constructor(
-		private readonly title: string,
-		private readonly base64Data: string,
-		private readonly artifact: InlinePreviewArtifact,
-	) {}
-
-	invalidate(): void {
-		this.cachedLines = undefined;
-		this.cachedWidth = undefined;
-	}
-
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-
-		const maxWidthCells = calculateInlineDisplayColumns(width, this.artifact);
-		const rendered = buildKittyPlaceholderImageRender({
-			title: this.title,
-			base64Data: this.base64Data,
-			imageId: this.imageId,
-			width,
-			maxWidthCells,
-			imageDimensions: getPngDimensions(this.base64Data) ?? this.artifact,
-			cellDimensions: getCellDimensions(),
-		});
-
-		this.cachedWidth = width;
-		this.cachedLines = rendered.lines;
-		return this.cachedLines;
-	}
-}
-
-function renderInlineLatexPreview(result: { content?: Array<{ type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown }>; details?: Record<string, unknown> }, theme: unknown, context: unknown): Component {
-	const details = result.details ?? {};
-	const renderState = inlinePreviewRenderStateFromDetails(details);
-	const inlinePreviews = renderState?.previews ?? [];
-	const pdf = renderState?.pdf ?? "";
-	const canShowImages = !(typeof context === "object" && context !== null && "showImages" in context && (context as { showImages?: unknown }).showImages === false);
-
-	const fg = (role: string, text: string) => {
-		if (typeof theme === "object" && theme !== null && "fg" in theme && typeof (theme as { fg?: unknown }).fg === "function") {
-			return (theme as { fg: (role: string, text: string) => string }).fg(role, text);
+const inlinePreviewRenderer = createInlinePreviewRenderer({
+	readState: (details) => lookupInlinePreviewRenderStateFromDetails(details, (previewId) => inlinePreviewRenderStates.get(previewId)),
+	canShowImages: (context) => {
+		if (typeof context === "object" && context !== null && "showImages" in context && (context as { showImages?: unknown }).showImages === false) {
+			return false;
 		}
-		return text;
-	};
-
-	const labelForPaths = (paths: string[]): string =>
-		paths.length === 1 ? `PNG: ${paths[0]}` : `PNGs:\n${paths.join("\n")}`;
-
-	const validatedPreviews: InlinePreviewArtifact[] = [];
-	const unavailablePngPaths: string[] = [];
-	for (const preview of inlinePreviews) {
-		const safePath = safeInlinePreviewPngPath(preview.pngPath);
-		if (!safePath) {
-			if (preview.pngPath) unavailablePngPaths.push(preview.pngPath);
-			continue;
-		}
-
-		validatedPreviews.push(safePath === preview.pngPath ? preview : { ...preview, pngPath: safePath });
-	}
-
-	if (validatedPreviews.length === 0) {
-		if (unavailablePngPaths.length > 0) {
-			return new Text(`ok: ${pdf}\n${fg("muted", `Inline preview unavailable: ${labelForPaths(unavailablePngPaths)}`)}`, 0, 0);
-		}
-		return new Text(`ok: ${pdf}\nInline preview: unavailable`, 0, 0);
-	}
-
-	if (unavailablePngPaths.length > 0) {
-		return new Text(`ok: ${pdf}\n${fg("muted", `Inline preview unavailable: ${labelForPaths(unavailablePngPaths)}`)}`, 0, 0);
-	}
-
-	if (!canShowImages) {
-		const label = validatedPreviews.map((preview) => preview.pngPath);
-		return new Text(
-			`${fg("success", "ok")}: ${pdf}\n${fg("muted", `Inline image display is not supported by this terminal. ${labelForPaths(label)}`)}`,
-			0,
-			0,
-		);
-	}
-
-	const title = `${fg("success", "✓ LaTeX preview")}`;
-	const container = new Container();
-	container.addChild(new Text(title, 0, 0));
-
-	const readImageData = (preview: InlinePreviewArtifact): string | null => {
-		const safePath = safeInlinePreviewPngPath(preview.pngPath);
+		return Boolean(getCapabilities().images);
+	},
+	isTmuxKittyTerminal,
+	readImageBase64: (pngPath) => {
+		const safePath = safeInlinePreviewPngPath(pngPath);
 		if (!safePath) return null;
 		try {
 			return readFileSync(safePath).toString("base64");
 		} catch {
 			return null;
 		}
-	};
+	},
+	makeText: (text) => new Text(text, 0, 0),
+	makeContainer: () => new Container(),
+	makeInlineImage: (options) => new Image(options.base64Data, "image/png", { fallbackColor: options.fallbackColor }, {
+		maxWidthCells: options.maxWidthCells,
+		filename: options.filename,
+	}),
+	makeKittyPlaceholderImage: buildKittyPlaceholderImageRender,
+	calculateDisplayColumns: calculateInlineDisplayColumns,
+	getCellDimensions,
+	getPngDimensions: (base64Data) => getPngDimensions(base64Data) ?? undefined,
+	allocateImageId: () => Math.floor(Math.random() * 0xfffffe) + 1,
+	rememberInvalidator: (context) => terminalRefreshPolicy.rememberInvalidator(context),
+});
 
-	if (isTmuxKittyTerminal()) {
-		terminalRefreshPolicy.rememberInvalidator(context);
-		for (const preview of validatedPreviews) {
-			const base64 = readImageData(preview);
-			if (base64 === null) {
-				return new Text(`ok: ${pdf}\n${fg("muted", `Inline preview unavailable: ${labelForPaths([preview.pngPath])}`)}`, 0, 0);
-			}
-			container.addChild(new TmuxKittyPlaceholderImage("", base64, preview));
-		}
-		return container;
-	}
-
-	if (!getCapabilities().images) {
-		const label = validatedPreviews.map((preview) => preview.pngPath);
-		return new Text(`${fg("success", "ok")}: ${pdf}\n${fg("muted", `Inline image display is not supported by this terminal. ${labelForPaths(label)}`)}`, 0, 0);
-	}
-
-	for (const preview of validatedPreviews) {
-		const base64 = readImageData(preview);
-		if (base64 === null) {
-			return new Text(`ok: ${pdf}\n${fg("muted", `Inline preview unavailable: ${labelForPaths([preview.pngPath])}`)}`, 0, 0);
-		}
-		container.addChild(new InlineLatexPreviewImage(base64, preview, (text) => fg("muted", text), preview.pngPath));
-	}
-
-	return container;
+function renderInlineLatexPreview(result: { content?: Array<{ type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown }>; details?: Record<string, unknown> }, theme: unknown, context: unknown): Component {
+	return inlinePreviewRenderer.render({ result, theme, context }).component;
 }
 
 function renderShowLatexResult(result: { content?: Array<{ type?: string; text?: string }>; details?: Record<string, unknown> }, _options: unknown, theme: unknown, context: unknown): Component {
