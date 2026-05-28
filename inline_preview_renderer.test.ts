@@ -102,29 +102,6 @@ function runRenderer(
 	return result;
 }
 
-function persistMetadataStateFromDetails(details: { inline_previews?: unknown[]; pdf?: unknown }): { pdf: string; previews: InlinePreviewRenderState["previews"] } {
-	const previewEntries = Array.isArray(details.inline_previews) ? details.inline_previews : [];
-	return {
-		pdf: typeof details.pdf === "string" ? details.pdf : "",
-		previews: previewEntries
-			.filter((entry): entry is { pngPath?: unknown; fullPageWidthPx?: unknown; fullPageHeightPx?: unknown; widthPx?: unknown; heightPx?: unknown } =>
-				typeof entry === "object" && entry !== null,
-			)
-			.map((entry) => ({
-				pngPath: String(entry.pngPath ?? ""),
-				page: 1,
-				dpi: 150,
-				renderer: "mutool",
-				trimmed: false,
-				fullPageWidthPx: typeof entry.fullPageWidthPx === "number" ? Math.max(1, Math.floor(entry.fullPageWidthPx)) : 1,
-				fullPageHeightPx: typeof entry.fullPageHeightPx === "number" ? Math.max(1, Math.floor(entry.fullPageHeightPx)) : 1,
-				widthPx: typeof entry.widthPx === "number" ? Math.max(1, Math.floor(entry.widthPx)) : 1,
-				heightPx: typeof entry.heightPx === "number" ? Math.max(1, Math.floor(entry.heightPx)) : 1,
-			})),
-	};
-}
-
-
 test("inline preview renderer recovers persisted inline metadata after state cache miss", () => {
 	const stateMap = new Map<string, InlinePreviewRenderState>();
 	const pngPath = createPngPath("recovered-inline-preview");
@@ -288,13 +265,7 @@ test("invalid persisted png metadata outside preview directory falls back to una
 		pdf: "/tmp/outside-preview.pdf",
 	};
 	const renderer = mkRenderer({
-		readState: (details) => {
-			const metadataState = persistMetadataStateFromDetails(details as { inline_previews?: unknown[]; pdf?: unknown });
-			return metadataState.previews.length === 0 ? null : {
-				pdf: metadataState.pdf,
-				previews: metadataState.previews,
-			};
-		},
+		readState: (details) => inlinePreviewRenderStateFromDetails(details, (previewId) => stateMap.get(previewId)),
 		imagePolicy: {
 			canShowImages: () => true,
 			terminalSupportsImages: () => true,
@@ -303,10 +274,13 @@ test("invalid persisted png metadata outside preview directory falls back to una
 	}, stateMap);
 
 	const rendered = runRenderer(renderer, undefined, detail, {});
-	assert.equal(rendered.diagnostics.branch, "missing-image-data");
-	assert.equal(rendered.diagnostics.fallbackReason, `missing-image:${outsidePngPath}`);
-	assert.deepEqual(rendered.diagnostics.missingPngPaths, [outsidePngPath]);
-	assert.match(rendered.component.render(80).join("\n"), /Inline preview unavailable/);
+	assert.equal(rendered.diagnostics.branch, "no-previews");
+	assert.equal(rendered.diagnostics.fallbackReason, "no-previews");
+	assert.equal(rendered.diagnostics.previewCount, 0);
+	assert.deepEqual(rendered.diagnostics.missingPngPaths, []);
+	const renderedLines = rendered.component.render(80).join("\n");
+	assert.match(renderedLines, /ok: \/tmp\/outside-preview\.pdf/);
+	assert.match(renderedLines, /Inline preview: unavailable/);
 });
 
 test("width changes and invalidation clear cached render output", () => {

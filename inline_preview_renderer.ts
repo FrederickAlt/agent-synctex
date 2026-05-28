@@ -1,6 +1,6 @@
 import type { Component } from "@mariozechner/pi-tui";
 import type { InlinePreviewArtifact } from "./inline_preview.ts";
-import type { InlinePreviewRenderState } from "./inline_preview_metadata.ts";
+import { inlinePreviewPdfPathFromDetails, type InlinePreviewRenderState } from "./inline_preview_metadata.ts";
 import type { KittyPlaceholderImageRender, KittyPlaceholderRenderOptions } from "./kitty_placeholder_image.ts";
 
 export interface InlinePreviewRenderComponent extends Component {
@@ -215,7 +215,7 @@ export function createInlinePreviewRenderer(env: InlinePreviewRenderEnvironment)
 			const details = result.details ?? {};
 			const renderState = env.readState(details);
 			const inlinePreviews = renderState?.previews ?? [];
-			const pdf = renderState?.pdf ?? "";
+			const pdf = renderState?.pdf ?? inlinePreviewPdfPathFromDetails((details as { pdf?: unknown }).pdf);
 			const canShowByContext = env.imagePolicy.canShowImages(context);
 			const canShowByTerminal = env.imagePolicy.terminalSupportsImages();
 			const cacheLog: InlinePreviewRenderCacheEvent[] = [];
