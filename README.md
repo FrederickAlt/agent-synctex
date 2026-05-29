@@ -3,11 +3,11 @@
 Pi extension that exposes seven tools:
 
 - `show_latex` — FREEFORM/raw LaTeX preview with optional front matter for `compiler` and `inline`; renders inline by default, or pass `inline=false` for an external viewer-service preview. It automatically loads `./preamble.tex` or `./praeamble.tex` from the current working directory when present, so do not repeat that preamble in the snippet.
-- `open_pdf` — open an existing local PDF through the viewer service and return a session-local numeric `pdf_id` for later PDF actions.
+- `open_pdf` — send a viewer-service request to open an existing local PDF and return a session-local numeric `pdf_id` for later PDF actions.
 - `close_pdf` — close a tracked viewer-service PDF by `pdf_id`.
 - `jump_pdf` — perform a line-based viewer-service forward SyncTeX jump in a tracked PDF by `pdf_id`, returning a short “line N contains:” header followed by the jumped-to LaTeX source line.
-- `get_synctex_callback_command` — print the current session's exact Zathura inverse SyncTeX callback command for manual configuration.
-- `compile_latex_file` — compile a local LaTeX source file in place, optionally opening/tracking the resulting PDF.
+- `get_synctex_callback_command` — print the current session's exact Zathura inverse SyncTeX callback command for manual configuration only.
+- `compile_latex_file` — compile a local LaTeX source file in place, optionally sending a viewer-service open request to track the resulting PDF.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
 Snippet previews communicate with an MCP-style stdio service (`show_latex_mcp.py`) and forward
@@ -34,7 +34,7 @@ Inline image width is proportional to the cropped content width relative to the 
 page width, so small symbols stay small while wide formulas use more of the TUI. With `inline=false`, it
 refreshes fixed compatibility files and submits an `open` request to the viewer-service protocol handled by
 `scripts/show_latex_viewer.py` (or the installed background service). The default extension path does not use
-a ready-marker watcher and never launches Zathura directly.
+a ready-marker watcher and never launches Zathura or any GUI viewer directly; it only writes/reads viewer-service protocol files.
 Inline preview details persist metadata locally in the tool result (`image_path`, `inline_previews`, and `pdf`), containing only
 safe artifact paths plus dimensions, so repeated renders in the same process can reuse an in-memory preview ID while a
 `/reload` can still recover images from the persisted metadata as long as `/tmp/codex-show-latex/inline` artifacts
@@ -62,8 +62,9 @@ pi -e /path/to/pdf-preview
 Keep the checked-out `scripts/` directory with the extension. The inverse SyncTeX callback helper
 is `scripts/pi_synctex_callback.mjs`; it is spawned on demand by Zathura callback commands and is
 not a systemd service. The preview viewer helper remains `scripts/show_latex_viewer.py` (or the
-installed `codex-show-latex-viewer.service` from the secure-split package). The extension never
-edits `~/.config/zathura/zathurarc` automatically.
+installed `codex-show-latex-viewer.service` from the secure-split package). That unsandboxed service owns
+all GUI/reader behavior; the sandboxed extension writes viewer-service protocol requests only. The extension
+never edits `~/.config/zathura/zathurarc` automatically.
 
 Viewer-service setup/status:
 
@@ -77,15 +78,26 @@ cat /tmp/codex-show-latex/viewer.log
 ```
 
 The service protocol uses `/tmp/codex-show-latex/viewer-requests`, `/tmp/codex-show-latex/viewer-results`,
-and `/tmp/codex-show-latex/viewer-state.json` (all under the mode-0700 base directory). If external
-preview/open/jump calls fail with `viewer service request timed out; is the viewer service running?`, start or
-restart the user service above and check `/tmp/codex-show-latex/viewer.log`. The extension sends the service a
-structured SyncTeX callback config (`kind`, `transport`, `socket_path`, `token`); raw callback commands are only
-for manual Zathura configuration via `get_synctex_callback_command`.
+and `/tmp/codex-show-latex/viewer-state.json` (all under the mode-0700 base directory). External open/close/jump requests
+require the viewer service and are handled only by the unsandboxed helper.
+
+### Viewer troubleshooting
+
+- **Timeout / service not processing requests**: if `open_pdf`, `close_pdf`, `jump_pdf`, `show_latex(inline=false)`, or `compile_latex_file(open_pdf=true)` fail with
+  `viewer service request timed out; is the viewer service running?`, start/restart `codex-show-latex-viewer.service` and
+  check `systemctl --user status codex-show-latex-viewer.service` plus `/tmp/codex-show-latex/viewer.log`.
+- **Backend unavailable**: failures like `viewer backend is unavailable` or `(code=backend_unavailable)` usually mean
+  the configured backend command is missing/unlaunchable. Run
+  `~/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py --status` and check the `backend` field for executable
+  availability/path before restarting the service.
+- The extension sends the service structured callback data (`kind`, `transport`, `socket_path`, `token`); raw callback commands are only
+  for manual Zathura configuration via `get_synctex_callback_command`, not for driving viewer operations from the extension.
+- For viewer-open failures, inspect `/tmp/codex-show-latex/viewer.log` and `/tmp/codex-show-latex/*.log` for details.
+- If LaTeX compilation fails (for `show_latex` or `compile_latex_file`), check `/tmp/codex-show-latex/*.log`; compile and service failures are separate.
 
 ## PDF tracking and jumps
 
-`open_pdf(pdf_file_path)` validates that the path exists, is readable, and is a regular PDF file. In default mode, it uses the configured viewer service (`show_latex_viewer.py`) to open or reuse the PDF, stores service metadata (`viewer_handle`, `viewer_backend`, capability flags), and returns a session-local `pdf_id`. IDs are short-lived session values only; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID where practical.
+`open_pdf(pdf_file_path)` validates that the path exists, is readable, and is a regular PDF file. In default mode, it sends the configured viewer service (`show_latex_viewer.py`) an open/reuse request for the PDF, stores service metadata (`viewer_handle`, `viewer_backend`, capability flags), and returns a session-local `pdf_id`. IDs are short-lived session values only; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID where practical.
 
 Tracked PDFs also remember a default source file when possible. `compile_latex_file(..., open_pdf=true)` stores the compiled source path exactly. `open_pdf(existing.pdf)` attempts to infer a default source from `<basename>.tex` next to the normalized PDF and from available `.synctex`/`.synctex.gz` input records.
 
@@ -93,11 +105,11 @@ Tracked PDFs also remember a default source file when possible. `compile_latex_f
 
 `close_pdf(pdf_id)` forwards close via service metadata and removes that PDF from the in-memory tracking table.
 
-Open, close, and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
+Open, close, and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex` and `/tmp/codex-show-latex/viewer.log`. These include service timeout, timeout-like unavailability, stale/unknown handle, and backend availability failures.
 
 ## Inverse SyncTeX PDF clicks
 
-Each Pi session starts a private Unix-socket callback endpoint with a random token; session switches and shutdowns close the old endpoint so older callback commands stop working. PDFs opened through `open_pdf` and LaTeX previews opened by `scripts/show_latex_viewer.py` are launched with Zathura's `--synctex-editor-command=<command>` already set to the correct session-specific callback.
+Each Pi session starts a private Unix-socket callback endpoint with a random token; session switches and shutdowns close the old endpoint so older callback commands stop working. Zathura is the viewer backend launched and controlled by the unsandboxed `scripts/show_latex_viewer.py` service. PDFs opened through `open_pdf` and LaTeX previews opened by the service are launched with Zathura's `--synctex-editor-command=<command>` already set to the correct session-specific callback.
 
 When Zathura invokes the callback, the extension pastes this block at the current interactive editor cursor and does not submit it or trigger/steer an agent turn:
 
@@ -109,7 +121,7 @@ PDF click: relative/path/main.tex:123
 
 The path is relative to the Pi session cwd. The source line is included when the clicked source file is readable; otherwise the block still ends with the blank line.
 
-For manual Zathura configuration, call `get_synctex_callback_command` or run the `/synctex_callback_command` slash command in the current Pi session. The returned command is exact for that session only and should be configured as Zathura's `synctex-editor-command`; do not reuse it in another Pi session. The command is built as a Zathura argv template so `%{input}` is substituted as one file-path argument, including paths with quotes, spaces, or shell metacharacters.
+For manual Zathura configuration, call `get_synctex_callback_command` or run the `/synctex_callback_command` slash command in the current Pi session. The returned command is exact for that session only and should be configured as Zathura's `synctex-editor-command`; do not reuse it in another Pi session. The command is built as a Zathura argv template so `%{input}` is substituted as one file-path argument, including paths with quotes, spaces, or shell metacharacters. It only helps with manual inverse SyncTeX configuration and does not imply the extension can open viewers directly.
 
 Manual patterns:
 
@@ -140,7 +152,7 @@ Install dev dependencies once with `npm install`, then run `npm run verify` to t
 Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk` (which runs latexmk with LuaLaTeX).
 
 Prefer `compile_latex_file` over invoking a bare compiler directly when you already have a `.tex` file to build.
-It can compile without opening a window: leave `open_pdf` unset/false for a build/check only run.
+It can compile without requesting external viewer state: leave `open_pdf` unset/false for a build/check only run.
 Pass `clean=true` to remove common same-basename LaTeX artifacts before compiling, including the previous PDF and SyncTeX sidecars.
 
 Both snippet previews and file compiles pass `-synctex=1` to the selected LaTeX command by default, so generated PDFs have SyncTeX sidecars when the compiler succeeds.
@@ -149,8 +161,8 @@ For `compile_latex_file`, the selected compiler is spawned with the source file'
 working directory, using the original file name as the job input. The resulting `<name>.pdf` stays
 next to the source file. By default, successful output is a single short `ok: <pdf>` line and no
 viewer state changes, so the tool remains useful as a compile/check operation. With `open_pdf=true`,
-the tool opens/tracks the PDF after a successful compile and returns both `pdf` and `pdf_id` in its
-details.
+the tool sends a viewer-service open request for the PDF after a successful compile and returns both `pdf` and `pdf_id` in its
+details. If compile succeeds but open fails, re-check service status/logs for `open`/`jump`-style viewer failures.
 
 Both `show_latex` and `compile_latex_file` report only a short error on failure and write diagnostic
 details to `/tmp/codex-show-latex/*.log`.
