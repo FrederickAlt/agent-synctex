@@ -100,6 +100,17 @@ const ZATHURA_DBUS_FALLBACK_DELAY_MS = 200;
 const PDF_OPEN_LOCK_ROOT = "/tmp/codex-show-latex/pdf-open-locks";
 const PDF_OPEN_LOCK_STALE_MS = 15_000;
 const PROC_ROOT = "/proc";
+const LEGACY_ZATHURA_ADAPTER_ENABLED = "PDF_PREVIEW_ZATHURA_LEGACY";
+
+function isLegacyZathuraAdapterEnabled(): boolean {
+	return process.env[LEGACY_ZATHURA_ADAPTER_ENABLED] === "1";
+}
+
+function assertLegacyZathuraAdapterAllowed(operation: string): void {
+	if (isLegacyZathuraAdapterEnabled()) return;
+	throw new Error(`Default preview flow does not use direct Zathura control for ${operation}. Set ${LEGACY_ZATHURA_ADAPTER_ENABLED}=1 for legacy adapter mode.`);
+}
+
 
 function readProcessArgs(pid: string, procRoot = PROC_ROOT): string[] | undefined {
 	try {
@@ -128,6 +139,7 @@ export function processArgsMatchZathuraPdf(args: string[], normalizedPdfPath: st
 }
 
 export function zathuraPidsForPdf(pdfFilePath: string, procRoot = PROC_ROOT): number[] {
+	assertLegacyZathuraAdapterAllowed("process discovery");
 	let entries: string[];
 	try {
 		entries = readdirSync(procRoot);
@@ -156,6 +168,7 @@ function processArgsMatchSynctexEditorCommand(args: string[], synctexEditorComma
 }
 
 function zathuraPidsForPdfWithSynctexCommand(pdfFilePath: string, synctexEditorCommand: string, procRoot = PROC_ROOT): number[] {
+	assertLegacyZathuraAdapterAllowed("process discovery");
 	let entries: string[];
 	try {
 		entries = readdirSync(procRoot);
@@ -176,6 +189,7 @@ function zathuraPidsForPdfWithSynctexCommand(pdfFilePath: string, synctexEditorC
 }
 
 function describeZathuraProcessesForPdf(pdfFilePath: string, synctexEditorCommand?: string, procRoot = PROC_ROOT): string {
+	assertLegacyZathuraAdapterAllowed("process discovery");
 	let entries: string[];
 	try {
 		entries = readdirSync(procRoot);
@@ -204,19 +218,29 @@ export function describePdfJumpFailureContext(pdfId: number, tracker: PdfTracker
 	const trackedPdf = tracker.getById(pdfId);
 	if (!trackedPdf) return `No tracked PDF found for pdf_id=${pdfId}`;
 
-	const trackedPidArgs = trackedPdf.pid === undefined ? undefined : readProcessArgs(String(trackedPdf.pid));
-	const effectiveSynctexCommand = currentSynctexEditorCommand ?? trackedPdf.synctexEditorCommand;
 	const lines = [
 		`tracked_pdf_id=${trackedPdf.id}`,
 		`tracked_pdf_path=${trackedPdf.path}`,
 		`tracked_source_file=${trackedPdf.sourceFile ?? "<unknown>"}`,
 		`tracked_pid=${trackedPdf.pid ?? "<unknown>"}`,
-		`tracked_pid_args=${trackedPidArgs ? trackedPidArgs.map((arg) => JSON.stringify(arg)).join(" ") : "<unavailable>"}`,
 		`tracked_synctex_callback_command=${trackedPdf.synctexEditorCommand ?? "<none>"}`,
 		`current_synctex_callback_command=${currentSynctexEditorCommand ?? "<none>"}`,
 		`callback_command_changed=${trackedPdf.synctexEditorCommand !== undefined && currentSynctexEditorCommand !== undefined && trackedPdf.synctexEditorCommand !== currentSynctexEditorCommand}`,
-		`effective_callback_process_snapshot=${describeZathuraProcessesForPdf(trackedPdf.path, effectiveSynctexCommand)}`,
+		`viewer_handle=${trackedPdf.viewerHandle ?? "<none>"}`,
+		`viewer_backend=${trackedPdf.viewerBackend ?? "<none>"}`,
+		`viewer_owned=${trackedPdf.viewerOwned ?? "<unknown>"}`,
 	];
+
+	if (!isLegacyZathuraAdapterEnabled()) {
+		return lines.join("\n");
+	}
+
+	const trackedPidArgs = trackedPdf.pid === undefined ? undefined : readProcessArgs(String(trackedPdf.pid));
+	const effectiveSynctexCommand = currentSynctexEditorCommand ?? trackedPdf.synctexEditorCommand;
+	lines.push(
+		`tracked_pid_args=${trackedPidArgs ? trackedPidArgs.map((arg) => JSON.stringify(arg)).join(" ") : "<unavailable>"}`,
+		`effective_callback_process_snapshot=${describeZathuraProcessesForPdf(trackedPdf.path, effectiveSynctexCommand)}`,
+	);
 
 	if (trackedPdf.synctexEditorCommand && currentSynctexEditorCommand && trackedPdf.synctexEditorCommand !== currentSynctexEditorCommand) {
 		lines.push(`tracked_callback_process_snapshot=${describeZathuraProcessesForPdf(trackedPdf.path, trackedPdf.synctexEditorCommand)}`);
@@ -745,6 +769,7 @@ export async function openPdfInZathura(
 	signal?: AbortSignal,
 	options: ZathuraOpenOptions = {},
 ): Promise<number | undefined> {
+	assertLegacyZathuraAdapterAllowed("open");
 	const command = options.command ?? "zathura";
 	const timeoutMs = options.timeoutMs ?? ZATHURA_OPEN_TIMEOUT_MS;
 	const reusablePidsForPdf = (): Set<number> => new Set(
@@ -954,6 +979,7 @@ export function closePdfInZathura(
 	pdfFilePath: string,
 	options: ZathuraCloseOptions = {},
 ): number[] {
+	assertLegacyZathuraAdapterAllowed("close");
 	const findPids = options.findPids ?? zathuraPidsForPdf;
 	const killProcess = options.killProcess ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
 	const pids = findPids(pdfFilePath);
@@ -1004,6 +1030,7 @@ export async function closeTrackedPdf(
 		};
 	}
 
+	assertLegacyZathuraAdapterAllowed("close");
 	const defaultFindPids = () => {
 		if (trackedPdf.synctexEditorCommand) {
 			const commandPids = zathuraPidsForPdfWithSynctexCommand(trackedPdf.path, trackedPdf.synctexEditorCommand);
@@ -1058,14 +1085,22 @@ export async function openAndTrackPdf(
 	pdfFilePath: string,
 	tracker: PdfTracker,
 	signal?: AbortSignal,
-	opener: PdfOpener = (path, abortSignal) => openPdfInZathura(path, abortSignal, { reuseExisting: true }),
+	opener: PdfOpener = (path, abortSignal) => {
+		assertLegacyZathuraAdapterAllowed("open and track");
+		return openPdfInZathura(path, abortSignal, { reuseExisting: true });
+	},
 	defaultSourceFile?: string,
 	synctexEditorCommand?: string,
 ): Promise<TrackedPdf> {
 	const pdfPath = normalizePdfFilePath(pdfFilePath);
 	const sourceFile = defaultSourceFile ?? inferDefaultSourceFileForPdf(pdfPath);
-	const reusableTrackedPdf = reuseTrackedPdfForPath(pdfPath, tracker, sourceFile, synctexEditorCommand);
-	if (reusableTrackedPdf) return reusableTrackedPdf;
+	const legacyAdapterEnabled = isLegacyZathuraAdapterEnabled();
+	const reusableTrackedPdf = legacyAdapterEnabled
+		? reuseTrackedPdfForPath(pdfPath, tracker, sourceFile, synctexEditorCommand)
+		: tracker.getByPath(pdfPath);
+	if (reusableTrackedPdf) {
+		return tracker.markReopened(reusableTrackedPdf.id, reusableTrackedPdf.pid, sourceFile, synctexEditorCommand) ?? reusableTrackedPdf;
+	}
 
 	const pendingOpen = tracker.getPendingOpen(pdfPath);
 	if (pendingOpen) {
@@ -1126,6 +1161,7 @@ export async function jumpToTrackedPdf(
 	};
 
 	const opener = options.opener ?? ((pdfPath: string, abortSignal?: AbortSignal) => {
+		assertLegacyZathuraAdapterAllowed("jump");
 		const openerOptions: ZathuraOpenOptions = {
 			command: options.command,
 			timeoutMs: options.timeoutMs,
@@ -1189,6 +1225,7 @@ export async function jumpToTrackedPdf(
 		}
 	}
 
+	assertLegacyZathuraAdapterAllowed("jump");
 	const resolveOwnedPid = (): number | undefined => {
 		if (!hasTrackedCommand) {
 			return trackedPdf.pid;

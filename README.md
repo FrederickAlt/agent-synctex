@@ -2,10 +2,10 @@
 
 Pi extension that exposes seven tools:
 
-- `show_latex` — FREEFORM/raw LaTeX preview with optional front matter for `compiler` and `inline`; renders inline by default, or pass `inline=false` for the external Zathura preview. It automatically loads `./preamble.tex` or `./praeamble.tex` from the current working directory when present, so do not repeat that preamble in the snippet.
-- `open_pdf` — open an existing local PDF in Zathura and return a session-local numeric `pdf_id` for later PDF actions.
-- `close_pdf` — close a tracked Zathura PDF window by `pdf_id`.
-- `jump_pdf` — perform a line-based Zathura forward SyncTeX jump in a tracked PDF by `pdf_id`, returning a short “line N contains:” header followed by the jumped-to LaTeX source line.
+- `show_latex` — FREEFORM/raw LaTeX preview with optional front matter for `compiler` and `inline`; renders inline by default, or pass `inline=false` for an external viewer-service preview. It automatically loads `./preamble.tex` or `./praeamble.tex` from the current working directory when present, so do not repeat that preamble in the snippet.
+- `open_pdf` — open an existing local PDF through the viewer service and return a session-local numeric `pdf_id` for later PDF actions.
+- `close_pdf` — close a tracked viewer-service PDF by `pdf_id`.
+- `jump_pdf` — perform a line-based viewer-service forward SyncTeX jump in a tracked PDF by `pdf_id`, returning a short “line N contains:” header followed by the jumped-to LaTeX source line.
 - `get_synctex_callback_command` — print the current session's exact Zathura inverse SyncTeX callback command for manual configuration.
 - `compile_latex_file` — compile a local LaTeX source file in place, optionally opening/tracking the resulting PDF.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
@@ -33,7 +33,8 @@ the tool result; the text result includes an `image_path=<png>` field for the pr
 Inline image width is proportional to the cropped content width relative to the full PDF
 page width, so small symbols stay small while wide formulas use more of the TUI. With `inline=false`, it atomically
 writes a ready descriptor that pairs the operation PDF with the session's SyncTeX callback command,
-refreshes fixed compatibility files, then uses the existing Zathura helper/fallback path.
+refreshes fixed compatibility files, then opens via the viewer-service client (`show_latex_viewer.py`) running as a background helper.
+The default extension behavior is service-driven; it never launches Zathura directly.
 Inline preview details persist metadata locally in the tool result (`image_path`, `inline_previews`, and `pdf`), containing only
 safe artifact paths plus dimensions, so repeated renders in the same process can reuse an in-memory preview ID while a
 `/reload` can still recover images from the persisted metadata as long as `/tmp/codex-show-latex/inline` artifacts
@@ -44,10 +45,10 @@ resolve without using the backend service.
 ## Files
 
 - `index.ts` — Pi extension entry point.
-- `pdf_tracking.ts` — PDF validation, Zathura opening, and in-memory session tracking helpers.
+- `pdf_tracking.ts` — PDF validation, viewer-service-aware session tracking helpers, and legacy Zathura adapter support behind `PDF_PREVIEW_ZATHURA_LEGACY=1`.
 - `synctex.ts` and `scripts/pi_synctex_callback.mjs` — session-scoped inverse SyncTeX IPC and Zathura callback forwarding.
 - `scripts/show_latex_mcp.py` — copied service bridge used by the extension.
-- `scripts/show_latex_viewer.py` and `systemd/codex-show-latex-viewer.service` — same helper service files from the original implementation.
+- `scripts/show_latex_viewer.py` and `systemd/codex-show-latex-viewer.service` — helper service files (viewer service + `pi_synctex_callback.mjs`).
 
 ## Install in Pi
 
@@ -66,15 +67,15 @@ edits `~/.config/zathura/zathurarc` automatically.
 
 ## PDF tracking and jumps
 
-`open_pdf(pdf_file_path)` validates that the path exists, is readable, is a regular PDF file, then launches Zathura with `--fork` unless a local Zathura process for the same normalized PDF path is already visible. Successful calls return `ok: pdf_id=<id> pdf=<path>` and include `pdf_id` in tool details. IDs are short-lived, session-local values valid only in the current running Pi session/process; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID within that session where practical, while distinct PDFs receive distinct IDs.
+`open_pdf(pdf_file_path)` validates that the path exists, is readable, and is a regular PDF file. In default mode, it uses the configured viewer service (`show_latex_viewer.py`) to open or reuse the PDF, stores service metadata (`viewer_handle`, `viewer_backend`, capability flags), and returns a session-local `pdf_id`. IDs are short-lived session values only; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID where practical.
 
 Tracked PDFs also remember a default source file when possible. `compile_latex_file(..., open_pdf=true)` stores the compiled source path exactly. `open_pdf(existing.pdf)` attempts to infer a default source from `<basename>.tex` next to the normalized PDF and from available `.synctex`/`.synctex.gz` input records.
 
-`jump_pdf(pdf_id, line, source_file?)` performs a forward SyncTeX jump with Zathura using the tracked numeric `pdf_id`; it does not accept arbitrary PDF paths. The public tool is line-based, so callers do not pass a column. If the default source is unknown, call it again with `source_file`. For content located in a file included with `\input`, `\include`, or similar, pass that included file as `source_file` and use the line number from that file, not the parent file’s include directive line. If the tracked Zathura window was closed or is unavailable, the tool tries to reopen the same tracked PDF before retrying the jump. After a successful jump, the text result names the line and then shows the verbatim LaTeX source line that was jumped to (metadata remains in tool details), so the agent can immediately notice when edits shifted the intended row. The agent should not tell the user which line it jumped to unless the user explicitly asks for the exact line; the user will see the line in the PDF viewer.
+`jump_pdf(pdf_id, line, source_file?)` performs a forward SyncTeX jump via service forward-search using the tracked numeric `pdf_id`; it does not accept arbitrary PDF paths. The public tool is line-based, so callers do not pass a column. If the default source is unknown, call it again with `source_file`. For content located in a file included with `\input`, `\include`, or similar, pass that included file as `source_file` and use the line number from that file, not the parent file’s include directive line. If the tracked service handle is stale, the tool reopens the PDF through the viewer service before retrying the jump. After a successful jump, the text result names the line and then shows the verbatim LaTeX source line that was jumped to (metadata remains in tool details), so the agent can immediately notice when edits shifted the intended row. The agent should not tell the user which line it jumped to unless the user explicitly asks for the exact line; the user will see the line in the PDF viewer.
 
-`close_pdf(pdf_id)` sends `SIGTERM` only to local `zathura` processes whose command line contains the tracked PDF path, then removes that PDF from the in-memory tracking table. If no matching process is found, the PDF is still untracked.
+`close_pdf(pdf_id)` forwards close via service metadata and removes that PDF from the in-memory tracking table.
 
-Open, close, and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
+Open, close, and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex`. Legacy direct-Zathura open/close/jump behavior can be enabled explicitly for adapter development by setting `PDF_PREVIEW_ZATHURA_LEGACY=1`.
 
 ## Inverse SyncTeX PDF clicks
 
@@ -140,7 +141,9 @@ details to `/tmp/codex-show-latex/*.log`.
 
 `show_latex` always applies a preamble, even when the caller does not specify one.
 
-There are no environment-variable configuration knobs for this extension. Runtime paths are hardcoded:
+For production flows, extension behavior is fixed to service-driven viewer control. Legacy direct-Zathura behavior is available only when `PDF_PREVIEW_ZATHURA_LEGACY=1` is set for explicit adapter testing.
+
+Runtime paths are hardcoded:
 
 - Preview temp directory: `/tmp/codex-show-latex`
 - Active preamble file: `/tmp/codex-show-latex/preamble.tex`

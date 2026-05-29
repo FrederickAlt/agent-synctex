@@ -9,6 +9,7 @@ import {
 	assertReadablePdfFile,
 	closePdfInZathura,
 	closeTrackedPdf,
+	describePdfJumpFailureContext,
 	inferDefaultSourceFileForPdf,
 	jumpToTrackedPdf,
 	normalizePdfFilePath,
@@ -16,7 +17,10 @@ import {
 	openPdfInZathura,
 	PdfTracker,
 	processArgsMatchZathuraPdf,
+	zathuraPidsForPdf,
 } from "./pdf_tracking.ts";
+
+process.env.PDF_PREVIEW_ZATHURA_LEGACY = "1";
 
 function tempDir(): string {
 	return mkdtempSync(join(tmpdir(), "pdf-tracking-test-"));
@@ -318,6 +322,78 @@ test("openAndTrackPdf does not track when opening fails", async () => {
 	assert.equal(tracker.getByPath(realpathSync(pdf)), undefined);
 });
 
+test("direct Zathura helpers require legacy adapter mode", async () => {
+	const previousMode = process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+	process.env.PDF_PREVIEW_ZATHURA_LEGACY = "0";
+	try {
+		assert.throws(
+			() => zathuraPidsForPdf("/tmp/paper.pdf"),
+			/Default preview flow does not use direct Zathura control for process discovery/,
+		);
+		await assert.rejects(
+			() => openPdfInZathura("/tmp/paper.pdf"),
+			/Default preview flow does not use direct Zathura control for open/,
+		);
+		assert.throws(
+			() => closePdfInZathura("/tmp/paper.pdf", { findPids: () => [] }),
+			/Default preview flow does not use direct Zathura control for close/,
+		);
+	} finally {
+		if (previousMode === undefined) {
+			delete process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+		} else {
+			process.env.PDF_PREVIEW_ZATHURA_LEGACY = previousMode;
+		}
+	}
+});
+
+test("jump failure context omits process discovery outside legacy adapter mode", () => {
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf("/tmp/paper.pdf", "/tmp/paper.tex", 1234, undefined, {
+		viewerHandle: "viewer-handle-1",
+		viewerBackend: "viewer-service",
+		viewerOwned: true,
+		viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	});
+	const previousMode = process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+	process.env.PDF_PREVIEW_ZATHURA_LEGACY = "0";
+	try {
+		const context = describePdfJumpFailureContext(trackedPdf.id, tracker);
+		assert.equal(context.includes("viewer_handle=viewer-handle-1"), true);
+		assert.equal(context.includes("viewer_backend=viewer-service"), true);
+		assert.equal(context.includes("process_snapshot"), false);
+		assert.equal(context.includes("tracked_pid_args"), false);
+	} finally {
+		if (previousMode === undefined) {
+			delete process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+		} else {
+			process.env.PDF_PREVIEW_ZATHURA_LEGACY = previousMode;
+		}
+	}
+});
+
+test("openAndTrackPdf rejects direct-open path when legacy adapter is disabled", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	writeMinimalPdf(pdf);
+
+	const tracker = new PdfTracker();
+	const previousMode = process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+	process.env.PDF_PREVIEW_ZATHURA_LEGACY = "0";
+	try {
+		await assert.rejects(
+			() => openAndTrackPdf(pdf, tracker),
+			/Default preview flow does not use direct Zathura control for open and track/,
+		);
+	} finally {
+		if (previousMode === undefined) {
+			delete process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+		} else {
+			process.env.PDF_PREVIEW_ZATHURA_LEGACY = previousMode;
+		}
+	}
+});
+
 test("jumpToTrackedPdf performs a line-based SyncTeX jump using the tracked default source", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");
@@ -363,6 +439,31 @@ test("jumpToTrackedPdf asks for source_file when no default source is known", as
 		() => jumpToTrackedPdf(trackedPdf.id, 1, undefined, tracker),
 		/No default source_file is known.*Pass source_file explicitly/,
 	);
+});
+
+test("jumpToTrackedPdf refuses direct reopen when legacy adapter is disabled", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, undefined, "zathura --synctex-editor-command=unused");
+	const previousMode = process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+	process.env.PDF_PREVIEW_ZATHURA_LEGACY = "0";
+	try {
+		await assert.rejects(
+			() => jumpToTrackedPdf(trackedPdf.id, 12, undefined, tracker),
+			/Default preview flow does not use direct Zathura control for jump/,
+		);
+	} finally {
+		if (previousMode === undefined) {
+			delete process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+		} else {
+			process.env.PDF_PREVIEW_ZATHURA_LEGACY = previousMode;
+		}
+	}
 });
 
 test("jumpToTrackedPdf rejects non-positive line numbers", async () => {
@@ -1036,6 +1137,28 @@ test("closeTrackedPdf closes only the tracked PID when multiple windows share a 
 	assert.equal(tracker.getById(first.id), undefined);
 	assert.equal(tracker.getById(second.id), second);
 	assert.equal(tracker.getByPath("/tmp/paper.pdf"), second);
+});
+
+test("closeTrackedPdf refuses direct close when legacy adapter is disabled", async () => {
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf("/tmp/paper.pdf");
+	const previousMode = process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+	process.env.PDF_PREVIEW_ZATHURA_LEGACY = "0";
+	try {
+		await assert.rejects(
+			() => closeTrackedPdf(trackedPdf.id, tracker, {
+				findPids: () => [303],
+				killProcess: () => {},
+			}),
+			/Default preview flow does not use direct Zathura control for close/,
+		);
+	} finally {
+		if (previousMode === undefined) {
+			delete process.env.PDF_PREVIEW_ZATHURA_LEGACY;
+		} else {
+			process.env.PDF_PREVIEW_ZATHURA_LEGACY = previousMode;
+		}
+	}
 });
 
 test("closeTrackedPdf closes service-owned PDFs via viewer service", async () => {

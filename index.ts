@@ -1740,8 +1740,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "open_pdf",
 		label: "Open PDF",
-		description: "Open an existing local PDF in Zathura and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same PDF path again reuses the existing tracked or visible viewer where practical. Zathura is launched with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
-		promptSnippet: "Open and track a local PDF in Zathura",
+		description: "Open an existing local PDF through the viewer service and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same PDF path again reuses the existing tracked or visible viewer where practical. The viewer is configured with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
+		promptSnippet: "Open and track a local PDF through the viewer service",
 		promptGuidelines: [
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
 			"Pass an existing local PDF path. The returned pdf_id is short-lived and valid only in the current Pi session.",
@@ -1820,7 +1820,7 @@ export default function (pi: ExtensionAPI) {
 		name: "close_pdf",
 		label: "Close PDF",
 		description: "Close an extension-tracked PDF window by pdf_id. Service-managed windows are closed through the viewer service using private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The PDF is then removed from this session's tracking table when the close request succeeds.",
-		promptSnippet: "Close a tracked PDF in Zathura",
+		promptSnippet: "Close a tracked PDF through the viewer service",
 		promptGuidelines: [
 			"Use close_pdf when the user asks to close a PDF previously opened or tracked by this extension.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true).",
@@ -1855,10 +1855,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "jump_pdf",
 		label: "Jump PDF",
-		description: "Perform a line-based Zathura forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. The PDF must have SyncTeX data, and the source file must be readable. Uses the tracked default source file when known, or pass source_file when no default source was inferred or when jumping to an included .tex file. On success, the text result names the jumped line and then shows the verbatim LaTeX source line.",
+		description: "Perform a line-based viewer-service forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. The PDF must have SyncTeX data, and the source file must be readable. Uses the tracked default source file when known, or pass source_file when no default source was inferred or when jumping to an included .tex file. On success, the text result names the jumped line and then shows the verbatim LaTeX source line.",
 		promptSnippet: "Jump to a source line in a tracked PDF",
 		promptGuidelines: [
-			"Use jump_pdf to move an already tracked Zathura PDF to a source line via forward SyncTeX.",
+			"Use jump_pdf to move an already tracked viewer-service PDF to a source line via forward SyncTeX.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); do not pass arbitrary PDF paths.",
 			"Reuse the same pdf_id for repeated jumps within one tracked PDF.",
 			"source_file is optional only when the target line is in the tracked default source file; provide it whenever the target is in another source file or needs disambiguation.",

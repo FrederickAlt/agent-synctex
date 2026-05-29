@@ -16,6 +16,8 @@ Desktop helper outside Codex/sandbox:
 
 The MCP process no longer needs `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, D-Bus, or Wayland/X11 socket access. Compiles are SyncTeX-enabled by default (`-synctex=1`), and each ready descriptor can carry an operation-scoped Zathura inverse SyncTeX callback command.
 
+The default boundary is one-way: Pi sends requests through files under `/tmp/codex-show-latex`, and the viewer helper responds with request/result status records under `/tmp/codex-show-latex/viewer-results`. It does not perform process scanning in-process, and there is no direct dependency on `ps`, `/proc`, or the system DBus service in the MCP process.
+
 ## Tool parameters
 
 ### `show_latex`
@@ -78,7 +80,8 @@ installs and starts codex-show-latex-viewer.service as a systemd --user service
 creates /tmp/codex-show-latex with mode 0700
 ```
 
-The service only runs `scripts/show_latex_viewer.py`; it does not install a global SyncTeX receiver and does not edit `~/.config/zathura/zathurarc`. When a ready descriptor includes `synctex_editor_command`, the viewer passes it to Zathura with `--synctex-editor-command=...` for that opened preview.
+The service only runs `scripts/show_latex_viewer.py` (with `scripts/pi_synctex_callback.mjs` packaged beside it); it does not install a global SyncTeX receiver and does not edit `~/.config/zathura/zathurarc`. `show_latex_mcp.py` is the MCP-side counterpart and shares the same callback helper.
+When a ready descriptor includes `synctex_editor_command`, the viewer passes it to Zathura with `--synctex-editor-command=...` for that opened preview.
 
 Restart Codex fully after installing. If you already installed an older copy, rerun `./install.sh` or restart `codex-show-latex-viewer.service` so the viewer helper can read the new ready descriptor fields.
 
