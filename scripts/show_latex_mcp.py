@@ -26,7 +26,7 @@ SERVER_NAME = "codex-show-latex-secure-split"
 SERVER_VERSION = "2.1.0"
 PROTOCOL_VERSION = "2025-06-18"
 
-DEFAULT_TMPDIR = "/tmp/codex-show-latex"
+DEFAULT_TMPDIR = os.environ.get("MCP_TMPDIR", "/tmp/codex-show-latex")
 TEX_NAME = "show-latex.tex"
 PDF_NAME = "show-latex.pdf"
 LOG_NAME = "show-latex.log"
@@ -45,8 +45,8 @@ Json = Dict[str, Any]
 
 
 def tmpdir() -> Path:
-    # Fixed path by design: the desktop helper also watches this exact path.
-    return Path(DEFAULT_TMPDIR)
+    # Allow tests and callers to override the working directory via MCP_TMPDIR.
+    return Path(os.environ.get("MCP_TMPDIR", DEFAULT_TMPDIR))
 
 
 def path_tex() -> Path:

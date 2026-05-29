@@ -1,7 +1,7 @@
 import { createInterface, type Interface } from "node:readline";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -24,7 +24,6 @@ import { applyLatexPreamble } from "./latex_preamble.ts";
 import { createInlinePreviewRenderer } from "./inline_preview_renderer.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
 import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./pdf_tracking.ts";
-import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
 import { readSourceLine, SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./synctex.ts";
 import { ViewerServiceClient, type ViewerServiceOpenResult } from "./viewer_service.ts";
 interface McpEnvelope {
@@ -90,9 +89,8 @@ class LoggedToolError extends Error {
 	}
 }
 
-const MCP_TMPDIR = "/tmp/codex-show-latex";
+const MCP_TMPDIR = process.env.MCP_TMPDIR ?? "/tmp/codex-show-latex";
 const MCP_FIXED_PREVIEW_PDF_PATH = resolve(MCP_TMPDIR, "show-latex.pdf");
-const MCP_VIEWER_LOG_PATH = resolve(MCP_TMPDIR, "zathura.log");
 const VIEWER_SERVICE_REQUEST_TIMEOUT_MS = 5_000;
 const LATEX_PREAMBLE_FILE_NAMES = ["preamble.tex", "praeamble.tex"] as const;
 const LATEX_PREAMBLE_PATH = resolve(MCP_TMPDIR, "preamble.tex");
@@ -270,10 +268,9 @@ function latexLogPath(latexFilePath: string): string {
 }
 
 function latexErrorLogPath(prefix: string): string {
-	const logDir = resolve(tmpdir(), "codex-show-latex");
 	const safePrefix = prefix.replace(/[^a-z0-9_.-]+/gi, "-").replace(/^-+|-+$/g, "") || "latex";
-	mkdirSync(logDir, { recursive: true, mode: 0o700 });
-	return resolve(logDir, `${safePrefix}.${process.pid}.${Date.now()}.log`);
+	mkdirSync(MCP_TMPDIR, { recursive: true, mode: 0o700 });
+	return resolve(MCP_TMPDIR, `${safePrefix}.${process.pid}.${Date.now()}.log`);
 }
 
 function latexCompileErrorLogPath(): string {
@@ -632,8 +629,8 @@ class ShowLatexMcpClient {
 		const argumentsPayload: Record<string, unknown> = { latex_source: latexSource };
 		if (compiler) argumentsPayload.compiler = compiler;
 		if (synctexEditorCommand) argumentsPayload.synctex_editor_command = synctexEditorCommand;
-		if (options.writeReady === false) argumentsPayload.write_ready = false;
-		if (options.writeFixed === false) argumentsPayload.write_fixed = false;
+		if (options.writeReady !== undefined) argumentsPayload.write_ready = options.writeReady;
+		if (options.writeFixed !== undefined) argumentsPayload.write_fixed = options.writeFixed;
 
 		const result = await this.sendRequest(
 			"tools/call",
@@ -1180,7 +1177,7 @@ function callbackKeyForContext(ctx: ExtensionContext): string {
 }
 
 function createSynctexCallbackServer(): SynctexCallbackServer {
-	return new SynctexCallbackServer({ callbackScriptPath: SYNCTEX_CALLBACK_SCRIPT_PATH });
+	return new SynctexCallbackServer({ callbackScriptPath: SYNCTEX_CALLBACK_SCRIPT_PATH, tmpDir: MCP_TMPDIR });
 }
 
 async function rotateSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCallbackServer> {
@@ -1482,76 +1479,33 @@ async function executeShowLatexPreviewTool(
 	let compiler: LatexCompiler | undefined;
 	let synctexCommand = "";
 	let previewPdfPath = "";
+	let preview: ShowLatexPreviewResult;
 	let inline = true;
+
 	try {
 		latexSource = latexSourceInput;
 		compiler = resolveLatexCompiler(compilerParam);
 		inline = inlineParam !== false;
-		const useViewerService = !inline;
-		if (useViewerService) {
+		if (!inline) {
 			if (!ctx) {
 				throw new Error("show_latex with inline=false requires a Pi agent session context");
 			}
 			const server = await ensureSynctexCallbacks(ctx);
 			synctexCommand = server.command;
 		}
-		const viewerLogBefore = inline ? undefined : fileSnapshot(MCP_VIEWER_LOG_PATH);
-		const preview = await compileAndPreviewLatex(latexSource, compiler, inline ? undefined : synctexCommand, signal, { writeReady: !inline, writeFixed: !inline, cropToContent: false, suppressPageNumbers: inline });
+
+		preview = await compileAndPreviewLatex(
+			latexSource,
+			compiler,
+			inline ? undefined : synctexCommand,
+			signal,
+			{ writeReady: false, writeFixed: !inline, cropToContent: false, suppressPageNumbers: inline },
+		);
 		previewPdfPath = preview.pdfPath;
-
-		if (!inline) {
-			try {
-				await viewerServiceClient.requestStatus(signal, 300);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				debugLog(`viewer status probe failed for service diagnostics: ${message}`);
-			}
-		}
-
-		const viewerServiceOpener = useViewerService && ctx
-			? async (path: string, abortSignal: AbortSignal | undefined) => {
-				const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
-				const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
-				return {
-					pid: response.pid,
-					viewerHandle: response.handle,
-					viewerBackend: response.backend,
-					viewerOwned: response.owned,
-					viewerCapabilities: response.capabilities,
-				};
-			}
-			: undefined;
-
-		if (inline) {
-			const pageArtifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
-			const artifacts = await mergeInlinePreviewArtifacts(pageArtifacts, { signal });
-			const previewId = rememberInlinePreviewRenderState({ pdf: preview.pdfPath, previews: artifacts });
-			return buildInlinePreviewToolPayload(preview.pdfPath, previewId, artifacts);
-		}
-
-		let trackedPdfId: number | undefined;
-		let openedPdfPath: string | undefined;
-		if (!(await previewAlreadyOpen([preview.pdfPath, MCP_FIXED_PREVIEW_PDF_PATH], signal, { viewerLogPath: MCP_VIEWER_LOG_PATH, viewerLogBefore }))) {
-			const pdfTracker = pdfTrackerForContext(ctx);
-			const trackedPdf = await openAndTrackPdf(
-				MCP_FIXED_PREVIEW_PDF_PATH,
-				pdfTracker,
-				signal,
-				viewerServiceOpener,
-				undefined,
-				synctexCommand || undefined,
-			);
-			trackedPdfId = trackedPdf.id;
-			openedPdfPath = trackedPdf.path;
-		}
-
-		return {
-			content: [{ type: "text", text: preview.text }],
-			details: { pdf: openedPdfPath ?? preview.pdfPath, pdf_id: trackedPdfId, operation_pdf: preview.pdfPath, inline: false, synctex_callback_command: synctexCommand },
-		};
 	} catch (error) {
-		throw latexToolFailure(toolName, "LaTeX preview failed", {
+		throw latexToolFailure(toolName, "LaTeX preview compilation failed", {
 			compiler: compiler ?? compilerParam ?? DEFAULT_LATEX_COMPILER,
+			inline,
 			latex_source_length: latexSource.length,
 			latex_source_tail: tailText(latexSource, 30000),
 			pdf: previewPdfPath,
@@ -1559,6 +1513,91 @@ async function executeShowLatexPreviewTool(
 			synctex_callback_command: synctexCommand,
 		}, error);
 	}
+
+	if (inline) {
+		const pageArtifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
+		const artifacts = await mergeInlinePreviewArtifacts(pageArtifacts, { signal });
+		const previewId = rememberInlinePreviewRenderState({ pdf: preview.pdfPath, previews: artifacts });
+		return buildInlinePreviewToolPayload(preview.pdfPath, previewId, artifacts);
+	}
+
+	try {
+		const callbackConfig = (await ensureSynctexCallbacks(ctx!)).callbackConfig;
+		const response = await openPdfThroughViewerService(MCP_FIXED_PREVIEW_PDF_PATH, callbackConfig, signal);
+		const pdfTracker = pdfTrackerForContext(ctx);
+		const trackedPdf = trackOpenResultFromViewerService(
+			pdfTracker,
+			MCP_FIXED_PREVIEW_PDF_PATH,
+			synctexCommand || undefined,
+			response,
+		);
+
+		return {
+			content: [{ type: "text", text: preview.text }],
+			details: {
+				pdf: trackedPdf.path,
+				pdf_id: trackedPdf.id,
+				operation_pdf: preview.pdfPath,
+				inline: false,
+				synctex_callback_command: synctexCommand,
+			},
+		};
+	} catch (error) {
+		throw latexToolFailure(toolName, describeShowLatexViewerOpenFailure(error), {
+			compiler: compiler ?? compilerParam ?? DEFAULT_LATEX_COMPILER,
+			inline,
+			latex_source_length: latexSource.length,
+			latex_source_tail: tailText(latexSource, 30000),
+			preview_pdf: previewPdfPath,
+			fixed_preview_pdf: MCP_FIXED_PREVIEW_PDF_PATH,
+			synctex_callback_command: synctexCommand,
+			open_error: errorMessage(error),
+			open_error_code: extractViewerServiceErrorCode(error),
+		}, error);
+	}
+}
+
+function describeShowLatexViewerOpenFailure(error: unknown): string {
+	const message = errorMessage(error).toLowerCase();
+	const errorCode = extractViewerServiceErrorCode(error);
+
+	if (message.includes("viewer service request timed out")) {
+		return "Viewer service request timed out while opening preview";
+	}
+	if (errorCode === "backend_unavailable") {
+		return "Viewer backend unavailable while opening preview";
+	}
+	if (errorCode) {
+		return `Viewer service unavailable while opening preview (code=${errorCode})`;
+	}
+	if (message.includes("viewer service unavailable")) {
+		return "Viewer service unavailable while opening preview";
+	}
+	return "Viewer service unavailable while opening preview";
+}
+
+function trackOpenResultFromViewerService(
+	tracker: PdfTracker,
+	pdfPath: string,
+	synctexCommand: string | undefined,
+	response: ViewerServiceOpenResult,
+): { id: number; path: string } {
+	const trackedResult = {
+		pid: response.pid,
+		viewerHandle: response.handle,
+		viewerBackend: response.backend,
+		viewerOwned: response.owned,
+		viewerCapabilities: response.capabilities,
+	};
+
+	const existing = tracker.getByPath(pdfPath);
+	if (existing) {
+		tracker.markReopened(existing.id, response.pid, undefined, synctexCommand, trackedResult);
+		return { id: existing.id, path: existing.path };
+	}
+
+	const tracked = tracker.trackOpenedPdf(pdfPath, undefined, response.pid, synctexCommand, trackedResult);
+	return { id: tracked.id, path: tracked.path };
 }
 
 function extractViewerServiceErrorCode(error: unknown): string | undefined {

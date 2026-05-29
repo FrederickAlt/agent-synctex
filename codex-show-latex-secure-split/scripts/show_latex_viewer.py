@@ -32,7 +32,7 @@ os.umask(0o077)
 
 OPEN_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-DEFAULT_TMPDIR = "/tmp/codex-show-latex"
+DEFAULT_TMPDIR = os.environ.get("MCP_TMPDIR", "/tmp/codex-show-latex")
 REQUESTS_NAME = "viewer-requests"
 RESULTS_NAME = "viewer-results"
 STATE_NAME = "viewer-state.json"
@@ -64,8 +64,7 @@ VIEWER_OPEN_CAPABILITIES = {
 
 
 def tmpdir() -> Path:
-	# Fixed path by design: this helper never accepts arbitrary paths.
-	return Path(DEFAULT_TMPDIR)
+	return Path(os.environ.get("MCP_TMPDIR", DEFAULT_TMPDIR))
 
 
 def path_requests() -> Path:
