@@ -14,12 +14,12 @@ Pi extension / viewer-service client path:
 
 Desktop viewer service outside Codex/sandbox:
   process status/open/close/forward_search requests
-  launch and control the Zathura backend from the desktop session
+  launch and control the viewer backend (currently Zathura) from the desktop session
 ```
 
-The MCP/Pi client process no longer needs `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, D-Bus, or Wayland/X11 socket access for default viewer control. Compiles are SyncTeX-enabled by default (`-synctex=1`). `show-latex.ready` is now only a compatibility artifact for older standalone MCP callers; the current extension's default external preview path uses the viewer-service request/result protocol, not a ready-marker watcher.
+The MCP/Pi client process no longer needs `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, D-Bus, or Wayland/X11 socket access for default viewer control. Compiles are SyncTeX-enabled by default (`-synctex=1`). The client does not launch viewers directly; it only writes/reads protocol files and lets the desktop helper handle GUI control. `show-latex.ready` is now only a compatibility artifact for older standalone MCP callers; the current extension's default external preview path uses the viewer-service request/result protocol, not a ready-marker watcher.
 
-The default boundary is file-protocol based: Pi sends requests through files under `/tmp/codex-show-latex/viewer-requests`, and the viewer helper responds with request/result status records under `/tmp/codex-show-latex/viewer-results`. The MCP/Pi client process does not probe D-Bus or scan `/proc`; the desktop viewer service may inspect `/proc` internally to verify Zathura process ownership before reuse/close operations.
+The default boundary is file-protocol based: Pi sends requests through files under `/tmp/codex-show-latex/viewer-requests`, and the viewer helper responds with request/result status records under `/tmp/codex-show-latex/viewer-results`. The MCP/Pi client process does not probe D-Bus or scan `/proc`; the desktop viewer service may inspect `/proc` internally to verify backend process ownership before reuse/close operations.
 
 ## Tool parameters
 
@@ -28,7 +28,7 @@ The default boundary is file-protocol based: Pi sends requests through files und
 ```text
 latex_source: string, required
 compiler: string, optional; default lualatex; one of lualatex, pdflatex, xelatex, latexmk
-synctex_editor_command: string, optional; legacy ready-descriptor Zathura inverse SyncTeX callback
+synctex_editor_command: string, optional; compatibility callback override for standalone MCP callers (not used by default service-mode callers)
 write_ready: boolean, optional; compatibility ready descriptor, default true for standalone MCP calls
 write_fixed: boolean, optional; fixed compatibility PDF copies, default true
 ```
@@ -102,8 +102,13 @@ cat /tmp/codex-show-latex/mcp-debug.log
 cat /tmp/codex-show-latex/viewer.log
 ```
 
-If a client reports `viewer service request timed out; is the viewer service running?`, restart the user
-service and inspect `/tmp/codex-show-latex/viewer.log` plus the JSON protocol directories above.
+Viewer operations are serviced by the background viewer service and can fail in a few distinct ways:
+
+- **Service not running (timeout)**: if a client reports `viewer service request timed out; is the viewer service running?`, restart the user
+  service and inspect `/tmp/codex-show-latex/viewer.log` plus the JSON protocol directories above.
+- **Backend unavailable**: failures that mention `viewer backend is unavailable` (or `code=backend_unavailable`) usually mean the configured backend command is missing/unlaunchable. Run
+  `~/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py --status` and verify backend availability before retrying.
+- **Compile failures**: `show_latex`/`compile_latex_file` compile errors are separate from service availability; check log files under `/tmp/codex-show-latex/` for compiler details and service diagnostics.
 
 ## Security notes
 
