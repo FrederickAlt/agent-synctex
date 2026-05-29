@@ -202,11 +202,74 @@ print(json.dumps({
 	assert.equal(result.fixed_exists, false);
 });
 
-test("viewer opens interleaved ready operations with their own PDF and SyncTeX command", () => {
+test("viewer service writes structured status results for valid requests", () => {
 	const output = runPython(String.raw`
 import json
 import tempfile
+import types
+from pathlib import Path
 import time
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-status-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+request_id = "status-success"
+request = {
+    "protocol_version": viewer.PROTOCOL_VERSION,
+    "request_id": request_id,
+    "operation": "status",
+    "created_at_ns": int(time.time_ns()),
+}
+viewer.atomic_write_text(viewer.request_path(request_id), json.dumps(request), mode=0o600)
+processed = viewer.scan_requests()
+result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+print(json.dumps({
+    "processed": processed,
+    "result": result,
+    "state_exists": viewer.path_state().exists(),
+    "request_gone": not viewer.request_path(request_id).exists(),
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		state_exists: boolean;
+		request_gone: boolean;
+		result: {
+			protocol_version: number;
+			request_id: string;
+			operation: string;
+			status: string;
+			status_details: {
+				protocol_version: number;
+				protocol_directories: { base: string; requests: string; results: string; state: string };
+				backend: { name: string; available: boolean; path?: string };
+				service_available: boolean;
+			};
+		};
+	};
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.result.request_id, "status-success");
+	assert.equal(result.result.operation, "status");
+	assert.equal(result.result.status, "ok");
+	assert.equal(result.result.status_details.protocol_version, 1);
+	assert.equal(result.result.status_details.backend.name, "zathura");
+	assert.equal(result.state_exists, true);
+	assert.equal(result.request_gone, true);
+	assert.ok(result.result.status_details.protocol_directories.requests.endsWith("viewer-requests"));
+	assert.ok(result.result.status_details.protocol_directories.results.endsWith("viewer-results"));
+	assert.ok(typeof result.result.status_details.service_available === "boolean");
+});
+
+test("viewer service ignores malformed status requests", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
 import types
 from pathlib import Path
 
@@ -215,49 +278,331 @@ viewer = types.ModuleType("show_latex_viewer")
 viewer.__file__ = str(script)
 exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
 
-tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-test-"))
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-malformed-"))
 viewer.DEFAULT_TMPDIR = str(tmp)
-viewer.find_viewer = lambda: "/usr/bin/zathura"
-viewer.gui_env = lambda: {}
-viewer.zathura_already_open = lambda pdf, synctex_command=None: False
-opened = []
-
-class FakeProc:
-    pid = 987654
-    def poll(self):
-        return 0
-
-def fake_popen(cmd, **kwargs):
-    opened.append(cmd)
-    return FakeProc()
-
-viewer.subprocess.Popen = fake_popen
-
-def write_operation(name, command):
-    pdf = tmp / "runs" / name / viewer.PDF_NAME
-    pdf.parent.mkdir(parents=True, exist_ok=True)
-    pdf.write_bytes(b"%PDF-1.4\n")
-    descriptor = {
-        "version": 1,
-        "operation_id": name,
-        "timestamp_ns": time.time_ns(),
-        "pdf": str(pdf.relative_to(tmp)),
-        "synctex_editor_command": command,
-    }
-    viewer.ready_path().write_text(json.dumps(descriptor), encoding="utf-8")
-    return viewer.read_ready_operation()
-
-first = write_operation("op-a", "cmd-A")
-second = write_operation("op-b", "cmd-B")
-viewer.open_pdf_if_needed(None, first.pdf, first.synctex_command)
-viewer.open_pdf_if_needed(None, second.pdf, second.synctex_command)
-print(json.dumps(opened))
+viewer.ensure_protocol_dirs()
+request_id = "malformed"
+viewer.atomic_write_text(viewer.request_path(request_id), "{", mode=0o600)
+processed = viewer.scan_requests()
+print(json.dumps({
+    "processed": processed,
+    "request_exists": viewer.request_path(request_id).exists(),
+    "result_exists": viewer.result_path(request_id).exists(),
+    "request_count": len(list(viewer.path_requests().glob("*.json"))),
+    "result_count": len(list(viewer.path_results().glob("*.json"))),
+}))
 `);
-	const opened = JSON.parse(output) as string[][];
+	const result = JSON.parse(output) as {
+		processed: number;
+		request_exists: boolean;
+		result_exists: boolean;
+		request_count: number;
+		result_count: number;
+	};
 
-	assert.equal(opened.length, 2);
-	assert.deepEqual(opened[0].slice(0, 2), ["/usr/bin/zathura", "--synctex-editor-command=cmd-A"]);
-	assert.deepEqual(opened[1].slice(0, 2), ["/usr/bin/zathura", "--synctex-editor-command=cmd-B"]);
-	assert.match(opened[0][2], /\/runs\/op-a\/show-latex\.pdf$/);
-	assert.match(opened[1][2], /\/runs\/op-b\/show-latex\.pdf$/);
+	assert.equal(result.processed, 0);
+	assert.equal(result.request_exists, false);
+	assert.equal(result.result_exists, false);
+	assert.equal(result.request_count, 0);
+	assert.equal(result.result_count, 0);
+});
+
+test("viewer service ignores stale requests and cleans up stale artifacts", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-stale-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+request_id = "stale-request"
+stale = {
+    "protocol_version": viewer.PROTOCOL_VERSION,
+    "request_id": request_id,
+    "operation": "status",
+    "created_at_ns": time.time_ns() - (viewer.REQUEST_TTL_SECONDS + 10) * 1_000_000_000,
+}
+viewer.atomic_write_text(viewer.request_path(request_id), json.dumps(stale), mode=0o600)
+result_id = "stale-result"
+viewer.atomic_write_text(viewer.result_path(result_id), json.dumps({"status": "ok"}), mode=0o600)
+# Force the stale-result file to be old enough for cleanup.
+now = time.time() - (viewer.RESULT_TTL_SECONDS + 10)
+os.utime(viewer.result_path(result_id), (now, now))
+processed = viewer.scan_requests()
+print(json.dumps({
+    "processed": processed,
+    "request_exists": viewer.request_path(request_id).exists(),
+    "result_exists": viewer.result_path(result_id).exists(),
+    "request_count": len(list(viewer.path_requests().glob("*.json"))),
+    "result_count": len(list(viewer.path_results().glob("*.json"))),
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		request_exists: boolean;
+		result_exists: boolean;
+		request_count: number;
+		result_count: number;
+	};
+
+	assert.equal(result.processed, 0);
+	assert.equal(result.request_exists, false);
+	assert.equal(result.result_exists, false);
+	assert.equal(result.request_count, 0);
+	assert.equal(result.result_count, 0);
+});
+
+test("viewer service rejects request filename/body id mismatch", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-mismatch-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+viewer.atomic_write_text(
+    viewer.request_path("request-filename"),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": "payload-id",
+        "operation": "status",
+        "created_at_ns": int(time.time_ns()),
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+print(json.dumps({
+    "processed": processed,
+    "filename_exists": viewer.request_path("request-filename").exists(),
+    "payload_file_exists": viewer.request_path("payload-id").exists(),
+    "request_count": len(list(viewer.path_requests().glob("*.json"))),
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		filename_exists: boolean;
+		payload_file_exists: boolean;
+		request_count: number;
+	};
+
+	assert.equal(result.processed, 0);
+	assert.equal(result.filename_exists, false);
+	assert.equal(result.payload_file_exists, false);
+	assert.equal(result.request_count, 0);
+});
+
+test("viewer service rejects oversized request payloads", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-too-big-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+viewer.atomic_write_text(
+    viewer.request_path("oversize"),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": "oversize",
+        "operation": "status",
+        "created_at_ns": int(time.time_ns()),
+        "details": {"blob": "x" * (viewer.MAX_REQUEST_BYTES + 128)},
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+print(json.dumps({
+    "processed": processed,
+    "request_exists": viewer.request_path("oversize").exists(),
+    "request_count": len(list(viewer.path_requests().glob("*.json"))),
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		request_exists: boolean;
+		request_count: number;
+	};
+
+	assert.equal(result.processed, 0);
+	assert.equal(result.request_exists, false);
+	assert.equal(result.request_count, 0);
+});
+
+test("viewer service ignores symlinked request and result files", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import tempfile
+import types
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-symlink-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+
+request_target = tmp / "real-request.json"
+request_target.write_text("{}", encoding="utf-8")
+request_symlink = viewer.request_path("symlink-request")
+os.symlink(request_target, request_symlink)
+
+result_target = tmp / "real-result.json"
+result_target.write_text('{"status": "ok"}', encoding="utf-8")
+result_symlink = viewer.result_path("symlink-result")
+os.symlink(result_target, result_symlink)
+
+processed = viewer.scan_requests()
+print(json.dumps({
+    "processed": processed,
+    "request_symlink_exists": request_symlink.exists() and request_symlink.is_symlink(),
+    "result_symlink_exists": result_symlink.exists() and result_symlink.is_symlink(),
+    "target_request_exists": request_target.exists(),
+    "target_result_exists": result_target.exists(),
+    "request_count": len(list(viewer.path_requests().glob("*.json"))),
+    "result_count": len(list(viewer.path_results().glob("*.json"))),
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		request_symlink_exists: boolean;
+		result_symlink_exists: boolean;
+		target_request_exists: boolean;
+		target_result_exists: boolean;
+		request_count: number;
+		result_count: number;
+	};
+
+	assert.equal(result.processed, 0);
+	assert.equal(result.request_symlink_exists, false);
+	assert.equal(result.result_symlink_exists, false);
+	assert.equal(result.target_request_exists, true);
+	assert.equal(result.target_result_exists, true);
+	assert.equal(result.request_count, 0);
+	assert.equal(result.result_count, 0);
+});
+
+test("viewer service enforces directory mode 0700", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import tempfile
+import types
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-perms-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+os.chmod(tmp, 0o755)
+os.chmod(viewer.path_requests(), 0o755)
+os.chmod(viewer.path_results(), 0o750)
+viewer.ensure_protocol_dirs()
+print(json.dumps({
+    "base_mode": oct(os.stat(tmp).st_mode & 0o777),
+    "request_mode": oct(os.stat(viewer.path_requests()).st_mode & 0o777),
+    "result_mode": oct(os.stat(viewer.path_results()).st_mode & 0o777),
+}))
+`);
+	const result = JSON.parse(output) as {
+		base_mode: string;
+		request_mode: string;
+		result_mode: string;
+	};
+
+	assert.equal(result.base_mode, "0o700");
+	assert.equal(result.request_mode, "0o700");
+	assert.equal(result.result_mode, "0o700");
+});
+
+test("viewer service writes request and result files with mode 0600", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-file-mode-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+
+request_id = "mode-check"
+request = {
+    "protocol_version": viewer.PROTOCOL_VERSION,
+    "request_id": request_id,
+    "operation": "status",
+    "created_at_ns": int(time.time_ns()),
+}
+viewer.atomic_write_text(viewer.request_path(request_id), json.dumps(request), mode=0o600)
+viewer.write_status_result(
+    request_id,
+    "status",
+    "ok",
+    {
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "supported": True,
+        "service_available": True,
+        "backend": {"name": "zathura", "available": True, "path": "/usr/bin/zathura"},
+        "protocol_directories": {
+            "base": str(tmp),
+            "requests": str(viewer.path_requests()),
+            "results": str(viewer.path_results()),
+            "state": str(viewer.path_state()),
+        },
+        "diagnostics": {"log_tail": "", "recent_events": []},
+        "service_instance_started_ns": int(time.time_ns()),
+        "request_id": request_id,
+        "operation": "status",
+    },
+)
+print(json.dumps({
+    "request_mode": oct((viewer.request_path(request_id).stat().st_mode) & 0o777),
+    "result_mode": oct((viewer.result_path(request_id).stat().st_mode) & 0o777),
+}))
+`);
+	const result = JSON.parse(output) as {
+		request_mode: string;
+		result_mode: string;
+	};
+
+	assert.equal(result.request_mode, "0o600");
+	assert.equal(result.result_mode, "0o600");
 });

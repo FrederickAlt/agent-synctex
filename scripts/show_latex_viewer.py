@@ -1,388 +1,498 @@
 #!/usr/bin/env python3
-"""Desktop-session helper for codex-show-latex-secure-split.
+"""Desktop-session viewer service for codex-show-latex.
 
-Runs outside the Codex sandbox, normally as a systemd --user service.
-Watches the fixed ready marker and opens the ready descriptor's PDF path in Zathura.
-The descriptor atomically pairs each preview PDF with that operation's optional
-session callback command under the private fixed temp directory.
+This helper exposes a filesystem protocol consumed by the Pi extension so that
+file operations are validated, serialized, and sandbox-safe.
+
+Clients create per-request files under:
+  /tmp/codex-show-latex/viewer-requests/<id>.json
+and poll matching result files under:
+  /tmp/codex-show-latex/viewer-results/<id>.json
+
+Only the `status` operation is implemented in this tracer slice.
 """
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import signal
 import stat
-import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Any, Dict, Optional
 
-# Keep generated preview/log files private to the user.
+# Keep generated preview/service files private to the user.
 os.umask(0o077)
 
 DEFAULT_TMPDIR = "/tmp/codex-show-latex"
-PDF_NAME = "show-latex.pdf"
-READY_NAME = "show-latex.ready"
-ZATHURA_LOG_NAME = "zathura.log"
-DEFAULT_POLL_SEC = 0.5
-MIN_REOPEN_INTERVAL_SEC = 1.0
+REQUESTS_NAME = "viewer-requests"
+RESULTS_NAME = "viewer-results"
+STATE_NAME = "viewer-state.json"
+LOG_NAME = "viewer.log"
+BACKEND_NAME = "zathura"
+
+PROTOCOL_VERSION = 1
+MAX_REQUEST_BYTES = 32 * 1024
+REQUEST_TTL_SECONDS = 120
+RESULT_TTL_SECONDS = 600
+POLL_SECONDS = 0.25
+MIN_BACKEND_REOPEN_SECONDS = 1.0
+LOG_TAIL_LINES = 12
+MAX_STATE_EVENTS = 20
+
+SERVICE_STARTED_NS = time.time_ns()
 
 
 def tmpdir() -> Path:
-    # Fixed path by design: this helper never accepts arbitrary paths.
-    return Path(DEFAULT_TMPDIR)
+	# Fixed path by design: this helper never accepts arbitrary paths.
+	return Path(DEFAULT_TMPDIR)
 
 
-def pdf_path() -> Path:
-    return tmpdir() / PDF_NAME
+def path_requests() -> Path:
+	return tmpdir() / REQUESTS_NAME
 
 
-def ready_path() -> Path:
-    return tmpdir() / READY_NAME
+def path_results() -> Path:
+	return tmpdir() / RESULTS_NAME
 
 
-def log_path() -> Path:
-    return tmpdir() / ZATHURA_LOG_NAME
+def path_state() -> Path:
+	return tmpdir() / STATE_NAME
 
 
-class ReadyOperation(NamedTuple):
-    signature: tuple[int, int]
-    pdf: Path
-    synctex_command: Optional[str]
+def path_log() -> Path:
+	return tmpdir() / LOG_NAME
+
+
+def service_dirs() -> list[Path]:
+	return [tmpdir(), path_requests(), path_results()]
 
 
 def ensure_secure_tmpdir(create: bool = True) -> Path:
-    d = tmpdir()
-    if d.exists() or d.is_symlink():
-        try:
-            st_l = os.lstat(d)
-        except FileNotFoundError:
-            st_l = None
-        if st_l is not None:
-            if stat.S_ISLNK(st_l.st_mode):
-                raise RuntimeError(f"refusing symlink temp directory: {d}")
-            if not stat.S_ISDIR(st_l.st_mode):
-                raise RuntimeError(f"temp path exists but is not a directory: {d}")
-            if st_l.st_uid != os.geteuid():
-                raise RuntimeError(f"temp directory is not owned by uid {os.geteuid()}: {d}")
-            if (st_l.st_mode & 0o077) != 0:
-                os.chmod(d, 0o700)
-    else:
-        if not create:
-            raise RuntimeError(f"temp directory does not exist: {d}")
-        d.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(d, 0o700)
-    return d
+	d = tmpdir()
+	if d.exists() or d.is_symlink():
+		try:
+			st_l = os.lstat(d)
+		except FileNotFoundError:
+			st_l = None
+		if st_l is not None:
+			if stat.S_ISLNK(st_l.st_mode):
+				raise RuntimeError(f"refusing symlink temp directory: {d}")
+			if not stat.S_ISDIR(st_l.st_mode):
+				raise RuntimeError(f"temp path exists but is not a directory: {d}")
+			if st_l.st_uid != os.geteuid():
+				raise RuntimeError(f"temp directory is not owned by uid {os.geteuid()}: {d}")
+			if (st_l.st_mode & 0o077) != 0:
+				os.chmod(d, 0o700)
+	else:
+		if not create:
+			raise RuntimeError(f"temp directory does not exist: {d}")
+		d.mkdir(parents=True, mode=0o700, exist_ok=True)
+		os.chmod(d, 0o700)
+	return d
+
+
+def ensure_protocol_dir(path: Path) -> None:
+	if path.exists() or path.is_symlink():
+		try:
+			st_l = os.lstat(path)
+		except FileNotFoundError:
+			st_l = None
+		if st_l is not None:
+			if stat.S_ISLNK(st_l.st_mode):
+				raise RuntimeError(f"refusing symlink path: {path}")
+			if not stat.S_ISDIR(st_l.st_mode):
+				raise RuntimeError(f"protocol path exists but is not a directory: {path}")
+			if st_l.st_uid != os.geteuid():
+				raise RuntimeError(f"protocol path is not owned by uid {os.geteuid()}: {path}")
+			if (st_l.st_mode & 0o077) != 0:
+				os.chmod(path, 0o700)
+			return
+
+	path.mkdir(parents=True, mode=0o700, exist_ok=True)
+	os.chmod(path, 0o700)
+
+
+def ensure_protocol_dirs() -> None:
+	for dir_path in service_dirs():
+		ensure_protocol_dir(dir_path)
 
 
 def log(message: str) -> None:
-    try:
-        ensure_secure_tmpdir(create=True)
-        ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        with log_path().open("a", encoding="utf-8") as f:
-            f.write(f"[{ts}] helper: {message}\n")
-    except Exception:
-        pass
+	try:
+		ensure_protocol_dirs()
+		ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+		with path_log().open("a", encoding="utf-8") as f:
+			f.write(f"[{ts}] viewer-service: {message}\n")
+	except Exception:
+		pass
 
 
-def pdf_from_ready_value(value: object) -> Optional[Path]:
-    if not isinstance(value, str) or not value:
-        return None
-    candidate = Path(value)
-    if not candidate.is_absolute():
-        candidate = tmpdir() / candidate
-    try:
-        root = tmpdir().resolve(strict=True)
-        parent = candidate.parent.resolve(strict=True)
-    except Exception as e:
-        log(f"ignoring ready pdf path with unsafe parent {candidate}: {e}")
-        return None
-    if parent != root and root not in parent.parents:
-        log(f"ignoring ready pdf path outside preview tmpdir: {candidate}")
-        return None
-    return candidate
+def atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
+	tmp = path.parent / f".{path.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
+	fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+	try:
+		with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+			f.write(text)
+			f.flush()
+			os.fsync(f.fileno())
+		os.replace(tmp, path)
+	finally:
+		try:
+			if tmp.exists():
+				tmp.unlink()
+		except Exception:
+			pass
 
 
-def read_ready_operation() -> Optional[ReadyOperation]:
-    path = ready_path()
-    try:
-        st_l = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(st_l.st_mode) or not stat.S_ISREG(st_l.st_mode):
-        log(f"ignoring unsafe ready marker: {path}")
-        return None
-    if st_l.st_uid != os.geteuid():
-        log(f"ignoring ready marker not owned by uid {os.geteuid()}: {path}")
-        return None
-
-    signature = (st_l.st_mtime_ns, st_l.st_size)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except Exception as e:
-        log(f"failed to read ready marker: {e}")
-        return None
-
-    pdf = pdf_path()
-    synctex_command: Optional[str] = None
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        descriptor_pdf = pdf_from_ready_value(data.get("pdf"))
-        if descriptor_pdf is None:
-            log("ignoring ready marker without a valid operation PDF")
-            return None
-        pdf = descriptor_pdf
-        command = data.get("synctex_editor_command")
-        if isinstance(command, str) and command:
-            synctex_command = command
-    return ReadyOperation(signature, pdf, synctex_command)
+def safe_unlink(path: Path) -> None:
+	try:
+		path.unlink()
+	except FileNotFoundError:
+		pass
 
 
-def marker_signature() -> tuple[int, int] | None:
-    operation = read_ready_operation()
-    return operation.signature if operation is not None else None
+def is_regular_file(path: Path) -> bool:
+	try:
+		st_l = os.lstat(path)
+	except FileNotFoundError:
+		return False
+	if stat.S_ISLNK(st_l.st_mode):
+		return False
+	return stat.S_ISREG(st_l.st_mode)
 
 
-def regular_pdf_is_safe_enough(path: Path) -> bool:
-    try:
-        st_l = os.lstat(path)
-    except FileNotFoundError:
-        log(f"pdf missing: {path}")
-        return False
-    if stat.S_ISLNK(st_l.st_mode):
-        log(f"refusing symlink pdf path: {path}")
-        return False
-    if not stat.S_ISREG(st_l.st_mode):
-        log(f"refusing non-regular pdf path: {path}")
-        return False
-    if st_l.st_uid != os.geteuid():
-        log(f"refusing pdf not owned by uid {os.geteuid()}: {path}")
-        return False
-    if st_l.st_size <= 0:
-        log(f"refusing empty pdf: {path}")
-        return False
-    return True
+def read_text_file(path: Path, max_bytes: int) -> str:
+	if not is_regular_file(path):
+		raise ValueError("not a regular file")
+	st = path.stat()
+	if st.st_size > max_bytes:
+		raise ValueError("request exceeds size limit")
+	return path.read_text(encoding="utf-8")
 
 
-def detect_xauthority(uid: int) -> Optional[str]:
-    candidates = []
-    env_xauth = os.environ.get("XAUTHORITY")
-    if env_xauth:
-        candidates.append(env_xauth)
-    candidates.extend(glob.glob(f"/run/user/{uid}/.mutter-Xwaylandauth.*"))
-    candidates.append(str(Path.home() / ".Xauthority"))
-    for c in candidates:
-        try:
-            st = os.stat(c)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISREG(st.st_mode) and st.st_uid == uid:
-            return c
-    return None
+def request_path(request_id: str) -> Path:
+	return path_requests() / f"{request_id}.json"
 
 
-def detect_wayland_display(runtime_dir: str) -> Optional[str]:
-    env_val = os.environ.get("WAYLAND_DISPLAY")
-    if env_val and Path(runtime_dir, env_val).exists():
-        return env_val
-    for name in ("wayland-0", "wayland-1"):
-        if Path(runtime_dir, name).exists():
-            return name
-    return env_val
+def result_path(request_id: str) -> Path:
+	return path_results() / f"{request_id}.json"
 
 
-def gui_env() -> dict[str, str]:
-    uid = os.geteuid()
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
-    env = os.environ.copy()
-    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
-    env.setdefault("HOME", str(Path.home()))
-    env["XDG_RUNTIME_DIR"] = runtime_dir
-
-    wayland = detect_wayland_display(runtime_dir)
-    if wayland:
-        env["WAYLAND_DISPLAY"] = wayland
-
-    if "DBUS_SESSION_BUS_ADDRESS" not in env:
-        bus = Path(runtime_dir) / "bus"
-        if bus.exists():
-            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
-
-    env.setdefault("DISPLAY", ":0")
-    env.setdefault("XDG_SESSION_TYPE", "wayland")
-
-    xauth = detect_xauthority(uid)
-    if xauth:
-        env["XAUTHORITY"] = xauth
-
-    return env
+def is_request_id_valid(request_id: str) -> bool:
+	if not isinstance(request_id, str):
+		return False
+	if not request_id or len(request_id) > 128:
+		return False
+	for char in request_id:
+		if char.isalnum() or char in "._-":
+			continue
+		return False
+	return True
 
 
-def process_has_zathura_pdf(pid: int, pdf: Path, synctex_command: Optional[str] = None) -> bool:
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except Exception:
-        return False
-    if not raw:
-        return False
-    args = [a.decode("utf-8", errors="replace") for a in raw.split(b"\0") if a]
-    if not args:
-        return False
-    exe = Path(args[0]).name
-    if "zathura" not in exe:
-        return False
-    wanted = str(pdf)
-    if not any(arg == wanted for arg in args[1:]):
-        return False
-    if synctex_command is None:
-        return True
-    return any(arg == f"--synctex-editor-command={synctex_command}" for arg in args[1:])
+def request_is_stale(created_at_ns: int, now_ns: int) -> bool:
+	return now_ns - created_at_ns > REQUEST_TTL_SECONDS * 1_000_000_000
 
 
-def zathura_already_open(pdf: Path, synctex_command: Optional[str] = None) -> bool:
-    for child in Path("/proc").iterdir():
-        if not child.name.isdigit():
-            continue
-        try:
-            pid = int(child.name)
-        except ValueError:
-            continue
-        if process_has_zathura_pdf(pid, pdf, synctex_command):
-            return True
-    return False
+def parse_request(path: Path, now_ns: int) -> Optional[Dict[str, Any]]:
+	if path.suffix != ".json":
+		return None
+	if not is_regular_file(path):
+		log(f"ignoring unsafe request path: {path}")
+		safe_unlink(path)
+		return None
+
+	try:
+		payload_text = read_text_file(path, MAX_REQUEST_BYTES)
+	except ValueError as exc:
+		log(f"request rejected {path}: {exc}")
+		safe_unlink(path)
+		return None
+
+	try:
+		obj = json.loads(payload_text)
+	except Exception:
+		log(f"ignoring malformed request JSON: {path}")
+		safe_unlink(path)
+		return None
+
+	if not isinstance(obj, dict):
+		log(f"request not an object: {path}")
+		safe_unlink(path)
+		return None
+
+	request_id = obj.get("request_id")
+	if not is_request_id_valid(request_id):
+		log(f"request has invalid id: {path}")
+		safe_unlink(path)
+		return None
+	if path.name != f"{request_id}.json":
+		log(f"request id mismatch for {path}: {request_id}")
+		safe_unlink(path)
+		return None
+
+	protocol_version = obj.get("protocol_version")
+	if protocol_version != PROTOCOL_VERSION:
+		log(f"request protocol_version unsupported: {path}")
+		safe_unlink(path)
+		return None
+
+	operation = obj.get("operation")
+	if not isinstance(operation, str):
+		log(f"request missing operation: {path}")
+		safe_unlink(path)
+		return None
+
+	created_at_ns = obj.get("created_at_ns")
+	if not isinstance(created_at_ns, int):
+		created_at_ns = path.stat().st_mtime_ns
+	if request_is_stale(created_at_ns, now_ns):
+		log(f"ignoring stale request: {path}")
+		safe_unlink(path)
+		return None
+
+	details = obj.get("details") if isinstance(obj.get("details"), dict) else {}
+	return {
+		"request_id": request_id,
+		"protocol_version": protocol_version,
+		"operation": operation,
+		"created_at_ns": int(created_at_ns),
+		"details": details,
+	}
 
 
 def find_viewer() -> str:
-    # Fixed viewer command. No environment-controlled arbitrary command.
-    fixed = Path("/usr/bin/zathura")
-    if fixed.exists() and os.access(fixed, os.X_OK):
-        return str(fixed)
-    for part in os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin").split(":"):
-        candidate = Path(part) / "zathura"
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return "zathura"
+	fixed = Path(f"/usr/bin/{BACKEND_NAME}")
+	if fixed.exists() and os.access(fixed, os.X_OK):
+		return str(fixed)
+	for part in os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin").split(":"):
+		candidate = Path(part) / BACKEND_NAME
+		if candidate.exists() and os.access(candidate, os.X_OK):
+			return str(candidate)
+	return BACKEND_NAME
 
 
-def open_pdf_if_needed(
-    last_proc: Optional[subprocess.Popen],
-    pdf: Path,
-    synctex_command: Optional[str],
-) -> Optional[subprocess.Popen]:
-    if not regular_pdf_is_safe_enough(pdf):
-        return last_proc
-
-    if last_proc is not None and last_proc.poll() is None:
-        if process_has_zathura_pdf(last_proc.pid, pdf, synctex_command):
-            log("zathura already tracked with current SyncTeX command; relying on auto-reload")
-            return last_proc
-        log("tracked zathura lacks current SyncTeX command; launching configured viewer")
-
-    if zathura_already_open(pdf, synctex_command):
-        log("zathura already open for ready pdf with current SyncTeX command; relying on auto-reload")
-        return None
-
-    env = gui_env()
-    viewer = find_viewer()
-    cmd = [viewer]
-    if synctex_command:
-        cmd.append(f"--synctex-editor-command={synctex_command}")
-    cmd.append(str(pdf))
-    log(
-        "launching "
-        + " ".join(cmd)
-        + f" DISPLAY={env.get('DISPLAY','')} WAYLAND_DISPLAY={env.get('WAYLAND_DISPLAY','')}"
-    )
-    ensure_secure_tmpdir(create=True)
-    with log_path().open("ab") as lf:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(tmpdir()),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=lf,
-            stderr=lf,
-            close_fds=True,
-            start_new_session=True,
-        )
-    return proc
+def protocol_directories() -> Dict[str, str]:
+	return {
+		"base": str(tmpdir()),
+		"requests": str(path_requests()),
+		"results": str(path_results()),
+		"state": str(path_state()),
+	}
 
 
-def run_check() -> int:
-    ensure_secure_tmpdir(create=True)
-    operation = read_ready_operation()
-    pdf = operation.pdf if operation is not None else pdf_path()
-    ok = regular_pdf_is_safe_enough(pdf)
-    print("ok" if ok else "not-ready")
-    return 0 if ok else 1
+def read_tail(path: Path, max_lines: int = LOG_TAIL_LINES) -> str:
+	if not path.exists() or not is_regular_file(path):
+		return ""
+	try:
+		lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+	except Exception:
+		return ""
+	return "\n".join(lines[-max_lines:])
 
 
-def status_text() -> str:
-    ensure_secure_tmpdir(create=True)
-    operation = read_ready_operation()
-    pdf = operation.pdf if operation is not None else pdf_path()
-    lines = [f"tmpdir={tmpdir()}"]
-    for name, path in (("pdf", pdf), ("ready", ready_path()), ("fixed_pdf", pdf_path()), ("log", log_path())):
-        try:
-            st = os.lstat(path)
-            kind = "symlink" if stat.S_ISLNK(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "other"
-            lines.append(f"{name}={path} exists kind={kind} size={st.st_size} mtime={int(st.st_mtime)}")
-        except FileNotFoundError:
-            lines.append(f"{name}={path} missing")
-    lines.append(f"viewer={find_viewer()}")
-    return "\n".join(lines)
+def read_state() -> Dict[str, Any]:
+	if not is_regular_file(path_state()):
+		return {
+			"protocol_version": PROTOCOL_VERSION,
+			"protocol_directories": protocol_directories(),
+			"events": [],
+			"service_started_ns": SERVICE_STARTED_NS,
+		}
+	try:
+		obj = json.loads(path_state().read_text(encoding="utf-8"))
+	except Exception:
+		return {
+			"protocol_version": PROTOCOL_VERSION,
+			"protocol_directories": protocol_directories(),
+			"events": [],
+			"service_started_ns": SERVICE_STARTED_NS,
+		}
+	if isinstance(obj, dict):
+		return obj
+	return {
+		"protocol_version": PROTOCOL_VERSION,
+		"protocol_directories": protocol_directories(),
+		"events": [],
+		"service_started_ns": SERVICE_STARTED_NS,
+	}
+
+
+def write_state(payload: Dict[str, Any]) -> None:
+	atomic_write_text(path_state(), json.dumps(payload, separators=(",", ":")) + "\n", mode=0o600)
+
+
+def add_state_event(state: Dict[str, Any], message: str) -> None:
+	events = state.setdefault("events", [])
+	if not isinstance(events, list):
+		events = []
+	state["events"] = events[-(MAX_STATE_EVENTS - 1):]
+	state["events"].append(message)
+
+
+def build_status_details(request_id: str, operation: str) -> Dict[str, Any]:
+	viewer = find_viewer()
+	state = read_state()
+	backend_available = Path(viewer).exists() and os.access(viewer, os.X_OK)
+	return {
+		"protocol_version": PROTOCOL_VERSION,
+		"supported": True,
+		"service_available": True,
+		"backend": {
+			"name": BACKEND_NAME,
+			"available": bool(backend_available),
+			"path": viewer,
+		},
+		"protocol_directories": protocol_directories(),
+		"diagnostics": {
+			"log_tail": read_tail(path_log()),
+			"recent_events": list(state.get("events", [])),
+		},
+		"service_instance_started_ns": SERVICE_STARTED_NS,
+		"request_id": request_id,
+		"operation": operation,
+	}
+
+
+def write_status_result(request_id: str, operation: str, status: str, status_details: Dict[str, Any], error: Optional[str] = None) -> None:
+	result = {
+		"protocol_version": PROTOCOL_VERSION,
+		"request_id": request_id,
+		"operation": operation,
+		"status": status,
+		"generated_at_ns": time.time_ns(),
+		"status_details": status_details,
+	}
+	if error:
+		result["error"] = error
+	path = result_path(request_id)
+	atomic_write_text(path, json.dumps(result, separators=(",", ":")) + "\n", mode=0o600)
+	log(f"wrote {operation} result for {request_id}")
+
+
+def cleanup_stale_files(now_ns: int) -> None:
+	for path in path_requests().iterdir():
+		if path.is_symlink():
+			safe_unlink(path)
+			continue
+		if not path.is_file():
+			continue
+		if now_ns - path.stat().st_mtime_ns > REQUEST_TTL_SECONDS * 1_000_000_000:
+			safe_unlink(path)
+
+	for path in path_results().iterdir():
+		if path.is_symlink():
+			safe_unlink(path)
+			continue
+		if not path.is_file():
+			continue
+		if now_ns - path.stat().st_mtime_ns > RESULT_TTL_SECONDS * 1_000_000_000:
+			safe_unlink(path)
+
+
+def scan_requests(now_ns: Optional[int] = None) -> int:
+	if now_ns is None:
+		now_ns = time.time_ns()
+
+	processed = 0
+	state = read_state()
+	state["protocol_version"] = PROTOCOL_VERSION
+	state["protocol_directories"] = protocol_directories()
+	state["last_scan_ns"] = now_ns
+	state["service_started_ns"] = SERVICE_STARTED_NS
+	state["service_available"] = True
+	state["backend_name"] = BACKEND_NAME
+	state["backend_path"] = find_viewer()
+	for path in sorted(path_requests().iterdir(), key=lambda p: p.name):
+		request = parse_request(path, now_ns)
+		if request is None:
+			continue
+
+		request_id = request["request_id"]
+		operation = request["operation"]
+		req_path = request_path(request_id)
+
+		if operation != "status":
+			error = f"unsupported operation: {operation}"
+			viewer_path = find_viewer()
+			write_status_result(
+				request_id,
+				operation,
+				"error",
+				{
+					"protocol_version": PROTOCOL_VERSION,
+					"supported": False,
+					"service_available": True,
+					"backend": {
+						"name": BACKEND_NAME,
+						"available": Path(viewer_path).exists() and os.access(viewer_path, os.X_OK),
+						"path": viewer_path,
+					},
+					"protocol_directories": protocol_directories(),
+					"diagnostics": {"log_tail": read_tail(path_log()), "recent_events": list(state.get("events", []))},
+					"service_instance_started_ns": SERVICE_STARTED_NS,
+					"request_id": request_id,
+					"operation": operation,
+				},
+				error,
+			)
+			add_state_event(state, f"unsupported operation request_id={request_id} operation={operation}")
+			safe_unlink(req_path)
+			continue
+
+		details = build_status_details(request_id, operation)
+		write_status_result(request_id, operation, "ok", details)
+		add_state_event(state, f"handled status request_id={request_id}")
+		safe_unlink(req_path)
+		processed += 1
+
+	cleanup_stale_files(now_ns)
+	write_state(state)
+	return processed
 
 
 def main() -> int:
-    if "--check" in sys.argv:
-        return run_check()
-    if "--status" in sys.argv:
-        print(status_text())
-        return 0
+	if "--status" in sys.argv:
+		ensure_secure_tmpdir(create=True)
+		ensure_protocol_dirs()
+		status = build_status_details("cli", "status")
+		print(json.dumps({"protocol_version": PROTOCOL_VERSION, "status": status}, separators=(",", ":")))
+		return 0
+	if "--check" in sys.argv:
+		ensure_secure_tmpdir(create=True)
+		ensure_protocol_dirs()
+		if path_requests().is_dir() and path_results().is_dir():
+			print("ok")
+			return 0
+		print("not-ready")
+		return 1
 
-    stop = False
+	stop = False
 
-    def handle_stop(signum: int, frame: object) -> None:
-        nonlocal stop
-        stop = True
-        log(f"received signal {signum}; stopping")
+	def handle_stop(signum: int, _frame: object) -> None:
+		nonlocal stop
+		stop = True
+		log(f"received signal {signum}; stopping")
 
-    signal.signal(signal.SIGTERM, handle_stop)
-    signal.signal(signal.SIGINT, handle_stop)
+	signal.signal(signal.SIGTERM, handle_stop)
+	signal.signal(signal.SIGINT, handle_stop)
 
-    poll_sec = DEFAULT_POLL_SEC
+	ensure_protocol_dirs()
+	log("viewer service started")
+	last_open_at = 0
+	while not stop:
+		now_ns = time.time_ns()
+		if now_ns - last_open_at >= int(MIN_BACKEND_REOPEN_SECONDS * 1_000_000_000):
+			last_open_at = now_ns
+		scan_requests(now_ns)
+		time.sleep(POLL_SECONDS)
 
-    ensure_secure_tmpdir(create=True)
-    log("viewer helper started")
-    initial_operation = read_ready_operation()
-    last_sig = initial_operation.signature if initial_operation is not None else None
-    last_open_at = 0.0
-    last_proc: Optional[subprocess.Popen] = None
-
-    while not stop:
-        operation = read_ready_operation()
-        if operation is not None and operation.signature != last_sig:
-            last_sig = operation.signature
-            now = time.monotonic()
-            if now - last_open_at >= MIN_REOPEN_INTERVAL_SEC:
-                try:
-                    last_proc = open_pdf_if_needed(last_proc, operation.pdf, operation.synctex_command)
-                    last_open_at = now
-                except Exception as e:
-                    log(f"open failed: {e}")
-            else:
-                log("rate-limited viewer open request")
-        time.sleep(poll_sec)
-
-    log("viewer helper stopped")
-    return 0
+	log("viewer service stopped")
+	return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+	raise SystemExit(main())

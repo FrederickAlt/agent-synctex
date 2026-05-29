@@ -26,6 +26,7 @@ import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } fr
 import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
 import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
 import { readSourceLine, SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
+import { ViewerServiceClient } from "./viewer_service.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;
@@ -92,6 +93,7 @@ class LoggedToolError extends Error {
 const MCP_TMPDIR = "/tmp/codex-show-latex";
 const MCP_FIXED_PREVIEW_PDF_PATH = resolve(MCP_TMPDIR, "show-latex.pdf");
 const MCP_VIEWER_LOG_PATH = resolve(MCP_TMPDIR, "zathura.log");
+const VIEWER_SERVICE_REQUEST_TIMEOUT_MS = 5_000;
 const LATEX_PREAMBLE_FILE_NAMES = ["preamble.tex", "praeamble.tex"] as const;
 const LATEX_PREAMBLE_PATH = resolve(MCP_TMPDIR, "preamble.tex");
 const DEFAULT_LATEX_COMPILER = "lualatex";
@@ -1110,6 +1112,7 @@ class ShowLatexMcpClient {
 const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
+const viewerServiceClient = new ViewerServiceClient(MCP_TMPDIR, { requestTimeoutMs: VIEWER_SERVICE_REQUEST_TIMEOUT_MS });
 const pdfTrackersByContext = new Map<string, PdfTracker>();
 const tmuxKittyPreviewInvalidationRegistry = new KittyPreviewInvalidationRegistry();
 const terminalRefreshPolicy = createTerminalRefreshPolicy({
@@ -1491,6 +1494,15 @@ async function executeShowLatexPreviewTool(
 		const viewerLogBefore = inline ? undefined : fileSnapshot(MCP_VIEWER_LOG_PATH);
 		const preview = await compileAndPreviewLatex(latexSource, compiler, inline ? undefined : synctexCommand, signal, { writeReady: !inline, writeFixed: !inline, cropToContent: false, suppressPageNumbers: inline });
 		previewPdfPath = preview.pdfPath;
+
+		if (!inline) {
+			try {
+				await viewerServiceClient.requestStatus(signal, 300);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				debugLog(`viewer status probe failed for service diagnostics: ${message}`);
+			}
+		}
 
 		if (inline) {
 			const pageArtifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
