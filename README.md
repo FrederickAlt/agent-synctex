@@ -31,10 +31,10 @@ and, for multi-page PDFs, merges the page PNGs into one vertical image when Imag
 (falling back to sequential PNGs otherwise). It renders inline in Pi chat without returning image bytes in
 the tool result; the text result includes an `image_path=<png>` field for the primary local preview image.
 Inline image width is proportional to the cropped content width relative to the full PDF
-page width, so small symbols stay small while wide formulas use more of the TUI. With `inline=false`, it atomically
-writes a ready descriptor that pairs the operation PDF with the session's SyncTeX callback command,
-refreshes fixed compatibility files, then opens via the viewer-service client (`show_latex_viewer.py`) running as a background helper.
-The default extension behavior is service-driven; it never launches Zathura directly.
+page width, so small symbols stay small while wide formulas use more of the TUI. With `inline=false`, it
+refreshes fixed compatibility files and submits an `open` request to the viewer-service protocol handled by
+`scripts/show_latex_viewer.py` (or the installed background service). The default extension path does not use
+a ready-marker watcher and never launches Zathura directly.
 Inline preview details persist metadata locally in the tool result (`image_path`, `inline_previews`, and `pdf`), containing only
 safe artifact paths plus dimensions, so repeated renders in the same process can reuse an in-memory preview ID while a
 `/reload` can still recover images from the persisted metadata as long as `/tmp/codex-show-latex/inline` artifacts
@@ -64,6 +64,24 @@ is `scripts/pi_synctex_callback.mjs`; it is spawned on demand by Zathura callbac
 not a systemd service. The preview viewer helper remains `scripts/show_latex_viewer.py` (or the
 installed `codex-show-latex-viewer.service` from the secure-split package). The extension never
 edits `~/.config/zathura/zathurarc` automatically.
+
+Viewer-service setup/status:
+
+```bash
+# install/start the packaged user service
+(cd codex-show-latex-secure-split && ./install.sh)
+
+systemctl --user status codex-show-latex-viewer.service
+~/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py --status
+cat /tmp/codex-show-latex/viewer.log
+```
+
+The service protocol uses `/tmp/codex-show-latex/viewer-requests`, `/tmp/codex-show-latex/viewer-results`,
+and `/tmp/codex-show-latex/viewer-state.json` (all under the mode-0700 base directory). If external
+preview/open/jump calls fail with `viewer service request timed out; is the viewer service running?`, start or
+restart the user service above and check `/tmp/codex-show-latex/viewer.log`. The extension sends the service a
+structured SyncTeX callback config (`kind`, `transport`, `socket_path`, `token`); raw callback commands are only
+for manual Zathura configuration via `get_synctex_callback_command`.
 
 ## PDF tracking and jumps
 
@@ -118,7 +136,7 @@ Install dev dependencies once with `npm install`, then run `npm run verify` to t
 ## Compiler selection
 
 `show_latex` and `compile_latex_file` both accept an optional `compiler` parameter. The default is `lualatex`.
-`show_latex` also accepts `inline` (default `true`). Use `inline=false` when you specifically want the external Zathura preview workflow.
+`show_latex` also accepts `inline` (default `true`). Use `inline=false` when you specifically want the external viewer-service preview workflow.
 Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk` (which runs latexmk with LuaLaTeX).
 
 Prefer `compile_latex_file` over invoking a bare compiler directly when you already have a `.tex` file to build.
@@ -155,5 +173,5 @@ The preamble can also be changed at runtime with `set_latex_preamble`, which wri
 ## Firejail note
 
 Your Pi runtime is firejail sandboxed. Keep `/tmp/codex-show-latex` accessible to the sandbox
-so the helper + viewer can communicate via marker/pdf files.
+so the extension and viewer service can communicate via request/result files and preview artifacts.
 # agent-synctex
