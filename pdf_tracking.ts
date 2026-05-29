@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
-import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -53,6 +53,7 @@ interface ZathuraOpenOptions {
 interface ZathuraJumpOptions extends ZathuraOpenOptions {
 	opener?: PdfOpener;
 	synctexPid?: number;
+	requestForwardSearch?: (viewerHandle: string, viewerBackend: string, sourceFile: string, line: number, synctexPid?: number, signal?: AbortSignal) => Promise<PdfServiceForwardSearchResult>;
 }
 
 interface ZathuraCloseOptions {
@@ -82,6 +83,11 @@ export interface PdfCloseResult {
 
 interface PdfServiceCloseResult {
 	closed: boolean;
+	reason?: string;
+}
+
+interface PdfServiceForwardSearchResult {
+	handled: boolean;
 	reason?: string;
 }
 
@@ -292,14 +298,21 @@ export function resolveSourceFilePath(sourceFile: string): string {
 export function assertReadableSourceFile(sourceFile: string): void {
 	let fileStatus;
 	try {
-		fileStatus = statSync(sourceFile);
+		fileStatus = lstatSync(sourceFile);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Cannot stat source_file ${sourceFile}: ${message}`);
 	}
 
+	if (fileStatus.isSymbolicLink()) {
+		throw new Error(`source_file must not be a symlink: ${sourceFile}`);
+	}
 	if (!fileStatus.isFile()) {
 		throw new Error(`source_file must point to a regular file: ${sourceFile}`);
+	}
+	const uid = process.getuid?.();
+	if (uid === undefined || fileStatus.uid !== uid) {
+		throw new Error(`source_file must be owned by current user: ${sourceFile}`);
 	}
 
 	try {
@@ -1092,6 +1105,9 @@ export async function jumpToTrackedPdf(
 	if (!trackedPdf) {
 		throw new Error(`Unknown tracked pdf_id=${pdfId}. Open the PDF first with open_pdf or compile_latex_file(..., open_pdf=true).`);
 	}
+	if (!Number.isInteger(line) || line < 1) {
+		throw new Error("line must be a positive integer");
+	}
 
 	const resolvedSourceFile = sourceFile
 		? resolveSourceFilePath(sourceFile)
@@ -1104,14 +1120,9 @@ export async function jumpToTrackedPdf(
 	const trackedSynctexCommand = options.synctexEditorCommand ?? trackedPdf.synctexEditorCommand;
 	const hasTrackedCommand = trackedSynctexCommand !== undefined;
 
-	const resolveOwnedPid = (): number | undefined => {
-		if (!hasTrackedCommand) {
-			return trackedPdf.pid;
-		}
-
-		const currentPids = zathuraPidsForPdfWithSynctexCommand(trackedPdf.path, trackedSynctexCommand);
-		if (trackedPdf.pid !== undefined && currentPids.includes(trackedPdf.pid)) return trackedPdf.pid;
-		return currentPids.length > 0 ? Math.max(...currentPids) : undefined;
+	const extractServiceErrorCode = (error: unknown): string | undefined => {
+		const message = error instanceof Error ? error.message : String(error);
+		return /\(code=([^)]+)\)/.exec(message)?.[1];
 	};
 
 	const opener = options.opener ?? ((pdfPath: string, abortSignal?: AbortSignal) => {
@@ -1123,6 +1134,70 @@ export async function jumpToTrackedPdf(
 		};
 		return openPdfInZathura(pdfPath, abortSignal, openerOptions);
 	});
+
+	if (trackedPdf.viewerHandle !== undefined && trackedPdf.viewerBackend !== undefined) {
+		if (trackedPdf.viewerCapabilities?.forward_search === false) {
+			throw new Error(`Tracked pdf_id=${pdfId} is not managed by a forward_search-capable viewer backend: ${trackedPdf.viewerBackend}`);
+		}
+		if (!options.requestForwardSearch) {
+			throw new Error(`Tracked pdf_id=${pdfId} requires viewer service forward_search but no forward-search handler is configured.`);
+		}
+
+		const jumpWithService = async (synctexPid: number | undefined): Promise<void> => {
+			await options.requestForwardSearch!(
+				trackedPdf.viewerHandle as string,
+				trackedPdf.viewerBackend as string,
+				resolvedSourceFile,
+				line,
+				synctexPid,
+				signal,
+			);
+		};
+
+		try {
+			await jumpWithService(trackedPdf.pid);
+			return { pdf: trackedPdf.path, sourceFile: resolvedSourceFile, line, reopened: false };
+		} catch (firstError) {
+			const errorCode = extractServiceErrorCode(firstError);
+			if (errorCode !== "handle_not_found") {
+				throw firstError;
+			}
+
+			let reopenedMetadata: PdfOpenResult | undefined;
+			let openerErrorMessage: string | undefined;
+			try {
+				const rawResult = await opener(trackedPdf.path, signal);
+				reopenedMetadata = normalizeOpenResult(rawResult);
+			} catch (reopenError) {
+				openerErrorMessage = reopenError instanceof Error ? reopenError.message : String(reopenError);
+			}
+			if (reopenedMetadata === undefined) {
+				const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
+				const secondMessage = openerErrorMessage ? `: ${openerErrorMessage}` : "";
+				throw new Error(`Tracked PDF pdf_id=${pdfId} appears closed or unavailable, and had a stale forward_search handle ${trackedPdf.viewerHandle} at ${trackedPdf.path}: ${firstMessage}${secondMessage}`);
+			}
+
+			tracker.markReopened(pdfId, reopenedMetadata.pid, trackedPdf.sourceFile, trackedSynctexCommand, reopenedMetadata);
+			try {
+				await jumpWithService(trackedPdf.pid);
+				return { pdf: trackedPdf.path, sourceFile: resolvedSourceFile, line, reopened: true };
+			} catch (retryError) {
+				const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
+				const secondMessage = retryError instanceof Error ? retryError.message : String(retryError);
+				throw new Error(`Tracked PDF pdf_id=${pdfId} appears closed or unavailable, stale handle retry failed for ${trackedPdf.path}: ${firstMessage.replace(/\n/g, " ")} ${secondMessage.replace(/\n/g, " ")}`);
+			}
+		}
+	}
+
+	const resolveOwnedPid = (): number | undefined => {
+		if (!hasTrackedCommand) {
+			return trackedPdf.pid;
+		}
+
+		const currentPids = zathuraPidsForPdfWithSynctexCommand(trackedPdf.path, trackedSynctexCommand);
+		if (trackedPdf.pid !== undefined && currentPids.includes(trackedPdf.pid)) return trackedPdf.pid;
+		return currentPids.length > 0 ? Math.max(...currentPids) : undefined;
+	};
 
 	const jumpWithPid = async (pid: number | undefined): Promise<void> => {
 		const jumpOptions: ZathuraJumpOptions = { ...options };

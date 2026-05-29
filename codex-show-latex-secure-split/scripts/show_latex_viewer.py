@@ -53,6 +53,7 @@ SYNCTEX_CALLBACK_KIND = "pi-synctex-callback-v1"
 SYNCTEX_CALLBACK_TRANSPORT = "unix"
 OPEN_REQUEST_OPERATION = "open"
 CLOSE_REQUEST_OPERATION = "close"
+FORWARD_SEARCH_REQUEST_OPERATION = "forward_search"
 VIEWER_OPEN_CAPABILITIES = {
     "open": True,
     "close": True,
@@ -224,6 +225,37 @@ def open_pdf_file_and_validate(path: Path) -> tuple[str | None, str | None, int 
 		return (str(exc), None, None)
 
 
+def source_file_and_validate(path: Path) -> tuple[str | None, str | None, int | None]:
+	flags = os.O_RDONLY
+	if hasattr(os, "O_NOFOLLOW"):
+		flags |= os.O_NOFOLLOW
+	try:
+		source_fd = os.open(path, flags)
+	except OSError as exc:
+		if exc.errno == getattr(errno, "ELOOP", 0):
+			return ("source_file must not be a symlink", None, None)
+		return (f"cannot open source_file: {path}", None, None)
+
+	try:
+		st = os.fstat(source_fd)
+		if stat.S_ISLNK(st.st_mode):
+			os.close(source_fd)
+			return ("source_file must not be a symlink", None, None)
+		if not stat.S_ISREG(st.st_mode):
+			os.close(source_fd)
+			return (f"source_file must be a regular file: {path}", None, None)
+		if st.st_uid != os.geteuid():
+			os.close(source_fd)
+			return (f"source_file is not owned by current user: {path}", None, None)
+		return (None, str(path.resolve()), source_fd)
+	except Exception as exc:
+		try:
+			os.close(source_fd)
+		except Exception:
+			pass
+		return (str(exc), None, None)
+
+
 def _read_from_fd(file_descriptor: int) -> bytes:
 	os.lseek(file_descriptor, 0, os.SEEK_SET)
 	return os.read(file_descriptor, 5)
@@ -315,6 +347,26 @@ def validate_close_request_details(details: Dict[str, Any]) -> Optional[str]:
 		return "missing or invalid handle"
 	if not isinstance(backend, str) or not backend:
 		return "missing or invalid backend"
+	return None
+
+
+def validate_forward_search_request_details(details: Dict[str, Any]) -> Optional[str]:
+	handle = details.get("handle")
+	backend = details.get("backend")
+	source_file = details.get("source_file")
+	line = details.get("line")
+	if not isinstance(handle, str) or not handle:
+		return "missing or invalid handle"
+	if not isinstance(backend, str) or not backend:
+		return "missing or invalid backend"
+	if not isinstance(source_file, str) or not source_file:
+		return "missing or invalid source_file"
+	if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+		return "line must be a positive integer"
+	if "synctex_pid" in details:
+		pid = details.get("synctex_pid")
+		if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+			return "invalid synctex_pid"
 	return None
 
 
@@ -541,6 +593,36 @@ def build_close_result_details(
 		"request_id": request_id,
 		"operation": CLOSE_REQUEST_OPERATION,
 		"closed": bool(closed),
+	}
+	if reason:
+		details["reason"] = reason
+	if handle:
+		details["handle"] = handle
+	if error_code is not None:
+		details["error_code"] = error_code
+	return details
+
+
+def build_forward_search_result_details(
+	request_id: str,
+	handled: bool,
+	reason: Optional[str] = None,
+	handle: Optional[str] = None,
+	backend: Optional[str] = None,
+	backend_identity_ok: bool = False,
+	error_code: Optional[str] = None,
+) -> Dict[str, Any]:
+	details = {
+		"protocol_version": PROTOCOL_VERSION,
+		"supported": True,
+		"service_available": True,
+		"backend": backend if backend else BACKEND_NAME,
+		"backend_identity_ok": bool(backend_identity_ok),
+		"protocol_directories": protocol_directories(),
+		"service_instance_started_ns": SERVICE_STARTED_NS,
+		"request_id": request_id,
+		"operation": FORWARD_SEARCH_REQUEST_OPERATION,
+		"handled": bool(handled),
 	}
 	if reason:
 		details["reason"] = reason
@@ -861,6 +943,151 @@ def close_pdf_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[s
 	}
 
 
+def forward_search_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any]) -> Dict[str, Any]:
+	error = validate_forward_search_request_details(details)
+	if error:
+		return {
+			"status": "error",
+			"error": error,
+			"status_details": build_forward_search_result_details(
+				request_id,
+				False,
+				error,
+				None,
+				None,
+				False,
+				"invalid_request",
+			),
+		}
+
+	handle = details["handle"]
+	backend = details["backend"]
+	source_file_value = details["source_file"]
+	line = details["line"]
+	synctex_pid = details.get("synctex_pid")
+
+	matched_session: Optional[Dict[str, Any]] = None
+	matched_path = None
+	for pdf_path, session in list(OPEN_SESSIONS.items()):
+		if session.get("handle") == handle:
+			matched_session = session
+			matched_path = pdf_path
+			break
+	if matched_session is None or matched_path is None:
+		return {
+			"status": "error",
+			"error": "viewer handle not recognized",
+			"status_details": build_forward_search_result_details(
+				request_id,
+				False,
+				"handle_not_found",
+				handle,
+				backend,
+				False,
+				"handle_not_found",
+			),
+		}
+
+	session_backend = matched_session.get("backend")
+	if session_backend != backend:
+		return {
+			"status": "error",
+			"error": "backend identity mismatch for viewer handle",
+			"status_details": build_forward_search_result_details(
+				request_id,
+				False,
+				"backend_mismatch",
+				handle,
+				backend,
+				False,
+				"backend_mismatch",
+			),
+		}
+
+	source_file_error, normalized_source_file, source_fd = source_file_and_validate(Path(source_file_value))
+	if source_file_error:
+		return {
+			"status": "error",
+			"error": source_file_error,
+			"status_details": build_forward_search_result_details(
+				request_id,
+				False,
+				source_file_error,
+				handle,
+				backend,
+				False,
+				"invalid_source_file",
+			),
+		}
+	if source_fd is not None:
+		try:
+			os.close(source_fd)
+		except Exception:
+			pass
+
+	viewer_path = matched_session.get("backend_path") or find_viewer()
+	args = [viewer_path, "--synctex-forward", f"{line}:1:{normalized_source_file}"]
+	if isinstance(synctex_pid, int):
+		args.append(f"--synctex-pid={synctex_pid}")
+	args.append(matched_path)
+
+	try:
+		completed = subprocess.run(args, capture_output=True, text=True, check=False, timeout=10)
+	except FileNotFoundError:
+		return {
+			"status": "error",
+			"error": "viewer backend is unavailable",
+			"status_details": build_forward_search_result_details(
+				request_id,
+				False,
+				"viewer backend is unavailable",
+				handle,
+				backend,
+				False,
+				"backend_unavailable",
+			),
+		}
+	except subprocess.TimeoutExpired:
+		return {
+			"status": "error",
+			"error": "viewer command timed out",
+			"status_details": build_forward_search_result_details(
+				request_id,
+				False,
+				"viewer command timed out",
+				handle,
+				backend,
+				False,
+				"backend_unavailable",
+			),
+		}
+	if completed.returncode != 0:
+		return {
+			"status": "error",
+			"error": "viewer forward_search failed",
+			"status_details": build_forward_search_result_details(
+				request_id,
+				False,
+				"viewer forward_search failed",
+				handle,
+				backend,
+				False,
+				"backend_unavailable",
+			),
+		}
+
+	return {
+		"status": "ok",
+		"status_details": build_forward_search_result_details(
+			request_id,
+			True,
+			handle=handle,
+			backend=backend,
+			backend_identity_ok=True,
+		),
+	}
+
+
 def protocol_directories() -> Dict[str, str]:
 	return {
 		"base": str(tmpdir()),
@@ -1043,6 +1270,28 @@ def scan_requests(now_ns: Optional[int] = None) -> int:
 			})
 			write_status_result(request_id, operation, status, status_details, error)
 			add_state_event(state, f"handled close request_id={request_id} status={status}")
+			safe_unlink(req_path)
+			processed += 1
+			continue
+
+		if operation == FORWARD_SEARCH_REQUEST_OPERATION:
+			forward_result = forward_search_in_viewer(request_id, request["details"], state)
+			status = forward_result.get("status", "error")
+			error = forward_result.get("error")
+			status_details = forward_result.get("status_details", {
+				"protocol_version": PROTOCOL_VERSION,
+				"supported": False,
+				"service_available": False,
+				"backend": BACKEND_NAME,
+				"backend_identity_ok": False,
+				"handled": False,
+				"protocol_directories": protocol_directories(),
+				"service_instance_started_ns": SERVICE_STARTED_NS,
+				"request_id": request_id,
+				"operation": FORWARD_SEARCH_REQUEST_OPERATION,
+			})
+			write_status_result(request_id, operation, status, status_details, error)
+			add_state_event(state, f"handled forward_search request_id={request_id} status={status}")
 			safe_unlink(req_path)
 			processed += 1
 			continue

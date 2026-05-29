@@ -92,11 +92,29 @@ interface ViewerServiceCloseResultBase {
 	error_code?: string;
 }
 
+interface ViewerServiceForwardSearchResultBase {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	backend: string;
+	backend_identity_ok: boolean;
+	protocol_directories: ViewerServiceProtocolDirectories;
+	service_instance_started_ns: number;
+	request_id: string;
+	operation: string;
+	handled: boolean;
+	reason?: string;
+	handle?: string;
+	error_code?: string;
+}
+
 export interface ViewerServiceOpenResult extends ViewerServiceOpenResultBase {
 	handle: string;
 }
 
 export interface ViewerServiceCloseResult extends ViewerServiceCloseResultBase {}
+
+export interface ViewerServiceForwardSearchResult extends ViewerServiceForwardSearchResultBase {}
 
 export interface ViewerServiceResultEnvelope {
 	protocol_version: number;
@@ -105,7 +123,7 @@ export interface ViewerServiceResultEnvelope {
 	status: "ok" | "error";
 	generated_at_ns: number;
 	error?: string;
-	status_details: ViewerServiceStatus | ViewerServiceOpenResultBase | ViewerServiceCloseResultBase;
+	status_details: ViewerServiceStatus | ViewerServiceOpenResultBase | ViewerServiceCloseResultBase | ViewerServiceForwardSearchResultBase;
 }
 
 export interface ViewerServiceOpenRequestDetails {
@@ -119,6 +137,15 @@ export interface ViewerServiceCloseRequestDetails {
 	handle: string;
 	backend: string;
 }
+
+export interface ViewerServiceForwardSearchRequestDetails {
+	handle: string;
+	backend: string;
+	source_file: string;
+	line: number;
+	synctex_pid?: number;
+}
+
 export interface ViewerServiceRequest {
 	protocol_version: number;
 	request_id: string;
@@ -297,6 +324,42 @@ export class ViewerServiceClient {
 			throw new Error("viewer service close response malformed");
 		}
 		return closeResult as ViewerServiceCloseResult;
+	}
+
+	async requestForwardSearch(
+		handle: string,
+		backend: string,
+		sourceFile: string,
+		line: number,
+		synctexPid?: number,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<ViewerServiceForwardSearchResult> {
+		const timeoutMs = requestTimeoutMs ?? this.requestTimeoutMs;
+		const result = await this.request(
+			"forward_search",
+			{
+				handle,
+				backend,
+				source_file: sourceFile,
+				line,
+				...(synctexPid === undefined ? {} : { synctex_pid: synctexPid }),
+			},
+			signal,
+			timeoutMs,
+		);
+		if (result.status !== "ok") {
+			const errorCode = "error_code" in result.status_details && typeof result.status_details.error_code === "string"
+				? result.status_details.error_code
+				: undefined;
+			const suffix = errorCode ? ` (code=${errorCode})` : "";
+			throw new Error(`${result.error || "viewer service returned error status"}${suffix}`);
+		}
+		const forwardSearchResult = result.status_details;
+		if (!isValidForwardSearchResult(forwardSearchResult)) {
+			throw new Error("viewer service forward_search response malformed");
+		}
+		return forwardSearchResult as ViewerServiceForwardSearchResult;
 	}
 
 	private async request(
@@ -511,6 +574,29 @@ function isValidCloseResult(details: unknown): details is ViewerServiceCloseResu
 	return true;
 }
 
+function isValidForwardSearchResult(details: unknown): details is ViewerServiceForwardSearchResultBase & Record<string, unknown> {
+	if (!isStringRecord(details)) return false;
+	if (!isStringRecord(details.protocol_directories)) return false;
+	const protocolDirectories = details.protocol_directories;
+	if (typeof protocolDirectories.base !== "string") return false;
+	if (typeof protocolDirectories.requests !== "string") return false;
+	if (typeof protocolDirectories.results !== "string") return false;
+	if (typeof protocolDirectories.state !== "string") return false;
+	if (typeof details.service_instance_started_ns !== "number") return false;
+	if (!isValidRequestId(details.request_id)) return false;
+	if (typeof details.operation !== "string" || !details.operation) return false;
+	if (typeof details.protocol_version !== "number") return false;
+	if (typeof details.supported !== "boolean") return false;
+	if (typeof details.service_available !== "boolean") return false;
+	if (typeof details.backend !== "string" || !details.backend) return false;
+	if (typeof details.backend_identity_ok !== "boolean") return false;
+	if (typeof details.handled !== "boolean") return false;
+	if (details.reason !== undefined && typeof details.reason !== "string") return false;
+	if (details.handle !== undefined && (typeof details.handle !== "string" || !details.handle)) return false;
+	if (details.error_code !== undefined && typeof details.error_code !== "string") return false;
+	return true;
+}
+
 function isValidStatusResult(details: unknown): details is ViewerServiceStatus & Record<string, unknown> {
 	if (!isStringRecord(details)) return false;
 	if (typeof details.protocol_version !== "number") return false;
@@ -553,6 +639,9 @@ function isValidResult(value: unknown): value is ViewerServiceResultEnvelope {
 	}
 	if (candidate.operation === "close") {
 		return isValidCloseResult(details);
+	}
+	if (candidate.operation === "forward_search") {
+		return isValidForwardSearchResult(details);
 	}
 	return isValidStatusResult(details);
 }

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { gzipSync } from "node:zlib";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -364,6 +364,262 @@ test("jumpToTrackedPdf asks for source_file when no default source is known", as
 		/No default source_file is known.*Pass source_file explicitly/,
 	);
 });
+
+test("jumpToTrackedPdf rejects non-positive line numbers", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source);
+
+	await assert.rejects(
+		() => jumpToTrackedPdf(trackedPdf.id, 0, undefined, tracker),
+		/line must be a positive integer/,
+	);
+});
+
+test("jumpToTrackedPdf errors when service metadata lacks a forward-search handler", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source);
+	trackedPdf.viewerHandle = "zathura:open:service";
+	trackedPdf.viewerBackend = "zathura";
+	trackedPdf.viewerCapabilities = {
+		open: true,
+		close: true,
+		forward_search: true,
+		inverse_search: true,
+		reuse: true,
+	};
+
+	await assert.rejects(
+		() => jumpToTrackedPdf(trackedPdf.id, 9, undefined, tracker),
+		/no forward-search handler is configured/,
+	);
+});
+
+test("jumpToTrackedPdf uses viewer service forward_search when service metadata is present", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	const fakeCalls: string[] = [];
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, 111);
+	trackedPdf.viewerHandle = "zathura:open:service";
+	trackedPdf.viewerBackend = "zathura";
+	trackedPdf.viewerOwned = true;
+	trackedPdf.viewerCapabilities = {
+		open: true,
+		close: true,
+		forward_search: true,
+		inverse_search: true,
+		reuse: true,
+	};
+
+	const result = await jumpToTrackedPdf(trackedPdf.id, 12, undefined, tracker, undefined, {
+		requestForwardSearch: async (viewerHandle, viewerBackend, sourceFile, line, synctexPid) => {
+			fakeCalls.push(`${viewerHandle}|${viewerBackend}|${sourceFile}|${line}|${synctexPid ?? ""}`);
+			return { handled: true };
+		},
+	});
+
+	assert.deepEqual(fakeCalls, [`zathura:open:service|zathura|${source}|12|111`]);
+	assert.deepEqual(result, { pdf, sourceFile: source, line: 12, reopened: false });
+});
+
+test("jumpToTrackedPdf rejects non-regular source files in service jumps", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const sourceDirectory = join(dir, "src-dir");
+	writeMinimalPdf(pdf);
+	mkdirSync(sourceDirectory, { recursive: true });
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, sourceDirectory);
+	trackedPdf.viewerHandle = "zathura:open:service";
+	trackedPdf.viewerBackend = "zathura";
+	trackedPdf.viewerCapabilities = {
+		open: true,
+		close: true,
+		forward_search: true,
+		inverse_search: true,
+		reuse: true,
+	};
+
+	await assert.rejects(
+		() => jumpToTrackedPdf(
+			trackedPdf.id,
+			5,
+			sourceDirectory,
+			tracker,
+			undefined,
+			{
+				requestForwardSearch: async () => ({ handled: true }),
+			},
+		),
+		/source_file .*regular file/,
+	);
+});
+
+test("jumpToTrackedPdf rejects a service handle without forward_search capability", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, 111);
+	trackedPdf.viewerHandle = "zathura:open:service";
+	trackedPdf.viewerBackend = "zathura";
+	trackedPdf.viewerCapabilities = {
+		open: true,
+		close: true,
+		forward_search: false,
+		inverse_search: true,
+		reuse: true,
+	};
+
+	await assert.rejects(
+		() => jumpToTrackedPdf(
+			trackedPdf.id,
+			8,
+			undefined,
+			tracker,
+			undefined,
+			{
+				requestForwardSearch: async () => ({ handled: true }),
+		},
+		),
+		/not.*forward_search.*capable/,
+	);
+});
+
+test("jumpToTrackedPdf retries stale service handles once", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	let forwardCalls = 0;
+	let openerCalls = 0;
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, 111);
+	trackedPdf.viewerHandle = "zathura:open:stale";
+	trackedPdf.viewerBackend = "zathura";
+	trackedPdf.viewerCapabilities = {
+		open: true,
+		close: true,
+		forward_search: true,
+		inverse_search: true,
+		reuse: true,
+	};
+
+	const result = await jumpToTrackedPdf(
+		trackedPdf.id,
+		21,
+		undefined,
+		tracker,
+		undefined,
+		{
+			requestForwardSearch: async (_viewerHandle, _viewerBackend, _sourceFile, _line, _synctexPid) => {
+				forwardCalls += 1;
+				if (forwardCalls === 1) {
+					throw new Error("viewer handle not recognized (code=handle_not_found)");
+				}
+				return { handled: true };
+			},
+			opener: async () => {
+				openerCalls += 1;
+				return {
+					pid: 2222,
+					viewerHandle: "zathura:open:recovered",
+					viewerBackend: "zathura",
+					viewerOwned: true,
+					viewerCapabilities: {
+						open: true,
+						close: true,
+						forward_search: true,
+						inverse_search: true,
+						reuse: true,
+					},
+				};
+			},
+		},
+	);
+
+	assert.equal(forwardCalls, 2);
+	assert.equal(openerCalls, 1);
+	assert.equal(result.reopened, true);
+	assert.equal(tracker.getById(trackedPdf.id)?.viewerHandle, "zathura:open:recovered");
+});
+
+test("jumpToTrackedPdf does not retry service stale handles for non-retriable errors", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	let openerCalls = 0;
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "\\documentclass{article}\n");
+
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, 111);
+	trackedPdf.viewerHandle = "zathura:open:service";
+	trackedPdf.viewerBackend = "zathura";
+	trackedPdf.viewerCapabilities = {
+		open: true,
+		close: true,
+		forward_search: true,
+		inverse_search: true,
+		reuse: true,
+	};
+
+	await assert.rejects(
+		() => jumpToTrackedPdf(
+			trackedPdf.id,
+			21,
+			undefined,
+			tracker,
+			undefined,
+			{
+				requestForwardSearch: async () => {
+					throw new Error("viewer backend is unavailable (code=backend_unavailable)");
+				},
+				opener: async () => {
+					openerCalls += 1;
+					return {
+						pid: 2222,
+						viewerHandle: "zathura:open:recover",
+						viewerBackend: "zathura",
+						viewerOwned: true,
+						viewerCapabilities: {
+							open: true,
+							close: true,
+							forward_search: true,
+							inverse_search: true,
+							reuse: true,
+						},
+					};
+				},
+			},
+		),
+		/backend_unavailable/,
+	);
+	assert.equal(openerCalls, 0);
+});
+
 
 test("jumpToTrackedPdf reopens a tracked PDF and retries when the first jump fails", async () => {
 	const dir = tempDir();

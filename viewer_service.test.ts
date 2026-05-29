@@ -594,3 +594,98 @@ test("viewer service client requestClosePdf surfaces backend errors", async () =
 		})(),
 	]);
 });
+
+test("viewer service client requestForwardSearch returns handled result", async () => {
+	const baseDir = temporaryDir("viewer-client-forward-success-");
+	const client = new ViewerServiceClient(baseDir, {
+		requestTimeoutMs: 1_500,
+		pollIntervalMs: 20,
+		requestIdFactory: () => "forward-ok",
+	});
+
+	const writeForwardOk = async () => {
+		await sleep(20);
+		writeFileSync(viewerServiceResultPath(baseDir, "forward-ok"), JSON.stringify({
+			protocol_version: 1,
+			request_id: "forward-ok",
+			operation: "forward_search",
+			status: "ok",
+			generated_at_ns: Date.now() * 1_000_000,
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: "zathura",
+				backend_identity_ok: true,
+				handled: true,
+				protocol_directories: {
+					base: baseDir,
+					requests: join(baseDir, "viewer-requests"),
+					results: join(baseDir, "viewer-results"),
+					state: join(baseDir, "viewer-state.json"),
+				},
+				service_instance_started_ns: Date.now() * 1_000_000,
+				request_id: "forward-ok",
+				operation: "forward_search",
+				handle: "zathura:open:1",
+			},
+		}), { encoding: "utf8", mode: 0o600 });
+	};
+
+	const resultPromise = client.requestForwardSearch("zathura:open:1", "zathura", "/tmp/source.tex", 42, 99);
+	const result = await Promise.all([writeForwardOk(), resultPromise]).then(([, forwardResult]) => forwardResult);
+	assert.equal(result.handled, true);
+	assert.equal(result.backend_identity_ok, true);
+	assert.equal(result.handle, "zathura:open:1");
+});
+
+test("viewer service client requestForwardSearch surfaces handle_not_found errors", async () => {
+	const baseDir = temporaryDir("viewer-client-forward-handle-not-found-");
+	const client = new ViewerServiceClient(baseDir, {
+		requestTimeoutMs: 1_500,
+		pollIntervalMs: 20,
+		requestIdFactory: () => "forward-not-found",
+	});
+
+	const writeForwardError = async () => {
+		await sleep(20);
+		writeFileSync(viewerServiceResultPath(baseDir, "forward-not-found"), JSON.stringify({
+			protocol_version: 1,
+			request_id: "forward-not-found",
+			operation: "forward_search",
+			status: "error",
+			generated_at_ns: Date.now() * 1_000_000,
+			error: "viewer handle not recognized",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: "zathura",
+				backend_identity_ok: false,
+				handled: false,
+				reason: "handle_not_found",
+				protocol_directories: {
+					base: baseDir,
+					requests: join(baseDir, "viewer-requests"),
+					results: join(baseDir, "viewer-results"),
+					state: join(baseDir, "viewer-state.json"),
+				},
+				service_instance_started_ns: Date.now() * 1_000_000,
+				request_id: "forward-not-found",
+				operation: "forward_search",
+				handle: "zathura:open:1",
+				error_code: "handle_not_found",
+			},
+		}), { encoding: "utf8", mode: 0o600 });
+	};
+
+	await Promise.all([
+		writeForwardError(),
+		(async () => {
+			await assert.rejects(
+				() => client.requestForwardSearch("zathura:open:1", "zathura", "/tmp/source.tex", 10),
+				/handle_not_found/,
+			);
+		})(),
+	]);
+});

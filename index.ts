@@ -1836,6 +1836,20 @@ export default function (pi: ExtensionAPI) {
 				const server = await ensureSynctexCallbacks(ctx);
 				synctexCommand = server.command;
 				const pdfTracker = pdfTrackerForContext(ctx);
+				const trackedPdf = pdfTracker.getById(pdfId);
+				const serviceOpener = trackedPdf?.viewerHandle !== undefined && trackedPdf.viewerBackend !== undefined
+					? async (path: string, openSignal: AbortSignal | undefined) => {
+						const callbackConfig = (await ensureSynctexCallbacks(ctx!)).callbackConfig;
+						const response = await openPdfThroughViewerService(path, callbackConfig, openSignal);
+						return {
+							pid: response.pid,
+							viewerHandle: response.handle,
+							viewerBackend: response.backend,
+							viewerOwned: response.owned,
+							viewerCapabilities: response.capabilities,
+						};
+					}
+					: undefined;
 
 				const result = await jumpToTrackedPdf(
 					pdfId,
@@ -1843,7 +1857,21 @@ export default function (pi: ExtensionAPI) {
 					sourceFile,
 					pdfTracker,
 					signal,
-					synctexCommand ? { synctexEditorCommand: synctexCommand } : {},
+					{
+						synctexEditorCommand: synctexCommand || undefined,
+						requestForwardSearch: async (viewerHandle, viewerBackend, sourceFilePath, jumpLine, synctexPid, jumpSignal) => {
+							const response = await viewerServiceClient.requestForwardSearch(
+								viewerHandle,
+								viewerBackend,
+								sourceFilePath,
+								jumpLine,
+								synctexPid,
+								jumpSignal,
+							);
+							return { handled: response.handled, reason: response.reason };
+						},
+						opener: serviceOpener,
+					},
 				);
 				const sourceLine = readSourceLine(result.sourceFile, result.line, process.cwd()) ?? "";
 				return {
