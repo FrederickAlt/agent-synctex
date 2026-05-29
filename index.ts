@@ -1765,27 +1765,27 @@ export default function (pi: ExtensionAPI) {
 				const server = await ensureSynctexCallbacks(ctx);
 				synctexCommand = server.command;
 				const pdfTracker = pdfTrackerForContext(ctx);
+				const serviceOpener = async (path: string, abortSignal: AbortSignal | undefined) => {
+					const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
+					const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
+					return {
+						pid: response.pid,
+						viewerHandle: response.handle,
+						viewerBackend: response.backend,
+						viewerOwned: response.owned,
+						viewerCapabilities: response.capabilities,
+					};
+				};
 				const trackedPdf = await openAndTrackPdf(
 					requestedPath,
 					pdfTracker,
 					signal,
-					synctexCommand
-						? async (path, abortSignal) => {
-							const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
-							const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
-							return {
-								pid: response.pid,
-								viewerHandle: response.handle,
-								viewerBackend: response.backend,
-								viewerOwned: response.owned,
-								viewerCapabilities: response.capabilities,
-							};
-						}
-						: undefined,
+					serviceOpener,
 					undefined,
-					synctexCommand || undefined,
+					synctexCommand,
 				);
 				pdfPath = trackedPdf.path;
+
 				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
 				const text = synctexCommand
 					? `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
@@ -2019,25 +2019,24 @@ export default function (pi: ExtensionAPI) {
 					const server = await ensureSynctexCallbacks(ctx);
 					synctexCommand = server.command;
 					const pdfTracker = pdfTrackerForContext(ctx);
+					const serviceOpener = async (path: string, abortSignal: AbortSignal | undefined) => {
+						const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
+						const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
+						return {
+							pid: response.pid,
+							viewerHandle: response.handle,
+							viewerBackend: response.backend,
+							viewerOwned: response.owned,
+							viewerCapabilities: response.capabilities,
+						};
+					};
 					const trackedPdf = await openAndTrackPdf(
 						pdfPath,
 						pdfTracker,
 						signal,
-						synctexCommand
-							? async (path, abortSignal) => {
-								const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
-								const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
-								return {
-									pid: response.pid,
-									viewerHandle: response.handle,
-									viewerBackend: response.backend,
-									viewerOwned: response.owned,
-									viewerCapabilities: response.capabilities,
-								};
-							}
-							: undefined,
+						serviceOpener,
 						latexFilePath,
-						synctexCommand || undefined,
+						synctexCommand,
 					);
 					const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
 					const text = synctexCommand

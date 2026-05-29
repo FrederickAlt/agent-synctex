@@ -45,7 +45,7 @@ resolve without using the backend service.
 ## Files
 
 - `index.ts` — Pi extension entry point.
-- `pdf_tracking.ts` — PDF validation, viewer-service-aware session tracking helpers, and legacy Zathura adapter support behind `PDF_PREVIEW_ZATHURA_LEGACY=1`.
+- `pdf_tracking.ts` — PDF validation, viewer-service-aware session tracking helpers.
 - `synctex.ts` and `scripts/pi_synctex_callback.mjs` — session-scoped inverse SyncTeX IPC and Zathura callback forwarding.
 - `scripts/show_latex_mcp.py` — copied service bridge used by the extension.
 - `scripts/show_latex_viewer.py` and `systemd/codex-show-latex-viewer.service` — helper service files (viewer service + `pi_synctex_callback.mjs`).
@@ -93,7 +93,7 @@ Tracked PDFs also remember a default source file when possible. `compile_latex_f
 
 `close_pdf(pdf_id)` forwards close via service metadata and removes that PDF from the in-memory tracking table.
 
-Open, close, and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex`. Legacy direct-Zathura open/close/jump behavior can be enabled explicitly for adapter development by setting `PDF_PREVIEW_ZATHURA_LEGACY=1`.
+Open, close, and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex`.
 
 ## Inverse SyncTeX PDF clicks
 
@@ -159,7 +159,7 @@ details to `/tmp/codex-show-latex/*.log`.
 
 `show_latex` always applies a preamble, even when the caller does not specify one.
 
-For production flows, extension behavior is fixed to service-driven viewer control. Legacy direct-Zathura behavior is available only when `PDF_PREVIEW_ZATHURA_LEGACY=1` is set for explicit adapter testing.
+For production flows, extension behavior is fixed to service-driven viewer control.
 
 Runtime paths are hardcoded:
 

@@ -1,5 +1,4 @@
 import { readFileSync, statSync } from "node:fs";
-import { zathuraAlreadyOpen } from "./pdf_tracking.ts";
 
 export interface FileSnapshot {
 	exists: boolean;
@@ -67,7 +66,7 @@ export async function previewAlreadyOpen(
 	signal?: AbortSignal,
 	options: PreviewOpenDetectionOptions = {},
 ): Promise<boolean> {
-	const isPdfOpen = options.isPdfOpen ?? zathuraAlreadyOpen;
+	const isPdfOpen = options.isPdfOpen ?? (() => false);
 	const timeoutMs = options.timeoutMs ?? 1_500;
 	const pollMs = options.pollMs ?? 100;
 	const deadline = Date.now() + timeoutMs;
