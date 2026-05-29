@@ -76,9 +76,27 @@ interface ViewerServiceOpenResultBase {
 	error_code?: string;
 }
 
+interface ViewerServiceCloseResultBase {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	backend: string;
+	backend_identity_ok: boolean;
+	protocol_directories: ViewerServiceProtocolDirectories;
+	service_instance_started_ns: number;
+	request_id: string;
+	operation: string;
+	closed: boolean;
+	reason?: string;
+	handle?: string;
+	error_code?: string;
+}
+
 export interface ViewerServiceOpenResult extends ViewerServiceOpenResultBase {
 	handle: string;
 }
+
+export interface ViewerServiceCloseResult extends ViewerServiceCloseResultBase {}
 
 export interface ViewerServiceResultEnvelope {
 	protocol_version: number;
@@ -87,7 +105,7 @@ export interface ViewerServiceResultEnvelope {
 	status: "ok" | "error";
 	generated_at_ns: number;
 	error?: string;
-	status_details: ViewerServiceStatus | ViewerServiceOpenResultBase;
+	status_details: ViewerServiceStatus | ViewerServiceOpenResultBase | ViewerServiceCloseResultBase;
 }
 
 export interface ViewerServiceOpenRequestDetails {
@@ -97,6 +115,10 @@ export interface ViewerServiceOpenRequestDetails {
 	require_persistent_viewer?: boolean;
 }
 
+export interface ViewerServiceCloseRequestDetails {
+	handle: string;
+	backend: string;
+}
 export interface ViewerServiceRequest {
 	protocol_version: number;
 	request_id: string;
@@ -245,6 +267,36 @@ export class ViewerServiceClient {
 			throw new Error("viewer service open response missing handle");
 		}
 		return openResult as ViewerServiceOpenResult;
+	}
+
+	async requestClosePdf(
+		handle: string,
+		backend: string,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<ViewerServiceCloseResult> {
+		const timeoutMs = requestTimeoutMs ?? this.requestTimeoutMs;
+		const result = await this.request(
+			"close",
+			{
+				handle,
+				backend,
+			},
+			signal,
+			timeoutMs,
+		);
+		if (result.status !== "ok") {
+			const errorCode = "error_code" in result.status_details && typeof result.status_details.error_code === "string"
+				? result.status_details.error_code
+				: undefined;
+			const suffix = errorCode ? ` (code=${errorCode})` : "";
+			throw new Error(`${result.error || "viewer service returned error status"}${suffix}`);
+		}
+		const closeResult = result.status_details;
+		if (!isValidCloseResult(closeResult)) {
+			throw new Error("viewer service close response malformed");
+		}
+		return closeResult as ViewerServiceCloseResult;
 	}
 
 	private async request(
@@ -436,6 +488,29 @@ function isValidOpenResult(details: unknown): details is ViewerServiceOpenResult
 	return true;
 }
 
+function isValidCloseResult(details: unknown): details is ViewerServiceCloseResultBase & Record<string, unknown> {
+	if (!isStringRecord(details)) return false;
+	if (!isStringRecord(details.protocol_directories)) return false;
+	const protocolDirectories = details.protocol_directories;
+	if (typeof protocolDirectories.base !== "string") return false;
+	if (typeof protocolDirectories.requests !== "string") return false;
+	if (typeof protocolDirectories.results !== "string") return false;
+	if (typeof protocolDirectories.state !== "string") return false;
+	if (typeof details.service_instance_started_ns !== "number") return false;
+	if (!isValidRequestId(details.request_id)) return false;
+	if (typeof details.operation !== "string" || !details.operation) return false;
+	if (typeof details.protocol_version !== "number") return false;
+	if (typeof details.supported !== "boolean") return false;
+	if (typeof details.service_available !== "boolean") return false;
+	if (typeof details.backend !== "string" || !details.backend) return false;
+	if (typeof details.backend_identity_ok !== "boolean") return false;
+	if (typeof details.closed !== "boolean") return false;
+	if (details.reason !== undefined && typeof details.reason !== "string") return false;
+	if (details.handle !== undefined && (typeof details.handle !== "string" || !details.handle)) return false;
+	if (details.error_code !== undefined && typeof details.error_code !== "string") return false;
+	return true;
+}
+
 function isValidStatusResult(details: unknown): details is ViewerServiceStatus & Record<string, unknown> {
 	if (!isStringRecord(details)) return false;
 	if (typeof details.protocol_version !== "number") return false;
@@ -475,6 +550,9 @@ function isValidResult(value: unknown): value is ViewerServiceResultEnvelope {
 	const details = candidate.status_details;
 	if (candidate.operation === "open") {
 		return isValidOpenResult(details);
+	}
+	if (candidate.operation === "close") {
+		return isValidCloseResult(details);
 	}
 	return isValidStatusResult(details);
 }

@@ -469,6 +469,101 @@ print(json.dumps({
 	assert.equal(result.tracker_has_path, true);
 });
 
+test("viewer service close request does not SIGTERM on identity mismatch", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-close-mismatch-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\\n")
+viewer.OPEN_SESSIONS[str(pdf)] = {
+    "handle": "fakezathura:handle:1",
+    "pid": 99999,
+    "backend": "fakezathura",
+    "owned": True,
+    "process_identity": {
+        "comm": "fakezathura",
+        "start_time": 111,
+        "cmdline": ["/tmp/fake", "--fork"],
+        "exe": "/tmp/fake",
+    },
+}
+
+killed: list[tuple[int, int]] = []
+orig_kill = viewer.os.kill
+
+def fake_kill(pid: int, signal: int) -> None:
+    killed.append((pid, signal))
+
+viewer.os.kill = fake_kill
+viewer._pid_alive = lambda pid: True
+viewer._snapshot_process_identity = lambda pid: {
+    "comm": "fakezathura",
+    "start_time": 222,
+    "cmdline": ["/tmp/fake", "--fork"],
+    "exe": "/tmp/fake",
+}
+
+request_id = "close-mismatch"
+viewer.atomic_write_text(
+    viewer.request_path(request_id),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "close",
+        "created_at_ns": int(time.time_ns()),
+        "details": {
+            "handle": "fakezathura:handle:1",
+            "backend": "fakezathura",
+        },
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+viewer.os.kill = orig_kill
+
+print(json.dumps({
+    "processed": processed,
+    "status": result["status"],
+    "closed": result["status_details"].get("closed"),
+    "reason": result["status_details"].get("reason"),
+    "backend_identity_ok": result["status_details"].get("backend_identity_ok"),
+    "killed": killed,
+    "session_still_tracked": str(pdf) in viewer.OPEN_SESSIONS,
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		status: string;
+		closed: boolean;
+		reason: string;
+		backend_identity_ok: boolean;
+		killed: Array<[number, number]>;
+		session_still_tracked: boolean;
+	};
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.status, "ok");
+	assert.equal(result.closed, false);
+	assert.equal(result.reason, "identity_mismatch");
+	assert.equal(result.backend_identity_ok, false);
+	assert.equal(result.killed.length, 0);
+	assert.equal(result.session_still_tracked, false);
+});
+
 test("viewer service rejects invalid PDF files for open requests", () => {
 	const output = runPython(String.raw`
 import json

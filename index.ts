@@ -1769,23 +1769,30 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "close_pdf",
 		label: "Close PDF",
-		description: "Close an extension-tracked Zathura PDF window by pdf_id. When the Zathura process ID is known, only that instance is closed; otherwise the extension falls back to local zathura processes whose command line contains the tracked PDF path. The PDF is then removed from this session's tracking table.",
+		description: "Close an extension-tracked PDF window by pdf_id. Service-managed windows are closed through the viewer service using private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The PDF is then removed from this session's tracking table when the close request succeeds.",
 		promptSnippet: "Close a tracked PDF in Zathura",
 		promptGuidelines: [
 			"Use close_pdf when the user asks to close a PDF previously opened or tracked by this extension.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true).",
 		],
 		parameters: ClosePdfParams,
-		execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			let pdfId = 0;
 			try {
 				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
 				const pdfTracker = pdfTrackerForContext(ctx);
-				const result = closeTrackedPdf(pdfId, pdfTracker);
-				const closedText = result.closedPids.length ? `closed_pids=${result.closedPids.join(",")}` : "closed_pids=none";
+				const result = await closeTrackedPdf(pdfId, pdfTracker, {
+					requestClose: async (viewerHandle, viewerBackend, closeSignal) => {
+						return viewerServiceClient.requestClosePdf(viewerHandle, viewerBackend, closeSignal);
+					},
+				}, signal);
+				const reasonText = result.reason ? ` reason=${result.reason}` : "";
+				const closedText = result.closed
+					? `closed_pids=${result.closedPids.length ? result.closedPids.join(",") : "none"}`
+					: "closed=false";
 				return {
-					content: [{ type: "text", text: `ok: pdf_id=${pdfId} pdf=${result.pdf} ${closedText}` }],
-					details: { pdf_id: pdfId, pdf: result.pdf, closed_pids: result.closedPids },
+					content: [{ type: "text", text: `ok: pdf_id=${pdfId} pdf=${result.pdf} ${closedText}${reasonText}` }],
+					details: { pdf_id: pdfId, pdf: result.pdf, closed: result.closed, reason: result.reason, closed_pids: result.closedPids },
 				};
 			} catch (error) {
 				throw latexToolFailure("close-pdf", "Close PDF failed", {

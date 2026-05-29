@@ -740,32 +740,182 @@ test("closePdfInZathura sends SIGTERM to matching zathura processes", () => {
 	]);
 });
 
-test("closeTrackedPdf closes and removes a tracked PDF", () => {
+test("closeTrackedPdf closes and removes a tracked PDF", async () => {
 	const tracker = new PdfTracker();
 	const trackedPdf = tracker.trackOpenedPdf("/tmp/paper.pdf");
-	const result = closeTrackedPdf(trackedPdf.id, tracker, {
+	const result = await closeTrackedPdf(trackedPdf.id, tracker, {
 		findPids: () => [303],
 		killProcess: () => {},
 	});
 
-	assert.deepEqual(result, { pdf: "/tmp/paper.pdf", pdfId: trackedPdf.id, closedPids: [303], wasTracked: true });
+	assert.deepEqual(result, {
+		pdf: "/tmp/paper.pdf",
+		pdfId: trackedPdf.id,
+		closed: true,
+		closedPids: [303],
+		wasTracked: true,
+	});
 	assert.equal(tracker.getById(trackedPdf.id), undefined);
 	assert.equal(tracker.getByPath("/tmp/paper.pdf"), undefined);
 });
 
-test("closeTrackedPdf closes only the tracked PID when multiple windows share a PDF path", () => {
+test("closeTrackedPdf closes only the tracked PID when multiple windows share a PDF path", async () => {
 	const tracker = new PdfTracker();
 	const first = tracker.trackOpenedPdf("/tmp/paper.pdf", undefined, 101);
 	const second = tracker.trackOpenedPdf("/tmp/paper.pdf", undefined, 202);
 	const killed: Array<{ pid: number; signal: NodeJS.Signals }> = [];
-	const result = closeTrackedPdf(first.id, tracker, {
+	const result = await closeTrackedPdf(first.id, tracker, {
 		findPids: () => [101, 202],
 		killProcess: (pid, signal) => killed.push({ pid, signal }),
 	});
 
-	assert.deepEqual(result, { pdf: "/tmp/paper.pdf", pdfId: first.id, closedPids: [101], wasTracked: true });
+	assert.deepEqual(result, {
+		pdf: "/tmp/paper.pdf",
+		pdfId: first.id,
+		closed: true,
+		closedPids: [101],
+		wasTracked: true,
+	});
 	assert.deepEqual(killed, [{ pid: 101, signal: "SIGTERM" }]);
 	assert.equal(tracker.getById(first.id), undefined);
 	assert.equal(tracker.getById(second.id), second);
 	assert.equal(tracker.getByPath("/tmp/paper.pdf"), second);
+});
+
+test("closeTrackedPdf closes service-owned PDFs via viewer service", async () => {
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf("/tmp/paper.pdf", undefined, 1234, undefined, {
+		viewerHandle: "zathura:open-service",
+		viewerBackend: "zathura",
+		viewerOwned: true,
+		viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	});
+	let requestedHandle: string | undefined;
+	let requestedBackend: string | undefined;
+	const result = await closeTrackedPdf(trackedPdf.id, tracker, {
+		requestClose: async (handle, backend) => {
+			requestedHandle = handle;
+			requestedBackend = backend;
+			return { closed: true };
+		},
+	});
+
+	assert.equal(requestedHandle, "zathura:open-service");
+	assert.equal(requestedBackend, "zathura");
+	assert.deepEqual(result, {
+		pdf: "/tmp/paper.pdf",
+		pdfId: trackedPdf.id,
+		closed: true,
+		closedPids: [],
+		wasTracked: true,
+	});
+	assert.equal(tracker.getById(trackedPdf.id), undefined);
+	assert.equal(tracker.getByPath("/tmp/paper.pdf"), undefined);
+});
+
+test("closeTrackedPdf returns no-op when service reports an unowned handle", async () => {
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf("/tmp/paper.pdf", undefined, 1234, undefined, {
+		viewerHandle: "zathura:open-shared",
+		viewerBackend: "zathura",
+		viewerOwned: false,
+		viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	});
+	let requestedHandle: string | undefined;
+	let requestedBackend: string | undefined;
+	const result = await closeTrackedPdf(trackedPdf.id, tracker, {
+		requestClose: async (handle, backend) => {
+			requestedHandle = handle;
+			requestedBackend = backend;
+			return { closed: false, reason: "not_service_owned" };
+		},
+	});
+
+	assert.equal(requestedHandle, "zathura:open-shared");
+	assert.equal(requestedBackend, "zathura");
+	assert.deepEqual(result, {
+		pdf: "/tmp/paper.pdf",
+		pdfId: trackedPdf.id,
+		closed: false,
+		closedPids: [],
+		wasTracked: true,
+		reason: "not_service_owned",
+	});
+	assert.equal(tracker.getById(trackedPdf.id), undefined);
+	assert.equal(tracker.getByPath("/tmp/paper.pdf"), undefined);
+});
+
+test("closeTrackedPdf forwards abort signal to viewer close request", async () => {
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf("/tmp/paper.pdf", undefined, 1234, undefined, {
+		viewerHandle: "zathura:open-service",
+		viewerBackend: "zathura",
+		viewerOwned: true,
+		viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	});
+	const controller = new AbortController();
+	let receivedSignal: AbortSignal | undefined;
+	const result = await closeTrackedPdf(
+		trackedPdf.id,
+		tracker,
+		{
+			requestClose: async (handle, backend, signal) => {
+				receivedSignal = signal;
+				assert.equal(handle, "zathura:open-service");
+				assert.equal(backend, "zathura");
+				return { closed: true };
+			},
+		},
+		controller.signal,
+	);
+
+	assert.equal(receivedSignal, controller.signal);
+	assert.deepEqual(result, {
+		pdf: "/tmp/paper.pdf",
+		pdfId: trackedPdf.id,
+		closed: true,
+		closedPids: [],
+		wasTracked: true,
+	});
+	assert.equal(tracker.getById(trackedPdf.id), undefined);
+});
+
+test("closeTrackedPdf surfaces service unknown-handle failures", async () => {
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf("/tmp/paper.pdf", undefined, 1234, undefined, {
+		viewerHandle: "zathura:missing",
+		viewerBackend: "zathura",
+		viewerOwned: true,
+		viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	});
+
+	await assert.rejects(
+		() => closeTrackedPdf(trackedPdf.id, tracker, {
+			requestClose: async () => {
+				throw new Error("viewer handle not recognized (code=unknown_handle)");
+			},
+		}),
+		/unknown_handle/,
+	);
+	assert.equal(tracker.getById(trackedPdf.id), trackedPdf);
+});
+
+test("closeTrackedPdf surfaces service backend failures", async () => {
+	const tracker = new PdfTracker();
+	const trackedPdf = tracker.trackOpenedPdf("/tmp/paper.pdf", undefined, 1234, undefined, {
+		viewerHandle: "zathura:backend-fail",
+		viewerBackend: "zathura",
+		viewerOwned: true,
+		viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	});
+
+	await assert.rejects(
+		() => closeTrackedPdf(trackedPdf.id, tracker, {
+			requestClose: async () => {
+				throw new Error("viewer backend unavailable (code=backend_unavailable)");
+			},
+		}),
+		/backend_unavailable/,
+	);
+	assert.equal(tracker.getById(trackedPdf.id), trackedPdf);
 });

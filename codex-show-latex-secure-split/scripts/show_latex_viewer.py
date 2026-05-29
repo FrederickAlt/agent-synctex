@@ -52,6 +52,7 @@ SERVICE_STARTED_NS = time.time_ns()
 SYNCTEX_CALLBACK_KIND = "pi-synctex-callback-v1"
 SYNCTEX_CALLBACK_TRANSPORT = "unix"
 OPEN_REQUEST_OPERATION = "open"
+CLOSE_REQUEST_OPERATION = "close"
 VIEWER_OPEN_CAPABILITIES = {
     "open": True,
     "close": True,
@@ -307,6 +308,16 @@ def validate_open_request_details(details: Dict[str, Any]) -> Optional[str]:
 	return None
 
 
+def validate_close_request_details(details: Dict[str, Any]) -> Optional[str]:
+	handle = details.get("handle")
+	backend = details.get("backend")
+	if not isinstance(handle, str) or not handle:
+		return "missing or invalid handle"
+	if not isinstance(backend, str) or not backend:
+		return "missing or invalid backend"
+	return None
+
+
 def request_is_stale(created_at_ns: int, now_ns: int) -> bool:
 	return now_ns - created_at_ns > REQUEST_TTL_SECONDS * 1_000_000_000
 
@@ -426,6 +437,57 @@ def _find_viewer_pid_for_pdf(viewer_path: str, pdf_paths: list[str]) -> Optional
 	return None
 
 
+def _snapshot_process_identity(pid: int) -> Optional[Dict[str, Any]]:
+	if pid <= 0:
+		return None
+	proc_path = Path("/proc") / str(pid)
+	try:
+		stat_text = (proc_path / "stat").read_text(encoding="utf-8")
+	except Exception:
+		return None
+
+	identity: Dict[str, Any] = {}
+	try:
+		start = stat_text.find("(")
+		end = stat_text.rfind(")")
+		if start != -1 and end != -1 and end > start:
+			identity["comm"] = stat_text[start + 1:end]
+			tail = stat_text[end + 2 :].split()
+			identity["start_time"] = int(tail[19])
+	except Exception:
+		pass
+
+	try:
+		raw_cmdline = (proc_path / "cmdline").read_bytes()
+		identity["cmdline"] = [arg.decode("utf-8", errors="replace") for arg in raw_cmdline.split(b"\0") if arg]
+	except Exception:
+		pass
+	try:
+		exe = os.readlink(proc_path / "exe")
+		identity["exe"] = exe
+	except Exception:
+		pass
+
+	return identity if identity else None
+
+
+def _is_process_identity_match(pid: int, session: Dict[str, Any]) -> bool:
+	if not isinstance(pid, int):
+		return False
+	expected_identity = session.get("process_identity")
+	if not isinstance(expected_identity, dict) or not expected_identity:
+		return False
+	current_identity = _snapshot_process_identity(pid)
+	if current_identity is None:
+		return False
+	for marker in ("comm", "start_time", "exe", "cmdline"):
+		expected_value = expected_identity.get(marker)
+		current_value = current_identity.get(marker)
+		if expected_value is not None and expected_value != current_value:
+			return False
+	return True
+
+
 def build_open_result_details(
 	request_id: str,
 	handle: Optional[str],
@@ -456,6 +518,36 @@ def build_open_result_details(
 		details["pid"] = pid
 	if pid_diagnostic:
 		details["pid_diagnostic"] = pid_diagnostic
+	return details
+
+
+def build_close_result_details(
+	request_id: str,
+	closed: bool,
+	reason: Optional[str] = None,
+	handle: Optional[str] = None,
+	backend: Optional[str] = None,
+	backend_identity_ok: bool = False,
+	error_code: Optional[str] = None,
+) -> Dict[str, Any]:
+	details = {
+		"protocol_version": PROTOCOL_VERSION,
+		"supported": True,
+		"service_available": True,
+		"backend": backend if backend else BACKEND_NAME,
+		"backend_identity_ok": bool(backend_identity_ok),
+		"protocol_directories": protocol_directories(),
+		"service_instance_started_ns": SERVICE_STARTED_NS,
+		"request_id": request_id,
+		"operation": CLOSE_REQUEST_OPERATION,
+		"closed": bool(closed),
+	}
+	if reason:
+		details["reason"] = reason
+	if handle:
+		details["handle"] = handle
+	if error_code is not None:
+		details["error_code"] = error_code
 	return details
 
 
@@ -521,20 +613,20 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 				handle = None
 			else:
 				current_pid = session.get("pid")
-				if current_pid and _pid_alive(current_pid):
+				if current_pid and _pid_alive(current_pid) and _is_process_identity_match(current_pid, session):
 					reused = True
 				else:
 					OPEN_SESSIONS.pop(normalized_pdf_path, None)
 					handle = None
 
-	if reuse_existing and handle:
+	if reuse_existing and handle and session:
 		os.close(pdf_fd)
 		return {
 			"status": "ok",
 			"status_details": build_open_result_details(
 				request_id,
 				handle,
-				True,
+				bool(session.get("owned")),
 				reused,
 				session.get("pid"),
 				None,
@@ -571,11 +663,15 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 		else:
 			owned = True
 
+	backend_path = str(Path(viewer_path).resolve())
 	OPEN_SESSIONS[normalized_pdf_path] = {
 		"handle": handle,
 		"pid": owned_pid,
 		"backend": BACKEND_NAME,
+		"backend_path": backend_path,
 		"callback": dict(callback),
+		"owned": bool(owned),
+		"process_identity": _snapshot_process_identity(owned_pid) if isinstance(owned_pid, int) else None,
 	}
 
 	if require_persistent_viewer and not owned:
@@ -602,6 +698,165 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 			reused,
 			owned_pid,
 			pid_diagnostic,
+		),
+	}
+
+
+def close_pdf_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any]) -> Dict[str, Any]:
+	error = validate_close_request_details(details)
+	if error:
+		return {
+			"status": "error",
+			"error": error,
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				error,
+				None,
+				None,
+				False,
+				"invalid_request",
+			),
+		}
+
+	handle = details.get("handle")
+	backend = details.get("backend")
+	if not isinstance(handle, str) or not isinstance(backend, str):
+		return {
+			"status": "error",
+			"error": "invalid request details",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				"invalid_request",
+				None,
+				backend,
+				False,
+				"invalid_request",
+			),
+		}
+
+	matched_path = None
+	matched_session: Optional[Dict[str, Any]] = None
+	for pdf_path, session in list(OPEN_SESSIONS.items()):
+		if session.get("handle") == handle:
+			matched_path = pdf_path
+			matched_session = session
+			break
+	if not matched_session or matched_path is None:
+		return {
+			"status": "error",
+			"error": "viewer handle not recognized",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				"unknown_handle",
+				handle,
+				backend,
+				False,
+				"unknown_handle",
+			),
+		}
+
+	session_backend = matched_session.get("backend")
+	if session_backend != backend:
+		return {
+			"status": "error",
+			"error": "backend identity mismatch for viewer handle",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				"backend_mismatch",
+				handle,
+				backend,
+				False,
+				"backend_mismatch",
+			),
+		}
+
+	if not bool(matched_session.get("owned")):
+		return {
+			"status": "ok",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				"not_service_owned",
+				handle,
+				backend,
+				True,
+			),
+		}
+
+	pid = matched_session.get("pid")
+	if not isinstance(pid, int) or not _pid_alive(pid):
+		OPEN_SESSIONS.pop(matched_path, None)
+		return {
+			"status": "ok",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				"not_running",
+				handle,
+				backend,
+				True,
+			),
+		}
+
+	if not _is_process_identity_match(pid, matched_session):
+		OPEN_SESSIONS.pop(matched_path, None)
+		return {
+			"status": "ok",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				"identity_mismatch",
+				handle,
+				backend,
+				False,
+				"identity_mismatch",
+			),
+		}
+
+	try:
+		os.kill(pid, signal.SIGTERM)
+	except PermissionError:
+		return {
+			"status": "error",
+			"error": f"could not send SIGTERM to viewer pid {pid}",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				"backend_unavailable",
+				handle,
+				backend,
+				True,
+				"backend_unavailable",
+			),
+		}
+	except ProcessLookupError:
+		OPEN_SESSIONS.pop(matched_path, None)
+		return {
+			"status": "ok",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				"not_running",
+				handle,
+				backend,
+				True,
+			),
+		}
+
+	OPEN_SESSIONS.pop(matched_path, None)
+	return {
+		"status": "ok",
+		"status_details": build_close_result_details(
+			request_id,
+			True,
+			None,
+			handle,
+			backend,
+			True,
 		),
 	}
 
@@ -766,6 +1021,28 @@ def scan_requests(now_ns: Optional[int] = None) -> int:
 			})
 			write_status_result(request_id, operation, status, status_details, error)
 			add_state_event(state, f"handled open request_id={request_id} status={status}")
+			safe_unlink(req_path)
+			processed += 1
+			continue
+
+		if operation == CLOSE_REQUEST_OPERATION:
+			close_result = close_pdf_in_viewer(request_id, request["details"], state)
+			status = close_result.get("status", "error")
+			error = close_result.get("error")
+			status_details = close_result.get("status_details", {
+				"protocol_version": PROTOCOL_VERSION,
+				"supported": False,
+				"service_available": False,
+				"backend": BACKEND_NAME,
+				"backend_identity_ok": False,
+				"closed": False,
+				"protocol_directories": protocol_directories(),
+				"service_instance_started_ns": SERVICE_STARTED_NS,
+				"request_id": request_id,
+				"operation": CLOSE_REQUEST_OPERATION,
+			})
+			write_status_result(request_id, operation, status, status_details, error)
+			add_state_event(state, f"handled close request_id={request_id} status={status}")
 			safe_unlink(req_path)
 			processed += 1
 			continue

@@ -60,6 +60,10 @@ interface ZathuraCloseOptions {
 	killProcess?: (pid: number, signal: NodeJS.Signals) => void;
 }
 
+interface PdfCloseOptions extends ZathuraCloseOptions {
+	requestClose?: (viewerHandle: string, viewerBackend: string, signal?: AbortSignal) => Promise<PdfServiceCloseResult>;
+}
+
 export interface PdfJumpResult {
 	pdf: string;
 	sourceFile: string;
@@ -70,8 +74,15 @@ export interface PdfJumpResult {
 export interface PdfCloseResult {
 	pdf: string;
 	pdfId: number;
+	closed: boolean;
 	closedPids: number[];
 	wasTracked: boolean;
+	reason?: string;
+}
+
+interface PdfServiceCloseResult {
+	closed: boolean;
+	reason?: string;
 }
 
 const PDF_HEADER = "%PDF-";
@@ -953,14 +964,31 @@ export function closePdfInZathura(
 	return closedPids;
 }
 
-export function closeTrackedPdf(
+export async function closeTrackedPdf(
 	pdfId: number,
 	tracker: PdfTracker,
-	options: ZathuraCloseOptions = {},
-): PdfCloseResult {
+	options: PdfCloseOptions = {},
+	signal?: AbortSignal,
+): Promise<PdfCloseResult> {
 	const trackedPdf = tracker.getById(pdfId);
 	if (!trackedPdf) {
 		throw new Error(`Unknown tracked pdf_id=${pdfId}. Open the PDF first with open_pdf or compile_latex_file(..., open_pdf=true).`);
+	}
+
+	if (trackedPdf.viewerHandle !== undefined && trackedPdf.viewerBackend !== undefined) {
+		if (!options.requestClose) {
+			throw new Error(`Tracked pdf_id=${pdfId} requires viewer service close but no close handler is configured.`);
+		}
+		const serviceResult = await options.requestClose(trackedPdf.viewerHandle, trackedPdf.viewerBackend, signal);
+		tracker.untrackById(pdfId);
+		return {
+			pdf: trackedPdf.path,
+			pdfId,
+			closed: serviceResult.closed,
+			...(serviceResult.reason !== undefined ? { reason: serviceResult.reason } : {}),
+			closedPids: [],
+			wasTracked: true,
+		};
 	}
 
 	const defaultFindPids = () => {
@@ -982,11 +1010,17 @@ export function closeTrackedPdf(
 	};
 	const findPids = defaultFindPids;
 	const closedPids = closePdfInZathura(trackedPdf.path, {
-		...options,
 		findPids,
+		killProcess: options.killProcess,
 	});
 	tracker.untrackById(pdfId);
-	return { pdf: trackedPdf.path, pdfId, closedPids, wasTracked: true };
+	return {
+		pdf: trackedPdf.path,
+		pdfId,
+		closed: closedPids.length > 0,
+		closedPids,
+		wasTracked: true,
+	};
 }
 
 function reuseTrackedPdfForPath(normalizedPdfPath: string, tracker: PdfTracker, defaultSourceFile?: string, synctexEditorCommand?: string): TrackedPdf | undefined {

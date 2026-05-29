@@ -359,3 +359,238 @@ test("viewer service client rejects symlinked result directory", async () => {
 		/viewer service result directory is a symlink:/,
 	);
 });
+test("viewer service client requestClosePdf returns service close result", async () => {
+	const baseDir = temporaryDir("viewer-client-close-success-");
+	const client = new ViewerServiceClient(baseDir, {
+		requestTimeoutMs: 1_500,
+		pollIntervalMs: 20,
+		requestIdFactory: () => "close-ok",
+	});
+
+	const writeCloseOk = async () => {
+		await sleep(20);
+		writeFileSync(viewerServiceResultPath(baseDir, "close-ok"), JSON.stringify({
+			protocol_version: 1,
+			request_id: "close-ok",
+			operation: "close",
+			status: "ok",
+			generated_at_ns: Date.now() * 1_000_000,
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: "zathura",
+				backend_identity_ok: true,
+				closed: true,
+				protocol_directories: {
+					base: baseDir,
+					requests: join(baseDir, "viewer-requests"),
+					results: join(baseDir, "viewer-results"),
+					state: join(baseDir, "viewer-state.json"),
+				},
+				service_instance_started_ns: Date.now() * 1_000_000,
+				request_id: "close-ok",
+				operation: "close",
+				handle: "zathura:open:1",
+			},
+		}), { encoding: "utf8", mode: 0o600 });
+	};
+
+	const resultPromise = client.requestClosePdf("zathura:open:1", "zathura");
+	const result = await Promise.all([writeCloseOk(), resultPromise]).then(([, closeResult]) => closeResult);
+	assert.equal(result.closed, true);
+	assert.equal(result.backend_identity_ok, true);
+	assert.equal(result.backend, "zathura");
+	assert.equal(result.handle, "zathura:open:1");
+});
+
+test("viewer service client propagates close no-op responses", async () => {
+	const baseDir = temporaryDir("viewer-client-close-noop-");
+	const client = new ViewerServiceClient(baseDir, {
+		requestTimeoutMs: 1_500,
+		pollIntervalMs: 20,
+		requestIdFactory: () => "close-noop",
+	});
+
+	const writeCloseNoop = async () => {
+		await sleep(20);
+		writeFileSync(viewerServiceResultPath(baseDir, "close-noop"), JSON.stringify({
+			protocol_version: 1,
+			request_id: "close-noop",
+			operation: "close",
+			status: "ok",
+			generated_at_ns: Date.now() * 1_000_000,
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: "zathura",
+				backend_identity_ok: true,
+				closed: false,
+				reason: "not_service_owned",
+				protocol_directories: {
+					base: baseDir,
+					requests: join(baseDir, "viewer-requests"),
+					results: join(baseDir, "viewer-results"),
+					state: join(baseDir, "viewer-state.json"),
+				},
+				service_instance_started_ns: Date.now() * 1_000_000,
+				request_id: "close-noop",
+				operation: "close",
+				handle: "zathura:open:1",
+			},
+		}), { encoding: "utf8", mode: 0o600 });
+	};
+
+	const resultPromise = client.requestClosePdf("zathura:open:1", "zathura");
+	const result = await Promise.all([writeCloseNoop(), resultPromise]).then(([, closeResult]) => closeResult);
+	assert.equal(result.closed, false);
+	assert.equal(result.reason, "not_service_owned");
+});
+
+test("viewer service client propagates identity mismatch as a non-closing response", async () => {
+	const baseDir = temporaryDir("viewer-client-close-mismatch-");
+	const client = new ViewerServiceClient(baseDir, {
+		requestTimeoutMs: 1_500,
+		pollIntervalMs: 20,
+		requestIdFactory: () => "close-mismatch",
+	});
+
+	const writeCloseMismatch = async () => {
+		await sleep(20);
+		writeFileSync(viewerServiceResultPath(baseDir, "close-mismatch"), JSON.stringify({
+			protocol_version: 1,
+			request_id: "close-mismatch",
+			operation: "close",
+			status: "ok",
+			generated_at_ns: Date.now() * 1_000_000,
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: "zathura",
+				backend_identity_ok: false,
+				closed: false,
+				reason: "identity_mismatch",
+				protocol_directories: {
+					base: baseDir,
+					requests: join(baseDir, "viewer-requests"),
+					results: join(baseDir, "viewer-results"),
+					state: join(baseDir, "viewer-state.json"),
+				},
+				service_instance_started_ns: Date.now() * 1_000_000,
+				request_id: "close-mismatch",
+				operation: "close",
+				handle: "zathura:open:1",
+			},
+		}), { encoding: "utf8", mode: 0o600 });
+	};
+
+	const resultPromise = client.requestClosePdf("zathura:open:1", "zathura");
+	const result = await Promise.all([writeCloseMismatch(), resultPromise]).then(([, closeResult]) => closeResult);
+	assert.equal(result.closed, false);
+	assert.equal(result.reason, "identity_mismatch");
+	assert.equal(result.backend_identity_ok, false);
+});
+
+test("viewer service client requestClosePdf surfaces unknown-handle errors", async () => {
+	const baseDir = temporaryDir("viewer-client-close-unknown-");
+	const client = new ViewerServiceClient(baseDir, {
+		requestTimeoutMs: 1_500,
+		pollIntervalMs: 20,
+		requestIdFactory: () => "close-unknown",
+	});
+
+	const writeCloseError = async () => {
+		await sleep(20);
+		writeFileSync(viewerServiceResultPath(baseDir, "close-unknown"), JSON.stringify({
+			protocol_version: 1,
+			request_id: "close-unknown",
+			operation: "close",
+			status: "error",
+			generated_at_ns: Date.now() * 1_000_000,
+			error: "viewer handle not recognized",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: "zathura",
+				backend_identity_ok: false,
+				closed: false,
+				reason: "unknown_handle",
+				protocol_directories: {
+					base: baseDir,
+					requests: join(baseDir, "viewer-requests"),
+					results: join(baseDir, "viewer-results"),
+					state: join(baseDir, "viewer-state.json"),
+				},
+				service_instance_started_ns: Date.now() * 1_000_000,
+				request_id: "close-unknown",
+				operation: "close",
+				handle: "zathura:missing",
+				error_code: "unknown_handle",
+			},
+		}), { encoding: "utf8", mode: 0o600 });
+	};
+
+	await Promise.all([
+		writeCloseError(),
+		(async () => {
+			await assert.rejects(
+				() => client.requestClosePdf("zathura:missing", "zathura"),
+				/unknown_handle/,
+			);
+		})(),
+	]);
+});
+
+test("viewer service client requestClosePdf surfaces backend errors", async () => {
+	const baseDir = temporaryDir("viewer-client-close-backend-");
+	const client = new ViewerServiceClient(baseDir, {
+		requestTimeoutMs: 1_500,
+		pollIntervalMs: 20,
+		requestIdFactory: () => "close-backend",
+	});
+
+	const writeCloseError = async () => {
+		await sleep(20);
+		writeFileSync(viewerServiceResultPath(baseDir, "close-backend"), JSON.stringify({
+			protocol_version: 1,
+			request_id: "close-backend",
+			operation: "close",
+			status: "error",
+			generated_at_ns: Date.now() * 1_000_000,
+			error: "viewer service unavailable",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: "zathura",
+				backend_identity_ok: false,
+				closed: false,
+				reason: "backend_unavailable",
+				protocol_directories: {
+					base: baseDir,
+					requests: join(baseDir, "viewer-requests"),
+					results: join(baseDir, "viewer-results"),
+					state: join(baseDir, "viewer-state.json"),
+				},
+				service_instance_started_ns: Date.now() * 1_000_000,
+				request_id: "close-backend",
+				operation: "close",
+				handle: "zathura:open:1",
+				error_code: "backend_unavailable",
+			},
+		}), { encoding: "utf8", mode: 0o600 });
+	};
+
+	await Promise.all([
+		writeCloseError(),
+		(async () => {
+			await assert.rejects(
+				() => client.requestClosePdf("zathura:open:1", "zathura"),
+				/backend_unavailable/,
+			);
+		})(),
+	]);
+});
