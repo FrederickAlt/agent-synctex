@@ -220,6 +220,27 @@ test("openAndTrackPdf stores a zathura PID returned by the opener", async () => 
 	assert.equal(trackedPdf.pid, 4321);
 });
 
+test("openAndTrackPdf stores viewer metadata from structured opener result", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	writeMinimalPdf(pdf);
+
+	const tracker = new PdfTracker();
+	const trackedPdf = await openAndTrackPdf(pdf, tracker, undefined, async () => ({
+		pid: 4321,
+		viewerHandle: "zathura:open",
+		viewerBackend: "zathura",
+		viewerOwned: true,
+		viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	}));
+
+	assert.equal(trackedPdf.pid, 4321);
+	assert.equal(trackedPdf.viewerHandle, "zathura:open");
+	assert.equal(trackedPdf.viewerBackend, "zathura");
+	assert.equal(trackedPdf.viewerOwned, true);
+	assert.deepEqual(trackedPdf.viewerCapabilities, { open: true, close: true, forward_search: true, inverse_search: true, reuse: true });
+});
+
 test("openAndTrackPdf reuses an existing tracked PDF for the same normalized path", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");

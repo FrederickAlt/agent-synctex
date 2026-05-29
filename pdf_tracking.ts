@@ -11,8 +11,26 @@ export interface TrackedPdf {
 	sourceFile?: string;
 	pid?: number;
 	synctexEditorCommand?: string;
+	viewerHandle?: string;
+	viewerBackend?: string;
+	viewerOwned?: boolean;
+	viewerCapabilities?: {
+		open: boolean;
+		close: boolean;
+		forward_search: boolean;
+		inverse_search: boolean;
+		reuse: boolean;
+	};
 	openedAtMs: number;
 	lastOpenedAtMs: number;
+}
+
+export interface PdfOpenResult {
+	pid?: number;
+	viewerHandle?: string;
+	viewerBackend?: string;
+	viewerOwned?: boolean;
+	viewerCapabilities?: TrackedPdf["viewerCapabilities"];
 }
 
 interface PdfOpenProcessResult {
@@ -794,7 +812,19 @@ async function jumpPdfInZathura(
 	}
 }
 
-export type PdfOpener = (pdfFilePath: string, signal?: AbortSignal) => Promise<number | undefined | void>;
+export type PdfOpener = (pdfFilePath: string, signal?: AbortSignal) => Promise<number | undefined | void | PdfOpenResult>;
+
+function normalizeOpenResult(rawResult: number | undefined | void | PdfOpenResult): PdfOpenResult {
+	if (typeof rawResult === "number") return { pid: rawResult };
+	if (!rawResult || typeof rawResult === "boolean") return {};
+	return {
+		pid: rawResult.pid,
+		viewerHandle: rawResult.viewerHandle,
+		viewerBackend: rawResult.viewerBackend,
+		viewerOwned: rawResult.viewerOwned,
+		viewerCapabilities: rawResult.viewerCapabilities,
+	};
+}
 
 export class PdfTracker {
 	private readonly trackedPdfsByPath = new Map<string, TrackedPdf[]>();
@@ -802,7 +832,13 @@ export class PdfTracker {
 	private readonly pendingOpensByPath = new Map<string, Promise<TrackedPdf>>();
 	private nextPdfId = 1;
 
-	trackOpenedPdf(normalizedPdfPath: string, defaultSourceFile?: string, pid?: number, synctexEditorCommand?: string): TrackedPdf {
+	trackOpenedPdf(
+		normalizedPdfPath: string,
+		defaultSourceFile?: string,
+		pid?: number,
+		synctexEditorCommand?: string,
+		viewerOpenResult: PdfOpenResult = {},
+	): TrackedPdf {
 		const now = Date.now();
 		const trackedPdf: TrackedPdf = {
 			id: this.nextPdfId,
@@ -810,6 +846,10 @@ export class PdfTracker {
 			sourceFile: defaultSourceFile,
 			pid,
 			synctexEditorCommand,
+			viewerHandle: viewerOpenResult.viewerHandle,
+			viewerBackend: viewerOpenResult.viewerBackend,
+			viewerOwned: viewerOpenResult.viewerOwned,
+			viewerCapabilities: viewerOpenResult.viewerCapabilities,
 			openedAtMs: now,
 			lastOpenedAtMs: now,
 		};
@@ -821,11 +861,21 @@ export class PdfTracker {
 		return trackedPdf;
 	}
 
-	markReopened(pdfId: number, pid?: number, defaultSourceFile?: string, synctexEditorCommand?: string): TrackedPdf | undefined {
+	markReopened(
+		pdfId: number,
+		pid?: number,
+		defaultSourceFile?: string,
+		synctexEditorCommand?: string,
+		viewerOpenResult?: PdfOpenResult,
+	): TrackedPdf | undefined {
 		const trackedPdf = this.trackedPdfsById.get(pdfId);
 		if (!trackedPdf) return undefined;
 		if (defaultSourceFile) trackedPdf.sourceFile = defaultSourceFile;
 		if (synctexEditorCommand) trackedPdf.synctexEditorCommand = synctexEditorCommand;
+		if (viewerOpenResult?.viewerHandle !== undefined) trackedPdf.viewerHandle = viewerOpenResult.viewerHandle;
+		if (viewerOpenResult?.viewerBackend !== undefined) trackedPdf.viewerBackend = viewerOpenResult.viewerBackend;
+		if (viewerOpenResult?.viewerOwned !== undefined) trackedPdf.viewerOwned = viewerOpenResult.viewerOwned;
+		if (viewerOpenResult?.viewerCapabilities !== undefined) trackedPdf.viewerCapabilities = viewerOpenResult.viewerCapabilities;
 		trackedPdf.pid = pid;
 		trackedPdf.lastOpenedAtMs = Date.now();
 		return trackedPdf;
@@ -981,12 +1031,12 @@ export async function openAndTrackPdf(
 
 	const staleTrackedPdf = tracker.getByPath(pdfPath);
 	const openPromise = (async () => {
-		const pid = await opener(pdfPath, signal);
-		const normalizedPid = typeof pid === "number" ? pid : undefined;
+		const openerResult = await opener(pdfPath, signal);
+		const normalizedResult = normalizeOpenResult(openerResult);
 		if (staleTrackedPdf && tracker.getById(staleTrackedPdf.id)) {
-			return tracker.markReopened(staleTrackedPdf.id, normalizedPid, sourceFile, synctexEditorCommand) ?? staleTrackedPdf;
+			return tracker.markReopened(staleTrackedPdf.id, normalizedResult.pid, sourceFile, synctexEditorCommand, normalizedResult) ?? staleTrackedPdf;
 		}
-		return tracker.trackOpenedPdf(pdfPath, sourceFile, normalizedPid, synctexEditorCommand);
+		return tracker.trackOpenedPdf(pdfPath, sourceFile, normalizedResult.pid, synctexEditorCommand, normalizedResult);
 	})();
 	tracker.setPendingOpen(pdfPath, openPromise);
 	try {
@@ -1055,15 +1105,17 @@ export async function jumpToTrackedPdf(
 
 	if (hasTrackedCommand) {
 		let reopenedPid: number | undefined;
+		let reopenedMetadata: PdfOpenResult | undefined;
 		try {
-			const rawPid = await opener(trackedPdf.path, signal);
-			reopenedPid = typeof rawPid === "number" ? rawPid : undefined;
+			const rawResult = await opener(trackedPdf.path, signal);
+			reopenedMetadata = normalizeOpenResult(rawResult);
+			reopenedPid = reopenedMetadata.pid;
 		} catch (reopenError) {
 			const message = reopenError instanceof Error ? reopenError.message : String(reopenError);
 			throw new Error(`Tracked PDF pdf_id=${pdfId} appears closed or unavailable, and could not be reopened at ${trackedPdf.path} with callback command ${trackedSynctexCommand}: ${message}`);
 		}
 
-		tracker.markReopened(pdfId, reopenedPid, trackedPdf.sourceFile, trackedSynctexCommand);
+		tracker.markReopened(pdfId, reopenedPid, trackedPdf.sourceFile, trackedSynctexCommand, reopenedMetadata);
 		const ownedPid = resolveOwnedPid();
 		if (ownedPid === undefined) {
 			if (reopenedPid !== undefined) {
@@ -1087,8 +1139,9 @@ export async function jumpToTrackedPdf(
 		return { pdf: trackedPdf.path, sourceFile: resolvedSourceFile, line, reopened: false };
 	} catch (firstJumpError) {
 		try {
-			const pid = await opener(trackedPdf.path, signal);
-			tracker.markReopened(pdfId, typeof pid === "number" ? pid : undefined, trackedPdf.sourceFile, trackedSynctexCommand);
+			const reopenedJumpResult = await opener(trackedPdf.path, signal);
+			const reopenedJumpMetadata = normalizeOpenResult(reopenedJumpResult);
+			tracker.markReopened(pdfId, reopenedJumpMetadata.pid, trackedPdf.sourceFile, trackedSynctexCommand, reopenedJumpMetadata);
 			await jumpWithPid(undefined);
 			return { pdf: trackedPdf.path, sourceFile: resolvedSourceFile, line, reopened: true };
 		} catch (reopenError) {

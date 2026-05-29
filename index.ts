@@ -23,10 +23,10 @@ import { createTerminalRefreshPolicy } from "./terminal_refresh_policy.ts";
 import { applyLatexPreamble } from "./latex_preamble.ts";
 import { createInlinePreviewRenderer } from "./inline_preview_renderer.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
-import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, openPdfInZathura, PdfTracker } from "./pdf_tracking.ts";
+import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./pdf_tracking.ts";
 import { fileSnapshot, previewAlreadyOpen } from "./preview_open_detection.ts";
-import { readSourceLine, SynctexCallbackServer, type SynctexPasteTarget } from "./synctex.ts";
-import { ViewerServiceClient } from "./viewer_service.ts";
+import { readSourceLine, SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./synctex.ts";
+import { ViewerServiceClient, type ViewerServiceOpenResult } from "./viewer_service.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;
@@ -1487,7 +1487,11 @@ async function executeShowLatexPreviewTool(
 		latexSource = latexSourceInput;
 		compiler = resolveLatexCompiler(compilerParam);
 		inline = inlineParam !== false;
-		if (!inline && ctx) {
+		const useViewerService = !inline;
+		if (useViewerService) {
+			if (!ctx) {
+				throw new Error("show_latex with inline=false requires a Pi agent session context");
+			}
 			const server = await ensureSynctexCallbacks(ctx);
 			synctexCommand = server.command;
 		}
@@ -1504,6 +1508,20 @@ async function executeShowLatexPreviewTool(
 			}
 		}
 
+		const viewerServiceOpener = useViewerService && ctx
+			? async (path: string, abortSignal: AbortSignal | undefined) => {
+				const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
+				const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
+				return {
+					pid: response.pid,
+					viewerHandle: response.handle,
+					viewerBackend: response.backend,
+					viewerOwned: response.owned,
+					viewerCapabilities: response.capabilities,
+				};
+			}
+			: undefined;
+
 		if (inline) {
 			const pageArtifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
 			const artifacts = await mergeInlinePreviewArtifacts(pageArtifacts, { signal });
@@ -1519,9 +1537,7 @@ async function executeShowLatexPreviewTool(
 				MCP_FIXED_PREVIEW_PDF_PATH,
 				pdfTracker,
 				signal,
-				synctexCommand
-					? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true, requirePersistentViewer: true })
-					: undefined,
+				viewerServiceOpener,
 				undefined,
 				synctexCommand || undefined,
 			);
@@ -1543,6 +1559,19 @@ async function executeShowLatexPreviewTool(
 			synctex_callback_command: synctexCommand,
 		}, error);
 	}
+}
+
+async function openPdfThroughViewerService(
+	path: string,
+	callbackConfig: SynctexCallbackConfig,
+	signal?: AbortSignal,
+): Promise<ViewerServiceOpenResult> {
+	return viewerServiceClient.requestOpenPdf(
+		path,
+		callbackConfig,
+		{ reuseExisting: true, requirePersistentViewer: true },
+		signal,
+	);
 }
 
 function resolvePositiveInteger(value: unknown, name: string): number {
@@ -1697,10 +1726,20 @@ export default function (pi: ExtensionAPI) {
 					pdfTracker,
 					signal,
 					synctexCommand
-						? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true, requirePersistentViewer: true })
+						? async (path, abortSignal) => {
+							const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
+							const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
+							return {
+								pid: response.pid,
+								viewerHandle: response.handle,
+								viewerBackend: response.backend,
+								viewerOwned: response.owned,
+								viewerCapabilities: response.capabilities,
+							};
+						}
 						: undefined,
 					undefined,
-					synctexCommand,
+					synctexCommand || undefined,
 				);
 				pdfPath = trackedPdf.path;
 				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
@@ -1709,7 +1748,13 @@ export default function (pi: ExtensionAPI) {
 					: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
 				return {
 					content: [{ type: "text", text }],
-					details: { pdf_id: trackedPdf.id, pid: trackedPdf.pid, pdf: trackedPdf.path, source: trackedPdf.sourceFile, synctex_callback_command: synctexCommand },
+					details: {
+						pdf_id: trackedPdf.id,
+						pid: trackedPdf.pid,
+						pdf: trackedPdf.path,
+						source: trackedPdf.sourceFile,
+						synctex_callback_command: synctexCommand,
+					},
 				};
 			} catch (error) {
 				throw latexToolFailure("open-pdf", "Open PDF failed", {
@@ -1894,10 +1939,20 @@ export default function (pi: ExtensionAPI) {
 						pdfTracker,
 						signal,
 						synctexCommand
-							? (path, abortSignal) => openPdfInZathura(path, abortSignal, { synctexEditorCommand: synctexCommand, reuseExisting: true, requirePersistentViewer: true })
+							? async (path, abortSignal) => {
+								const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
+								const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
+								return {
+									pid: response.pid,
+									viewerHandle: response.handle,
+									viewerBackend: response.backend,
+									viewerOwned: response.owned,
+									viewerCapabilities: response.capabilities,
+								};
+							}
 							: undefined,
 						latexFilePath,
-						synctexCommand,
+						synctexCommand || undefined,
 					);
 					const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
 					const text = synctexCommand
@@ -1905,7 +1960,15 @@ export default function (pi: ExtensionAPI) {
 						: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
 					return {
 						content: [{ type: "text", text }],
-						details: { source: latexFilePath, pdf: trackedPdf.path, pdf_id: trackedPdf.id, pid: trackedPdf.pid, clean: shouldClean, cleaned_artifacts: cleanedArtifacts, synctex_callback_command: synctexCommand },
+						details: {
+							source: latexFilePath,
+							pdf: trackedPdf.path,
+							pdf_id: trackedPdf.id,
+							pid: trackedPdf.pid,
+							clean: shouldClean,
+							cleaned_artifacts: cleanedArtifacts,
+							synctex_callback_command: synctexCommand,
+						},
 					};
 				} catch (error) {
 					throw latexToolFailure("compile-latex-file", "LaTeX compile succeeded but opening failed", {

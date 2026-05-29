@@ -31,6 +31,21 @@ export interface ViewerServiceDiagnostics {
 	recent_events: string[];
 }
 
+export interface SynctexCallbackConfig {
+	kind: "pi-synctex-callback-v1";
+	transport: "unix";
+	socket_path: string;
+	token: string;
+}
+
+export interface ViewerServiceOpenCapabilities {
+	open: boolean;
+	close: boolean;
+	forward_search: boolean;
+	inverse_search: boolean;
+	reuse: boolean;
+}
+
 export interface ViewerServiceStatus {
 	protocol_version: number;
 	supported: boolean;
@@ -43,6 +58,28 @@ export interface ViewerServiceStatus {
 	operation: string;
 }
 
+interface ViewerServiceOpenResultBase {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	backend: string;
+	capabilities: ViewerServiceOpenCapabilities;
+	owned: boolean;
+	reused: boolean;
+	handle?: string;
+	pid?: number;
+	pid_diagnostic?: string;
+	protocol_directories: ViewerServiceProtocolDirectories;
+	service_instance_started_ns: number;
+	request_id: string;
+	operation: string;
+	error_code?: string;
+}
+
+export interface ViewerServiceOpenResult extends ViewerServiceOpenResultBase {
+	handle: string;
+}
+
 export interface ViewerServiceResultEnvelope {
 	protocol_version: number;
 	request_id: string;
@@ -50,10 +87,17 @@ export interface ViewerServiceResultEnvelope {
 	status: "ok" | "error";
 	generated_at_ns: number;
 	error?: string;
-	status_details: ViewerServiceStatus;
+	status_details: ViewerServiceStatus | ViewerServiceOpenResultBase;
 }
 
-interface ViewerServiceRequest {
+export interface ViewerServiceOpenRequestDetails {
+	pdf_path: string;
+	callback: SynctexCallbackConfig;
+	reuse_existing?: boolean;
+	require_persistent_viewer?: boolean;
+}
+
+export interface ViewerServiceRequest {
 	protocol_version: number;
 	request_id: string;
 	operation: string;
@@ -164,7 +208,43 @@ export class ViewerServiceClient {
 		if (result.status !== "ok") {
 			throw new Error(result.error || "viewer service returned error status");
 		}
-		return result.status_details;
+		return result.status_details as ViewerServiceStatus;
+	}
+
+	async requestOpenPdf(
+		pdfPath: string,
+		callback: SynctexCallbackConfig,
+		options: { reuseExisting?: boolean; requirePersistentViewer?: boolean } = {},
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<ViewerServiceOpenResult> {
+		const timeoutMs = requestTimeoutMs ?? this.requestTimeoutMs;
+		const result = await this.request(
+			"open",
+			{
+				pdf_path: pdfPath,
+				callback,
+				reuse_existing: options.reuseExisting ?? true,
+				require_persistent_viewer: options.requirePersistentViewer ?? false,
+			},
+			signal,
+			timeoutMs,
+		);
+		if (result.status !== "ok") {
+			const errorCode = "error_code" in result.status_details && typeof result.status_details.error_code === "string"
+				? result.status_details.error_code
+				: undefined;
+			const suffix = errorCode ? ` (code=${errorCode})` : "";
+			throw new Error(`${result.error || "viewer service returned error status"}${suffix}`);
+		}
+		const openResult = result.status_details;
+		if (!isValidOpenResult(openResult)) {
+			throw new Error("viewer service open response malformed");
+		}
+		if (typeof openResult.handle !== "string" || !openResult.handle) {
+			throw new Error("viewer service open response missing handle");
+		}
+		return openResult as ViewerServiceOpenResult;
 	}
 
 	private async request(
@@ -325,6 +405,64 @@ function isStringRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
+function isValidOpenResult(details: unknown): details is ViewerServiceOpenResultBase & Record<string, unknown> {
+	if (!isStringRecord(details)) return false;
+	if (!isStringRecord(details.protocol_directories)) return false;
+	const protocolDirectories = details.protocol_directories;
+	if (typeof protocolDirectories.base !== "string") return false;
+	if (typeof protocolDirectories.requests !== "string") return false;
+	if (typeof protocolDirectories.results !== "string") return false;
+	if (typeof protocolDirectories.state !== "string") return false;
+	if (typeof details.service_instance_started_ns !== "number") return false;
+	if (!isValidRequestId(details.request_id)) return false;
+	if (typeof details.operation !== "string" || !details.operation) return false;
+	if (typeof details.protocol_version !== "number") return false;
+	if (typeof details.supported !== "boolean") return false;
+	if (typeof details.service_available !== "boolean") return false;
+	if (typeof details.backend !== "string" || !details.backend) return false;
+	if (!isStringRecord(details.capabilities)) return false;
+	const capabilities = details.capabilities;
+	if (typeof capabilities.open !== "boolean") return false;
+	if (typeof capabilities.close !== "boolean") return false;
+	if (typeof capabilities.forward_search !== "boolean") return false;
+	if (typeof capabilities.inverse_search !== "boolean") return false;
+	if (typeof capabilities.reuse !== "boolean") return false;
+	if (typeof details.owned !== "boolean") return false;
+	if (typeof details.reused !== "boolean") return false;
+	if (details.handle !== undefined && (typeof details.handle !== "string" || !details.handle)) return false;
+	if (details.pid !== undefined && typeof details.pid !== "number") return false;
+	if (details.pid_diagnostic !== undefined && typeof details.pid_diagnostic !== "string") return false;
+	if (details.error_code !== undefined && typeof details.error_code !== "string") return false;
+	return true;
+}
+
+function isValidStatusResult(details: unknown): details is ViewerServiceStatus & Record<string, unknown> {
+	if (!isStringRecord(details)) return false;
+	if (typeof details.protocol_version !== "number") return false;
+	if (typeof details.service_instance_started_ns !== "number") return false;
+	if (!isValidRequestId(details.request_id)) return false;
+	if (typeof details.operation !== "string" || !details.operation) return false;
+	if (typeof details.supported !== "boolean") return false;
+	if (typeof details.service_available !== "boolean") return false;
+	if (!isStringRecord(details.backend)) return false;
+	const backend = details.backend;
+	if (typeof backend.name !== "string" || !backend.name) return false;
+	if (typeof backend.available !== "boolean") return false;
+	if (backend.path !== undefined && typeof backend.path !== "string") return false;
+	if (!isStringRecord(details.protocol_directories)) return false;
+	const protocolDirectories = details.protocol_directories;
+	if (typeof protocolDirectories.base !== "string") return false;
+	if (typeof protocolDirectories.requests !== "string") return false;
+	if (typeof protocolDirectories.results !== "string") return false;
+	if (typeof protocolDirectories.state !== "string") return false;
+	if (!isStringRecord(details.diagnostics)) return false;
+	const diagnostics = details.diagnostics;
+	if (typeof diagnostics.log_tail !== "string") return false;
+	if (!Array.isArray(diagnostics.recent_events)) return false;
+	if (!diagnostics.recent_events.every((event) => typeof event === "string")) return false;
+	return true;
+}
+
 function isValidResult(value: unknown): value is ViewerServiceResultEnvelope {
 	if (!isStringRecord(value)) return false;
 	const candidate = value;
@@ -335,27 +473,10 @@ function isValidResult(value: unknown): value is ViewerServiceResultEnvelope {
 	if (typeof candidate.generated_at_ns !== "number") return false;
 	if (!isStringRecord(candidate.status_details)) return false;
 	const details = candidate.status_details;
-	if (typeof details.protocol_version !== "number") return false;
-	if (typeof details.service_instance_started_ns !== "number") return false;
-	if (!isValidRequestId(details.request_id)) return false;
-	if (typeof details.operation !== "string" || !details.operation) return false;
-	if (typeof details.supported !== "boolean") return false;
-	if (typeof details.service_available !== "boolean") return false;
-	if (!isStringRecord(details.backend)) return false;
-	if (typeof details.backend.name !== "string" || !details.backend.name) return false;
-	if (typeof details.backend.available !== "boolean") return false;
-	if (details.backend.path !== undefined && typeof details.backend.path !== "string") return false;
-	if (!isStringRecord(details.protocol_directories)) return false;
-	if (typeof details.protocol_directories.base !== "string") return false;
-	if (typeof details.protocol_directories.requests !== "string") return false;
-	if (typeof details.protocol_directories.results !== "string") return false;
-	if (typeof details.protocol_directories.state !== "string") return false;
-	if (!isStringRecord(details.diagnostics)) return false;
-	const diagnostics = details.diagnostics;
-	if (typeof diagnostics.log_tail !== "string") return false;
-	if (!Array.isArray(diagnostics.recent_events)) return false;
-	if (!diagnostics.recent_events.every((event) => typeof event === "string")) return false;
-	return true;
+	if (candidate.operation === "open") {
+		return isValidOpenResult(details);
+	}
+	return isValidStatusResult(details);
 }
 
 export function viewerServiceRequestPath(baseDir: string, requestId: string): string {

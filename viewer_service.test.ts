@@ -8,6 +8,7 @@ import {
 	viewerServiceRequestPath,
 	viewerServiceResultPath,
 } from "./viewer_service.ts";
+import type { SynctexCallbackConfig } from "./viewer_service.ts";
 
 function fileMode(path: string): number {
 	return lstatSync(path).mode & 0o777;
@@ -104,6 +105,130 @@ test("viewer service client errors on malformed result payload", async () => {
 			await assert.rejects(
 				() => client.requestStatus(),
 				/Malformed viewer service result payload: not-json/,
+			);
+		})(),
+	]);
+});
+
+test("viewer service requestOpenPdf surfaces invalid-PDF open errors", async () => {
+	const baseDir = temporaryDir("viewer-client-open-error-invalid-pdf-");
+	const client = new ViewerServiceClient(baseDir, {
+		requestTimeoutMs: 1_500,
+		pollIntervalMs: 20,
+		requestIdFactory: () => "open-error",
+	});
+	const callback: SynctexCallbackConfig = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/synctex.sock",
+		token: "abc123",
+	};
+
+	const writeOpenError = async () => {
+		await sleep(20);
+		writeFileSync(viewerServiceResultPath(baseDir, "open-error"), JSON.stringify({
+			protocol_version: 1,
+			request_id: "open-error",
+			operation: "open",
+			status: "error",
+			generated_at_ns: Date.now() * 1_000_000,
+			error: "pdf_path is not a PDF file",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: "zathura",
+				capabilities: {
+					open: true,
+					close: true,
+					forward_search: true,
+					inverse_search: true,
+					reuse: true,
+				},
+				owned: false,
+				reused: false,
+				protocol_directories: {
+					base: baseDir,
+					requests: join(baseDir, "viewer-requests"),
+					results: join(baseDir, "viewer-results"),
+					state: join(baseDir, "viewer-state.json"),
+				},
+				service_instance_started_ns: Date.now() * 1_000_000,
+				request_id: "open-error",
+				operation: "open",
+				error_code: "invalid_pdf",
+			},
+		}), { encoding: "utf8", mode: 0o600 });
+	};
+
+	await Promise.all([
+		writeOpenError(),
+		(async () => {
+			await assert.rejects(
+				() => client.requestOpenPdf("/tmp/not-a-pdf", callback),
+				/pdf_path is not a PDF file.*code=invalid_pdf/,
+			);
+		})(),
+	]);
+});
+
+test("viewer service requestOpenPdf surfaces backend-unavailable open errors", async () => {
+	const baseDir = temporaryDir("viewer-client-open-error-backend-");
+	const client = new ViewerServiceClient(baseDir, {
+		requestTimeoutMs: 1_500,
+		pollIntervalMs: 20,
+		requestIdFactory: () => "open-backend",
+	});
+	const callback: SynctexCallbackConfig = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/synctex.sock",
+		token: "abc123",
+	};
+
+	const writeOpenError = async () => {
+		await sleep(20);
+		writeFileSync(viewerServiceResultPath(baseDir, "open-backend"), JSON.stringify({
+			protocol_version: 1,
+			request_id: "open-backend",
+			operation: "open",
+			status: "error",
+			generated_at_ns: Date.now() * 1_000_000,
+			error: "viewer backend is unavailable",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: "zathura",
+				capabilities: {
+					open: true,
+					close: true,
+					forward_search: true,
+					inverse_search: true,
+					reuse: true,
+				},
+				owned: false,
+				reused: false,
+				protocol_directories: {
+					base: baseDir,
+					requests: join(baseDir, "viewer-requests"),
+					results: join(baseDir, "viewer-results"),
+					state: join(baseDir, "viewer-state.json"),
+				},
+				service_instance_started_ns: Date.now() * 1_000_000,
+				request_id: "open-backend",
+				operation: "open",
+				error_code: "backend_unavailable",
+			},
+		}), { encoding: "utf8", mode: 0o600 });
+	};
+
+	await Promise.all([
+		writeOpenError(),
+		(async () => {
+			await assert.rejects(
+				() => client.requestOpenPdf("/tmp/some.pdf", callback),
+				/viewer backend is unavailable.*code=backend_unavailable/,
 			);
 		})(),
 	]);

@@ -21,6 +21,13 @@ export interface SynctexClick {
 	line: number;
 }
 
+export interface SynctexCallbackConfig {
+	kind: "pi-synctex-callback-v1";
+	transport: "unix";
+	socket_path: string;
+	token: string;
+}
+
 interface SynctexCallbackMessage extends SynctexClick {
 	token: string;
 }
@@ -41,6 +48,8 @@ const DEFAULT_SYNCTEX_TMPDIR = resolve(tmpdir(), "codex-show-latex");
 const SOCKET_NAME_PREFIX = "pi-synctex-";
 const ZATHURA_INPUT_PLACEHOLDER = "%{input}";
 const ZATHURA_LINE_PLACEHOLDER = "%{line}";
+const SYNCTEX_CALLBACK_KIND: SynctexCallbackConfig["kind"] = "pi-synctex-callback-v1";
+const SYNCTEX_CALLBACK_TRANSPORT: SynctexCallbackConfig["transport"] = "unix";
 const SYNCTEX_CALLBACK_SOCKET_IDLE_TIMEOUT_MS = 5_000;
 const SYNCTEX_CALLBACK_CLOSE_TIMEOUT_MS = 1_000;
 
@@ -164,6 +173,15 @@ export class SynctexCallbackServer {
 		this.token = randomBytes(24).toString("hex");
 		this.callbackScriptPath = options.callbackScriptPath;
 		this.nodePath = options.nodePath ?? process.execPath;
+	}
+
+	get callbackConfig(): SynctexCallbackConfig {
+		return {
+			kind: SYNCTEX_CALLBACK_KIND,
+			transport: SYNCTEX_CALLBACK_TRANSPORT,
+			socket_path: this.socketPath,
+			token: this.token,
+		};
 	}
 
 	get command(): string {

@@ -266,6 +266,433 @@ print(json.dumps({
 	assert.ok(typeof result.result.status_details.service_available === "boolean");
 });
 
+test("viewer service open request returns structured open result and tracks reusable sessions", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import signal
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-open-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+dir = tmp / "bin"
+dir.mkdir()
+zathura = dir / viewer.BACKEND_NAME
+zathura.write_text("#!/bin/sh\nwhile true; do sleep 0.1; done\n")
+os.chmod(zathura, 0o700)
+os.environ["PATH"] = f"{dir}:{os.environ.get('PATH', '')}"
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\\n")
+callback = {
+    "kind": viewer.SYNCTEX_CALLBACK_KIND,
+    "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+    "socket_path": "/tmp/synctex.sock",
+    "token": "abc123",
+}
+request_id = "open-first"
+viewer.atomic_write_text(
+    viewer.request_path(request_id),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {"pdf_path": str(pdf), "callback": callback},
+    }),
+    mode=0o600,
+)
+processed_first = viewer.scan_requests()
+first = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+
+request_id_2 = "open-second"
+viewer.atomic_write_text(
+    viewer.request_path(request_id_2),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id_2,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {"pdf_path": str(pdf), "callback": callback},
+    }),
+    mode=0o600,
+)
+processed_second = viewer.scan_requests()
+second = json.loads(viewer.result_path(request_id_2).read_text(encoding="utf-8"))
+
+tracked = viewer.OPEN_SESSIONS.get(str(pdf), {})
+pid = tracked.get("pid")
+if pid is not None:
+    try:
+        os.kill(int(pid), signal.SIGKILL)
+    except OSError:
+        pass
+print(json.dumps({
+    "processed_first": processed_first,
+    "processed_second": processed_second,
+    "first_status": first["status"],
+    "second_status": second["status"],
+    "first_reused": first["status_details"].get("reused", False),
+    "second_reused": second["status_details"].get("reused", False),
+    "same_handle": first["status_details"].get("handle") == second["status_details"].get("handle"),
+    "tracker_has_path": str(pdf) in viewer.OPEN_SESSIONS,
+    "tracker_handle": tracked.get("handle"),
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed_first: number;
+		processed_second: number;
+		first_status: string;
+		second_status: string;
+		first_reused: boolean;
+		second_reused: boolean;
+		same_handle: boolean;
+		tracker_has_path: boolean;
+		tracker_handle: string;
+	};
+
+	assert.equal(result.processed_first, 1);
+	assert.equal(result.processed_second, 1);
+	assert.equal(result.first_status, "ok");
+	assert.equal(result.second_status, "ok");
+	assert.equal(result.first_reused, false);
+	assert.equal(result.second_reused, true);
+	assert.equal(result.same_handle, true);
+	assert.equal(result.tracker_has_path, true);
+	assert.ok(result.tracker_handle.length > 0);
+});
+
+test("viewer service open request can skip reuse when reuse_existing=false", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-open-no-reuse-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+dir = tmp / "bin"
+dir.mkdir()
+zathura = dir / viewer.BACKEND_NAME
+zathura.write_text("#!/bin/sh\nwhile true; do sleep 0.1; done\n")
+os.chmod(zathura, 0o700)
+os.environ["PATH"] = f"{dir}:{os.environ.get('PATH', '')}"
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\\n")
+callback = {
+    "kind": viewer.SYNCTEX_CALLBACK_KIND,
+    "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+    "socket_path": "/tmp/synctex.sock",
+    "token": "abc123",
+}
+request_id = "open-first"
+viewer.atomic_write_text(
+    viewer.request_path(request_id),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {"pdf_path": str(pdf), "callback": callback},
+    }),
+    mode=0o600,
+)
+processed_first = viewer.scan_requests()
+first = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+
+request_id_2 = "open-third"
+viewer.atomic_write_text(
+    viewer.request_path(request_id_2),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id_2,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {"pdf_path": str(pdf), "callback": callback, "reuse_existing": False},
+    }),
+    mode=0o600,
+)
+processed_second = viewer.scan_requests()
+second = json.loads(viewer.result_path(request_id_2).read_text(encoding="utf-8"))
+
+print(json.dumps({
+    "processed_first": processed_first,
+    "processed_second": processed_second,
+    "first_status": first["status"],
+    "second_status": second["status"],
+    "first_reused": first["status_details"].get("reused", False),
+    "second_reused": second["status_details"].get("reused", False),
+    "first_handle": first["status_details"].get("handle", ""),
+    "second_handle": second["status_details"].get("handle", ""),
+    "tracker_has_path": str(Path(pdf).resolve()) in viewer.OPEN_SESSIONS,
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed_first: number;
+		processed_second: number;
+		first_status: string;
+		second_status: string;
+		first_reused: boolean;
+		second_reused: boolean;
+		first_handle: string;
+		second_handle: string;
+		tracker_has_path: boolean;
+	};
+
+	assert.equal(result.processed_first, 1);
+	assert.equal(result.processed_second, 1);
+	assert.equal(result.first_status, "ok");
+	assert.equal(result.second_status, "ok");
+	assert.equal(result.first_reused, false);
+	assert.equal(result.second_reused, false);
+	assert.equal(result.first_handle === result.second_handle, false);
+	assert.equal(result.tracker_has_path, true);
+});
+
+test("viewer service rejects invalid PDF files for open requests", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-open-invalid-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+
+pdf = Path(tempfile.mkstemp(prefix="bad-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_text("not-a-pdf", encoding="utf-8")
+request_id = "open-invalid"
+viewer.atomic_write_text(
+    viewer.request_path(request_id),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {
+            "pdf_path": str(pdf),
+            "callback": {
+                "kind": viewer.SYNCTEX_CALLBACK_KIND,
+                "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+                "socket_path": "/tmp/synctex.sock",
+                "token": "abc123",
+            },
+        },
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+print(json.dumps({
+    "processed": processed,
+    "status": result["status"],
+    "error": result.get("error", ""),
+    "request_gone": not viewer.request_path(request_id).exists(),
+}))
+`);
+	const result = JSON.parse(output) as { processed: number; status: string; error: string; request_gone: boolean };
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.status, "error");
+	assert.match(result.error, /pdf_path is not a PDF file/);
+	assert.equal(result.request_gone, true);
+});
+
+test("viewer service rejects symlinked PDFs for open requests", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-open-symlink-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+
+real_pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+real_pdf.write_bytes(b"%PDF-1.4\n")
+link_pdf = tmp / "pdf-link"
+os.symlink(real_pdf, link_pdf)
+request_id = "open-symlink"
+viewer.atomic_write_text(
+    viewer.request_path(request_id),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {
+            "pdf_path": str(link_pdf),
+            "callback": {
+                "kind": viewer.SYNCTEX_CALLBACK_KIND,
+                "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+                "socket_path": "/tmp/synctex.sock",
+                "token": "abc123",
+            },
+        },
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+print(json.dumps({
+    "processed": processed,
+    "status": result["status"],
+    "error": result.get("error", ""),
+}))
+`);
+	const result = JSON.parse(output) as { processed: number; status: string; error: string };
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.status, "error");
+	assert.match(result.error, /must not be a symlink/);
+});
+
+test("viewer service validates open request callback configuration", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-open-callback-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.ensure_protocol_dirs()
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.4\n")
+request_id = "open-bad-callback"
+viewer.atomic_write_text(
+    viewer.request_path(request_id),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {
+            "pdf_path": str(pdf),
+            "callback": {
+                "kind": viewer.SYNCTEX_CALLBACK_KIND,
+                "transport": "tcp",
+                "socket_path": "/tmp/synctex.sock",
+                "token": "abc123",
+            },
+        },
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+print(json.dumps({
+    "processed": processed,
+    "status": result["status"],
+    "error": result.get("error", ""),
+}))
+`);
+	const result = JSON.parse(output) as { processed: number; status: string; error: string };
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.status, "error");
+	assert.match(result.error, /callback transport must be unix/);
+});
+
+test("viewer service returns backend-unavailable for missing backend", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-open-backend-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "definitely-missing-viewer-backend"
+viewer.ensure_protocol_dirs()
+os.environ["PATH"] = "/tmp"
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.4\n")
+request_id = "open-no-backend"
+viewer.atomic_write_text(
+    viewer.request_path(request_id),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {
+            "pdf_path": str(pdf),
+            "callback": {
+                "kind": viewer.SYNCTEX_CALLBACK_KIND,
+                "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+                "socket_path": "/tmp/synctex.sock",
+                "token": "abc123",
+            },
+        },
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+print(json.dumps({
+    "processed": processed,
+    "status": result["status"],
+    "error": result.get("error", ""),
+}))
+`);
+	const result = JSON.parse(output) as { processed: number; status: string; error: string };
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.status, "error");
+	assert.match(result.error, /viewer backend is unavailable/);
+});
+
 test("viewer service ignores malformed status requests", () => {
 	const output = runPython(String.raw`
 import json

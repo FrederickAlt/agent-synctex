@@ -20,7 +20,7 @@ if [[ "$SRC_REAL" != "$DEST_REAL" ]]; then
   mv "$INSTALL_DIR.tmp" "$INSTALL_DIR"
 fi
 
-chmod +x "$INSTALL_DIR/scripts/show_latex_mcp.py" "$INSTALL_DIR/scripts/show_latex_viewer.py"
+chmod +x "$INSTALL_DIR/scripts/show_latex_mcp.py" "$INSTALL_DIR/scripts/show_latex_viewer.py" "$INSTALL_DIR/scripts/pi_synctex_callback.mjs"
 mkdir -p "$TMP_DIR"
 chmod 700 "$TMP_DIR"
 

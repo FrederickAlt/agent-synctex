@@ -9,22 +9,28 @@ Clients create per-request files under:
 and poll matching result files under:
   /tmp/codex-show-latex/viewer-results/<id>.json
 
-Only the `status` operation is implemented in this tracer slice.
+Supports status checks and viewer `open` requests.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
 import stat
 import sys
+import shlex
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 # Keep generated preview/service files private to the user.
 os.umask(0o077)
+
+OPEN_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 DEFAULT_TMPDIR = "/tmp/codex-show-latex"
 REQUESTS_NAME = "viewer-requests"
@@ -43,6 +49,16 @@ LOG_TAIL_LINES = 12
 MAX_STATE_EVENTS = 20
 
 SERVICE_STARTED_NS = time.time_ns()
+SYNCTEX_CALLBACK_KIND = "pi-synctex-callback-v1"
+SYNCTEX_CALLBACK_TRANSPORT = "unix"
+OPEN_REQUEST_OPERATION = "open"
+VIEWER_OPEN_CAPABILITIES = {
+    "open": True,
+    "close": True,
+    "forward_search": True,
+    "inverse_search": True,
+    "reuse": True,
+}
 
 
 def tmpdir() -> Path:
@@ -173,6 +189,75 @@ def read_text_file(path: Path, max_bytes: int) -> str:
 	return path.read_text(encoding="utf-8")
 
 
+def open_pdf_file_and_validate(path: Path) -> tuple[str | None, str | None, int | None]:
+	# Best-effort TOCTOU hardening: O_NOFOLLOW is used when available, but older
+	# runtimes without it still perform fd-based validation without symlink denial.
+	flags = os.O_RDONLY
+	if hasattr(os, "O_NOFOLLOW"):
+		flags |= os.O_NOFOLLOW
+	try:
+		pdf_fd = os.open(path, flags)
+	except OSError as exc:
+		if exc.errno == getattr(errno, "ELOOP", 0):
+			return ("pdf_path must not be a symlink", None, None)
+		return (f"cannot open pdf_path: {path}", None, None)
+
+	try:
+		st = os.fstat(pdf_fd)
+		if not stat.S_ISREG(st.st_mode):
+			os.close(pdf_fd)
+			return (f"pdf_path must be a regular file: {path}", None, None)
+		if st.st_uid != os.geteuid():
+			os.close(pdf_fd)
+			return (f"pdf_path is not owned by current user: {path}", None, None)
+		header = os.pread(pdf_fd, 5, 0) if hasattr(os, "pread") else _read_from_fd(pdf_fd)
+		if header != b"%PDF-":
+			os.close(pdf_fd)
+			return (f"pdf_path is not a PDF file: {path}", None, None)
+		return (None, str(path.resolve()), pdf_fd)
+	except Exception as exc:
+		try:
+			os.close(pdf_fd)
+		except Exception:
+			pass
+		return (str(exc), None, None)
+
+
+def _read_from_fd(file_descriptor: int) -> bytes:
+	os.lseek(file_descriptor, 0, os.SEEK_SET)
+	return os.read(file_descriptor, 5)
+
+
+def find_synctex_callback_script() -> Path:
+	candidates = [
+		Path(__file__).resolve().parent / "pi_synctex_callback.mjs",
+		Path(__file__).resolve().parent.parent / "scripts" / "pi_synctex_callback.mjs",
+	]
+	for candidate in candidates:
+		if candidate.is_file() and os.access(candidate, os.X_OK):
+			return candidate
+		if candidate.is_file() and os.access(candidate, os.R_OK):
+			return candidate
+	raise RuntimeError("missing trusted pi_synctex_callback.mjs helper")
+
+
+def build_synctex_callback_command(config: Dict[str, Any]) -> str:
+	node_path = shutil.which("node") or "node"
+	command = [
+		node_path,
+		str(find_synctex_callback_script()),
+		"--socket",
+		str(config["socket_path"]),
+		"--token",
+		str(config["token"]),
+		"--file",
+		"%{input}",
+		"--line",
+		"%{line}",
+	]
+	return " ".join(shlex.quote(part) for part in command)
+
+
 def request_path(request_id: str) -> Path:
 	return path_requests() / f"{request_id}.json"
 
@@ -191,6 +276,35 @@ def is_request_id_valid(request_id: str) -> bool:
 			continue
 		return False
 	return True
+
+
+def validate_callback_config(config: Dict[str, Any]) -> Optional[str]:
+	if not isinstance(config, dict):
+		return "callback must be an object"
+	if config.get("kind") != SYNCTEX_CALLBACK_KIND:
+		return "callback kind must be pi-synctex-callback-v1"
+	if config.get("transport") != SYNCTEX_CALLBACK_TRANSPORT:
+		return "callback transport must be unix"
+	socket_path = config.get("socket_path")
+	token = config.get("token")
+	if not isinstance(socket_path, str) or not socket_path:
+		return "callback socket_path must be a non-empty string"
+	if not isinstance(token, str) or not token:
+		return "callback token must be a non-empty string"
+	return None
+
+
+def validate_open_request_details(details: Dict[str, Any]) -> Optional[str]:
+	pdf_path = details.get("pdf_path")
+	if not isinstance(pdf_path, str) or not pdf_path:
+		return "missing or invalid pdf_path"
+	callback = details.get("callback")
+	if not isinstance(callback, dict):
+		return "missing or invalid callback"
+	error = validate_callback_config(callback)
+	if error:
+		return error
+	return None
 
 
 def request_is_stale(created_at_ns: int, now_ns: int) -> bool:
@@ -273,6 +387,223 @@ def find_viewer() -> str:
 		if candidate.exists() and os.access(candidate, os.X_OK):
 			return str(candidate)
 	return BACKEND_NAME
+
+
+def _pid_alive(pid: int) -> bool:
+	if pid <= 0:
+		return False
+	try:
+		os.kill(pid, 0)
+	except ProcessLookupError:
+		return False
+	except PermissionError:
+		return True
+	except Exception:
+		return False
+	return True
+
+
+def _find_viewer_pid_for_pdf(viewer_path: str, pdf_paths: list[str]) -> Optional[int]:
+	if not pdf_paths:
+		return None
+
+	for entry in Path("/proc").iterdir():
+		if not entry.name.isdigit():
+			continue
+		pid = int(entry.name)
+		try:
+			cmdline = entry.joinpath("cmdline").read_bytes().split(b"\0")
+			parts = [part.decode("utf-8", errors="replace") for part in cmdline if part]
+		except Exception:
+			continue
+		if not parts:
+			continue
+		if Path(parts[0]).name != Path(viewer_path).name:
+			continue
+		for path in pdf_paths:
+			if path and any(part == path or part.endswith(path) for part in parts):
+				return pid
+	return None
+
+
+def build_open_result_details(
+	request_id: str,
+	handle: Optional[str],
+	owned: bool,
+	reused: bool,
+	pid: Optional[int],
+	pid_diagnostic: Optional[str],
+	error_code: Optional[str] = None,
+) -> Dict[str, Any]:
+	details = {
+		"protocol_version": PROTOCOL_VERSION,
+		"supported": True,
+		"service_available": True,
+		"backend": BACKEND_NAME,
+		"capabilities": VIEWER_OPEN_CAPABILITIES,
+		"owned": bool(owned),
+		"reused": bool(reused),
+		"protocol_directories": protocol_directories(),
+		"service_instance_started_ns": SERVICE_STARTED_NS,
+		"request_id": request_id,
+		"operation": OPEN_REQUEST_OPERATION,
+	}
+	if handle:
+		details["handle"] = handle
+	if error_code is not None:
+		details["error_code"] = error_code
+	if pid is not None:
+		details["pid"] = pid
+	if pid_diagnostic:
+		details["pid_diagnostic"] = pid_diagnostic
+	return details
+
+
+def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any]) -> Dict[str, Any]:
+	error = validate_open_request_details(details)
+	if error:
+		return {
+			"status": "error",
+			"error": error,
+			"status_details": build_open_result_details(
+				request_id,
+				None,
+				False,
+				False,
+				None,
+				None,
+				"callback_invalid" if "callback" in error else "invalid_request",
+			),
+		}
+
+	pdf_path_value = details["pdf_path"]
+	pdf_error, normalized_pdf_path, pdf_fd = open_pdf_file_and_validate(Path(pdf_path_value))
+	if pdf_error:
+		return {
+			"status": "error",
+			"error": pdf_error,
+			"status_details": build_open_result_details(
+				request_id,
+				None,
+				False,
+				False,
+				None,
+				None,
+				"invalid_pdf",
+			),
+		}
+
+	callback = details["callback"]
+	reuse_existing = details.get("reuse_existing", True)
+	if not isinstance(reuse_existing, bool):
+		reuse_existing = True
+	require_persistent_viewer = details.get("require_persistent_viewer", False)
+	if not isinstance(require_persistent_viewer, bool):
+		require_persistent_viewer = False
+
+	viewer_path = find_viewer()
+	backend_available = Path(viewer_path).exists() and os.access(viewer_path, os.X_OK)
+	if not backend_available:
+		os.close(pdf_fd)
+		return {
+			"status": "error",
+			"error": "viewer backend is unavailable",
+			"status_details": build_open_result_details(request_id, None, False, False, None, "backend unavailable", "backend_unavailable"),
+		}
+
+	reused = False
+	handle = None
+	session = OPEN_SESSIONS.get(normalized_pdf_path, {})
+	if reuse_existing:
+		handle = session.get("handle")
+		if handle:
+			if session.get("callback") != callback:
+				handle = None
+			else:
+				current_pid = session.get("pid")
+				if current_pid and _pid_alive(current_pid):
+					reused = True
+				else:
+					OPEN_SESSIONS.pop(normalized_pdf_path, None)
+					handle = None
+
+	if reuse_existing and handle:
+		os.close(pdf_fd)
+		return {
+			"status": "ok",
+			"status_details": build_open_result_details(
+				request_id,
+				handle,
+				True,
+				reused,
+				session.get("pid"),
+				None,
+			),
+		}
+
+	handle = f"{BACKEND_NAME}:{request_id}:{int(time.time_ns())}"
+	callback_command = build_synctex_callback_command(callback)
+	fd_argument = f"/proc/self/fd/{pdf_fd}"
+	args = [viewer_path, "--fork", fd_argument, f"--synctex-editor-command={callback_command}"]
+	process = None
+	try:
+		process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, pass_fds=(pdf_fd,))
+	except Exception as exc:
+		os.close(pdf_fd)
+		return {
+			"status": "error",
+			"error": f"failed to launch viewer: {exc}",
+			"status_details": build_open_result_details(request_id, handle, False, False, None, str(exc), "launch_failed"),
+		}
+	# Keep fd open until launcher inherits it, then close to avoid leak.
+	os.close(pdf_fd)
+
+	time.sleep(0.05)
+	owned_pid = process.pid
+	owned = _pid_alive(process.pid or -1)
+	pid_diagnostic = None
+	if not owned:
+		owned_pid = _find_viewer_pid_for_pdf(viewer_path, [normalized_pdf_path, fd_argument])
+		if owned_pid is None:
+			owned = False
+			if process.stderr is not None:
+				pid_diagnostic = process.stderr.read().decode("utf-8", errors="replace").strip()
+		else:
+			owned = True
+
+	OPEN_SESSIONS[normalized_pdf_path] = {
+		"handle": handle,
+		"pid": owned_pid,
+		"backend": BACKEND_NAME,
+		"callback": dict(callback),
+	}
+
+	if require_persistent_viewer and not owned:
+		return {
+			"status": "error",
+			"error": "viewer did not produce a persistent viewer process",
+			"status_details": build_open_result_details(
+				request_id,
+				handle,
+				False,
+				reused,
+				owned_pid,
+				pid_diagnostic,
+				"launch_failed",
+			),
+		}
+
+	return {
+		"status": "ok",
+		"status_details": build_open_result_details(
+			request_id,
+			handle,
+			bool(owned_pid) and owned,
+			reused,
+			owned_pid,
+			pid_diagnostic,
+		),
+	}
 
 
 def protocol_directories() -> Dict[str, str]:
@@ -414,6 +745,30 @@ def scan_requests(now_ns: Optional[int] = None) -> int:
 		request_id = request["request_id"]
 		operation = request["operation"]
 		req_path = request_path(request_id)
+
+		if operation == OPEN_REQUEST_OPERATION:
+			open_result = open_pdf_with_viewer(request_id, request["details"], state)
+			status = open_result.get("status", "error")
+			error = open_result.get("error")
+			status_details = open_result.get("status_details", {
+				"protocol_version": PROTOCOL_VERSION,
+				"supported": False,
+				"service_available": False,
+				"backend": BACKEND_NAME,
+				"capabilities": VIEWER_OPEN_CAPABILITIES,
+				"owned": False,
+				"reused": False,
+				"handle": "",
+				"protocol_directories": protocol_directories(),
+				"service_instance_started_ns": SERVICE_STARTED_NS,
+				"request_id": request_id,
+				"operation": OPEN_REQUEST_OPERATION,
+			})
+			write_status_result(request_id, operation, status, status_details, error)
+			add_state_event(state, f"handled open request_id={request_id} status={status}")
+			safe_unlink(req_path)
+			processed += 1
+			continue
 
 		if operation != "status":
 			error = f"unsupported operation: {operation}"
