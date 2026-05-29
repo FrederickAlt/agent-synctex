@@ -213,8 +213,8 @@ function resolveLatexCompiler(compiler: unknown): LatexCompiler | undefined {
 	throw new Error(`compiler must be one of: ${LATEX_COMPILERS.join(", ")}`);
 }
 
-function resolveLatexFilePath(latexFilePath: string): string {
-	return resolve(expandHomePath(latexFilePath.trim()));
+function resolveLatexFilePath(latexFilePath: string, cwd = process.cwd()): string {
+	return resolve(cwd, expandHomePath(latexFilePath.trim()));
 }
 
 function assertReadableLatexFile(latexFilePath: string): void {
@@ -1561,6 +1561,11 @@ async function executeShowLatexPreviewTool(
 	}
 }
 
+function extractViewerServiceErrorCode(error: unknown): string | undefined {
+	const message = error instanceof Error ? error.message : String(error);
+	return /\(code=([^)]+)\)/.exec(message)?.[1];
+}
+
 async function openPdfThroughViewerService(
 	path: string,
 	callbackConfig: SynctexCallbackConfig,
@@ -1753,6 +1758,10 @@ export default function (pi: ExtensionAPI) {
 						pid: trackedPdf.pid,
 						pdf: trackedPdf.path,
 						source: trackedPdf.sourceFile,
+						viewer_handle: trackedPdf.viewerHandle,
+						viewer_backend: trackedPdf.viewerBackend,
+						viewer_owned: trackedPdf.viewerOwned,
+						viewer_capabilities: trackedPdf.viewerCapabilities,
 						synctex_callback_command: synctexCommand,
 					},
 				};
@@ -1761,6 +1770,8 @@ export default function (pi: ExtensionAPI) {
 					requested_path: requestedPath,
 					pdf: pdfPath,
 					synctex_callback_command: synctexCommand,
+					open_error: error instanceof Error ? error.message : String(error),
+					open_error_code: extractViewerServiceErrorCode(error),
 				}, error);
 			}
 		},
@@ -1948,7 +1959,7 @@ export default function (pi: ExtensionAPI) {
 					throw new Error("latex_file_path must be a non-empty string");
 				}
 
-				latexFilePath = resolveLatexFilePath(requestedPath);
+				latexFilePath = resolveLatexFilePath(requestedPath, ctx?.cwd);
 				compiler = resolveLatexCompiler(params.compiler);
 				shouldOpenPdf = params.open_pdf === true;
 				shouldClean = params.clean === true;
@@ -2000,6 +2011,10 @@ export default function (pi: ExtensionAPI) {
 							pdf: trackedPdf.path,
 							pdf_id: trackedPdf.id,
 							pid: trackedPdf.pid,
+							viewer_handle: trackedPdf.viewerHandle,
+							viewer_backend: trackedPdf.viewerBackend,
+							viewer_owned: trackedPdf.viewerOwned,
+							viewer_capabilities: trackedPdf.viewerCapabilities,
 							clean: shouldClean,
 							cleaned_artifacts: cleanedArtifacts,
 							synctex_callback_command: synctexCommand,
@@ -2014,6 +2029,8 @@ export default function (pi: ExtensionAPI) {
 						cleaned_artifacts: cleanedArtifacts,
 						pdf: pdfPath,
 						synctex_callback_command: synctexCommand,
+						open_error: error instanceof Error ? error.message : String(error),
+						open_error_code: extractViewerServiceErrorCode(error),
 					}, error);
 				}
 			} catch (error) {
