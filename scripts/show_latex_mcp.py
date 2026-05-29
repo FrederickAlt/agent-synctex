@@ -4,7 +4,7 @@
 Security model:
 - This process compiles LaTeX into operation-scoped files under /tmp/codex-show-latex.
 - It never launches a GUI application.
-- A separate desktop-session helper watches show-latex.ready and opens the descriptor PDF.
+- External viewer operations are handled by a separate desktop-session viewer service; show-latex.ready is only a compatibility artifact for older standalone callers.
 """
 
 from __future__ import annotations
@@ -310,9 +310,9 @@ def compile_latex(
         raise RuntimeError(compiler_error_message(f"PDF was not created at {pdf_path}", output, log_path))
 
     if write_fixed:
-        # Keep a fixed-path copy for older viewer helpers and for the Pi extension's
-        # single-window "current preview" fallback.  Inline previews disable this
-        # so existing Zathura windows do not auto-reload another agent's compile.
+        # Keep a fixed-path copy for compatibility and for the Pi extension's
+        # single-window "current preview" artifacts. Inline previews disable this
+        # so service-opened viewers do not auto-reload another agent's compile.
         atomic_copy_file(pdf_path, path_pdf())
         atomic_copy_file(tex_path, path_tex())
         fixed_log_path = path_log()

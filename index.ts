@@ -1282,7 +1282,7 @@ const ShowLatexParams = Type.Object(
 		}),
 		compiler: LatexCompilerParam,
 		inline: Type.Optional(Type.Boolean({
-			description: "When true, rasterize the compiled PDF and show it inline in the Pi TUI instead of opening Zathura. Defaults to true.",
+			description: "When true, rasterize the compiled PDF and show it inline in the Pi TUI instead of requesting an external viewer-service preview. Defaults to true.",
 			default: true,
 		})),
 	},
@@ -1297,7 +1297,7 @@ const CompileLatexFileParams = Type.Object(
 		}),
 		compiler: LatexCompilerParam,
 		open_pdf: Type.Optional(Type.Boolean({
-			description: "When true, open and track the compiled PDF after successful compilation. Defaults to false.",
+			description: "When true, request the viewer service to open and track the compiled PDF after successful compilation. Defaults to false.",
 			default: false,
 		})),
 		clean: Type.Optional(Type.Boolean({
@@ -1311,7 +1311,7 @@ const CompileLatexFileParams = Type.Object(
 const OpenPdfParams = Type.Object(
 	{
 		pdf_file_path: Type.String({
-			description: "Path to an existing local PDF file to open in Zathura and track for later SyncTeX actions.",
+			description: "Path to an existing local PDF file to send to the viewer service for opening/tracking and later SyncTeX actions.",
 			minLength: 1,
 		}),
 	},
@@ -1717,7 +1717,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "show_latex",
 		label: "Show LaTeX",
-		description: "FREEFORM/raw LaTeX preview. Pass LaTeX code directly; optional YAML-like front matter may set compiler and inline. Example: ---\ncompiler: lualatex\ninline: true\n---\n\\begin{equation}\nx\n\\end{equation}\nThe \\begin{document}...\\end{document} wrapper is accepted but not required. Defaults to inline preview with lualatex; set inline=false to open/refresh the viewer instead.",
+		description: "FREEFORM/raw LaTeX preview. Pass LaTeX code directly; optional YAML-like front matter may set compiler and inline. Example: ---\ncompiler: lualatex\ninline: true\n---\n\\begin{equation}\nx\n\\end{equation}\nThe \\begin{document}...\\end{document} wrapper is accepted but not required. Defaults to inline preview with lualatex; set inline=false to refresh fixed artifacts and request a viewer-service open instead.",
 		promptSnippet: "FREEFORM LaTeX preview; optional front matter can set compiler and inline",
 		promptGuidelines: [
 			"Use show_latex when the user asks for a LaTeX PDF preview. Prefer passing only the LaTeX body, for example \\[x\\]; \\begin{document}...\\end{document} is accepted but usually unnecessary.",
@@ -1746,7 +1746,7 @@ export default function (pi: ExtensionAPI) {
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
 			"Pass an existing local PDF path. The returned pdf_id is short-lived and valid only in the current Pi session.",
 			"Opening the same normalized PDF path again should return the existing pdf_id instead of creating a duplicate viewer where practical.",
-			"Extension-opened Zathura PDFs are wired to paste inverse SyncTeX clicks into the current interactive editor without triggering an agent turn.",
+			"PDFs opened through the viewer service are wired to paste inverse SyncTeX clicks into the current interactive editor without triggering an agent turn when the backend supports it.",
 		],
 		parameters: OpenPdfParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -1819,7 +1819,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "close_pdf",
 		label: "Close PDF",
-		description: "Close an extension-tracked PDF window by pdf_id. Service-managed windows are closed through the viewer service using private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The PDF is then removed from this session's tracking table when the close request succeeds.",
+		description: "Request the viewer service to close an extension-tracked PDF by pdf_id. Service-managed windows are closed through private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The PDF is then removed from this session's tracking table when the close request succeeds.",
 		promptSnippet: "Close a tracked PDF through the viewer service",
 		promptGuidelines: [
 			"Use close_pdf when the user asks to close a PDF previously opened or tracked by this extension.",
@@ -1863,7 +1863,7 @@ export default function (pi: ExtensionAPI) {
 			"Reuse the same pdf_id for repeated jumps within one tracked PDF.",
 			"source_file is optional only when the target line is in the tracked default source file; provide it whenever the target is in another source file or needs disambiguation.",
 			"When the target content is in a file included by \\input, \\include, or similar, pass source_file as the included .tex file and use the line number from that included file. Do not jump to the parent file's \\input/\\include line unless that directive itself is the target.",
-			"Mental model: pdf_id = viewer/PDF; source_file = TeX file containing the target line. For multi-file LaTeX, compile/open main.tex once, keep its pdf_id, and use jump_pdf(pdf_id, line, source_file=<included file>) for all fragments. Never open a new PDF merely because the target line is in another included file.",
+			"Mental model: pdf_id = viewer/PDF; source_file = TeX file containing the target line. For multi-file LaTeX, compile main.tex once and track its resulting PDF once, keep its pdf_id, and use jump_pdf(pdf_id, line, source_file=<included file>) for all fragments. Never open a new PDF merely because the target line is in another included file.",
 			"After a successful jump, the tool result text names the jumped line and then shows the source line's verbatim LaTeX. Use it to verify that edits did not shift the intended target row.",
 			"After a successful jump, do not tell the user which line you jumped to unless they explicitly ask for the exact line; the user will see the line in the PDF viewer.",
 		],
@@ -1972,14 +1972,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "compile_latex_file",
 		label: "Compile LaTeX File",
-		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to open and track the successfully compiled PDF; leave it false (the default) to compile without opening a viewer window. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles.",
+		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a viewer-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external viewer state. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles.",
 		promptSnippet: "Compile a local LaTeX file as PDF",
 		promptGuidelines: [
 			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
-			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without opening a window; set open_pdf=true only when the user wants the compiled PDF opened/tracked immediately.",
+			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without requesting external viewer state; set open_pdf=true only when the user wants the compiled PDF opened/tracked by the viewer service immediately.",
 			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling.",
 			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
-			"For multi-file LaTeX projects, compile/open the root file that produces the PDF, such as main.tex. The returned pdf_id identifies the resulting PDF/viewer and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
+			"For multi-file LaTeX projects, compile the root file that produces the PDF, such as main.tex, and use open_pdf=true only when a viewer-service-tracked PDF is needed. The returned pdf_id identifies the resulting PDF/viewer and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
 			"On failure this tool returns only a short error message and writes details to a temporary log file.",
 		],
 		parameters: CompileLatexFileParams,

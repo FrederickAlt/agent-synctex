@@ -7,7 +7,7 @@ Pi extension that exposes seven tools:
 - `close_pdf` — close a tracked viewer-service PDF by `pdf_id`.
 - `jump_pdf` — perform a line-based viewer-service forward SyncTeX jump in a tracked PDF by `pdf_id`, returning a short “line N contains:” header followed by the jumped-to LaTeX source line.
 - `get_synctex_callback_command` — print the current session's exact Zathura inverse SyncTeX callback command for manual configuration only.
-- `compile_latex_file` — compile a local LaTeX source file in place, optionally opening/tracking the resulting PDF.
+- `compile_latex_file` — compile a local LaTeX source file in place, optionally sending a viewer-service open request to track the resulting PDF.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
 Snippet previews communicate with an MCP-style stdio service (`show_latex_mcp.py`) and forward
@@ -83,7 +83,7 @@ require the viewer service and are handled only by the unsandboxed helper.
 
 ### Viewer troubleshooting
 
-- **Service not running (timeout)**: if `open_pdf`, `close_pdf`, `jump_pdf`, or `show_latex(inline=false)` fail with
+- **Timeout / service not processing requests**: if `open_pdf`, `close_pdf`, `jump_pdf`, `show_latex(inline=false)`, or `compile_latex_file(open_pdf=true)` fail with
   `viewer service request timed out; is the viewer service running?`, start/restart `codex-show-latex-viewer.service` and
   check `systemctl --user status codex-show-latex-viewer.service` plus `/tmp/codex-show-latex/viewer.log`.
 - **Backend unavailable**: failures like `viewer backend is unavailable` or `(code=backend_unavailable)` usually mean
@@ -97,7 +97,7 @@ require the viewer service and are handled only by the unsandboxed helper.
 
 ## PDF tracking and jumps
 
-`open_pdf(pdf_file_path)` validates that the path exists, is readable, and is a regular PDF file. In default mode, it uses the configured viewer service (`show_latex_viewer.py`) to open or reuse the PDF, stores service metadata (`viewer_handle`, `viewer_backend`, capability flags), and returns a session-local `pdf_id`. IDs are short-lived session values only; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID where practical.
+`open_pdf(pdf_file_path)` validates that the path exists, is readable, and is a regular PDF file. In default mode, it sends the configured viewer service (`show_latex_viewer.py`) an open/reuse request for the PDF, stores service metadata (`viewer_handle`, `viewer_backend`, capability flags), and returns a session-local `pdf_id`. IDs are short-lived session values only; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID where practical.
 
 Tracked PDFs also remember a default source file when possible. `compile_latex_file(..., open_pdf=true)` stores the compiled source path exactly. `open_pdf(existing.pdf)` attempts to infer a default source from `<basename>.tex` next to the normalized PDF and from available `.synctex`/`.synctex.gz` input records.
 
@@ -152,7 +152,7 @@ Install dev dependencies once with `npm install`, then run `npm run verify` to t
 Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk` (which runs latexmk with LuaLaTeX).
 
 Prefer `compile_latex_file` over invoking a bare compiler directly when you already have a `.tex` file to build.
-It can compile without opening a window: leave `open_pdf` unset/false for a build/check only run.
+It can compile without requesting external viewer state: leave `open_pdf` unset/false for a build/check only run.
 Pass `clean=true` to remove common same-basename LaTeX artifacts before compiling, including the previous PDF and SyncTeX sidecars.
 
 Both snippet previews and file compiles pass `-synctex=1` to the selected LaTeX command by default, so generated PDFs have SyncTeX sidecars when the compiler succeeds.
@@ -161,7 +161,7 @@ For `compile_latex_file`, the selected compiler is spawned with the source file'
 working directory, using the original file name as the job input. The resulting `<name>.pdf` stays
 next to the source file. By default, successful output is a single short `ok: <pdf>` line and no
 viewer state changes, so the tool remains useful as a compile/check operation. With `open_pdf=true`,
-the tool opens/tracks the PDF after a successful compile and returns both `pdf` and `pdf_id` in its
+the tool sends a viewer-service open request for the PDF after a successful compile and returns both `pdf` and `pdf_id` in its
 details. If compile succeeds but open fails, re-check service status/logs for `open`/`jump`-style viewer failures.
 
 Both `show_latex` and `compile_latex_file` report only a short error on failure and write diagnostic

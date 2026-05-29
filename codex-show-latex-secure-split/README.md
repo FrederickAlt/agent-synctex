@@ -104,7 +104,7 @@ cat /tmp/codex-show-latex/viewer.log
 
 Viewer operations are serviced by the background viewer service and can fail in a few distinct ways:
 
-- **Service not running (timeout)**: if a client reports `viewer service request timed out; is the viewer service running?`, restart the user
+- **Timeout / service not processing requests**: if a client reports `viewer service request timed out; is the viewer service running?` from an external open/close/jump request (including `show_latex(inline=false)` or `compile_latex_file(open_pdf=true)`), restart the user
   service and inspect `/tmp/codex-show-latex/viewer.log` plus the JSON protocol directories above.
 - **Backend unavailable**: failures that mention `viewer backend is unavailable` (or `code=backend_unavailable`) usually mean the configured backend command is missing/unlaunchable. Run
   `~/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py --status` and verify backend availability before retrying.
@@ -116,4 +116,4 @@ The unsandboxed helper accepts only fixed-shape JSON request files in the privat
 
 It refuses unsafe temp/PDF paths such as symlinks, non-regular PDF files, or files not owned by the current user. Close and forward-search requests are checked against service-owned viewer handles and backend identity before acting.
 
-The remaining intentional capability is narrow: a client that can write valid requests under `/tmp/codex-show-latex/viewer-requests` can ask the desktop service to open, close, or forward-search a validated PDF in Zathura.
+The remaining intentional capability is narrow: a client that can write valid requests under `/tmp/codex-show-latex/viewer-requests` can ask the desktop service to open, close, or forward-search a validated PDF through the configured viewer backend (currently Zathura).
