@@ -901,11 +901,15 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 
 	handle = f"{BACKEND_NAME}:{request_id}:{int(time.time_ns())}"
 	callback_command = build_synctex_callback_command(callback)
-	fd_argument = f"/proc/self/fd/{pdf_fd}"
-	args = [viewer_path, f"--synctex-editor-command={callback_command}", fd_argument]
+	# Launch Zathura with the canonical PDF path rather than /proc/self/fd/<fd>.
+	# Zathura records the opened filename in its D-Bus state and uses that filename
+	# to locate SyncTeX data during forward search. When launched through a procfd,
+	# real Zathura exposes a temporary /tmp/zathura.stdin.* filename and
+	# --synctex-forward cannot find the PDF's .synctex sidecar.
+	args = [viewer_path, f"--synctex-editor-command={callback_command}", normalized_pdf_path]
 	process = None
 	try:
-		process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(pdf_fd,))
+		process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 	except Exception as exc:
 		os.close(pdf_fd)
 		return {
@@ -913,7 +917,6 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 			"error": f"failed to launch viewer: {exc}",
 			"status_details": build_open_result_details(request_id, handle, False, False, None, str(exc), "launch_failed"),
 		}
-	# Keep fd open until launcher inherits it, then close to avoid leak.
 	os.close(pdf_fd)
 
 	time.sleep(0.05)
@@ -922,7 +925,7 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 	owned_process = process if owned else None
 	pid_diagnostic = None
 	if not owned:
-		owned_pid = _find_viewer_pid_for_pdf(viewer_path, [normalized_pdf_path, fd_argument])
+		owned_pid = _find_viewer_pid_for_pdf(viewer_path, [normalized_pdf_path])
 		if owned_pid is None:
 			owned = False
 			pid_diagnostic = _read_process_stderr_if_finished(process)

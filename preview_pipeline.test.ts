@@ -1021,6 +1021,8 @@ try:
         "session_still_tracked": pdf_key in viewer.OPEN_SESSIONS,
         "invocation_count": len(invocation_lines),
         "invocation_has_fork": any("--fork" in entry for entry in invocation_lines),
+        "invocation_uses_pdf_path": any(str(pdf.resolve()) in entry for entry in invocation_lines),
+        "invocation_uses_procfd": any("/proc/self/fd/" in entry for entry in invocation_lines),
         "tracked_cmdline_has_no_fork": not cmdline_has_fork(expected_cmdline),
     }))
 finally:
@@ -1041,6 +1043,8 @@ finally:
 		session_still_tracked: boolean;
 		invocation_count: number;
 		invocation_has_fork: boolean;
+		invocation_uses_pdf_path: boolean;
+		invocation_uses_procfd: boolean;
 		tracked_cmdline_has_no_fork: boolean;
 	};
 
@@ -1057,6 +1061,8 @@ finally:
 	assert.equal(result.session_still_tracked, false);
 	assert.equal(result.invocation_count, 1);
 	assert.equal(result.invocation_has_fork, false);
+	assert.equal(result.invocation_uses_pdf_path, true);
+	assert.equal(result.invocation_uses_procfd, false);
 	assert.equal(result.tracked_cmdline_has_no_fork, true);
 });
 
