@@ -20,7 +20,7 @@ import {
 	type InlinePreviewRenderState,
 } from "./inline_preview_metadata.ts";
 import { createTerminalRefreshPolicy } from "./terminal_refresh_policy.ts";
-import { applyLatexPreamble } from "./latex_preamble.ts";
+import { applyLatexPreamble } from "./src/modules/latex_preamble.ts";
 import { createInlinePreviewRenderer } from "./inline_preview_renderer.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
 import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./pdf_tracking.ts";
