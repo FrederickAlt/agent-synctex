@@ -18,4 +18,4 @@ This project may expose a project-local host broker via `pdf-preview-servicectl`
 `codex-show-latex-viewer.service` without raw access to the user session D-Bus. Treat this as a narrow,
 privileged escape hatch. Do not use it for anything except maintaining/testing the PDF preview viewer service
 that supports PDF open, close, and SyncTeX/forward-search operations. Do not repurpose the broker, broaden its
-permissions, call it from unrelated projects, or use it for arbitrary host commands.
+permissions, or use it for arbitrary host commands.
