@@ -2,9 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 
+const BASE_PATH = process.env.PATH || "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
 function runPython(script: string): string {
 	const env = { ...process.env };
 	delete env.MCP_TMPDIR;
+	env.PATH = BASE_PATH;
 	const result = spawnSync("python3", ["-c", script], {
 		cwd: process.cwd(),
 		encoding: "utf8",
@@ -376,6 +379,19 @@ try:
     if isinstance(first_open_pid, int):
         launched_pids.append(first_open_pid)
 
+    def wait_for_invocations(min_count: int) -> list[str]:
+        for _ in range(20):
+            if not backend_argv_log.exists():
+                time.sleep(0.05)
+                continue
+            lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+            if len(lines) >= min_count:
+                return lines
+            time.sleep(0.05)
+        return [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line] if backend_argv_log.exists() else []
+
+    invocation_lines = wait_for_invocations(1)
+
     request_id_2 = "open-second"
     viewer.atomic_write_text(
         viewer.request_path(request_id_2),
@@ -401,7 +417,7 @@ try:
     tracked = viewer.OPEN_SESSIONS.get(pdf_key, {})
     tracker_pid = tracked.get("pid")
     tracker_handle = tracked.get("handle")
-    invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+    invocation_lines = invocation_lines if len(invocation_lines) >= 1 else wait_for_invocations(1)
 
     tracked_identity = None
     if isinstance(first_pid, int):
@@ -460,7 +476,6 @@ finally:
 		invocation_has_fork: boolean;
 		tracked_cmdline_has_no_fork: boolean;
 	};
-
 	assert.equal(result.processed_first, 1);
 	assert.equal(result.processed_second, 1);
 	assert.equal(result.first_status, "ok");
@@ -580,6 +595,19 @@ try:
     if isinstance(first_open_pid, int):
         launched_pids.append(first_open_pid)
 
+    def wait_for_invocations(min_count: int) -> list[str]:
+        for _ in range(20):
+            if not backend_argv_log.exists():
+                time.sleep(0.05)
+                continue
+            lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+            if len(lines) >= min_count:
+                return lines
+            time.sleep(0.05)
+        return [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line] if backend_argv_log.exists() else []
+
+    _ = wait_for_invocations(1)
+
     request_id_2 = "open-third"
     viewer.atomic_write_text(
         viewer.request_path(request_id_2),
@@ -600,7 +628,7 @@ try:
     if isinstance(second_pid, int):
         launched_pids.append(second_pid)
 
-    invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+    invocation_lines = wait_for_invocations(2)
 
     print(json.dumps({
         "processed_first": processed_first,
@@ -636,7 +664,6 @@ finally:
 		invocation_count: number;
 		invocation_lines: string[];
 	};
-
 	assert.equal(result.processed_first, 1);
 	assert.equal(result.processed_second, 1);
 	assert.equal(result.first_status, "ok");
@@ -676,15 +703,12 @@ bin_dir.mkdir()
 backend_argv_log = bin_dir / "fakezathura-argv.log"
 os.environ["FAKE_BACKEND_ARGV_LOG"] = str(backend_argv_log)
 zathura = bin_dir / viewer.BACKEND_NAME
-zathura.write_text("""#!/usr/bin/env python3
-import os
-import sys
-from pathlib import Path
-
-log_path = os.environ.get("FAKE_BACKEND_ARGV_LOG")
-if log_path:
-    Path(log_path).open("a", encoding="utf-8").write(" ".join(sys.argv) + "\\n")
-raise SystemExit(0)
+zathura.write_text("""#!/bin/sh
+log_path="$FAKE_BACKEND_ARGV_LOG"
+if [ -n "$log_path" ]; then
+    printf '%s\\n' "$0 $*" >> "$log_path"
+fi
+exit 0
 """)
 os.chmod(zathura, 0o700)
 os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
@@ -714,10 +738,43 @@ def write_open(request_id: str):
     result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
     return processed, result
 
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def wait_for_invocations(min_count: int) -> list[str]:
+    for _ in range(20):
+        if not backend_argv_log.exists():
+            time.sleep(0.05)
+            continue
+        lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+        if len(lines) >= min_count:
+            return lines
+        time.sleep(0.05)
+    return [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line] if backend_argv_log.exists() else []
+
 processed_first, first = write_open("open-exited-first")
+first_pid = first["status_details"].get("pid")
+if isinstance(first_pid, int):
+    for _ in range(20):
+        if not pid_alive(first_pid):
+            break
+        time.sleep(0.05)
 processed_second, second = write_open("open-exited-second")
-invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+invocation_lines = wait_for_invocations(2)
 pdf_key = str(pdf.resolve())
+tracker_has_path = pdf_key in viewer.OPEN_SESSIONS
+if tracker_has_path:
+    for _ in range(20):
+        time.sleep(0.05)
+        tracker_has_path = pdf_key in viewer.OPEN_SESSIONS
+        if not tracker_has_path:
+            break
 
 print(json.dumps({
     "processed_first": processed_first,
@@ -729,7 +786,7 @@ print(json.dumps({
     "first_reused": first["status_details"].get("reused"),
     "second_reused": second["status_details"].get("reused"),
     "same_handle": first["status_details"].get("handle") == second["status_details"].get("handle"),
-    "tracker_has_path": pdf_key in viewer.OPEN_SESSIONS,
+    "tracker_has_path": tracker_has_path,
     "invocation_count": len(invocation_lines),
     "invocation_has_fork": any("--fork" in line for line in invocation_lines),
 }))
@@ -748,7 +805,6 @@ print(json.dumps({
 		invocation_count: number;
 		invocation_has_fork: boolean;
 	};
-
 	assert.equal(result.processed_first, 1);
 	assert.equal(result.processed_second, 1);
 	assert.equal(result.first_status, "ok");
@@ -978,7 +1034,7 @@ try:
     expected_identity = open_session.get("process_identity")
     expected_cmdline = expected_identity.get("cmdline") if isinstance(expected_identity, dict) else []
 
-    invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+    invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line] if backend_argv_log.exists() else []
     alive_before_close = isinstance(pid, int) and pid_alive(pid)
 
     if not isinstance(handle, str) or not isinstance(pid, int):
