@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 
 const PYTHON_BIN = process.platform === "win32" ? "python" : "python3";
 const SERVICE_SCRIPT = resolve("scripts/show_latex_viewer.py");
@@ -11,6 +11,12 @@ const SERVICE_SCRIPT = resolve("scripts/show_latex_viewer.py");
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
+	});
+}
+
+function killProcess(pid: number): void {
+	spawnSync("kill", ["-9", String(pid)], {
+		stdio: ["ignore", "ignore", "ignore"],
 	});
 }
 
@@ -59,13 +65,32 @@ async function waitForViewerResult(baseDir: string, requestId: string): Promise<
 	return JSON.parse(raw) as any;
 }
 
+function writeFakeZathuraViewerBinary(path: string): void {
+	const script = `#!/usr/bin/env bash
+set -eu
+trap 'exit 0' INT TERM
+while true; do
+	if [ "$PPID" -eq 1 ]; then
+		exit 0
+	fi
+	sleep 0.05
+	done
+`;
+	writeFileSync(path, script, { encoding: "utf8", mode: 0o700 });
+	chmodSync(path, 0o700);
+}
+
 async function waitForServiceDirs(baseDir: string): Promise<void> {
 	await waitForPath(join(baseDir, "viewer-requests"), 1500);
 	await waitForPath(join(baseDir, "viewer-results"), 1500);
 }
 
-async function withViewerService(environment: Record<string, string>, fn: (baseDir: string) => Promise<void>): Promise<void> {
-	const baseDir = mkdtempSync(join(tmpdir(), "viewer-service-backend-wrapper-"));
+async function withViewerService(
+	environment: Record<string, string>,
+	fn: (baseDir: string) => Promise<void>,
+	serviceBaseDir?: string,
+): Promise<void> {
+	const baseDir = serviceBaseDir ?? mkdtempSync(join(tmpdir(), "viewer-service-backend-wrapper-"));
 	mkdirSync(baseDir, { recursive: true, mode: 0o700 });
 	const proc: ChildProcess = spawn(PYTHON_BIN, [SERVICE_SCRIPT], {
 		env: {
@@ -170,4 +195,158 @@ test("show_latex_viewer fake backend can report unsupported capabilities", async
 		const second = await waitForViewerResult(baseDir, "status-unsupported");
 		assert.equal(second.status_details.supported, true);
 	});
+});
+
+
+test("show_latex_viewer zathura backend reuses persistent open sessions", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-open-"));
+	const fakeViewer = join(serviceBaseDir, "zathura");
+	writeFakeZathuraViewerBinary(fakeViewer);
+	const pdfPath = join(serviceBaseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n", { mode: 0o600 });
+
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/show-latex-zathura-callback.sock",
+		token: "zathura-token",
+	};
+	const otherCallback = {
+		...callback,
+		token: "different-token",
+	};
+
+	const openDetails = {
+		callback,
+		pdf_path: pdfPath,
+	};
+	const openDetailsWithDifferentCallback = {
+		callback: otherCallback,
+		pdf_path: pdfPath,
+	};
+
+	await withViewerService(
+		{
+			VIEWER_SERVICE_BACKEND: "zathura",
+			ZATHURA_VIEWER_PATH: fakeViewer,
+		},
+		async (baseDir) => {
+			writeResultRequest(baseDir, "status-zathura", "status", {});
+			const status = await waitForViewerResult(baseDir, "status-zathura");
+			assert.equal(status.status, "ok");
+			assert.equal(status.status_details.backend.name, "zathura");
+			assert.equal(status.status_details.backend.path, fakeViewer);
+
+			writeResultRequest(baseDir, "zathura-open-first", "open", openDetails);
+			const first = await waitForViewerResult(baseDir, "zathura-open-first");
+			assert.equal(first.status, "ok");
+			assert.equal(first.status_details.backend, "zathura");
+			assert.equal(first.status_details.reused, false);
+			assert.equal(first.status_details.owned, true);
+			assert.equal(first.status_details.pid > 0, true);
+
+			writeResultRequest(baseDir, "zathura-open-second", "open", openDetails);
+			const second = await waitForViewerResult(baseDir, "zathura-open-second");
+			assert.equal(second.status, "ok");
+			assert.equal(second.status_details.backend, "zathura");
+			assert.equal(second.status_details.reused, true);
+			assert.equal(second.status_details.handle, first.status_details.handle);
+			assert.equal(second.status_details.pid, first.status_details.pid);
+
+			writeResultRequest(baseDir, "zathura-open-third", "open", openDetailsWithDifferentCallback);
+			const third = await waitForViewerResult(baseDir, "zathura-open-third");
+			assert.equal(third.status, "ok");
+			assert.equal(third.status_details.backend, "zathura");
+			assert.equal(third.status_details.reused, false);
+			assert.notEqual(third.status_details.handle, first.status_details.handle);
+		},
+		serviceBaseDir,
+	);
+});
+
+
+test("show_latex_viewer zathura backend surfaces backend-unavailable", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-bad-"));
+	const missingViewer = join(serviceBaseDir, "missing-zathura");
+	const pdfPath = join(serviceBaseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n", { mode: 0o600 });
+
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/show-latex-zathura-callback.sock",
+		token: "zathura-token",
+	};
+	const openDetails = {
+		callback,
+		pdf_path: pdfPath,
+	};
+
+	await withViewerService(
+		{
+			VIEWER_SERVICE_BACKEND: "zathura",
+			ZATHURA_VIEWER_PATH: missingViewer,
+		},
+		async (baseDir) => {
+			writeResultRequest(baseDir, "status-zathura-unavailable", "status", {});
+			const status = await waitForViewerResult(baseDir, "status-zathura-unavailable");
+			assert.equal(status.status, "ok");
+			assert.equal(status.status_details.backend.name, "zathura");
+			assert.equal(status.status_details.backend.available, false);
+			assert.equal(status.status_details.backend.path, missingViewer);
+
+			writeResultRequest(baseDir, "open-zathura-unavailable", "open", openDetails);
+			const result = await waitForViewerResult(baseDir, "open-zathura-unavailable");
+			assert.equal(result.status, "error");
+			assert.equal(result.error, "viewer backend is unavailable");
+			assert.equal(result.status_details.error_code, "backend_unavailable");
+			assert.equal(result.status_details.owned, false);
+			assert.equal(result.status_details.reused, false);
+		},
+		serviceBaseDir,
+	);
+});
+
+
+test("show_latex_viewer zathura backend relaunches after stale tracked session", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-stale-"));
+	const fakeViewer = join(serviceBaseDir, "zathura");
+	writeFakeZathuraViewerBinary(fakeViewer);
+	const pdfPath = join(serviceBaseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n", { mode: 0o600 });
+
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/show-latex-zathura-callback.sock",
+		token: "zathura-token",
+	};
+	const openDetails = {
+		callback,
+		pdf_path: pdfPath,
+	};
+
+	await withViewerService(
+		{
+			VIEWER_SERVICE_BACKEND: "zathura",
+			ZATHURA_VIEWER_PATH: fakeViewer,
+		},
+		async (baseDir) => {
+			writeResultRequest(baseDir, "zathura-open-first", "open", openDetails);
+			const first = await waitForViewerResult(baseDir, "zathura-open-first");
+			assert.equal(first.status, "ok");
+			assert.equal(first.status_details.reused, false);
+
+			killProcess(first.status_details.pid);
+			await sleep(120);
+
+			writeResultRequest(baseDir, "zathura-open-second", "open", openDetails);
+			const second = await waitForViewerResult(baseDir, "zathura-open-second");
+			assert.equal(second.status, "ok");
+			assert.equal(second.status_details.reused, false);
+			assert.notEqual(second.status_details.handle, first.status_details.handle);
+			assert.notEqual(second.status_details.pid, first.status_details.pid);
+		},
+		serviceBaseDir,
+	);
 });

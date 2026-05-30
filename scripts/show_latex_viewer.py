@@ -39,6 +39,7 @@ STATE_NAME = "viewer-state.json"
 LOG_NAME = "viewer.log"
 BACKEND_NAME = "zathura"
 VIEWER_BACKEND_ENV = "VIEWER_SERVICE_BACKEND"
+ZATHURA_VIEWER_PATH_ENV = "ZATHURA_VIEWER_PATH"
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 32 * 1024
@@ -496,14 +497,316 @@ class ViewerBackendAdapter:
 
 
 class ZathuraViewerBackend(ViewerBackendAdapter):
-	def __init__(self) -> None:
+	def __init__(self, executable_path: Optional[str] = None) -> None:
 		super().__init__(BACKEND_NAME, VIEWER_OPEN_CAPABILITIES)
+		self._executable_path = executable_path
 
 	def resolve_path(self) -> str:
-		return find_viewer()
+		return self._executable_path if self._executable_path else find_viewer()
+
+	def _snapshot_process_identity(self, pid: int) -> Optional[Dict[str, Any]]:
+		if pid <= 0:
+			return None
+		proc_path = Path("/proc") / str(pid)
+		try:
+			stat_text = (proc_path / "stat").read_text(encoding="utf-8")
+		except Exception:
+			return None
+
+		identity: Dict[str, Any] = {}
+		try:
+			start = stat_text.find("(")
+			end = stat_text.rfind(")")
+			if start != -1 and end != -1 and end > start:
+				identity["comm"] = stat_text[start + 1:end]
+				tail = stat_text[end + 2 :].split()
+				identity["start_time"] = int(tail[19])
+		except Exception:
+			pass
+
+		try:
+			raw_cmdline = (proc_path / "cmdline").read_bytes()
+			identity["cmdline"] = [arg.decode("utf-8", errors="replace") for arg in raw_cmdline.split(b"\0") if arg]
+		except Exception:
+			pass
+
+		try:
+			exe = os.readlink(proc_path / "exe")
+			identity["exe"] = exe
+		except Exception:
+			pass
+
+		return identity if identity else None
+
+	def _is_process_identity_match(self, pid: int, session: Dict[str, Any]) -> bool:
+		if not isinstance(pid, int) or pid <= 0:
+			return False
+		expected_identity = session.get("process_identity")
+		if not isinstance(expected_identity, dict) or not expected_identity:
+			return False
+		current_identity = self._snapshot_process_identity(pid)
+		if current_identity is None:
+			return False
+		for marker in ("comm", "start_time", "exe", "cmdline"):
+			expected_value = expected_identity.get(marker)
+			current_value = current_identity.get(marker)
+			if expected_value is not None and expected_value != current_value:
+				return False
+		return True
+
+	def _is_process_alive(self, pid: int) -> bool:
+		if pid <= 0:
+			return False
+		try:
+			os.kill(pid, 0)
+		except ProcessLookupError:
+			return False
+		except PermissionError:
+			return True
+		except Exception:
+			return False
+		return True
+
+	def _find_owned_viewer_pid_for_pdf(self, viewer_path: str, pdf_path: str) -> Optional[int]:
+		pids = _iter_viewer_pids_for_pdf(viewer_path, [pdf_path], allow_wrapped=False)
+		return pids[0] if pids else None
+
+	def _is_reusable_session(self, normalized_pdf_path: str, callback: Dict[str, Any]) -> bool:
+		session = OPEN_SESSIONS.get(normalized_pdf_path)
+		if not isinstance(session, dict):
+			OPEN_SESSIONS.pop(normalized_pdf_path, None)
+			return False
+		if session.get("callback") != callback:
+			return False
+
+		current_pid = session.get("pid")
+		session_process = session.get("process")
+		if not isinstance(current_pid, int):
+			OPEN_SESSIONS.pop(normalized_pdf_path, None)
+			return False
+
+		if isinstance(session_process, subprocess.Popen):
+			if session_process.poll() is not None:
+				try:
+					session_process.wait(timeout=0)
+				except Exception:
+					pass
+				OPEN_SESSIONS.pop(normalized_pdf_path, None)
+				return False
+			if self._is_process_identity_match(current_pid, session):
+				return True
+			OPEN_SESSIONS.pop(normalized_pdf_path, None)
+			return False
+
+		if not self._is_process_alive(current_pid):
+			OPEN_SESSIONS.pop(normalized_pdf_path, None)
+			return False
+		if self._is_process_identity_match(current_pid, session):
+			return True
+		OPEN_SESSIONS.pop(normalized_pdf_path, None)
+		return False
+
+	def _start_viewer_process(self, args: list[str]) -> subprocess.Popen:
+		return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+	def _discover_owned_pid(self, viewer_path: str, normalized_pdf_path: str, process: subprocess.Popen) -> tuple[bool, Optional[int], Optional[subprocess.Popen], Optional[str]]:
+		owned_pid = process.pid if isinstance(process.pid, int) else None
+		owned_process = process if isinstance(owned_pid, int) and process.poll() is None else None
+		owned = owned_process is not None
+		pid_diagnostic: Optional[str] = None
+		if not owned:
+			owned_pid = self._find_owned_viewer_pid_for_pdf(viewer_path, normalized_pdf_path)
+			if owned_pid is None:
+				pid_diagnostic = _read_process_stderr_if_finished(process)
+			else:
+				owned = True
+		return owned, owned_pid, owned_process, pid_diagnostic
+
+	def _build_session_state(self, handle: str, owned_pid: int, viewer_path: str, callback: Dict[str, Any], process: Optional[subprocess.Popen]) -> Dict[str, Any]:
+		session = {
+			"handle": handle,
+			"pid": owned_pid,
+			"backend": self.name,
+			"backend_path": str(Path(viewer_path).resolve()),
+			"callback": dict(callback),
+			"owned": True,
+			"process_identity": self._snapshot_process_identity(owned_pid),
+		}
+		if isinstance(process, subprocess.Popen):
+			session["process"] = process
+		return session
 
 	def open(self, request_id: str, details: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
-		return open_pdf_with_viewer(request_id, details, state, self)
+		if not self.supports("open"):
+			return {
+				"status": "error",
+				"error": f"backend {self.name} does not support open",
+				"status_details": build_open_result_details(
+					request_id,
+					None,
+					False,
+					False,
+					None,
+					None,
+					"unsupported_operation",
+					backend=self,
+					supported=False,
+				),
+			}
+
+		error = validate_open_request_details(details)
+		if error:
+			return {
+				"status": "error",
+				"error": error,
+				"status_details": build_open_result_details(
+					request_id,
+					None,
+					False,
+					False,
+					None,
+					None,
+					"callback_invalid" if "callback" in error else "invalid_request",
+					backend=self,
+				),
+			}
+
+		pdf_path_value = details["pdf_path"]
+		pdf_error, normalized_pdf_path, pdf_fd = open_pdf_file_and_validate(Path(pdf_path_value))
+		if pdf_error:
+			return {
+				"status": "error",
+				"error": pdf_error,
+				"status_details": build_open_result_details(
+					request_id,
+					None,
+					False,
+					False,
+					None,
+					None,
+					"invalid_pdf",
+					backend=self,
+				),
+			}
+
+		callback = details["callback"]
+		reuse_existing = details.get("reuse_existing", True)
+		if not isinstance(reuse_existing, bool):
+			reuse_existing = True
+		require_persistent_viewer = details.get("require_persistent_viewer", False)
+		if not isinstance(require_persistent_viewer, bool):
+			require_persistent_viewer = False
+
+		viewer_path = self.resolve_path()
+		backend_available = Path(viewer_path).exists() and os.access(viewer_path, os.X_OK)
+		if not backend_available:
+			os.close(pdf_fd)
+			return {
+				"status": "error",
+				"error": "viewer backend is unavailable",
+				"status_details": build_open_result_details(
+					request_id,
+					None,
+					False,
+					False,
+					None,
+					"backend unavailable",
+					"backend_unavailable",
+					backend=self,
+				),
+			}
+
+		reused = False
+		handle = None
+		if reuse_existing and self._is_reusable_session(normalized_pdf_path, callback):
+			session = OPEN_SESSIONS.get(normalized_pdf_path)
+			if session:
+				handle = session.get("handle")
+				reused = True
+
+		if reuse_existing and handle:
+			os.close(pdf_fd)
+			return {
+				"status": "ok",
+				"status_details": build_open_result_details(
+					request_id,
+					handle,
+					bool(session.get("owned")) if isinstance(session, dict) else False,
+					reused,
+					session.get("pid") if isinstance(session, dict) else None,
+					None,
+					backend=self,
+				),
+			}
+
+		handle = f"{self.name}:{request_id}:{int(time.time_ns())}"
+		callback_command = build_synctex_callback_command(callback)
+		# Launch Zathura with the canonical PDF path rather than /proc/self/fd/<fd>.
+		# Zathura records the opened filename in its D-Bus state and uses that filename
+		# to locate SyncTeX data during forward search. When launched through a procfd,
+		# real Zathura exposes a temporary /tmp/zathura.stdin.* filename and
+		# --synctex-forward cannot find the PDF's .synctex sidecar.
+		args = [viewer_path, f"--synctex-editor-command={callback_command}", normalized_pdf_path]
+		try:
+			process = self._start_viewer_process(args)
+		except Exception as exc:
+			os.close(pdf_fd)
+			return {
+				"status": "error",
+				"error": f"failed to launch viewer: {exc}",
+				"status_details": build_open_result_details(
+					request_id,
+					handle,
+					False,
+					False,
+					None,
+					str(exc),
+					"launch_failed",
+					backend=self,
+				),
+			}
+		os.close(pdf_fd)
+
+		time.sleep(0.05)
+		owned, owned_pid, owned_process, pid_diagnostic = self._discover_owned_pid(viewer_path, normalized_pdf_path, process)
+
+		if owned and isinstance(owned_pid, int):
+			OPEN_SESSIONS[normalized_pdf_path] = self._build_session_state(
+				handle,
+				owned_pid,
+				viewer_path,
+				callback,
+				owned_process,
+			)
+
+		if require_persistent_viewer and not owned:
+			return {
+				"status": "error",
+				"error": "viewer did not produce a persistent viewer process",
+				"status_details": build_open_result_details(
+					request_id,
+					handle,
+					False,
+					reused,
+					owned_pid,
+					pid_diagnostic,
+					"launch_failed",
+					backend=self,
+				),
+			}
+
+		return {
+			"status": "ok",
+			"status_details": build_open_result_details(
+				request_id,
+				handle,
+				bool(owned_pid) and owned,
+				reused,
+				owned_pid,
+				pid_diagnostic,
+				backend=self,
+			),
+		}
 
 
 class FakeViewerBackend(ViewerBackendAdapter):
@@ -640,11 +943,14 @@ _VIEWER_BACKEND: Optional[ViewerBackendAdapter] = None
 
 def select_viewer_backend() -> ViewerBackendAdapter:
 	backend_name = os.environ.get(VIEWER_BACKEND_ENV, BACKEND_NAME)
+	zathura_path_env = os.environ.get(ZATHURA_VIEWER_PATH_ENV)
+	zathura_path = zathura_path_env.strip() if isinstance(zathura_path_env, str) else None
+
 	if backend_name in {"fake", "fake-viewer"}:
 		return FakeViewerBackend()
 	if backend_name in {"zathura", BACKEND_NAME}:
-		return ZathuraViewerBackend()
-	return ZathuraViewerBackend()
+		return ZathuraViewerBackend(zathura_path)
+	return ZathuraViewerBackend(zathura_path)
 
 
 def viewer_backend() -> ViewerBackendAdapter:
@@ -1007,220 +1313,10 @@ def _run_forward_search_command(
 	return completed, None, args
 
 
-def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any], backend: Optional[ViewerBackendAdapter] = None) -> Dict[str, Any]:
+def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], state: Dict[str, Any], backend: Optional[ViewerBackendAdapter] = None) -> Dict[str, Any]:
 	if backend is None:
 		backend = viewer_backend()
-	if not backend.supports("open"):
-		return {
-			"status": "error",
-			"error": f"backend {backend.name} does not support open",
-			"status_details": build_open_result_details(
-				request_id,
-				None,
-				False,
-				False,
-				None,
-				None,
-				"unsupported_operation",
-				backend=backend,
-				supported=False,
-			),
-		}
-
-	error = validate_open_request_details(details)
-	if error:
-		return {
-			"status": "error",
-			"error": error,
-			"status_details": build_open_result_details(
-				request_id,
-				None,
-				False,
-				False,
-				None,
-				None,
-				"callback_invalid" if "callback" in error else "invalid_request",
-				backend=backend,
-			),
-		}
-
-	pdf_path_value = details["pdf_path"]
-	pdf_error, normalized_pdf_path, pdf_fd = open_pdf_file_and_validate(Path(pdf_path_value))
-	if pdf_error:
-		return {
-			"status": "error",
-			"error": pdf_error,
-			"status_details": build_open_result_details(
-				request_id,
-				None,
-				False,
-				False,
-				None,
-				None,
-				"invalid_pdf",
-				backend=backend,
-			),
-		}
-
-	callback = details["callback"]
-	reuse_existing = details.get("reuse_existing", True)
-	if not isinstance(reuse_existing, bool):
-		reuse_existing = True
-	require_persistent_viewer = details.get("require_persistent_viewer", False)
-	if not isinstance(require_persistent_viewer, bool):
-		require_persistent_viewer = False
-
-	viewer_path = backend.resolve_path()
-	backend_available = Path(viewer_path).exists() and os.access(viewer_path, os.X_OK)
-	if not backend_available:
-		os.close(pdf_fd)
-		return {
-			"status": "error",
-			"error": "viewer backend is unavailable",
-			"status_details": build_open_result_details(
-				request_id,
-				None,
-				False,
-				False,
-				None,
-				"backend unavailable",
-				"backend_unavailable",
-				backend=backend,
-			),
-		}
-
-	reused = False
-	handle = None
-	session = OPEN_SESSIONS.get(normalized_pdf_path, {})
-	if reuse_existing:
-		handle = session.get("handle")
-		if handle:
-			if session.get("callback") != callback:
-				handle = None
-			else:
-				current_pid = session.get("pid")
-				session_process = session.get("process")
-				if not isinstance(current_pid, int):
-					OPEN_SESSIONS.pop(normalized_pdf_path, None)
-					handle = None
-				elif isinstance(session_process, subprocess.Popen):
-					if session_process.poll() is not None:
-						try:
-							session_process.wait(timeout=0)
-						except Exception:
-							pass
-						OPEN_SESSIONS.pop(normalized_pdf_path, None)
-						handle = None
-					elif _is_process_identity_match(current_pid, session):
-						reused = True
-					else:
-						OPEN_SESSIONS.pop(normalized_pdf_path, None)
-						handle = None
-				elif _pid_alive(current_pid) and _is_process_identity_match(current_pid, session):
-					reused = True
-				else:
-					OPEN_SESSIONS.pop(normalized_pdf_path, None)
-					handle = None
-
-	if reuse_existing and handle and session and reused:
-		os.close(pdf_fd)
-		return {
-			"status": "ok",
-			"status_details": build_open_result_details(
-				request_id,
-				handle,
-				bool(session.get("owned")),
-				reused,
-				session.get("pid"),
-				None,
-				backend=backend,
-			),
-		}
-
-	handle = f"{backend.name}:{request_id}:{int(time.time_ns())}"
-	callback_command = build_synctex_callback_command(callback)
-	# Launch Zathura with the canonical PDF path rather than /proc/self/fd/<fd>.
-	# Zathura records the opened filename in its D-Bus state and uses that filename
-	# to locate SyncTeX data during forward search. When launched through a procfd,
-	# real Zathura exposes a temporary /tmp/zathura.stdin.* filename and
-	# --synctex-forward cannot find the PDF's .synctex sidecar.
-	args = [viewer_path, f"--synctex-editor-command={callback_command}", normalized_pdf_path]
-	process = None
-	try:
-		process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-	except Exception as exc:
-		os.close(pdf_fd)
-		return {
-			"status": "error",
-			"error": f"failed to launch viewer: {exc}",
-			"status_details": build_open_result_details(
-				request_id,
-				handle,
-				False,
-				False,
-				None,
-				str(exc),
-				"launch_failed",
-				backend=backend,
-			),
-		}
-	os.close(pdf_fd)
-
-	time.sleep(0.05)
-	owned_pid = process.pid if isinstance(process.pid, int) else None
-	owned = isinstance(owned_pid, int) and process.poll() is None
-	owned_process = process if owned else None
-	pid_diagnostic = None
-	if not owned:
-		owned_pid = _find_viewer_pid_for_pdf(viewer_path, [normalized_pdf_path])
-		if owned_pid is None:
-			owned = False
-			pid_diagnostic = _read_process_stderr_if_finished(process)
-		else:
-			owned = True
-
-	backend_path = str(Path(viewer_path).resolve())
-	if owned:
-		OPEN_SESSIONS[normalized_pdf_path] = {
-			"handle": handle,
-			"pid": owned_pid,
-			"backend": backend.name,
-			"backend_path": backend_path,
-			"callback": dict(callback),
-			"owned": True,
-			"process_identity": _snapshot_process_identity(owned_pid) if isinstance(owned_pid, int) else None,
-		}
-		if owned_process is not None:
-			OPEN_SESSIONS[normalized_pdf_path]["process"] = owned_process
-
-	if require_persistent_viewer and not owned:
-		return {
-			"status": "error",
-			"error": "viewer did not produce a persistent viewer process",
-			"status_details": build_open_result_details(
-				request_id,
-				handle,
-				False,
-				reused,
-				owned_pid,
-				pid_diagnostic,
-				"launch_failed",
-				backend=backend,
-			),
-		}
-
-	return {
-		"status": "ok",
-		"status_details": build_open_result_details(
-			request_id,
-			handle,
-			bool(owned_pid) and owned,
-			reused,
-			owned_pid,
-			pid_diagnostic,
-			backend=backend,
-		),
-	}
+	return backend.open(request_id, details, state)
 
 
 def close_pdf_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any]) -> Dict[str, Any]:
