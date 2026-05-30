@@ -8,7 +8,9 @@ import {
 	clearPdfTrackerForContext,
 	closeTrackedPdfForContext,
 	contextSessionKey,
+	describePdfJumpFailureContextForContext,
 	getPdfTrackerForContext,
+	jumpTrackedPdfForContext,
 	openTrackedPdfForContext,
 	openTrackedPdfForContextFromViewerService,
 } from "../../../src/modules/pdf_session/pdf_session.ts";
@@ -134,4 +136,128 @@ test("closeTrackedPdfForContext closes tracked PDF and removes from tracker", as
 
 	const tracker = getPdfTrackerForContext(ctx);
 	assert.equal(tracker.getById(tracked.id), undefined);
+});
+
+test("jumpTrackedPdfForContext forwards jump requests, reads the target source line, and returns source_line", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "line one\nline two\nline three\n");
+	const ctx = fakeContext(dir, {});
+	const tracker = getPdfTrackerForContext(ctx);
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, 123);
+	trackedPdf.viewerHandle = "viewer-handle-1";
+	trackedPdf.viewerBackend = "viewer-backend";
+	trackedPdf.viewerOwned = true;
+	trackedPdf.viewerCapabilities = {
+		open: true,
+		close: true,
+		forward_search: true,
+		inverse_search: true,
+		reuse: true,
+	};
+
+	const forwardSearchCalls: string[] = [];
+	const result = await jumpTrackedPdfForContext(
+		ctx,
+		trackedPdf.id,
+		2,
+		undefined,
+		undefined,
+		{
+			synctexEditorCommand: "callback-command",
+			requestForwardSearch: async (viewerHandle, viewerBackend, sourceFilePath, jumpLine, synctexPid) => {
+				forwardSearchCalls.push(`${viewerHandle}|${viewerBackend}|${sourceFilePath}|${jumpLine}|${synctexPid ?? ""}`);
+				return { handled: true };
+			},
+			cwd: ctx.cwd,
+		},
+	);
+
+	assert.equal(forwardSearchCalls.length, 1);
+	assert.equal(forwardSearchCalls[0], `viewer-handle-1|viewer-backend|${source}|2|123`);
+	assert.equal(result.sourceLine, "line two");
+	assert.equal(result.reopened, false);
+});
+
+test("jumpTrackedPdfForContext retries stale handles once and updates tracked metadata", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "first\nsecond\n");
+	const ctx = fakeContext(dir, {});
+	const tracker = getPdfTrackerForContext(ctx);
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, 333);
+	trackedPdf.viewerHandle = "viewer-stale";
+	trackedPdf.viewerBackend = "viewer-backend";
+	trackedPdf.viewerOwned = true;
+	trackedPdf.viewerCapabilities = {
+		open: true,
+		close: true,
+		forward_search: true,
+		inverse_search: true,
+		reuse: true,
+	};
+
+	let forwardCalls = 0;
+	let openerCalls = 0;
+	const result = await jumpTrackedPdfForContext(
+		ctx,
+		trackedPdf.id,
+		1,
+		undefined,
+		undefined,
+		{
+			synctexEditorCommand: "callback-command-retry",
+			opener: async () => {
+				openerCalls += 1;
+				return {
+					pid: 999,
+					viewerHandle: "viewer-recovered",
+					viewerBackend: "viewer-backend",
+					viewerOwned: true,
+					viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+				};
+			},
+			requestForwardSearch: async (_viewerHandle, _viewerBackend, _sourceFilePath, _jumpLine, _synctexPid) => {
+				forwardCalls += 1;
+				if (forwardCalls === 1) {
+					throw new Error("viewer handle not found (code=handle_not_found)");
+				}
+				return { handled: true };
+			},
+			sourceLineReader: () => "first",
+			cwd: ctx.cwd,
+		},
+	);
+
+	assert.equal(result.reopened, true);
+	assert.equal(forwardCalls, 2);
+	assert.equal(openerCalls, 1);
+	assert.equal(tracker.getById(trackedPdf.id)?.viewerHandle, "viewer-recovered");
+	assert.equal(result.sourceLine, "first");
+});
+
+test("describePdfJumpFailureContextForContext includes current callback metadata", () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "source\n");
+	const ctx = fakeContext(dir, {});
+	const tracker = getPdfTrackerForContext(ctx);
+	const trackedPdf = tracker.trackOpenedPdf(pdf, source, 555, "callback-old", {
+		viewerHandle: "viewer-handle",
+		viewerBackend: "viewer-backend",
+		viewerOwned: true,
+		viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	});
+
+	const context = describePdfJumpFailureContextForContext(ctx, trackedPdf.id, "callback-new");
+	assert.equal(context.includes("tracked_pdf_id=1"), true);
+	assert.equal(context.includes("tracked_synctex_callback_command=callback-old"), true);
+	assert.equal(context.includes("current_synctex_callback_command=callback-new"), true);
+	assert.equal(context.includes("callback_command_changed=true"), true);
 });
