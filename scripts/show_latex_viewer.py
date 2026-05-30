@@ -495,6 +495,21 @@ class ViewerBackendAdapter:
 			),
 		}
 
+	def close(self, request_id: str, details: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+		return {
+			"status": "error",
+			"error": f"backend {self.name} does not support close",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				None,
+				None,
+				self.name,
+				False,
+				"unsupported_operation",
+			),
+		}
+
 
 class ZathuraViewerBackend(ViewerBackendAdapter):
 	def __init__(self, executable_path: Optional[str] = None) -> None:
@@ -554,19 +569,6 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 				return False
 		return True
 
-	def _is_process_alive(self, pid: int) -> bool:
-		if pid <= 0:
-			return False
-		try:
-			os.kill(pid, 0)
-		except ProcessLookupError:
-			return False
-		except PermissionError:
-			return True
-		except Exception:
-			return False
-		return True
-
 	def _find_owned_viewer_pid_for_pdf(self, viewer_path: str, pdf_path: str) -> Optional[int]:
 		pids = _iter_viewer_pids_for_pdf(viewer_path, [pdf_path], allow_wrapped=False)
 		return pids[0] if pids else None
@@ -598,7 +600,7 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 			OPEN_SESSIONS.pop(normalized_pdf_path, None)
 			return False
 
-		if not self._is_process_alive(current_pid):
+		if not _pid_alive(current_pid):
 			OPEN_SESSIONS.pop(normalized_pdf_path, None)
 			return False
 		if self._is_process_identity_match(current_pid, session):
@@ -805,6 +807,347 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 				owned_pid,
 				pid_diagnostic,
 				backend=self,
+			),
+		}
+
+
+	def _find_session_by_handle(self, handle: str) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+		for pdf_path, session in list(OPEN_SESSIONS.items()):
+			if isinstance(session, dict) and session.get("handle") == handle:
+				return pdf_path, session
+		return None, None
+
+	def _terminate_owned_process(
+		self,
+		process: subprocess.Popen,
+		pid: int,
+		matched_path: str,
+		request_id: str,
+		handle: str,
+		backend: str,
+	) -> Optional[Dict[str, Any]]:
+		try:
+			process.terminate()
+		except ProcessLookupError:
+			OPEN_SESSIONS.pop(matched_path, None)
+			return {
+				"status": "ok",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"not_running",
+					handle,
+					backend,
+					True,
+				),
+			}
+		except PermissionError:
+			return {
+				"status": "error",
+				"error": f"could not send SIGTERM to viewer pid {pid}",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"backend_unavailable",
+					handle,
+					backend,
+					True,
+					"backend_unavailable",
+				),
+			}
+		except Exception:
+			return {
+				"status": "error",
+				"error": f"could not send SIGTERM to viewer pid {pid}",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"backend_unavailable",
+					handle,
+					backend,
+					True,
+					"backend_unavailable",
+				),
+			}
+
+		try:
+			process.wait(timeout=1.0)
+			return None
+		except subprocess.TimeoutExpired:
+			try:
+				process.kill()
+			except PermissionError:
+				return {
+					"status": "error",
+					"error": f"could not send SIGKILL to viewer pid {pid}",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"backend_unavailable",
+						handle,
+						backend,
+						True,
+						"backend_unavailable",
+					),
+				}
+			except ProcessLookupError:
+				OPEN_SESSIONS.pop(matched_path, None)
+				return {
+					"status": "ok",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"not_running",
+						handle,
+						backend,
+						True,
+					),
+				}
+			except Exception:
+				return {
+					"status": "error",
+					"error": f"could not send SIGKILL to viewer pid {pid}",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"backend_unavailable",
+						handle,
+						backend,
+						True,
+						"backend_unavailable",
+					),
+				}
+
+			try:
+				process.wait(timeout=1.0)
+			except subprocess.TimeoutExpired:
+				return {
+					"status": "error",
+					"error": f"viewer did not exit after SIGTERM/SIGKILL for pid {pid}",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"backend_unavailable",
+						handle,
+						backend,
+						True,
+						"backend_unavailable",
+					),
+				}
+			except Exception:
+				return {
+					"status": "error",
+					"error": f"could not verify termination of viewer pid {pid}",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"backend_unavailable",
+						handle,
+						backend,
+						True,
+						"backend_unavailable",
+					),
+				}
+		return None
+	def close(self, request_id: str, details: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+		if not self.supports("close"):
+			return {
+				"status": "error",
+				"error": f"backend {self.name} does not support close",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					None,
+					None,
+					self.name,
+					False,
+					"unsupported_operation",
+				),
+			}
+
+		handle = details.get("handle")
+		backend = details.get("backend")
+		if not isinstance(handle, str) or not isinstance(backend, str) or not backend:
+			return {
+				"status": "error",
+				"error": "invalid request details",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"invalid_request",
+					None,
+					backend if isinstance(backend, str) else None,
+					False,
+					"invalid_request",
+				),
+			}
+
+		matched_path, matched_session = self._find_session_by_handle(handle)
+		if matched_session is None or matched_path is None:
+			return {
+				"status": "error",
+				"error": "viewer handle not recognized",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"unknown_handle",
+					handle,
+					backend,
+					False,
+					"unknown_handle",
+				),
+			}
+
+		session_backend = matched_session.get("backend")
+		if session_backend != backend:
+			return {
+				"status": "error",
+				"error": "backend identity mismatch for viewer handle",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"backend_mismatch",
+					handle,
+					backend,
+					False,
+					"backend_mismatch",
+				),
+			}
+
+		if not bool(matched_session.get("owned")):
+			return {
+				"status": "ok",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"not_service_owned",
+					handle,
+					backend,
+					True,
+				),
+			}
+
+		pid = matched_session.get("pid")
+		if not isinstance(pid, int):
+			OPEN_SESSIONS.pop(matched_path, None)
+			return {
+				"status": "ok",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"not_running",
+					handle,
+					backend,
+					True,
+				),
+			}
+
+		service_process = matched_session.get("process")
+		if isinstance(service_process, subprocess.Popen):
+			if service_process.poll() is not None:
+				try:
+					service_process.wait(timeout=0)
+				except Exception:
+					pass
+				OPEN_SESSIONS.pop(matched_path, None)
+				return {
+					"status": "ok",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"not_running",
+						handle,
+						backend,
+						True,
+					),
+				}
+
+			terminated_error = self._terminate_owned_process(service_process, pid, matched_path, request_id, handle, backend)
+			if terminated_error is not None:
+				return terminated_error
+
+			OPEN_SESSIONS.pop(matched_path, None)
+			return {
+				"status": "ok",
+				"status_details": build_close_result_details(
+					request_id,
+					True,
+					None,
+					handle,
+					backend,
+					True,
+				),
+			}
+
+		if not _pid_alive(pid):
+			OPEN_SESSIONS.pop(matched_path, None)
+			return {
+				"status": "ok",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"not_running",
+					handle,
+					backend,
+					True,
+				),
+			}
+
+		if not self._is_process_identity_match(pid, matched_session):
+			OPEN_SESSIONS.pop(matched_path, None)
+			return {
+				"status": "ok",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"identity_mismatch",
+					handle,
+					backend,
+					False,
+					"identity_mismatch",
+				),
+			}
+
+		try:
+			os.kill(pid, signal.SIGTERM)
+		except PermissionError:
+			return {
+				"status": "error",
+				"error": f"could not send SIGTERM to viewer pid {pid}",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"backend_unavailable",
+					handle,
+					backend,
+					True,
+					"backend_unavailable",
+				),
+			}
+		except ProcessLookupError:
+			OPEN_SESSIONS.pop(matched_path, None)
+			return {
+				"status": "ok",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"not_running",
+					handle,
+					backend,
+					True,
+				),
+			}
+
+		OPEN_SESSIONS.pop(matched_path, None)
+		return {
+			"status": "ok",
+			"status_details": build_close_result_details(
+				request_id,
+				True,
+				None,
+				handle,
+				backend,
+				True,
 			),
 		}
 
@@ -1335,317 +1678,7 @@ def close_pdf_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[s
 				"invalid_request",
 			),
 		}
-
-	handle = details.get("handle")
-	backend = details.get("backend")
-	if not isinstance(handle, str) or not isinstance(backend, str):
-		return {
-			"status": "error",
-			"error": "invalid request details",
-			"status_details": build_close_result_details(
-				request_id,
-				False,
-				"invalid_request",
-				None,
-				backend,
-				False,
-				"invalid_request",
-			),
-		}
-
-	matched_path = None
-	matched_session: Optional[Dict[str, Any]] = None
-	for pdf_path, session in list(OPEN_SESSIONS.items()):
-		if session.get("handle") == handle:
-			matched_path = pdf_path
-			matched_session = session
-			break
-	if not matched_session or matched_path is None:
-		return {
-			"status": "error",
-			"error": "viewer handle not recognized",
-			"status_details": build_close_result_details(
-				request_id,
-				False,
-				"unknown_handle",
-				handle,
-				backend,
-				False,
-				"unknown_handle",
-			),
-		}
-
-	session_backend = matched_session.get("backend")
-	if session_backend != backend:
-		return {
-			"status": "error",
-			"error": "backend identity mismatch for viewer handle",
-			"status_details": build_close_result_details(
-				request_id,
-				False,
-				"backend_mismatch",
-				handle,
-				backend,
-				False,
-				"backend_mismatch",
-			),
-		}
-
-	if not bool(matched_session.get("owned")):
-		return {
-			"status": "ok",
-			"status_details": build_close_result_details(
-				request_id,
-				False,
-				"not_service_owned",
-				handle,
-				backend,
-				True,
-			),
-		}
-
-	pid = matched_session.get("pid")
-	if not isinstance(pid, int):
-		OPEN_SESSIONS.pop(matched_path, None)
-		return {
-			"status": "ok",
-			"status_details": build_close_result_details(
-				request_id,
-				False,
-				"not_running",
-				handle,
-				backend,
-				True,
-			),
-		}
-
-	service_process = matched_session.get("process")
-	if isinstance(service_process, subprocess.Popen):
-		if service_process.poll() is not None:
-			try:
-				service_process.wait(timeout=0)
-			except Exception:
-				pass
-			OPEN_SESSIONS.pop(matched_path, None)
-			return {
-				"status": "ok",
-				"status_details": build_close_result_details(
-					request_id,
-					False,
-					"not_running",
-					handle,
-					backend,
-					True,
-				),
-			}
-
-		try:
-			service_process.terminate()
-		except PermissionError:
-			return {
-				"status": "error",
-				"error": f"could not send SIGTERM to viewer pid {pid}",
-				"status_details": build_close_result_details(
-					request_id,
-					False,
-					"backend_unavailable",
-					handle,
-					backend,
-					True,
-					"backend_unavailable",
-				),
-			}
-		except ProcessLookupError:
-			OPEN_SESSIONS.pop(matched_path, None)
-			return {
-				"status": "ok",
-				"status_details": build_close_result_details(
-					request_id,
-					False,
-					"not_running",
-					handle,
-					backend,
-					True,
-				),
-			}
-		except Exception:
-			return {
-				"status": "error",
-				"error": f"could not send SIGTERM to viewer pid {pid}",
-				"status_details": build_close_result_details(
-					request_id,
-					False,
-					"backend_unavailable",
-					handle,
-					backend,
-					True,
-					"backend_unavailable",
-				),
-			}
-
-		try:
-			service_process.wait(timeout=1.0)
-		except subprocess.TimeoutExpired:
-			try:
-				service_process.kill()
-			except PermissionError:
-				return {
-					"status": "error",
-					"error": f"could not send SIGKILL to viewer pid {pid}",
-					"status_details": build_close_result_details(
-						request_id,
-						False,
-						"backend_unavailable",
-						handle,
-						backend,
-						True,
-						"backend_unavailable",
-					),
-				}
-			except ProcessLookupError:
-				OPEN_SESSIONS.pop(matched_path, None)
-				return {
-					"status": "ok",
-					"status_details": build_close_result_details(
-						request_id,
-						False,
-						"not_running",
-						handle,
-						backend,
-						True,
-					),
-				}
-			except Exception:
-				return {
-					"status": "error",
-					"error": f"could not send SIGKILL to viewer pid {pid}",
-					"status_details": build_close_result_details(
-						request_id,
-						False,
-						"backend_unavailable",
-						handle,
-						backend,
-						True,
-						"backend_unavailable",
-					),
-				}
-
-			try:
-				service_process.wait(timeout=1.0)
-			except subprocess.TimeoutExpired:
-				return {
-					"status": "error",
-					"error": f"viewer did not exit after SIGTERM/SIGKILL for pid {pid}",
-					"status_details": build_close_result_details(
-						request_id,
-						False,
-						"backend_unavailable",
-						handle,
-						backend,
-						True,
-						"backend_unavailable",
-					),
-				}
-			except Exception:
-				return {
-					"status": "error",
-					"error": f"could not verify termination of viewer pid {pid}",
-					"status_details": build_close_result_details(
-						request_id,
-						False,
-						"backend_unavailable",
-						handle,
-						backend,
-						True,
-						"backend_unavailable",
-					),
-				}
-
-		OPEN_SESSIONS.pop(matched_path, None)
-		return {
-			"status": "ok",
-			"status_details": build_close_result_details(
-				request_id,
-				True,
-				None,
-				handle,
-				backend,
-				True,
-			),
-		}
-
-	if not _pid_alive(pid):
-		OPEN_SESSIONS.pop(matched_path, None)
-		return {
-			"status": "ok",
-			"status_details": build_close_result_details(
-				request_id,
-				False,
-				"not_running",
-				handle,
-				backend,
-				True,
-			),
-		}
-
-	if not _is_process_identity_match(pid, matched_session):
-		OPEN_SESSIONS.pop(matched_path, None)
-		return {
-			"status": "ok",
-			"status_details": build_close_result_details(
-				request_id,
-				False,
-				"identity_mismatch",
-				handle,
-				backend,
-				False,
-				"identity_mismatch",
-			),
-		}
-
-	try:
-		os.kill(pid, signal.SIGTERM)
-	except PermissionError:
-		return {
-			"status": "error",
-			"error": f"could not send SIGTERM to viewer pid {pid}",
-			"status_details": build_close_result_details(
-				request_id,
-				False,
-				"backend_unavailable",
-				handle,
-				backend,
-				True,
-				"backend_unavailable",
-			),
-		}
-	except ProcessLookupError:
-		OPEN_SESSIONS.pop(matched_path, None)
-		return {
-			"status": "ok",
-			"status_details": build_close_result_details(
-				request_id,
-				False,
-				"not_running",
-				handle,
-				backend,
-				True,
-			),
-		}
-
-	OPEN_SESSIONS.pop(matched_path, None)
-	return {
-		"status": "ok",
-		"status_details": build_close_result_details(
-			request_id,
-			True,
-			None,
-			handle,
-			backend,
-			True,
-		),
-	}
-
+	return viewer_backend().close(request_id, details, _state)
 
 
 

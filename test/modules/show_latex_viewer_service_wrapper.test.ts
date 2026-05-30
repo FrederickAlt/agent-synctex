@@ -20,6 +20,24 @@ function killProcess(pid: number): void {
 	});
 }
 
+function isProcessAlive(pid: number): boolean {
+	const result = spawnSync("kill", ["-0", String(pid)], {
+		stdio: ["ignore", "ignore", "ignore"],
+	});
+	return result.status === 0;
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 800): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isProcessAlive(pid)) {
+			return;
+		}
+		await sleep(25);
+	}
+	throw new Error(`timed out waiting for process ${pid} to exit`);
+}
+
 function writeResultRequest(baseDir: string, requestId: string, operation: string, details: Record<string, unknown>): string {
 	const path = join(baseDir, "viewer-requests", `${requestId}.json`);
 	writeFileSync(
@@ -346,6 +364,116 @@ test("show_latex_viewer zathura backend relaunches after stale tracked session",
 			assert.equal(second.status_details.reused, false);
 			assert.notEqual(second.status_details.handle, first.status_details.handle);
 			assert.notEqual(second.status_details.pid, first.status_details.pid);
+		},
+		serviceBaseDir,
+	);
+});
+
+
+test("show_latex_viewer zathura backend closes owned viewers through backend adapter", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-close-"));
+	const fakeViewer = join(serviceBaseDir, "zathura");
+	writeFakeZathuraViewerBinary(fakeViewer);
+	const pdfPath = join(serviceBaseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n", { mode: 0o600 });
+
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/show-latex-zathura-close-callback.sock",
+		token: "zathura-token",
+	};
+	const openDetails = {
+		callback,
+		pdf_path: pdfPath,
+	};
+
+	await withViewerService(
+		{
+			VIEWER_SERVICE_BACKEND: "zathura",
+			ZATHURA_VIEWER_PATH: fakeViewer,
+		},
+		async (baseDir) => {
+			writeResultRequest(baseDir, "zathura-close-open", "open", openDetails);
+			const opened = await waitForViewerResult(baseDir, "zathura-close-open");
+			assert.equal(opened.status, "ok");
+			assert.equal(opened.status_details.closed, undefined);
+
+			const pid = opened.status_details.pid;
+			assert.equal(typeof pid, "number");
+			writeResultRequest(baseDir, "zathura-close", "close", {
+				handle: opened.status_details.handle,
+				backend: "zathura",
+			});
+			const closeResult = await waitForViewerResult(baseDir, "zathura-close");
+			assert.equal(closeResult.status, "ok");
+			assert.equal(closeResult.status_details.closed, true);
+			assert.equal(closeResult.status_details.reason, undefined);
+			await waitForProcessExit(pid);
+		},
+		serviceBaseDir,
+	);
+});
+
+
+test("show_latex_viewer zathura backend close preserves stale and mismatched handles", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-close-stale-"));
+	const fakeViewer = join(serviceBaseDir, "zathura");
+	writeFakeZathuraViewerBinary(fakeViewer);
+	const pdfPath = join(serviceBaseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n", { mode: 0o600 });
+
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/show-latex-zathura-close-callback.sock",
+		token: "zathura-token",
+	};
+	const openDetails = {
+		callback,
+		pdf_path: pdfPath,
+	};
+
+	await withViewerService(
+		{
+			VIEWER_SERVICE_BACKEND: "zathura",
+			ZATHURA_VIEWER_PATH: fakeViewer,
+		},
+		async (baseDir) => {
+			writeResultRequest(baseDir, "zathura-close-open-stale", "open", openDetails);
+			const opened = await waitForViewerResult(baseDir, "zathura-close-open-stale");
+			assert.equal(opened.status, "ok");
+
+			const handle = opened.status_details.handle;
+			const pid = opened.status_details.pid;
+
+			writeResultRequest(baseDir, "zathura-close-backend-mismatch", "close", {
+				handle,
+				backend: "fake-viewer",
+			});
+			const mismatch = await waitForViewerResult(baseDir, "zathura-close-backend-mismatch");
+			assert.equal(mismatch.status, "error");
+			assert.equal(mismatch.status_details.reason, "backend_mismatch");
+
+			killProcess(pid);
+			await sleep(120);
+
+			writeResultRequest(baseDir, "zathura-close-stale", "close", {
+				handle,
+				backend: "zathura",
+			});
+			const staleClose = await waitForViewerResult(baseDir, "zathura-close-stale");
+			assert.equal(staleClose.status, "ok");
+			assert.equal(staleClose.status_details.closed, false);
+			assert.equal(staleClose.status_details.reason, "not_running");
+
+			writeResultRequest(baseDir, "zathura-close-unknown", "close", {
+				handle: "does-not-exist",
+				backend: "zathura",
+			});
+			const unknown = await waitForViewerResult(baseDir, "zathura-close-unknown");
+			assert.equal(unknown.status, "error");
+			assert.equal(unknown.status_details.reason, "unknown_handle");
 		},
 		serviceBaseDir,
 	);

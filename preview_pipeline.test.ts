@@ -1161,6 +1161,367 @@ print(json.dumps({
 	assert.equal(result.session_still_tracked, false);
 });
 
+test("viewer service close request returns not_service_owned for external-viewer sessions", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-close-not-service-owned-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\n")
+pdf_key = str(pdf.resolve())
+viewer.OPEN_SESSIONS[pdf_key] = {
+    "handle": "fakezathura:close-not-owned:1",
+    "pid": 424242,
+    "backend": "fakezathura",
+    "owned": False,
+    "process_identity": {
+        "comm": "fakezathura",
+        "start_time": 111,
+        "cmdline": ["/tmp/fakezathura"],
+        "exe": "/tmp/fakezathura",
+    },
+}
+
+viewer.atomic_write_text(
+    viewer.request_path("close-not-service-owned"),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": "close-not-service-owned",
+        "operation": "close",
+        "created_at_ns": int(__import__("time").time_ns()),
+        "details": {
+            "handle": "fakezathura:close-not-owned:1",
+            "backend": "fakezathura",
+        },
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+result = json.loads(viewer.result_path("close-not-service-owned").read_text(encoding="utf-8"))
+
+print(json.dumps({
+    "processed": processed,
+    "status": result["status"],
+    "closed": result["status_details"].get("closed"),
+    "reason": result["status_details"].get("reason"),
+    "backend_identity_ok": result["status_details"].get("backend_identity_ok"),
+    "session_still_tracked": pdf_key in viewer.OPEN_SESSIONS,
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		status: string;
+		closed: boolean;
+		reason: string;
+		backend_identity_ok: boolean;
+		session_still_tracked: boolean;
+	};
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.status, "ok");
+	assert.equal(result.closed, false);
+	assert.equal(result.reason, "not_service_owned");
+	assert.equal(result.backend_identity_ok, true);
+	assert.equal(result.session_still_tracked, true);
+});
+
+test("viewer service close request reports backend_unavailable for SIGTERM permission failures", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-close-backend-unavailable-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\n")
+pdf_key = str(pdf.resolve())
+viewer.OPEN_SESSIONS[pdf_key] = {
+    "handle": "fakezathura:close-backend-unavailable:1",
+    "pid": 424243,
+    "backend": "fakezathura",
+    "owned": True,
+    "process_identity": {
+        "comm": "fakezathura",
+        "start_time": 111,
+        "cmdline": ["/tmp/fakezathura"],
+        "exe": "/tmp/fakezathura",
+    },
+}
+
+orig_kill = viewer.os.kill
+orig_snapshot_identity = viewer.ZathuraViewerBackend._snapshot_process_identity
+killed: list[tuple[int, int]] = []
+
+def deny_kill(pid: int, signal: int) -> None:
+    killed.append((pid, signal))
+    raise PermissionError("permission denied")
+
+viewer.os.kill = deny_kill
+viewer._pid_alive = lambda pid: True
+viewer.ZathuraViewerBackend._snapshot_process_identity = lambda self, pid: {
+    "comm": "fakezathura",
+    "start_time": 111,
+    "cmdline": ["/tmp/fakezathura"],
+    "exe": "/tmp/fakezathura",
+}
+
+try:
+    viewer.atomic_write_text(
+        viewer.request_path("close-backend-unavailable"),
+        json.dumps({
+            "protocol_version": viewer.PROTOCOL_VERSION,
+            "request_id": "close-backend-unavailable",
+            "operation": "close",
+            "created_at_ns": int(__import__("time").time_ns()),
+            "details": {
+                "handle": "fakezathura:close-backend-unavailable:1",
+                "backend": "fakezathura",
+            },
+        }),
+        mode=0o600,
+    )
+    processed = viewer.scan_requests()
+    result = json.loads(viewer.result_path("close-backend-unavailable").read_text(encoding="utf-8"))
+finally:
+    viewer.os.kill = orig_kill
+    viewer.ZathuraViewerBackend._snapshot_process_identity = orig_snapshot_identity
+
+print(json.dumps({
+    "processed": processed,
+    "status": result["status"],
+    "closed": result["status_details"].get("closed"),
+    "reason": result["status_details"].get("reason"),
+    "error_code": result["status_details"].get("error_code"),
+    "session_still_tracked": pdf_key in viewer.OPEN_SESSIONS,
+    "killed": killed,
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		status: string;
+		closed: boolean;
+		reason: string;
+		error_code: string;
+		session_still_tracked: boolean;
+		killed: Array<[number, number]>;
+	};
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.status, "error");
+	assert.equal(result.closed, false);
+	assert.equal(result.reason, "backend_unavailable");
+	assert.equal(result.error_code, "backend_unavailable");
+	assert.equal(result.session_still_tracked, true);
+	assert.deepEqual(result.killed, [[424243, 15]]);
+});
+
+test("viewer service close request keeps not_running on terminate race", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+from pathlib import Path
+import subprocess
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-close-terminate-race-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+class GoneBeforeTerminate(subprocess.Popen):
+    def __init__(self):
+        pass
+
+    def poll(self):
+        return None
+
+    def terminate(self) -> None:
+        raise ProcessLookupError(3, "gone", 99999)
+
+    def wait(self, timeout: float | None = None) -> None:
+        raise AssertionError("wait should not run if terminate fails")
+
+    def kill(self) -> None:
+        raise AssertionError("kill should not run if terminate fails")
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\n")
+pdf_key = str(pdf.resolve())
+viewer.OPEN_SESSIONS[pdf_key] = {
+    "handle": "fakezathura:close-terminate-race:1",
+    "pid": 424244,
+    "backend": "fakezathura",
+    "owned": True,
+    "process": GoneBeforeTerminate(),
+    "process_identity": {
+        "comm": "fakezathura",
+        "start_time": 111,
+        "cmdline": ["/tmp/fakezathura"],
+        "exe": "/tmp/fakezathura",
+    },
+}
+
+viewer.atomic_write_text(
+    viewer.request_path("close-terminate-race"),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": "close-terminate-race",
+        "operation": "close",
+        "created_at_ns": int(__import__("time").time_ns()),
+        "details": {
+            "handle": "fakezathura:close-terminate-race:1",
+            "backend": "fakezathura",
+        },
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+result = json.loads(viewer.result_path("close-terminate-race").read_text(encoding="utf-8"))
+
+print(json.dumps({
+    "processed": processed,
+    "status": result["status"],
+    "closed": result["status_details"].get("closed"),
+    "reason": result["status_details"].get("reason"),
+    "session_still_tracked": pdf_key in viewer.OPEN_SESSIONS,
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		status: string;
+		closed: boolean;
+		reason: string;
+		session_still_tracked: boolean;
+	};
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.status, "ok");
+	assert.equal(result.closed, false);
+	assert.equal(result.reason, "not_running");
+	assert.equal(result.session_still_tracked, false);
+});
+
+test("viewer service close request keeps not_running on kill race", () => {
+	const output = runPython(String.raw`
+import json
+import tempfile
+import types
+from pathlib import Path
+import subprocess
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-close-kill-race-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+class KillDisappearsAfterTerminate(subprocess.Popen):
+    def __init__(self):
+        self._kill_called = False
+
+    def poll(self):
+        return None
+
+    def terminate(self) -> None:
+        pass
+
+    def wait(self, timeout: float | None = None):
+        if not self._kill_called:
+            raise subprocess.TimeoutExpired("fake-viewer", 1.0)
+        raise AssertionError("unexpected second wait")
+
+    def kill(self) -> None:
+        self._kill_called = True
+        raise ProcessLookupError(3, "gone", 99999)
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\n")
+pdf_key = str(pdf.resolve())
+viewer.OPEN_SESSIONS[pdf_key] = {
+    "handle": "fakezathura:close-kill-race:1",
+    "pid": 424245,
+    "backend": "fakezathura",
+    "owned": True,
+    "process": KillDisappearsAfterTerminate(),
+    "process_identity": {
+        "comm": "fakezathura",
+        "start_time": 111,
+        "cmdline": ["/tmp/fakezathura"],
+        "exe": "/tmp/fakezathura",
+    },
+}
+
+viewer.atomic_write_text(
+    viewer.request_path("close-kill-race"),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": "close-kill-race",
+        "operation": "close",
+        "created_at_ns": int(__import__("time").time_ns()),
+        "details": {
+            "handle": "fakezathura:close-kill-race:1",
+            "backend": "fakezathura",
+        },
+    }),
+    mode=0o600,
+)
+processed = viewer.scan_requests()
+result = json.loads(viewer.result_path("close-kill-race").read_text(encoding="utf-8"))
+
+print(json.dumps({
+    "processed": processed,
+    "status": result["status"],
+    "closed": result["status_details"].get("closed"),
+    "reason": result["status_details"].get("reason"),
+    "session_still_tracked": pdf_key in viewer.OPEN_SESSIONS,
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed: number;
+		status: string;
+		closed: boolean;
+		reason: string;
+		session_still_tracked: boolean;
+	};
+
+	assert.equal(result.processed, 1);
+	assert.equal(result.status, "ok");
+	assert.equal(result.closed, false);
+	assert.equal(result.reason, "not_running");
+	assert.equal(result.session_still_tracked, false);
+});
+
 test("viewer service forward_search retries with rediscovered pid on mismatch", () => {
 	const output = runPython(String.raw`
 import json
