@@ -25,7 +25,7 @@ import { createInlinePreviewRenderer } from "./src/modules/preview/inline_previe
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./src/modules/preview/kitty_placeholder_image.ts";
 import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./src/modules/pdf_tracking/pdf_tracking.ts";
 import { readSourceLine, SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./src/modules/synctex/synctex.ts";
-import { ViewerServiceClient, type ViewerServiceOpenResult } from "./viewer_service.ts";
+import { ViewerServiceClient, type ViewerServiceOpenResult } from "./src/modules/viewer_service.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;

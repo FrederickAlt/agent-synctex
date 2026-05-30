@@ -7,8 +7,8 @@ import {
 	ViewerServiceClient,
 	viewerServiceRequestPath,
 	viewerServiceResultPath,
-} from "./viewer_service.ts";
-import type { SynctexCallbackConfig } from "./viewer_service.ts";
+} from "../../src/modules/viewer_service.ts";
+import type { SynctexCallbackConfig } from "../../src/modules/viewer_service.ts";
 
 function fileMode(path: string): number {
 	return lstatSync(path).mode & 0o777;
