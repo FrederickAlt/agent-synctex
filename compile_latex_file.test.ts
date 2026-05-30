@@ -118,8 +118,13 @@ const capabilities = {
 };
 const serviceStartedNs = Number(process.hrtime.bigint());
 const openRequestSummaryPath = path.join(baseDir, "open-request-summary.json");
+const openCountPath = path.join(baseDir, "open-count.json");
 const deprecatedDetailKeys = ["synctex_callback_command", "synctex_editor_command", "zathura_args"];
 let openCount = 0;
+
+function writeOpenCount() {
+	fs.writeFileSync(openCountPath, JSON.stringify({ open_count: openCount }), { mode: 0o600 });
+}
 
 function writeResult(filePath, response) {
 	const tempPath = filePath + ".tmp";
@@ -233,6 +238,7 @@ function handleOpenRequest(request) {
 	}
 
 	openCount += 1;
+	writeOpenCount();
 	writeResult(responsePath, {
 		protocol_version: 1,
 		request_id: requestId,
@@ -291,6 +297,7 @@ process.env.MCP_TMPDIR = MCP_TMPDIR;
 const MCP_REQUESTS_DIR = join(MCP_TMPDIR, "viewer-requests");
 const MCP_RESULTS_DIR = join(MCP_TMPDIR, "viewer-results");
 const MCP_OPEN_REQUEST_LOG = join(MCP_TMPDIR, "open-request-summary.json");
+const MCP_OPEN_COUNT_LOG = join(MCP_TMPDIR, "open-count.json");
 
 type FakeViewerOpenRequestRecord = {
 	request_id: string;
@@ -378,6 +385,14 @@ function compiledIndexModulePath(): string {
 
 function readFakeViewerOpenRequest(): FakeViewerOpenRequestRecord {
 	return JSON.parse(readFileSync(MCP_OPEN_REQUEST_LOG, "utf8")) as FakeViewerOpenRequestRecord;
+}
+
+function readFakeViewerOpenCount(): number {
+	try {
+		return (JSON.parse(readFileSync(MCP_OPEN_COUNT_LOG, "utf8")) as { open_count: number }).open_count;
+	} catch {
+		return 0;
+	}
 }
 
 function rewriteProjectRelativeImportsForTempModule(outputText: string): string {
@@ -687,6 +702,50 @@ test("compile_latex_file opens through viewer service when open_pdf=true", async
 			assert.equal(openRequest.detail_keys.includes("synctex_callback_command"), false);
 			assert.equal(openRequest.detail_keys.includes("synctex_editor_command"), false);
 			assert.equal(openRequest.detail_keys.includes("zathura_args"), false);
+		});
+	} finally {
+		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("compile_latex_file reuses tracked PDF when opening compiled output repeatedly", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompiler(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+
+	const context = createSessionContext(root);
+	try {
+		await withFakeViewerService(false, async () => {
+			const first = await tool.execute(
+				"compile-latex-file-reuse-1",
+				{ latex_file_path: sourcePath, open_pdf: true },
+				undefined,
+				undefined,
+				context,
+			);
+			const firstDetails = first.details as { pdf_id: number; pdf: string };
+
+			const afterFirst = readFakeViewerOpenCount();
+			assert.equal(firstDetails.pdf, resolve(root, "paper.pdf"));
+			assert.equal(firstDetails.pdf_id > 0, true);
+			assert.equal(afterFirst, 1);
+
+			const second = await tool.execute(
+				"compile-latex-file-reuse-2",
+				{ latex_file_path: sourcePath, open_pdf: true },
+				undefined,
+				undefined,
+				context,
+			);
+			const secondDetails = second.details as { pdf_id: number };
+			assert.equal(secondDetails.pdf_id, firstDetails.pdf_id);
+			assert.equal(readFakeViewerOpenCount(), afterFirst);
 		});
 	} finally {
 		await runSessionShutdown(context);

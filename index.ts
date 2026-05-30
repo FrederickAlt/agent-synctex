@@ -23,7 +23,15 @@ import { createTerminalRefreshPolicy } from "./src/modules/preview/terminal_refr
 import { applyLatexPreamble } from "./src/modules/latex/latex_preamble.ts";
 import { createInlinePreviewRenderer } from "./src/modules/preview/inline_preview_renderer.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./src/modules/preview/kitty_placeholder_image.ts";
-import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./src/modules/pdf_tracking/pdf_tracking.ts";
+import { describePdfJumpFailureContext, jumpToTrackedPdf } from "./src/modules/pdf_tracking/pdf_tracking.ts";
+import {
+	clearPdfTrackerForContext,
+	contextSessionKey,
+	getPdfTrackerForContext,
+	openTrackedPdfForContext,
+	openTrackedPdfForContextFromViewerService,
+	closeTrackedPdfForContext,
+} from "./src/modules/pdf_session/pdf_session.ts";
 import { readSourceLine, SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./src/modules/synctex/synctex.ts";
 import { ViewerServiceClient, type ViewerServiceOpenResult } from "./src/modules/viewer_service.ts";
 import {
@@ -863,7 +871,6 @@ const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
 const viewerServiceClient = new ViewerServiceClient(MCP_TMPDIR, { requestTimeoutMs: VIEWER_SERVICE_REQUEST_TIMEOUT_MS });
-const pdfTrackersByContext = new Map<string, PdfTracker>();
 const tmuxKittyPreviewInvalidationRegistry = new KittyPreviewInvalidationRegistry();
 const terminalRefreshPolicy = createTerminalRefreshPolicy({
 	adapter: {
@@ -883,8 +890,6 @@ const inlinePreviewRenderStates = new Map<string, InlinePreviewRenderState>();
 const MAX_INLINE_PREVIEW_RENDER_STATES = 8;
 const synctexCallbacksByContext = new Map<string, SynctexCallbackServer>();
 const synctexCallbackServers = new Set<SynctexCallbackServer>();
-const contextUiIds = new WeakMap<object, string>();
-let nextContextUiId = 1;
 
 function rememberInlinePreviewRenderState(state: InlinePreviewRenderState): string {
 	const id = randomUUID();
@@ -900,31 +905,6 @@ function rememberInlinePreviewRenderState(state: InlinePreviewRenderState): stri
 function inlinePreviewRenderStateFromDetails(details: Record<string, unknown>): InlinePreviewRenderState | null {
 	return lookupInlinePreviewRenderStateFromDetails(details, (previewId) => inlinePreviewRenderStates.get(previewId));
 }
-function contextSessionKey(ctx?: ExtensionContext): string {
-	if (!ctx) {
-		throw new Error("PDF tracking is only available inside a Pi agent session");
-	}
-
-	const ui = ctx.ui as object;
-	let uiId = contextUiIds.get(ui);
-	if (!uiId) {
-		uiId = `ui-${nextContextUiId++}`;
-		contextUiIds.set(ui, uiId);
-	}
-
-	return `${ctx.cwd}|${uiId}`;
-}
-
-function pdfTrackerForContext(ctx?: ExtensionContext): PdfTracker {
-	const key = contextSessionKey(ctx);
-	let tracker = pdfTrackersByContext.get(key);
-	if (!tracker) {
-		tracker = new PdfTracker();
-		pdfTrackersByContext.set(key, tracker);
-	}
-	return tracker;
-}
-
 function callbackKeyForContext(ctx: ExtensionContext): string {
 	return contextSessionKey(ctx);
 }
@@ -1231,13 +1211,12 @@ async function executeShowLatexPreviewTool(
 
 	try {
 		const callbackConfig = (await ensureSynctexCallbacks(ctx!)).callbackConfig;
-		const response = await openPdfThroughViewerService(MCP_FIXED_PREVIEW_PDF_PATH, callbackConfig, signal);
-		const pdfTracker = pdfTrackerForContext(ctx);
-		const trackedPdf = trackOpenResultFromViewerService(
-			pdfTracker,
+		const trackedPdf = await openTrackedPdfForContextFromViewerService(
+			ctx,
 			MCP_FIXED_PREVIEW_PDF_PATH,
+			signal,
+			(path, openSignal) => openPdfThroughViewerService(path, callbackConfig, openSignal),
 			synctexCommand || undefined,
-			response,
 		);
 
 		return {
@@ -1282,30 +1261,6 @@ function describeShowLatexViewerOpenFailure(error: unknown): string {
 		return "Viewer service unavailable while opening preview";
 	}
 	return "Viewer service unavailable while opening preview";
-}
-
-function trackOpenResultFromViewerService(
-	tracker: PdfTracker,
-	pdfPath: string,
-	synctexCommand: string | undefined,
-	response: ViewerServiceOpenResult,
-): { id: number; path: string } {
-	const trackedResult = {
-		pid: response.pid,
-		viewerHandle: response.handle,
-		viewerBackend: response.backend,
-		viewerOwned: response.owned,
-		viewerCapabilities: response.capabilities,
-	};
-
-	const existing = tracker.getByPath(pdfPath);
-	if (existing) {
-		tracker.markReopened(existing.id, response.pid, undefined, synctexCommand, trackedResult);
-		return { id: existing.id, path: existing.path };
-	}
-
-	const tracked = tracker.trackOpenedPdf(pdfPath, undefined, response.pid, synctexCommand, trackedResult);
-	return { id: tracked.id, path: tracked.path };
 }
 
 function extractViewerServiceErrorCode(error: unknown): string | undefined {
@@ -1472,23 +1427,11 @@ export default function (pi: ExtensionAPI) {
 				}
 				const server = await ensureSynctexCallbacks(ctx);
 				synctexCommand = server.command;
-				const pdfTracker = pdfTrackerForContext(ctx);
-				const serviceOpener = async (path: string, abortSignal: AbortSignal | undefined) => {
-					const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
-					const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
-					return {
-						pid: response.pid,
-						viewerHandle: response.handle,
-						viewerBackend: response.backend,
-						viewerOwned: response.owned,
-						viewerCapabilities: response.capabilities,
-					};
-				};
-				const trackedPdf = await openAndTrackPdf(
+				const trackedPdf = await openTrackedPdfForContext(
+					ctx,
 					requestedPath,
-					pdfTracker,
 					signal,
-					serviceOpener,
+					async (path, openSignal) => openPdfThroughViewerService(path, (await ensureSynctexCallbacks(ctx)).callbackConfig, openSignal),
 					undefined,
 					synctexCommand,
 				);
@@ -1538,12 +1481,14 @@ export default function (pi: ExtensionAPI) {
 			let pdfId = 0;
 			try {
 				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
-				const pdfTracker = pdfTrackerForContext(ctx);
-				const result = await closeTrackedPdf(pdfId, pdfTracker, {
-					requestClose: async (viewerHandle, viewerBackend, closeSignal) => {
+				const result = await closeTrackedPdfForContext(
+					ctx,
+					pdfId,
+					async (viewerHandle, viewerBackend, closeSignal) => {
 						return viewerServiceClient.requestClosePdf(viewerHandle, viewerBackend, closeSignal);
 					},
-				}, signal);
+					signal,
+				);
 				const reasonText = result.reason ? ` reason=${result.reason}` : "";
 				const closedText = result.closed
 					? `closed_pids=${result.closedPids.length ? result.closedPids.join(",") : "none"}`
@@ -1593,7 +1538,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const server = await ensureSynctexCallbacks(ctx);
 				synctexCommand = server.command;
-				const pdfTracker = pdfTrackerForContext(ctx);
+				const pdfTracker = getPdfTrackerForContext(ctx);
 				const trackedPdf = pdfTracker.getById(pdfId);
 				const serviceOpener = trackedPdf?.viewerHandle !== undefined && trackedPdf.viewerBackend !== undefined
 					? async (path: string, openSignal: AbortSignal | undefined) => {
@@ -1644,7 +1589,7 @@ export default function (pi: ExtensionAPI) {
 					synctex_callback_command: synctexCommand,
 				};
 				if (ctx && pdfId > 0) {
-					failureContext.jump_failure_context = describePdfJumpFailureContext(pdfId, pdfTrackerForContext(ctx), synctexCommand || undefined);
+					failureContext.jump_failure_context = describePdfJumpFailureContext(pdfId, getPdfTrackerForContext(ctx), synctexCommand || undefined);
 				}
 				throw latexToolFailure("jump-pdf", "PDF jump failed", failureContext, error);
 			}
@@ -1724,23 +1669,11 @@ export default function (pi: ExtensionAPI) {
 					}
 					const server = await ensureSynctexCallbacks(ctx);
 					synctexCommand = server.command;
-					const pdfTracker = pdfTrackerForContext(ctx);
-					const serviceOpener = async (path: string, abortSignal: AbortSignal | undefined) => {
-						const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
-						const response = await openPdfThroughViewerService(path, callbackConfig, abortSignal);
-						return {
-							pid: response.pid,
-							viewerHandle: response.handle,
-							viewerBackend: response.backend,
-							viewerOwned: response.owned,
-							viewerCapabilities: response.capabilities,
-						};
-					};
-					const trackedPdf = await openAndTrackPdf(
+					const trackedPdf = await openTrackedPdfForContext(
+						ctx,
 						compileResult.pdfPath,
-						pdfTracker,
 						signal,
-						serviceOpener,
+						async (path, openSignal) => openPdfThroughViewerService(path, (await ensureSynctexCallbacks(ctx)).callbackConfig, openSignal),
 						resolvedSource,
 						synctexCommand,
 					);
@@ -1841,9 +1774,7 @@ export default function (pi: ExtensionAPI) {
 		terminalRefreshPolicy.cleanup();
 		terminalRefreshPolicy.clearInvalidators();
 		if (ctx) {
-			const key = contextSessionKey(ctx);
-			pdfTrackersByContext.get(key)?.clear();
-			pdfTrackersByContext.delete(key);
+			clearPdfTrackerForContext(ctx);
 		}
 		await shutdownSynctexCallbacks();
 		await mcpClient.shutdown();
