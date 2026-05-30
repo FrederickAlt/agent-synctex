@@ -353,7 +353,10 @@ export class ViewerServiceClient {
 				? result.status_details.error_code
 				: undefined;
 			const suffix = errorCode ? ` (code=${errorCode})` : "";
-			throw new Error(`${result.error || "viewer service returned error status"}${suffix}`);
+			const diagnostics = "diagnostics" in result.status_details
+				? ` diagnostics=${JSON.stringify(result.status_details.diagnostics)}`
+				: "";
+			throw new Error(`${result.error || "viewer service returned error status"}${suffix}${diagnostics}`);
 		}
 		const forwardSearchResult = result.status_details;
 		if (!isValidForwardSearchResult(forwardSearchResult)) {

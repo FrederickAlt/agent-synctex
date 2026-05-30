@@ -160,10 +160,32 @@ For extension-triggered scroll, resize, or render bugs that need the real Pi TUI
 
 These Pi-internal imports are best for throwaway/debug repros unless this repo gains an explicit test dependency on Pi internals. Keep committed tests at the extension seams above when possible.
 
+## Viewer-service testing
+
+The default test suite is intentionally headless. It uses fake viewer backends and protocol files to test service open/reuse/close/forward-search behavior without launching a real GUI. Use this layer for committed regressions around:
+
+- ambient `MCP_TMPDIR` isolation;
+- service request/result protocol shape;
+- PDF/source validation and request hardening;
+- owned viewer PID tracking, stale/exited process handling, and close cleanup;
+- forward-search command construction and diagnostic propagation.
+
+Real Zathura behavior still needs an opt-in smoke test because D-Bus and SyncTeX behavior cannot be fully represented by fake processes. After installing the current checkout's service files and restarting `codex-show-latex-viewer.service`, run from Pi:
+
+1. `show_latex` with `inline=false` and confirm a viewer opens through the service.
+2. `compile_latex_file(..., open_pdf=true)` on a repo-local `.tex` file and record the returned `pdf_id`.
+3. `jump_pdf(pdf_id, line)` and confirm forward-search moves the viewer to the source line.
+4. `close_pdf(pdf_id)` and confirm the service-owned viewer closes.
+
+Do not treat direct `zathura ...` commands launched from an agent `bash` tool as equivalent to the real service path: those commands run in the agent sandbox, while the viewer service runs in the user's desktop session. Use `~/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py --status`, `viewer.log`, and the tool error logs under the preview temp directory for diagnostics.
+
 ## Verification commands
 
 - Full: `npm run verify`
 - Focused examples:
+  - `node --test preview_pipeline.test.ts`
+  - `node --test viewer_service.test.ts`
+  - `node --test show_latex.test.ts compile_latex_file.test.ts`
   - `node --test inline_preview_renderer.test.ts`
   - `node --test kitty_placeholder_image.test.ts`
   - `node --test kitty_placeholder_oracle.test.ts`
@@ -173,6 +195,7 @@ These Pi-internal imports are best for throwaway/debug repros unless this repo g
 
 These tests are designed as deterministic, offline checks and do **not** rely on:
 - Live Pi runtime interaction beyond unit/test harness.
+- Real Zathura/D-Bus desktop behavior.
 - Real Kitty/tmux terminals.
 - Real terminal screenshots/HITL.
 - A full VT/graphics emulator.

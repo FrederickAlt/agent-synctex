@@ -1155,6 +1155,299 @@ print(json.dumps({
 	assert.equal(result.session_still_tracked, false);
 });
 
+test("viewer service forward_search retries with rediscovered pid on mismatch", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import signal
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-forward-search-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+bin_dir = tmp / "bin"
+bin_dir.mkdir()
+backend_log = bin_dir / "fakezathura-argv.log"
+worker_pid_file = bin_dir / "fakezathura-worker.pid"
+os.environ["FAKE_BACKEND_ARGV_LOG"] = str(backend_log)
+os.environ["FAKE_VIEWER_WORKER_PID_FILE"] = str(worker_pid_file)
+
+zathura = bin_dir / viewer.BACKEND_NAME
+zathura.write_text("""#!/usr/bin/env python3\nimport os\nimport sys\nimport time\nfrom pathlib import Path\n\nlog_path = os.environ.get(\"FAKE_BACKEND_ARGV_LOG\")\npid_file = os.environ.get(\"FAKE_VIEWER_WORKER_PID_FILE\")\nscript_path = Path(sys.argv[0])\n\ndef write_log() -> None:\n    if log_path:\n        Path(log_path).open(\"a\", encoding=\"utf-8\").write(\" \".join(sys.argv) + \"\\n\")\n\ndef read_target_pid() -> int | None:\n    if not pid_file:\n        return None\n    try:\n        raw = Path(pid_file).read_text(encoding=\"utf-8\").strip()\n        return int(raw) if raw else None\n    except Exception:\n        return None\n\ndef requested_synctex_pid() -> int | None:\n    for arg in sys.argv:\n        if arg.startswith(\"--synctex-pid=\"):\n            try:\n                return int(arg.split(\"=\", 1)[1])\n            except ValueError:\n                return None\n    return None\n\nwrite_log()\n\nif \"--synctex-forward\" in sys.argv:\n    expected = read_target_pid()\n    requested = requested_synctex_pid()\n    if expected is None or requested != expected:\n        sys.stderr.write(f\"rejecting pid={requested}; expected={expected}\")\n        raise SystemExit(2)\n    raise SystemExit(0)\n\nif \"--worker\" in sys.argv:\n    while True:\n        time.sleep(0.1)\n\ntry:\n    pdf_path = os.readlink(sys.argv[-1])\nexcept Exception:\n    pdf_path = sys.argv[-1]\npid = os.fork()\nif pid == 0:\n    os.execl(sys.executable, sys.executable, str(script_path), \"--worker\", pdf_path)\nif pid_file:\n    Path(pid_file).write_text(str(pid), encoding=\"utf-8\")\nwhile True:\n    time.sleep(0.1)\n""")
+os.chmod(zathura, 0o700)
+os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\\n")
+source = Path(tempfile.mkstemp(prefix="source-", suffix=".tex", dir=str(tmp))[1])
+source.write_text("forward search", encoding="utf-8")
+callback = {
+    "kind": viewer.SYNCTEX_CALLBACK_KIND,
+    "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+    "socket_path": "/tmp/synctex.sock",
+    "token": "abc123",
+}
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def reap_pid(pid: int) -> None:
+    for signal_to_send in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, signal_to_send)
+        except OSError:
+            return
+        for _ in range(30):
+            try:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError:
+                break
+            if waited != 0:
+                return
+            time.sleep(0.05)
+
+
+request_id = "open-forward-retry"
+viewer.atomic_write_text(
+    viewer.request_path(request_id),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {"pdf_path": str(pdf), "callback": callback},
+    }),
+    mode=0o600,
+)
+processed_open = viewer.scan_requests()
+open_result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+open_pid = open_result["status_details"].get("pid")
+
+for _ in range(50):
+    if worker_pid_file.exists() and worker_pid_file.read_text(encoding="utf-8").strip():
+        break
+    time.sleep(0.05)
+worker_pid = int(worker_pid_file.read_text(encoding="utf-8").strip()) if worker_pid_file.exists() else None
+
+request_id_forward = "forward-mismatch"
+viewer.atomic_write_text(
+    viewer.request_path(request_id_forward),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id_forward,
+        "operation": "forward_search",
+        "created_at_ns": int(time.time_ns()),
+        "details": {
+            "handle": open_result["status_details"].get("handle"),
+            "backend": "fakezathura",
+            "source_file": str(source),
+            "line": 1,
+            "synctex_pid": open_pid,
+        },
+    }),
+    mode=0o600,
+)
+processed_forward = viewer.scan_requests()
+forward_result = json.loads(viewer.result_path(request_id_forward).read_text(encoding="utf-8"))
+invocation_lines = [line for line in backend_log.read_text(encoding="utf-8").splitlines() if line]
+session_pid = None
+session = viewer.OPEN_SESSIONS.get(str(pdf.resolve()), {})
+if isinstance(session.get("pid"), int):
+    session_pid = session.get("pid")
+
+after_open = pid_alive(open_pid) if isinstance(open_pid, int) else False
+if isinstance(open_pid, int):
+    reap_pid(open_pid)
+if isinstance(worker_pid, int):
+    reap_pid(worker_pid)
+
+print(json.dumps({
+    "processed_open": processed_open,
+    "processed_forward": processed_forward,
+    "open_status": open_result["status"],
+    "forward_status": forward_result["status"],
+    "after_open_alive": after_open,
+    "request_handle": open_result["status_details"].get("handle"),
+    "open_pid": open_pid if isinstance(open_pid, int) else None,
+    "rediscovered_pid": worker_pid,
+    "session_pid": session_pid,
+    "invocation_count": len(invocation_lines),
+    "invocation_lines": invocation_lines,
+    "contains_wrong_pid_forward": any("--synctex-forward" in line and (f"--synctex-pid={open_pid}" in line) for line in invocation_lines),
+    "contains_rediscovered_forward": any("--synctex-forward" in line and worker_pid is not None and (f"--synctex-pid={worker_pid}" in line) for line in invocation_lines),
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed_open: number;
+		processed_forward: number;
+		open_status: string;
+		forward_status: string;
+		after_open_alive: boolean;
+		request_handle: string;
+		open_pid: number;
+		rediscovered_pid: number;
+		session_pid: number;
+		invocation_count: number;
+		invocation_lines: string[];
+		contains_wrong_pid_forward: boolean;
+		contains_rediscovered_forward: boolean;
+	};
+
+	assert.equal(result.processed_open, 1);
+	assert.equal(result.processed_forward, 1);
+	assert.equal(result.open_status, "ok");
+	assert.equal(result.forward_status, "ok");
+	assert.equal(result.request_handle.startsWith("fakezathura:"), true);
+	assert.equal(result.session_pid === result.rediscovered_pid, true);
+	assert.equal(result.contains_wrong_pid_forward, true);
+	assert.equal(result.contains_rediscovered_forward, true);
+	assert.equal(result.invocation_count >= 3, true);
+});
+
+test("viewer service forward_search failure includes command diagnostics", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import signal
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-forward-failed-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+bin_dir = tmp / "bin"
+bin_dir.mkdir()
+backend_log = bin_dir / "fakezathura-argv.log"
+os.environ["FAKE_BACKEND_ARGV_LOG"] = str(backend_log)
+
+zathura = bin_dir / viewer.BACKEND_NAME
+zathura.write_text("""#!/usr/bin/env python3\nimport os\nimport sys\nimport time\nfrom pathlib import Path\n\nlog_path = os.environ.get(\"FAKE_BACKEND_ARGV_LOG\")\nif log_path:\n    Path(log_path).open(\"a\", encoding=\"utf-8\").write(\" \".join(sys.argv) + \"\\n\")\nif \"--synctex-forward\" in sys.argv:\n    sys.stderr.write(\"forced forward-search failure\\n\")\n    raise SystemExit(3)\nwhile True:\n    time.sleep(0.1)\n""")
+os.chmod(zathura, 0o700)
+os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\n")
+source = Path(tempfile.mkstemp(prefix="source-", suffix=".tex", dir=str(tmp))[1])
+source.write_text("forward search", encoding="utf-8")
+callback = {
+    "kind": viewer.SYNCTEX_CALLBACK_KIND,
+    "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+    "socket_path": "/tmp/synctex.sock",
+    "token": "abc123",
+}
+
+
+def reap_pid(pid: int) -> None:
+    for signal_to_send in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, signal_to_send)
+        except OSError:
+            return
+        for _ in range(20):
+            try:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError:
+                break
+            if waited != 0:
+                return
+            time.sleep(0.05)
+
+request_id = "open-forward-fail"
+viewer.atomic_write_text(
+    viewer.request_path(request_id),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {"pdf_path": str(pdf), "callback": callback},
+    }),
+    mode=0o600,
+)
+viewer.scan_requests()
+open_result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+open_pid = open_result["status_details"].get("pid")
+
+request_id_forward = "forward-search-fail"
+viewer.atomic_write_text(
+    viewer.request_path(request_id_forward),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": request_id_forward,
+        "operation": "forward_search",
+        "created_at_ns": int(time.time_ns()),
+        "details": {
+            "handle": open_result["status_details"].get("handle"),
+            "backend": "fakezathura",
+            "source_file": str(source),
+            "line": 1,
+            "synctex_pid": open_pid,
+        },
+    }),
+    mode=0o600,
+)
+viewer.scan_requests()
+forward_result = json.loads(viewer.result_path(request_id_forward).read_text(encoding="utf-8"))
+diagnostics = forward_result.get("status_details", {}).get("diagnostics", [])
+
+if isinstance(open_pid, int):
+    reap_pid(open_pid)
+
+print(json.dumps({
+    "forward_status": forward_result["status"],
+    "forward_error": forward_result.get("error", ""),
+    "diagnostics": diagnostics,
+    "has_diagnostic_returncode": any(isinstance(item, dict) and item.get("returncode") == 3 for item in diagnostics),
+    "has_diagnostic_stderr": any(isinstance(item, dict) and "forced forward-search failure" in str(item.get("stderr", "")) for item in diagnostics),
+    "reason": forward_result["status_details"].get("reason"),
+}))
+`);
+	const result = JSON.parse(output) as {
+		forward_status: string;
+		forward_error: string;
+		diagnostics: Array<{ returncode?: number; stderr?: string; label?: string }>;
+		has_diagnostic_returncode: boolean;
+		has_diagnostic_stderr: boolean;
+		reason: string;
+	};
+
+	assert.equal(result.forward_status, "error");
+	assert.equal(/viewer forward_search failed/.test(result.forward_error), true);
+	assert.equal(/returncode=3/.test(result.reason), true);
+	assert.equal(result.has_diagnostic_returncode, true);
+	assert.equal(result.has_diagnostic_stderr, true);
+	assert.equal(result.diagnostics.length >= 1, true);
+});
+
 test("viewer service rejects invalid PDF files for open requests", () => {
 	const output = runPython(String.raw`
 import json

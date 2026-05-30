@@ -465,10 +465,9 @@ def _pid_alive(pid: int) -> bool:
 	return True
 
 
-def _find_viewer_pid_for_pdf(viewer_path: str, pdf_paths: list[str]) -> Optional[int]:
-	if not pdf_paths:
-		return None
-
+def _iter_viewer_pids_for_command(viewer_path: str, *, allow_wrapped: bool = False) -> list[int]:
+	viewer_name = Path(viewer_path).name
+	pids: list[int] = []
 	for entry in Path("/proc").iterdir():
 		if not entry.name.isdigit():
 			continue
@@ -480,11 +479,101 @@ def _find_viewer_pid_for_pdf(viewer_path: str, pdf_paths: list[str]) -> Optional
 			continue
 		if not parts:
 			continue
-		if Path(parts[0]).name != Path(viewer_path).name:
+		parts_path_names = tuple(p for p in parts if isinstance(p, str))
+		if not parts_path_names:
+			continue
+		if not allow_wrapped:
+			if Path(parts_path_names[0]).name != viewer_name:
+				continue
+		else:
+			if not any(part_name == viewer_name for part_name in [Path(part).name for part in parts_path_names]):
+				continue
+		pids.append(pid)
+	return pids
+
+
+
+def _iter_viewer_pids_for_pdf(
+	viewer_path: str,
+	pdf_paths: list[str],
+	*,
+	allow_wrapped: bool = False,
+) -> list[int]:
+	if not pdf_paths:
+		return []
+
+	pids: list[int] = []
+	for pid in _iter_viewer_pids_for_command(viewer_path, allow_wrapped=allow_wrapped):
+		if not Path(f"/proc/{pid}").exists():
+			continue
+		try:
+			parts = [part.decode("utf-8", errors="replace") for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
+		except Exception:
 			continue
 		for path in pdf_paths:
 			if path and any(part == path or part.endswith(path) for part in parts):
-				return pid
+				pids.append(pid)
+				break
+	return pids
+
+def _find_viewer_pid_for_pdf(viewer_path: str, pdf_paths: list[str]) -> Optional[int]:
+	pids = _iter_viewer_pids_for_pdf(viewer_path, pdf_paths, allow_wrapped=False)
+	return pids[0] if pids else None
+
+
+def _iter_wrapped_viewer_pids_for_pdf(viewer_path: str, pdf_paths: list[str]) -> list[int]:
+	return _iter_viewer_pids_for_pdf(viewer_path, pdf_paths, allow_wrapped=True)
+
+
+def _is_process_identity_match_for_session_reuse(pid: int, session: Dict[str, Any]) -> bool:
+	if not isinstance(pid, int) or pid <= 0:
+		return False
+	expected_identity = session.get("process_identity")
+	if not isinstance(expected_identity, dict) or not expected_identity:
+		return False
+	current_identity = _snapshot_process_identity(pid)
+	if current_identity is None:
+		return False
+	for marker in ("comm", "exe"):
+		expected_value = expected_identity.get(marker)
+		current_value = current_identity.get(marker)
+		if expected_value is not None and expected_value != current_value:
+			return False
+	return True
+
+
+def _extract_rediscovery_path_hints(pdf_path: str, session: Dict[str, Any]) -> list[str]:
+	paths: list[str] = []
+	if pdf_path:
+		paths.append(pdf_path)
+	identity = session.get("process_identity")
+	if isinstance(identity, dict):
+		cmdline = identity.get("cmdline")
+		if isinstance(cmdline, list):
+			for arg in cmdline:
+				if isinstance(arg, str) and arg.startswith("/proc/self/fd/"):
+					paths.append(arg)
+	return list(dict.fromkeys(paths))
+
+
+def _find_viewer_pid_for_pdf_with_session_identity(
+	viewer_path: str,
+	pdf_path: str,
+	session: Dict[str, Any],
+	exclude_pid: Optional[int] = None,
+) -> Optional[int]:
+	pdf_paths = _extract_rediscovery_path_hints(pdf_path, session)
+	for pid in _iter_wrapped_viewer_pids_for_pdf(viewer_path, pdf_paths):
+		if exclude_pid is not None and pid == exclude_pid:
+			continue
+		if _is_process_identity_match_for_session_reuse(pid, session):
+			return pid
+
+	for pid in _iter_viewer_pids_for_command(viewer_path, allow_wrapped=True):
+		if exclude_pid is not None and pid == exclude_pid:
+			continue
+		if _is_process_identity_match_for_session_reuse(pid, session):
+			return pid
 	return None
 
 
@@ -624,6 +713,7 @@ def build_forward_search_result_details(
 	backend: Optional[str] = None,
 	backend_identity_ok: bool = False,
 	error_code: Optional[str] = None,
+	diagnostics: Optional[list[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
 	details = {
 		"protocol_version": PROTOCOL_VERSION,
@@ -643,7 +733,71 @@ def build_forward_search_result_details(
 		details["handle"] = handle
 	if error_code is not None:
 		details["error_code"] = error_code
+	if diagnostics:
+		details["diagnostics"] = diagnostics
 	return details
+
+
+def _format_forward_search_output(value: Optional[str], limit: int = 2048) -> str:
+	if not value:
+		return ""
+	text = value.strip()
+	if len(text) <= limit:
+		return text
+	return f"{text[:limit]}..."
+
+
+def _build_forward_search_diagnostic(
+	label: str,
+	args: list[str],
+	synctex_pid: Optional[int],
+	completed: Optional[subprocess.CompletedProcess] = None,
+	error: Optional[str] = None,
+) -> Dict[str, Any]:
+	diagnostic: Dict[str, Any] = {
+		"label": label,
+		"command": args,
+	}
+	if synctex_pid is not None:
+		diagnostic["synctex_pid"] = synctex_pid
+	if completed is not None:
+		diagnostic["returncode"] = completed.returncode
+		stdout = completed.stdout if isinstance(completed.stdout, str) else ""
+		stderr = completed.stderr if isinstance(completed.stderr, str) else ""
+		formatted_stdout = _format_forward_search_output(stdout)
+		formatted_stderr = _format_forward_search_output(stderr)
+		if formatted_stdout:
+			diagnostic["stdout"] = formatted_stdout
+		if formatted_stderr:
+			diagnostic["stderr"] = formatted_stderr
+	if error is not None:
+		diagnostic["error"] = error
+	return diagnostic
+
+
+def _run_forward_search_command(
+	viewer_path: str,
+	line: int,
+	normalized_source_file: str,
+	matched_path: str,
+	synctex_pid: Optional[int],
+	timeout_seconds: float,
+) -> tuple[Optional[subprocess.CompletedProcess], Optional[str], list[str]]:
+	args = [viewer_path, "--synctex-forward", f"{line}:1:{normalized_source_file}"]
+	if isinstance(synctex_pid, int):
+		args.append(f"--synctex-pid={synctex_pid}")
+	args.append(matched_path)
+
+	try:
+		completed = subprocess.run(args, capture_output=True, text=True, check=False, timeout=timeout_seconds)
+	except FileNotFoundError:
+		return None, "viewer backend is unavailable", args
+	except subprocess.TimeoutExpired as exc:
+		return None, f"viewer command timed out: {exc}", args
+	except Exception as exc:
+		return None, f"failed to invoke viewer command: {exc}", args
+
+	return completed, None, args
 
 
 def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1145,6 +1299,8 @@ def close_pdf_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[s
 	}
 
 
+
+
 def forward_search_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any]) -> Dict[str, Any]:
 	error = validate_forward_search_request_details(details)
 	if error:
@@ -1228,68 +1384,110 @@ def forward_search_in_viewer(request_id: str, details: Dict[str, Any], _state: D
 			pass
 
 	viewer_path = matched_session.get("backend_path") or find_viewer()
-	args = [viewer_path, "--synctex-forward", f"{line}:1:{normalized_source_file}"]
-	if isinstance(synctex_pid, int):
-		args.append(f"--synctex-pid={synctex_pid}")
-	args.append(matched_path)
+	forward_diagnostics: list[Dict[str, Any]] = []
 
-	try:
-		completed = subprocess.run(args, capture_output=True, text=True, check=False, timeout=10)
-	except FileNotFoundError:
+	def attempt_forward_search(current_pid: Optional[int], attempt_label: str, timeout_seconds: float = 10.0) -> Optional[subprocess.CompletedProcess]:
+		completed, command_error, command = _run_forward_search_command(
+			viewer_path,
+			line,
+			normalized_source_file,
+			matched_path,
+			current_pid,
+			timeout_seconds,
+		)
+		if command_error is not None:
+			forward_diagnostics.append(_build_forward_search_diagnostic(attempt_label, command, current_pid, error=command_error))
+			return None
+		forward_diagnostics.append(_build_forward_search_diagnostic(attempt_label, command, current_pid, completed=completed))
+		return completed
+
+	requested_pid = synctex_pid if isinstance(synctex_pid, int) else None
+	completed = attempt_forward_search(requested_pid, "tracked")
+	if completed is not None and completed.returncode == 0:
 		return {
-			"status": "error",
-			"error": "viewer backend is unavailable",
+			"status": "ok",
 			"status_details": build_forward_search_result_details(
 				request_id,
-				False,
-				"viewer backend is unavailable",
-				handle,
-				backend,
-				False,
-				"backend_unavailable",
-			),
-		}
-	except subprocess.TimeoutExpired:
-		return {
-			"status": "error",
-			"error": "viewer command timed out",
-			"status_details": build_forward_search_result_details(
-				request_id,
-				False,
-				"viewer command timed out",
-				handle,
-				backend,
-				False,
-				"backend_unavailable",
-			),
-		}
-	if completed.returncode != 0:
-		return {
-			"status": "error",
-			"error": "viewer forward_search failed",
-			"status_details": build_forward_search_result_details(
-				request_id,
-				False,
-				"viewer forward_search failed",
-				handle,
-				backend,
-				False,
-				"backend_unavailable",
+				True,
+				handle=handle,
+				backend=backend,
+				backend_identity_ok=True,
 			),
 		}
 
+	if completed is None:
+		error_detail = forward_diagnostics[-1].get("error", "viewer forward_search failed")
+		log(f"forward_search failed for handle={handle} pid={requested_pid}: {error_detail}")
+		return {
+			"status": "error",
+			"error": error_detail,
+			"status_details": build_forward_search_result_details(
+				request_id,
+				False,
+				error_detail,
+				handle,
+				backend,
+				False,
+				"backend_unavailable",
+				diagnostics=forward_diagnostics,
+			),
+		}
+
+	rediscovered_pid = None
+	next_attempt = None
+	if requested_pid is not None:
+		matched_candidate = _find_viewer_pid_for_pdf_with_session_identity(
+			viewer_path,
+			matched_path,
+			matched_session,
+			exclude_pid=requested_pid,
+		)
+		if matched_candidate is not None and matched_candidate != requested_pid:
+			rediscovered_pid = matched_candidate
+			log(f"forward_search retrying with rediscovered pid={rediscovered_pid} for handle={handle}")
+			next_attempt = attempt_forward_search(rediscovered_pid, "rediscovered")
+
+	if next_attempt is not None and next_attempt.returncode == 0:
+		matched_session["pid"] = rediscovered_pid
+		matched_session["process_identity"] = _snapshot_process_identity(rediscovered_pid) if isinstance(rediscovered_pid, int) else None
+		return {
+			"status": "ok",
+			"status_details": build_forward_search_result_details(
+				request_id,
+				True,
+				handle=handle,
+				backend=backend,
+				backend_identity_ok=True,
+			),
+		}
+
+	if rediscovered_pid is None and requested_pid is not None:
+		log(f"forward_search did not find rediscoverable pid for handle={handle} current pid={requested_pid}")
+
+	final_attempt = forward_diagnostics[-1]
+	final_return_code = final_attempt.get("returncode")
+	final_error = final_attempt.get("error")
+	reason = "viewer forward_search failed"
+	if isinstance(final_return_code, int):
+		reason = f"viewer forward_search failed (returncode={final_return_code})"
+	elif final_error:
+		reason = f"viewer forward_search failed ({final_error})"
+
+	log(f"forward_search failed for handle={handle}: {reason}; diagnostics={json.dumps(forward_diagnostics, separators=(',', ':'))}")
 	return {
-		"status": "ok",
+		"status": "error",
+		"error": reason if isinstance(reason, str) else "viewer forward_search failed",
 		"status_details": build_forward_search_result_details(
 			request_id,
-			True,
-			handle=handle,
-			backend=backend,
-			backend_identity_ok=True,
+			False,
+			reason,
+			handle,
+			backend,
+			False,
+			"backend_unavailable",
+			diagnostics=forward_diagnostics,
 		),
 	}
-
-
 def protocol_directories() -> Dict[str, str]:
 	return {
 		"base": str(tmpdir()),

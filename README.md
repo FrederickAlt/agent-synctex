@@ -69,8 +69,11 @@ never edits `~/.config/zathura/zathurarc` automatically.
 Viewer-service setup/status:
 
 ```bash
-# install/start the packaged user service from the repo assets
-cp "$(pwd)/systemd/codex-show-latex-viewer.service" "$HOME/.config/systemd/user/codex-show-latex-viewer.service"
+# install/start the user service from the repo assets
+install -d "$HOME/plugins/codex-show-latex-mcp/scripts" "$HOME/.config/systemd/user"
+install -m 755 "$(pwd)/scripts/show_latex_viewer.py" "$HOME/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py"
+install -m 755 "$(pwd)/scripts/pi_synctex_callback.mjs" "$HOME/plugins/codex-show-latex-mcp/scripts/pi_synctex_callback.mjs"
+install -m 644 "$(pwd)/systemd/codex-show-latex-viewer.service" "$HOME/.config/systemd/user/codex-show-latex-viewer.service"
 systemctl --user daemon-reload
 systemctl --user enable --now codex-show-latex-viewer.service
 
@@ -145,7 +148,16 @@ In headless/non-interactive sessions the callback never submits a message automa
 
 ## Development
 
-Install dev dependencies once with `npm install`, then run `npm run verify` to typecheck and execute the Node built-in test suite. Unit tests avoid real Zathura/LaTeX dependencies by using temp files and fake helper commands. Inline previews require either `mutool` (from `mupdf-tools`) or `pdftoppm` (from `poppler-utils`) at runtime; optional whitespace trimming uses ImageMagick's `magick` when available. Actual terminal image display requires Pi/TUI image support in the current terminal (Kitty, Ghostty, WezTerm, or iTerm2; tmux/screen generally disable it).
+Install dev dependencies once with `npm install`, then run `npm run verify` to typecheck and execute the Node built-in test suite. Unit tests avoid real Zathura/LaTeX dependencies by using temp files and fake helper commands. They validate the extension protocol and a headless fake viewer service, but they do not prove real Zathura D-Bus/SyncTeX forward-search behavior.
+
+For service changes, also run a manual smoke test from Pi after installing/restarting the user service from the current checkout:
+
+1. `show_latex` with `inline=false` opens a Zathura window through the service.
+2. `compile_latex_file(..., open_pdf=true)` on a repo-local `.tex` file returns a `pdf_id` and opens the compiled PDF.
+3. `jump_pdf(pdf_id, line)` forward-searches to a source line.
+4. `close_pdf(pdf_id)` closes the service-owned viewer.
+
+When diagnosing that smoke test, prefer service logs/status over sandboxed shell invocations of `zathura`, because bare commands run from the agent sandbox do not exercise the same unsandboxed service environment. Inline previews require either `mutool` (from `mupdf-tools`) or `pdftoppm` (from `poppler-utils`) at runtime; optional whitespace trimming uses ImageMagick's `magick` when available. Actual terminal image display requires Pi/TUI image support in the current terminal (Kitty, Ghostty, WezTerm, or iTerm2; tmux/screen generally disable it).
 
 ## Compiler selection
 
