@@ -2,7 +2,7 @@ import { createInterface, type Interface } from "node:readline";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, ToolResponse } from "@mariozechner/pi-coding-agent";
@@ -31,6 +31,13 @@ import {
 	registerTracerTools,
 	type TracerToolDefinition,
 } from "./src/modules/pi_adapter/pi_adapter.ts";
+import {
+	createLatexFileCompileToolSupport,
+	DEFAULT_LATEX_COMPILER,
+	LATEX_COMPILERS,
+	LoggedToolError,
+	type LatexCompiler,
+} from "./src/modules/latex/latex_file_compiler.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;
@@ -73,35 +80,11 @@ interface ShowLatexCallOptions {
 	suppressPageNumbers?: boolean;
 }
 
-interface LatexCommandSpec {
-	displayName: string;
-	command: string;
-	args: string[];
-}
-
-interface LatexCommandResult {
-	exitCode: number | null;
-	signal: string | null;
-	output: string;
-	timedOut: boolean;
-	aborted: boolean;
-}
-
-class LoggedToolError extends Error {
-	constructor(message: string, readonly logPath: string, readonly tail: string = "") {
-		super(message);
-		this.name = "LoggedToolError";
-	}
-}
-
 const MCP_TMPDIR = process.env.MCP_TMPDIR ?? "/tmp/codex-show-latex";
 const MCP_FIXED_PREVIEW_PDF_PATH = resolve(MCP_TMPDIR, "show-latex.pdf");
 const VIEWER_SERVICE_REQUEST_TIMEOUT_MS = 5_000;
 const LATEX_PREAMBLE_FILE_NAMES = ["preamble.tex", "praeamble.tex"] as const;
 const LATEX_PREAMBLE_PATH = resolve(MCP_TMPDIR, "preamble.tex");
-const DEFAULT_LATEX_COMPILER = "lualatex";
-const LATEX_COMPILERS = [DEFAULT_LATEX_COMPILER, "pdflatex", "xelatex", "latexmk"] as const;
-type LatexCompiler = (typeof LATEX_COMPILERS)[number];
 const REQUEST_TIMEOUT_DEFAULT_MS = 60_000;
 const STARTUP_TIMEOUT_DEFAULT_MS = 5_000;
 const STARTUP_TIMEOUT_MAX_MS = 120_000;
@@ -208,37 +191,24 @@ function initializeLatexPreambleFile(): void {
 	}
 }
 
+const latexFileCompileToolSupport = createLatexFileCompileToolSupport();
+
 function resolveLatexCompiler(compiler: unknown): LatexCompiler | undefined {
-	if (compiler === undefined || compiler === null) return undefined;
-	const value = String(compiler).trim().toLowerCase();
-	if (!value) return undefined;
-	if ((LATEX_COMPILERS as readonly string[]).includes(value)) return value as LatexCompiler;
-	throw new Error(`compiler must be one of: ${LATEX_COMPILERS.join(", ")}`);
+	return latexFileCompileToolSupport.resolveLatexCompiler(compiler);
 }
 
 function resolveLatexFilePath(latexFilePath: string, cwd = process.cwd()): string {
-	return resolve(cwd, expandHomePath(latexFilePath.trim()));
+	return latexFileCompileToolSupport.resolveLatexFilePath(latexFilePath, cwd);
 }
 
-function assertReadableLatexFile(latexFilePath: string): void {
-	let fileStatus;
-	try {
-		fileStatus = statSync(latexFilePath);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`Cannot stat LaTeX file ${latexFilePath}: ${message}`);
-	}
+function errorMessage(error: unknown): string {
+	if (error instanceof Error) return error.message;
+	return String(error);
+}
 
-	if (!fileStatus.isFile()) {
-		throw new Error(`latex_file_path must point to a regular file: ${latexFilePath}`);
-	}
-
-	try {
-		accessSync(latexFilePath, constants.R_OK);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`Cannot read LaTeX file ${latexFilePath}: ${message}`);
-	}
+function errorDetails(error: unknown): string {
+	if (error instanceof Error) return error.stack || error.message;
+	return String(error);
 }
 
 function tailText(text: string, limit = 12000): string {
@@ -254,80 +224,10 @@ function lastLines(text: string, count = 5): string {
 		.join("\n");
 }
 
-function readTail(path: string, limit = 12000): string {
-	try {
-		return tailText(readFileSync(path, "utf8"), limit);
-	} catch {
-		return "";
-	}
-}
-
-function latexOutputPdfPath(latexFilePath: string): string {
-	const extension = extname(latexFilePath);
-	return resolve(dirname(latexFilePath), `${basename(latexFilePath, extension)}.pdf`);
-}
-
-function latexLogPath(latexFilePath: string): string {
-	const extension = extname(latexFilePath);
-	return resolve(dirname(latexFilePath), `${basename(latexFilePath, extension)}.log`);
-}
-
 function latexErrorLogPath(prefix: string): string {
 	const safePrefix = prefix.replace(/[^a-z0-9_.-]+/gi, "-").replace(/^-+|-+$/g, "") || "latex";
 	mkdirSync(MCP_TMPDIR, { recursive: true, mode: 0o700 });
 	return resolve(MCP_TMPDIR, `${safePrefix}.${process.pid}.${Date.now()}.log`);
-}
-
-function latexCompileErrorLogPath(): string {
-	return latexErrorLogPath("compile-latex-file");
-}
-
-function latexCommandLine(spec: LatexCommandSpec): string {
-	return [spec.command, ...spec.args].map((part) => JSON.stringify(part)).join(" ");
-}
-
-function writeLatexCompileErrorLog(
-	latexFilePath: string,
-	spec: LatexCommandSpec,
-	reason: string,
-	compilerOutput: string,
-): string {
-	const projectLogPath = latexLogPath(latexFilePath);
-	const projectLogTail = readTail(projectLogPath, 30000).trim();
-	const outputTail = tailText(compilerOutput.trim(), 30000).trim();
-	const tempLogPath = latexCompileErrorLogPath();
-	const sections = [
-		"LaTeX file compilation failed",
-		`source: ${latexFilePath}`,
-		`cwd: ${dirname(latexFilePath)}`,
-		`compiler: ${spec.displayName}`,
-		`command: ${latexCommandLine(spec)}`,
-		`reason: ${reason}`,
-		projectLogTail ? `\n--- project log tail (${projectLogPath}) ---\n${projectLogTail}` : "",
-		outputTail ? `\n--- compiler output tail ---\n${outputTail}` : "",
-	].filter((section) => section.length > 0);
-
-	writeFileSync(tempLogPath, `${sections.join("\n")}\n`, { mode: 0o600 });
-	return tempLogPath;
-}
-
-function errorMessage(error: unknown): string {
-	if (error instanceof Error) return error.message;
-	return String(error);
-}
-
-function errorDetails(error: unknown): string {
-	if (error instanceof Error) return error.stack || error.message;
-	return String(error);
-}
-
-const LATEX_ERROR_TAIL_LINES = 20;
-
-function shortFailureMessage(shortMessage: string, logPath: string, tail: string): string {
-	const tailLines = lastLines(tail, LATEX_ERROR_TAIL_LINES);
-	return tailLines
-		? `${shortMessage}. Log: ${logPath}\nLast ${LATEX_ERROR_TAIL_LINES} lines:\n${tailLines}`
-		: `${shortMessage}. Log: ${logPath}`;
 }
 
 function writeLatexToolErrorLog(
@@ -351,6 +251,15 @@ function writeLatexToolErrorLog(
 	return tempLogPath;
 }
 
+const LATEX_ERROR_TAIL_LINES = 20;
+
+function shortFailureMessage(shortMessage: string, logPath: string, tail: string): string {
+	const tailLines = lastLines(tail, LATEX_ERROR_TAIL_LINES);
+	return tailLines
+		? `${shortMessage}. Log: ${logPath}\nLast ${LATEX_ERROR_TAIL_LINES} lines:\n${tailLines}`
+		: `${shortMessage}. Log: ${logPath}`;
+}
+
 function latexToolFailure(
 	toolName: string,
 	shortMessage: string,
@@ -368,167 +277,6 @@ function latexToolFailure(
 		return new Error(`${shortMessage}. Could not write temp log: ${message}`);
 	}
 }
-
-function latexCompileErrorTail(latexFilePath: string, reason: string, compilerOutput: string): string {
-	const projectLogTail = readTail(latexLogPath(latexFilePath), 30000).trim();
-	const outputTail = tailText(compilerOutput.trim(), 30000).trim();
-	return lastLines(projectLogTail || outputTail || reason, LATEX_ERROR_TAIL_LINES);
-}
-
-function latexCompileFailure(
-	latexFilePath: string,
-	spec: LatexCommandSpec,
-	reason: string,
-	compilerOutput: string,
-): Error {
-	try {
-		const tempLogPath = writeLatexCompileErrorLog(latexFilePath, spec, reason, compilerOutput);
-		const tail = latexCompileErrorTail(latexFilePath, reason, compilerOutput);
-		return new LoggedToolError(shortFailureMessage("LaTeX compile failed", tempLogPath, tail), tempLogPath, tail);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		return new Error(`LaTeX compile failed. Could not write temp log: ${message}`);
-	}
-}
-
-function latexCommandForFile(latexFilePath: string, compiler?: LatexCompiler): LatexCommandSpec {
-	const requested = compiler ?? DEFAULT_LATEX_COMPILER;
-	const fileName = basename(latexFilePath);
-	if (requested === "latexmk") {
-		return {
-			displayName: "latexmk(lualatex)",
-			command: "latexmk",
-			args: [
-				"-pdf",
-				"-lualatex",
-				"-synctex=1",
-				"-interaction=nonstopmode",
-				"-halt-on-error",
-				"-file-line-error",
-				"-pdflualatex=lualatex -no-shell-escape %O %S",
-				fileName,
-			],
-		};
-	}
-
-	return {
-		displayName: requested,
-		command: requested,
-		args: [
-			"-synctex=1",
-			"-interaction=nonstopmode",
-			"-halt-on-error",
-			"-file-line-error",
-			"-no-shell-escape",
-			fileName,
-		],
-	};
-}
-
-function runLatexCommand(spec: LatexCommandSpec, cwd: string, signal?: AbortSignal): Promise<LatexCommandResult> {
-	return new Promise((resolvePromise, reject) => {
-		if (signal?.aborted) {
-			resolvePromise({ exitCode: null, signal: null, output: "", timedOut: false, aborted: true });
-			return;
-		}
-
-		let output = "";
-		let timedOut = false;
-		let aborted = false;
-		let settled = false;
-
-		const child = spawn(spec.command, spec.args, {
-			cwd,
-			env: {
-				...process.env,
-				HOME: process.env.HOME || homedir(),
-				PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
-			},
-		});
-
-		const appendOutput = (chunk: Buffer | string) => {
-			output += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-			if (output.length > 12000) output = output.slice(-12000);
-		};
-
-		child.stdout.on("data", appendOutput);
-		child.stderr.on("data", appendOutput);
-
-		const timer = setTimeout(() => {
-			timedOut = true;
-			child.kill("SIGKILL");
-		}, REQUEST_TIMEOUT_DEFAULT_MS);
-
-		const onAbort = () => {
-			aborted = true;
-			child.kill("SIGTERM");
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-
-		const finish = (callback: () => void) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", onAbort);
-			callback();
-		};
-
-		child.on("error", (error) => {
-			finish(() => reject(error));
-		});
-
-		child.on("close", (exitCode, closeSignal) => {
-			finish(() => resolvePromise({
-				exitCode,
-				signal: closeSignal,
-				output,
-				timedOut,
-				aborted,
-			}));
-		});
-	});
-}
-
-async function compileLatexFile(latexFilePath: string, compiler?: LatexCompiler, signal?: AbortSignal, clean = false): Promise<{ pdfPath: string; cleanedArtifacts: string[] }> {
-	assertReadableLatexFile(latexFilePath);
-
-	const cleanedArtifacts = clean ? cleanLatexFileArtifacts(latexFilePath) : [];
-	const outputPdfPath = latexOutputPdfPath(latexFilePath);
-	const spec = latexCommandForFile(latexFilePath, compiler);
-
-	debugLog(`compile file start compiler=${spec.displayName} cwd=${dirname(latexFilePath)} file=${basename(latexFilePath)} clean=${clean} cleaned=${cleanedArtifacts.length}`);
-	let result: LatexCommandResult;
-	try {
-		result = await runLatexCommand(spec, dirname(latexFilePath), signal);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw latexCompileFailure(latexFilePath, spec, `failed to start compiler: ${message}`, "");
-	}
-
-	if (result.aborted) {
-		throw latexCompileFailure(latexFilePath, spec, "compilation aborted", result.output);
-	}
-	if (result.timedOut) {
-		throw latexCompileFailure(latexFilePath, spec, `compiler timed out after ${REQUEST_TIMEOUT_DEFAULT_MS / 1000}s`, result.output);
-	}
-	if (result.exitCode !== 0) {
-		throw latexCompileFailure(latexFilePath, spec, `compiler exited nonzero: ${result.exitCode ?? result.signal ?? "unknown"}`, result.output);
-	}
-
-	let outputPdfStatus;
-	try {
-		outputPdfStatus = statSync(outputPdfPath);
-	} catch {
-		throw latexCompileFailure(latexFilePath, spec, `PDF was not created at ${outputPdfPath}`, result.output);
-	}
-	if (!outputPdfStatus.isFile()) {
-		throw latexCompileFailure(latexFilePath, spec, `PDF path is not a regular file: ${outputPdfPath}`, result.output);
-	}
-
-	debugLog(`compile file ok; wrote ${outputPdfPath}`);
-	return { pdfPath: outputPdfPath, cleanedArtifacts };
-}
-
 function resolveMcpScriptPath(): string {
 	const candidates: string[] = [];
 
@@ -1226,58 +974,13 @@ async function shutdownSynctexCallbacks(ctx?: ExtensionContext): Promise<void> {
 	await Promise.all(servers.map((server) => server.close()));
 }
 
-const LATEX_FILE_ARTIFACT_EXTENSIONS = [
-	".aux",
-	".bbl",
-	".bcf",
-	".blg",
-	".dvi",
-	".fdb_latexmk",
-	".fls",
-	".idx",
-	".ilg",
-	".ind",
-	".lof",
-	".log",
-	".lot",
-	".nav",
-	".out",
-	".pdf",
-	".ps",
-	".run.xml",
-	".snm",
-	".synctex",
-	".synctex.gz",
-	".toc",
-	".vrb",
-	".xdv",
-] as const;
-
-function latexFileArtifactPaths(latexFilePath: string): string[] {
-	const dir = dirname(latexFilePath);
-	const base = basename(latexFilePath, extname(latexFilePath));
-	return LATEX_FILE_ARTIFACT_EXTENSIONS.map((extension) => join(dir, `${base}${extension}`));
-}
-
-function cleanLatexFileArtifacts(latexFilePath: string): string[] {
-	const removed: string[] = [];
-	for (const artifactPath of latexFileArtifactPaths(latexFilePath)) {
-		if (!existsSync(artifactPath)) continue;
-		rmSync(artifactPath, { force: true });
-		removed.push(artifactPath);
-	}
-	return removed;
-}
-
-const LatexCompilerParam = Type.Optional(Type.Union([
-	Type.Literal("lualatex"),
-	Type.Literal("pdflatex"),
-	Type.Literal("xelatex"),
-	Type.Literal("latexmk"),
-], {
-	description: `Optional LaTeX compiler. Defaults to ${DEFAULT_LATEX_COMPILER}.`,
-	default: DEFAULT_LATEX_COMPILER,
-}));
+const LatexCompilerParam = Type.Optional(Type.Union(
+	LATEX_COMPILERS.map((compiler) => Type.Literal(compiler)),
+	{
+		description: `Optional LaTeX compiler. Defaults to ${DEFAULT_LATEX_COMPILER}.`,
+		default: DEFAULT_LATEX_COMPILER,
+	},
+));
 
 const ShowLatexParams = Type.Object(
 	{
@@ -1978,12 +1681,13 @@ export default function (pi: ExtensionAPI) {
 		"compile_latex_file": async (_toolCallId, params, signal, _onUpdate, ctx) => {
 			let requestedPath = "";
 			let latexFilePath = "";
-			let pdfPath = "";
+			let compileResult:
+				| { source: string; pdfPath: string; clean: boolean; cleanedArtifacts: string[] }
+				| undefined;
+			let synctexCommand = "";
 			let compiler: LatexCompiler | undefined;
 			let shouldOpenPdf = false;
 			let shouldClean = false;
-			let cleanedArtifacts: string[] = [];
-			let synctexCommand = "";
 			try {
 				requestedPath = String(params.latex_file_path ?? "");
 				if (!requestedPath.trim()) {
@@ -1994,13 +1698,23 @@ export default function (pi: ExtensionAPI) {
 				compiler = resolveLatexCompiler(params.compiler);
 				shouldOpenPdf = params.open_pdf === true;
 				shouldClean = params.clean === true;
-				const compileResult = await compileLatexFile(latexFilePath, compiler, signal, shouldClean);
-				pdfPath = compileResult.pdfPath;
-				cleanedArtifacts = compileResult.cleanedArtifacts;
+				compileResult = await latexFileCompileToolSupport.compileLatexFile({
+					requestedPath: latexFilePath,
+					compiler: params.compiler,
+					clean: shouldClean,
+					signal,
+				});
+				const toolResult = latexFileCompileToolSupport.buildToolResult(compileResult);
+				const resolvedSource = toolResult.source;
 				if (!shouldOpenPdf) {
 					return {
-						content: [{ type: "text", text: `ok: ${pdfPath}` }],
-						details: { source: latexFilePath, pdf: pdfPath, clean: shouldClean, cleaned_artifacts: cleanedArtifacts },
+						content: [{ type: "text", text: `ok: ${toolResult.pdf}` }],
+						details: {
+							source: toolResult.source,
+							pdf: toolResult.pdf,
+							clean: toolResult.clean,
+							cleaned_artifacts: toolResult.cleaned_artifacts,
+						},
 					};
 				}
 
@@ -2023,11 +1737,11 @@ export default function (pi: ExtensionAPI) {
 						};
 					};
 					const trackedPdf = await openAndTrackPdf(
-						pdfPath,
+						compileResult.pdfPath,
 						pdfTracker,
 						signal,
 						serviceOpener,
-						latexFilePath,
+						resolvedSource,
 						synctexCommand,
 					);
 					const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
@@ -2037,7 +1751,7 @@ export default function (pi: ExtensionAPI) {
 					return {
 						content: [{ type: "text", text }],
 						details: {
-							source: latexFilePath,
+							source: resolvedSource,
 							pdf: trackedPdf.path,
 							pdf_id: trackedPdf.id,
 							pid: trackedPdf.pid,
@@ -2045,36 +1759,39 @@ export default function (pi: ExtensionAPI) {
 							viewer_backend: trackedPdf.viewerBackend,
 							viewer_owned: trackedPdf.viewerOwned,
 							viewer_capabilities: trackedPdf.viewerCapabilities,
-							clean: shouldClean,
-							cleaned_artifacts: cleanedArtifacts,
+							clean: compileResult.clean,
+							cleaned_artifacts: compileResult.cleanedArtifacts,
 							synctex_callback_command: synctexCommand,
 						},
 					};
 				} catch (error) {
 					throw latexToolFailure("compile-latex-file", "LaTeX compile succeeded but opening failed", {
 						requested_path: requestedPath,
-						source: latexFilePath,
+						source: compileResult?.source ?? latexFilePath,
 						compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
-						clean: shouldClean,
-						cleaned_artifacts: cleanedArtifacts,
-						pdf: pdfPath,
+						clean: compileResult?.clean ?? shouldClean,
+						cleaned_artifacts: compileResult?.cleanedArtifacts ?? [],
+						pdf: compileResult?.pdfPath ?? "",
 						synctex_callback_command: synctexCommand,
 						open_error: error instanceof Error ? error.message : String(error),
 						open_error_code: extractViewerServiceErrorCode(error),
 					}, error);
 				}
 			} catch (error) {
+				const resultPdfPath = compileResult?.pdfPath ?? "";
+				const cleanArtifacts = compileResult?.cleanedArtifacts ?? [];
+				const cleanSetting = compileResult?.clean ?? shouldClean;
 				throw latexToolFailure("compile-latex-file", "LaTeX compile failed", {
 					requested_path: requestedPath,
-					source: latexFilePath,
+					source: compileResult?.source ?? latexFilePath,
 					compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
 					open_pdf: shouldOpenPdf,
-					clean: shouldClean,
-					cleaned_artifacts: cleanedArtifacts,
-					pdf: pdfPath,
+					clean: cleanSetting,
+					cleaned_artifacts: cleanArtifacts,
+					pdf: resultPdfPath,
 					synctex_callback_command: synctexCommand,
 				}, error);
-			}
+				}
 		},
 	});
 

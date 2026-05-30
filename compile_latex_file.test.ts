@@ -442,7 +442,26 @@ async function captureCompileTool(): Promise<CompileTool> {
 	return capturedTool;
 }
 
-function writeFakeCompiler(binDir: string): string {
+type FakeCompilerOptions = {
+	exitCode?: number;
+	logContents?: string;
+	stdoutContents?: string;
+	stderrContents?: string;
+};
+
+function writeFakeCompiler(binDir: string, options: FakeCompilerOptions = {}): string {
+	const {
+		exitCode = 0,
+		logContents,
+		stdoutContents,
+		stderrContents,
+	} = options;
+	const writeLogLine = logContents === undefined
+		? ""
+		: `\n\tconst sourceBase = path.basename(source, ".tex");\n\tfs.writeFileSync(path.resolve(process.cwd(), sourceBase + ".log"), ${JSON.stringify(logContents)});`;
+	const writeStdout = stdoutContents === undefined ? "" : `\n\tprocess.stdout.write(${JSON.stringify(stdoutContents)});`;
+	const writeStderr = stderrContents === undefined ? "" : `\n\tprocess.stderr.write(${JSON.stringify(stderrContents)});`;
+
 	const compilerPath = resolve(binDir, "lualatex");
 	writeFileSync(
 		compilerPath,
@@ -452,7 +471,13 @@ function writeFakeCompiler(binDir: string): string {
 	const source = process.argv[process.argv.length - 1];
 	if (!source) process.exit(1);
 	const pdf = path.resolve(process.cwd(), source.replace(/\\.tex$/, ".pdf"));
-	fs.writeFileSync(pdf, "%PDF-1.7\\n");
+	if (${exitCode} === 0) {
+		fs.writeFileSync(pdf, "%PDF-1.7\\n");
+	}
+	${writeLogLine}
+	${writeStdout}
+	${writeStderr}
+	process.exit(${exitCode});
 `,
 		{ mode: 0o700 },
 	);
@@ -527,6 +552,20 @@ async function withFakeViewerService(failOpen: boolean, fn: () => Promise<void>)
 		fakeViewerServiceProcess = undefined;
 		rmSync(serviceDir, { recursive: true, force: true });
 	}
+}
+
+function extractCompileFailureLogPath(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	const match = message.match(/Log:\s*(\S+)/);
+	if (!match) {
+		throw new Error(`expected failure to include log path; message was: ${message}`);
+	}
+	return match[1];
+}
+
+function readCompileFailureLog(error: unknown): string {
+	const logPath = extractCompileFailureLogPath(error);
+	return readFileSync(logPath, "utf8");
 }
 
 test("compile_latex_file compiles without opening by default", async () => {
@@ -696,6 +735,159 @@ test("compile_latex_file distinguishes open failures from compile failures", asy
 		});
 	} finally {
 		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+
+test("compile_latex_file precompile failures include resolved source in logged context", async () => {
+	const { root } = withTemporaryProject();
+	const missingSource = resolve(root, "missing.tex");
+	const tool = await captureCompileTool();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	process.env.PATH = `${binDir}:${originalPath}`;
+
+	try {
+		try {
+			await tool.execute("compile-latex-file-missing", { latex_file_path: missingSource }, undefined, undefined, createSessionContext(root));
+			assert.fail("expected compile_latex_file missing source failure");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			assert.equal(/LaTeX compile failed/.test(message), true);
+			const logText = readCompileFailureLog(error);
+			assert.equal(logText.includes(`requested_path: ${missingSource}`), true);
+			assert.equal(logText.includes(`source: ${missingSource}`), true);
+			assert.equal(logText.includes("Cannot stat LaTeX file"), true);
+		}
+	} finally {
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+
+test("compile_latex_file preserves source context for invalid compiler and preserves compiler value", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompiler(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+
+	try {
+		try {
+			await tool.execute("compile-latex-file-invalid-compiler", { latex_file_path: sourcePath, compiler: "bogus" }, undefined, undefined, undefined);
+			assert.fail("expected compile_latex_file invalid compiler failure");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			assert.equal(/LaTeX compile failed/.test(message), true);
+			const logText = readCompileFailureLog(error);
+			assert.equal(logText.includes(`requested_path: ${sourcePath}`), true);
+			assert.equal(logText.includes(`source: ${sourcePath}`), true);
+			assert.equal(logText.includes("compiler: bogus"), true);
+		}
+	} finally {
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+
+test("compile_latex_file clean=true removes same-basename artifacts before compile", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const sourceBase = resolve(root, "paper");
+	const artifacts = [
+		`${sourceBase}.aux`,
+		`${sourceBase}.log`,
+		`${sourceBase}.out`,
+		`${sourceBase}.pdf`,
+		`${sourceBase}.synctex`,
+		`${sourceBase}.synctex.gz`,
+	];
+	for (const artifact of artifacts) {
+		writeFileSync(artifact, "old artifact");
+	}
+	const tool = await captureCompileTool();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompiler(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+
+	try {
+		const result = await tool.execute("compile-latex-file-clean-artifacts", { latex_file_path: sourcePath, clean: true }, undefined, undefined, undefined);
+		const details = result.details as { cleaned_artifacts: string[] };
+		for (const artifact of artifacts) {
+			assert.equal(details.cleaned_artifacts.includes(artifact), true, `cleaned list should include ${artifact}`);
+		}
+		const pdfPath = resolve(root, "paper.pdf");
+		const pdfContents = readFileSync(pdfPath, "utf8");
+		assert.equal(pdfContents, "%PDF-1.7\n");
+	} finally {
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+
+test("compile_latex_file includes compiler-output tail in failure log on compile failure", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompiler(binDir, {
+		exitCode: 7,
+		logContents: "project-log-entry\nsecond-log-entry\n",
+		stderrContents: "compiler-stderr-line\n",
+	});
+	process.env.PATH = `${binDir}:${originalPath}`;
+
+	try {
+		try {
+			await tool.execute("compile-latex-file-failing", { latex_file_path: sourcePath }, undefined, undefined, undefined);
+			assert.fail("expected compile_latex_file nonzero compiler failure");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			assert.equal(/LaTeX compile failed/.test(message), true);
+			const logText = readCompileFailureLog(error);
+			assert.equal(logText.includes("LaTeX file compilation failed"), true);
+			assert.equal(logText.includes("compiler exited nonzero: 7"), true);
+			assert.equal(logText.includes("project-log-entry"), true);
+			assert.equal(logText.includes("compiler output tail"), true);
+		}
+	} finally {
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+
+test("compile_latex_file keeps legacy regular-file validation message", async () => {
+	const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-compile-test-"));
+	const directoryPath = resolve(root, "a-directory");
+	mkdirSync(directoryPath, { recursive: true });
+	const tool = await captureCompileTool();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompiler(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+
+	try {
+		try {
+			await tool.execute("compile-latex-file-directory", { latex_file_path: directoryPath }, undefined, undefined, undefined);
+			assert.fail("expected compile_latex_file directory source failure");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			assert.equal(/LaTeX compile failed/.test(message), true);
+			assert.equal(readCompileFailureLog(error).includes(`latex_file_path must point to a regular file: ${directoryPath}`), true);
+		}
+	} finally {
 		process.env.PATH = originalPath;
 		rmSync(root, { recursive: true, force: true });
 	}
