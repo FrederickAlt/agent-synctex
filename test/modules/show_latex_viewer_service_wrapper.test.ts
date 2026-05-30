@@ -98,6 +98,32 @@ while true; do
 	chmodSync(path, 0o700);
 }
 
+function writeFakeZathuraViewerBinaryWithForwardSearch(path: string, options: { logPath?: string; forwardExitCode?: number } = {}): void {
+	const logPath = options.logPath ?? "";
+	const forwardExitCode = options.forwardExitCode ?? 0;
+	const script = `#!/usr/bin/env bash
+set -eu
+if [ "$1" = "--synctex-forward" ]; then
+	if [ -n "${logPath}" ]; then
+		echo "$0" >> "${logPath}"
+		for arg in "$@"; do
+			echo "$arg" >> "${logPath}"
+			done
+	fi
+	exit ${forwardExitCode}
+fi
+trap 'exit 0' INT TERM
+while true; do
+	if [ "$PPID" -eq 1 ]; then
+		exit 0
+	fi
+	sleep 0.05
+	done
+`;
+	writeFileSync(path, script, { encoding: "utf8", mode: 0o700 });
+	chmodSync(path, 0o700);
+}
+
 async function waitForServiceDirs(baseDir: string): Promise<void> {
 	await waitForPath(join(baseDir, "viewer-requests"), 1500);
 	await waitForPath(join(baseDir, "viewer-results"), 1500);
@@ -216,6 +242,26 @@ test("show_latex_viewer fake backend can report unsupported capabilities", async
 });
 
 
+test("show_latex_viewer fake backend routes forward_search through adapter", async () => {
+	await withViewerService({}, async (baseDir) => {
+		const sourceFile = join(baseDir, "source.tex");
+		writeFileSync(sourceFile, "\\begin{document}\n", { mode: 0o600 });
+
+		writeResultRequest(baseDir, "forward-unsupported", "forward_search", {
+			handle: "does-not-exist",
+			backend: "fake-viewer",
+			source_file: sourceFile,
+			line: 1,
+		});
+		const result = await waitForViewerResult(baseDir, "forward-unsupported");
+		assert.equal(result.status, "error");
+		assert.equal(result.status_details.error_code, "unsupported_operation");
+		assert.equal(result.status_details.backend, "fake-viewer");
+		assert.equal(result.error.includes("does not support forward_search"), true);
+	});
+});
+
+
 test("show_latex_viewer zathura backend reuses persistent open sessions", async () => {
 	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-open-"));
 	const fakeViewer = join(serviceBaseDir, "zathura");
@@ -277,6 +323,113 @@ test("show_latex_viewer zathura backend reuses persistent open sessions", async 
 			assert.equal(third.status_details.backend, "zathura");
 			assert.equal(third.status_details.reused, false);
 			assert.notEqual(third.status_details.handle, first.status_details.handle);
+		},
+		serviceBaseDir,
+	);
+});
+
+
+test("show_latex_viewer zathura backend executes forward_search with synctex command args", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-forward-args-"));
+	const fakeViewer = join(serviceBaseDir, "zathura");
+	const commandLog = join(serviceBaseDir, "forward-search-args.log");
+	writeFakeZathuraViewerBinaryWithForwardSearch(fakeViewer, { logPath: commandLog });
+	const pdfPath = join(serviceBaseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n", { mode: 0o600 });
+	const sourcePath = join(serviceBaseDir, "source.tex");
+	writeFileSync(sourcePath, "\\section{X}\n", { mode: 0o600 });
+
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/show-latex-zathura-forward-callback.sock",
+		token: "zathura-token",
+	};
+	const openDetails = {
+		callback,
+		pdf_path: pdfPath,
+	};
+
+	await withViewerService(
+		{
+			VIEWER_SERVICE_BACKEND: "zathura",
+			ZATHURA_VIEWER_PATH: fakeViewer,
+		},
+		async (baseDir) => {
+			writeResultRequest(baseDir, "zathura-forward-open", "open", openDetails);
+			const open = await waitForViewerResult(baseDir, "zathura-forward-open");
+			assert.equal(open.status, "ok");
+
+			writeResultRequest(baseDir, "zathura-forward-search", "forward_search", {
+				handle: open.status_details.handle,
+				backend: "zathura",
+				source_file: sourcePath,
+				line: 9,
+				synctex_pid: open.status_details.pid,
+			});
+			const forwardResult = await waitForViewerResult(baseDir, "zathura-forward-search");
+			assert.equal(forwardResult.status, "ok");
+			assert.equal(forwardResult.status_details.handled, true);
+			assert.equal(forwardResult.status_details.backend_identity_ok, true);
+			assert.equal(forwardResult.status_details.handle, open.status_details.handle);
+
+			const commandArgs = readFileSync(commandLog, "utf8").trim().split(/\n/);
+			const forwardIndex = commandArgs.indexOf("--synctex-forward");
+			assert.equal(forwardIndex >= 0, true);
+			assert.equal(commandArgs[0], fakeViewer);
+			assert.equal(commandArgs[forwardIndex + 1], `9:1:${sourcePath}`);
+			assert.equal(commandArgs[forwardIndex + 2], `--synctex-pid=${open.status_details.pid}`);
+			assert.equal(commandArgs[forwardIndex + 3], pdfPath);
+		},
+		serviceBaseDir,
+	);
+});
+
+
+test("show_latex_viewer zathura backend returns forward_search failure diagnostics", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-forward-fail-"));
+	const fakeViewer = join(serviceBaseDir, "zathura");
+	writeFakeZathuraViewerBinaryWithForwardSearch(fakeViewer, { forwardExitCode: 17 });
+	const pdfPath = join(serviceBaseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n", { mode: 0o600 });
+	const sourcePath = join(serviceBaseDir, "source.tex");
+	writeFileSync(sourcePath, "\\section{X}\n", { mode: 0o600 });
+
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/show-latex-zathura-forward-fail-callback.sock",
+		token: "zathura-token",
+	};
+	const openDetails = {
+		callback,
+		pdf_path: pdfPath,
+	};
+
+	await withViewerService(
+		{
+			VIEWER_SERVICE_BACKEND: "zathura",
+			ZATHURA_VIEWER_PATH: fakeViewer,
+		},
+		async (baseDir) => {
+			writeResultRequest(baseDir, "zathura-forward-open", "open", openDetails);
+			const open = await waitForViewerResult(baseDir, "zathura-forward-open");
+			assert.equal(open.status, "ok");
+
+			writeResultRequest(baseDir, "zathura-forward-search", "forward_search", {
+				handle: open.status_details.handle,
+				backend: "zathura",
+				source_file: sourcePath,
+				line: 1,
+			});
+			const forwardResult = await waitForViewerResult(baseDir, "zathura-forward-search");
+			assert.equal(forwardResult.status, "error");
+			assert.equal(forwardResult.status_details.error_code, "backend_unavailable");
+			assert.equal(forwardResult.status_details.handled, false);
+			assert.equal(forwardResult.status_details.diagnostics.length, 1);
+			assert.equal(forwardResult.status_details.diagnostics[0].label, "tracked");
+			assert.equal(forwardResult.status_details.diagnostics[0].returncode, 17);
+			assert.equal(forwardResult.error.includes("returncode=17"), true);
 		},
 		serviceBaseDir,
 	);

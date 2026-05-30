@@ -510,6 +510,23 @@ class ViewerBackendAdapter:
 			),
 		}
 
+	def forward_search(self, request_id: str, details: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+		status_details = build_forward_search_result_details(
+			request_id,
+			False,
+			None,
+			None,
+			self.name,
+			False,
+			"unsupported_operation",
+		)
+		status_details["supported"] = False
+		return {
+			"status": "error",
+			"error": f"backend {self.name} does not support forward_search",
+			"status_details": status_details,
+		}
+
 
 class ZathuraViewerBackend(ViewerBackendAdapter):
 	def __init__(self, executable_path: Optional[str] = None) -> None:
@@ -623,6 +640,48 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 			else:
 				owned = True
 		return owned, owned_pid, owned_process, pid_diagnostic
+
+	def _build_synctex_editor_command(self, callback: Dict[str, Any]) -> str:
+		return build_synctex_callback_command(callback)
+
+	def _find_session_pid_with_identity(
+		self,
+		viewer_path: str,
+		pdf_path: str,
+		session: Dict[str, Any],
+		exclude_pid: Optional[int] = None,
+	) -> Optional[int]:
+		return _find_viewer_pid_for_pdf_with_session_identity(
+			viewer_path,
+			pdf_path,
+			session,
+			exclude_pid=exclude_pid,
+		)
+
+	def _run_forward_search_command(
+		self,
+		viewer_path: str,
+		line: int,
+		normalized_source_file: str,
+		matched_path: str,
+		synctex_pid: Optional[int],
+		timeout_seconds: float,
+	) -> tuple[Optional[subprocess.CompletedProcess], Optional[str], list[str]]:
+		args = [viewer_path, "--synctex-forward", f"{line}:1:{normalized_source_file}"]
+		if isinstance(synctex_pid, int):
+			args.append(f"--synctex-pid={synctex_pid}")
+		args.append(matched_path)
+
+		try:
+			completed = subprocess.run(args, capture_output=True, text=True, check=False, timeout=timeout_seconds)
+		except FileNotFoundError:
+			return None, "viewer backend is unavailable", args
+		except subprocess.TimeoutExpired as exc:
+			return None, f"viewer command timed out: {exc}", args
+		except Exception as exc:
+			return None, f"failed to invoke viewer command: {exc}", args
+
+		return completed, None, args
 
 	def _build_session_state(self, handle: str, owned_pid: int, viewer_path: str, callback: Dict[str, Any], process: Optional[subprocess.Popen]) -> Dict[str, Any]:
 		session = {
@@ -742,7 +801,7 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 			}
 
 		handle = f"{self.name}:{request_id}:{int(time.time_ns())}"
-		callback_command = build_synctex_callback_command(callback)
+		callback_command = self._build_synctex_editor_command(callback)
 		# Launch Zathura with the canonical PDF path rather than /proc/self/fd/<fd>.
 		# Zathura records the opened filename in its D-Bus state and uses that filename
 		# to locate SyncTeX data during forward search. When launched through a procfd,
@@ -1148,6 +1207,211 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 				handle,
 				backend,
 				True,
+			),
+		}
+
+	def forward_search(self, request_id: str, details: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+		if not self.supports("forward_search"):
+			return {
+				"status": "error",
+				"error": f"backend {self.name} does not support forward_search",
+				"status_details": build_forward_search_result_details(
+					request_id,
+					False,
+					None,
+					None,
+					self.name,
+					False,
+					"unsupported_operation",
+				),
+			}
+
+		error = validate_forward_search_request_details(details)
+		if error:
+			return {
+				"status": "error",
+				"error": error,
+				"status_details": build_forward_search_result_details(
+					request_id,
+					False,
+					error,
+					None,
+					self.name,
+					False,
+					"invalid_request",
+				),
+			}
+
+		handle = details["handle"]
+		backend = details["backend"]
+		source_file_value = details["source_file"]
+		line = details["line"]
+		synctex_pid = details.get("synctex_pid")
+
+		matched_session: Optional[Dict[str, Any]] = None
+		matched_path = None
+		for pdf_path, session in list(OPEN_SESSIONS.items()):
+			if session.get("handle") == handle:
+				matched_session = session
+				matched_path = pdf_path
+				break
+		if matched_session is None or matched_path is None:
+			return {
+				"status": "error",
+				"error": "viewer handle not recognized",
+				"status_details": build_forward_search_result_details(
+					request_id,
+					False,
+					"handle_not_found",
+					handle,
+					backend,
+					False,
+					"handle_not_found",
+				),
+			}
+
+		session_backend = matched_session.get("backend")
+		if session_backend != backend:
+			return {
+				"status": "error",
+				"error": "backend identity mismatch for viewer handle",
+				"status_details": build_forward_search_result_details(
+					request_id,
+					False,
+					"backend_mismatch",
+					handle,
+					backend,
+					False,
+					"backend_mismatch",
+				),
+			}
+
+		source_file_error, normalized_source_file, source_fd = source_file_and_validate(Path(source_file_value))
+		if source_file_error:
+			return {
+				"status": "error",
+				"error": source_file_error,
+				"status_details": build_forward_search_result_details(
+					request_id,
+					False,
+					source_file_error,
+					handle,
+					backend,
+					False,
+					"invalid_source_file",
+				),
+			}
+		if source_fd is not None:
+			try:
+				os.close(source_fd)
+			except Exception:
+				pass
+
+		viewer_path = matched_session.get("backend_path") or self.resolve_path()
+		forward_diagnostics: list[Dict[str, Any]] = []
+
+		def attempt_forward_search(current_pid: Optional[int], attempt_label: str, timeout_seconds: float = 10.0) -> Optional[subprocess.CompletedProcess]:
+			completed, command_error, command = self._run_forward_search_command(
+				viewer_path,
+				line,
+				normalized_source_file,
+				matched_path,
+				current_pid,
+				timeout_seconds,
+			)
+			if command_error is not None:
+				forward_diagnostics.append(_build_forward_search_diagnostic(attempt_label, command, current_pid, error=command_error))
+				return None
+			forward_diagnostics.append(_build_forward_search_diagnostic(attempt_label, command, current_pid, completed=completed))
+			return completed
+
+		requested_pid = synctex_pid if isinstance(synctex_pid, int) else None
+		completed = attempt_forward_search(requested_pid, "tracked")
+		if completed is not None and completed.returncode == 0:
+			return {
+				"status": "ok",
+				"status_details": build_forward_search_result_details(
+					request_id,
+					True,
+					None,
+					handle,
+					backend,
+					True,
+				),
+			}
+
+		if completed is None:
+			error_detail = forward_diagnostics[-1].get("error", "viewer forward_search failed")
+			log(f"forward_search failed for handle={handle} pid={requested_pid}: {error_detail}")
+			return {
+				"status": "error",
+				"error": error_detail,
+				"status_details": build_forward_search_result_details(
+					request_id,
+					False,
+					error_detail,
+					handle,
+					backend,
+					False,
+					"backend_unavailable",
+					diagnostics=forward_diagnostics,
+				),
+			}
+
+		rediscovered_pid = None
+		next_attempt = None
+		if requested_pid is not None:
+			matched_candidate = self._find_session_pid_with_identity(
+				viewer_path,
+				matched_path,
+				matched_session,
+				exclude_pid=requested_pid,
+			)
+			if matched_candidate is not None and matched_candidate != requested_pid:
+				rediscovered_pid = matched_candidate
+				log(f"forward_search retrying with rediscovered pid={rediscovered_pid} for handle={handle}")
+				next_attempt = attempt_forward_search(rediscovered_pid, "rediscovered")
+
+		if next_attempt is not None and next_attempt.returncode == 0:
+			matched_session["pid"] = rediscovered_pid
+			matched_session["process_identity"] = self._snapshot_process_identity(rediscovered_pid) if isinstance(rediscovered_pid, int) else None
+			return {
+				"status": "ok",
+				"status_details": build_forward_search_result_details(
+					request_id,
+					True,
+					None,
+					handle,
+					backend,
+					True,
+				),
+			}
+
+		if rediscovered_pid is None and requested_pid is not None:
+			log(f"forward_search did not find rediscoverable pid for handle={handle} current pid={requested_pid}")
+
+		final_attempt = forward_diagnostics[-1]
+		final_return_code = final_attempt.get("returncode")
+		final_error = final_attempt.get("error")
+		reason = "viewer forward_search failed"
+		if isinstance(final_return_code, int):
+			reason = f"viewer forward_search failed (returncode={final_return_code})"
+		elif final_error:
+			reason = f"viewer forward_search failed ({final_error})"
+
+		log(f"forward_search failed for handle={handle}: {reason}; diagnostics={json.dumps(forward_diagnostics, separators=(",", ":"))}")
+		return {
+			"status": "error",
+			"error": reason if isinstance(reason, str) else "viewer forward_search failed",
+			"status_details": build_forward_search_result_details(
+				request_id,
+				False,
+				reason,
+				handle,
+				backend,
+				False,
+				"backend_unavailable",
+				diagnostics=forward_diagnostics,
 			),
 		}
 
@@ -1631,31 +1895,6 @@ def _build_forward_search_diagnostic(
 	return diagnostic
 
 
-def _run_forward_search_command(
-	viewer_path: str,
-	line: int,
-	normalized_source_file: str,
-	matched_path: str,
-	synctex_pid: Optional[int],
-	timeout_seconds: float,
-) -> tuple[Optional[subprocess.CompletedProcess], Optional[str], list[str]]:
-	args = [viewer_path, "--synctex-forward", f"{line}:1:{normalized_source_file}"]
-	if isinstance(synctex_pid, int):
-		args.append(f"--synctex-pid={synctex_pid}")
-	args.append(matched_path)
-
-	try:
-		completed = subprocess.run(args, capture_output=True, text=True, check=False, timeout=timeout_seconds)
-	except FileNotFoundError:
-		return None, "viewer backend is unavailable", args
-	except subprocess.TimeoutExpired as exc:
-		return None, f"viewer command timed out: {exc}", args
-	except Exception as exc:
-		return None, f"failed to invoke viewer command: {exc}", args
-
-	return completed, None, args
-
-
 def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], state: Dict[str, Any], backend: Optional[ViewerBackendAdapter] = None) -> Dict[str, Any]:
 	if backend is None:
 		backend = viewer_backend()
@@ -1681,7 +1920,6 @@ def close_pdf_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[s
 	return viewer_backend().close(request_id, details, _state)
 
 
-
 def forward_search_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any]) -> Dict[str, Any]:
 	error = validate_forward_search_request_details(details)
 	if error:
@@ -1699,176 +1937,9 @@ def forward_search_in_viewer(request_id: str, details: Dict[str, Any], _state: D
 			),
 		}
 
-	handle = details["handle"]
-	backend = details["backend"]
-	source_file_value = details["source_file"]
-	line = details["line"]
-	synctex_pid = details.get("synctex_pid")
+	return viewer_backend().forward_search(request_id, details, _state)
 
-	matched_session: Optional[Dict[str, Any]] = None
-	matched_path = None
-	for pdf_path, session in list(OPEN_SESSIONS.items()):
-		if session.get("handle") == handle:
-			matched_session = session
-			matched_path = pdf_path
-			break
-	if matched_session is None or matched_path is None:
-		return {
-			"status": "error",
-			"error": "viewer handle not recognized",
-			"status_details": build_forward_search_result_details(
-				request_id,
-				False,
-				"handle_not_found",
-				handle,
-				backend,
-				False,
-				"handle_not_found",
-			),
-		}
 
-	session_backend = matched_session.get("backend")
-	if session_backend != backend:
-		return {
-			"status": "error",
-			"error": "backend identity mismatch for viewer handle",
-			"status_details": build_forward_search_result_details(
-				request_id,
-				False,
-				"backend_mismatch",
-				handle,
-				backend,
-				False,
-				"backend_mismatch",
-			),
-		}
-
-	source_file_error, normalized_source_file, source_fd = source_file_and_validate(Path(source_file_value))
-	if source_file_error:
-		return {
-			"status": "error",
-			"error": source_file_error,
-			"status_details": build_forward_search_result_details(
-				request_id,
-				False,
-				source_file_error,
-				handle,
-				backend,
-				False,
-				"invalid_source_file",
-			),
-		}
-	if source_fd is not None:
-		try:
-			os.close(source_fd)
-		except Exception:
-			pass
-
-	viewer_path = matched_session.get("backend_path") or find_viewer()
-	forward_diagnostics: list[Dict[str, Any]] = []
-
-	def attempt_forward_search(current_pid: Optional[int], attempt_label: str, timeout_seconds: float = 10.0) -> Optional[subprocess.CompletedProcess]:
-		completed, command_error, command = _run_forward_search_command(
-			viewer_path,
-			line,
-			normalized_source_file,
-			matched_path,
-			current_pid,
-			timeout_seconds,
-		)
-		if command_error is not None:
-			forward_diagnostics.append(_build_forward_search_diagnostic(attempt_label, command, current_pid, error=command_error))
-			return None
-		forward_diagnostics.append(_build_forward_search_diagnostic(attempt_label, command, current_pid, completed=completed))
-		return completed
-
-	requested_pid = synctex_pid if isinstance(synctex_pid, int) else None
-	completed = attempt_forward_search(requested_pid, "tracked")
-	if completed is not None and completed.returncode == 0:
-		return {
-			"status": "ok",
-			"status_details": build_forward_search_result_details(
-				request_id,
-				True,
-				handle=handle,
-				backend=backend,
-				backend_identity_ok=True,
-			),
-		}
-
-	if completed is None:
-		error_detail = forward_diagnostics[-1].get("error", "viewer forward_search failed")
-		log(f"forward_search failed for handle={handle} pid={requested_pid}: {error_detail}")
-		return {
-			"status": "error",
-			"error": error_detail,
-			"status_details": build_forward_search_result_details(
-				request_id,
-				False,
-				error_detail,
-				handle,
-				backend,
-				False,
-				"backend_unavailable",
-				diagnostics=forward_diagnostics,
-			),
-		}
-
-	rediscovered_pid = None
-	next_attempt = None
-	if requested_pid is not None:
-		matched_candidate = _find_viewer_pid_for_pdf_with_session_identity(
-			viewer_path,
-			matched_path,
-			matched_session,
-			exclude_pid=requested_pid,
-		)
-		if matched_candidate is not None and matched_candidate != requested_pid:
-			rediscovered_pid = matched_candidate
-			log(f"forward_search retrying with rediscovered pid={rediscovered_pid} for handle={handle}")
-			next_attempt = attempt_forward_search(rediscovered_pid, "rediscovered")
-
-	if next_attempt is not None and next_attempt.returncode == 0:
-		matched_session["pid"] = rediscovered_pid
-		matched_session["process_identity"] = _snapshot_process_identity(rediscovered_pid) if isinstance(rediscovered_pid, int) else None
-		return {
-			"status": "ok",
-			"status_details": build_forward_search_result_details(
-				request_id,
-				True,
-				handle=handle,
-				backend=backend,
-				backend_identity_ok=True,
-			),
-		}
-
-	if rediscovered_pid is None and requested_pid is not None:
-		log(f"forward_search did not find rediscoverable pid for handle={handle} current pid={requested_pid}")
-
-	final_attempt = forward_diagnostics[-1]
-	final_return_code = final_attempt.get("returncode")
-	final_error = final_attempt.get("error")
-	reason = "viewer forward_search failed"
-	if isinstance(final_return_code, int):
-		reason = f"viewer forward_search failed (returncode={final_return_code})"
-	elif final_error:
-		reason = f"viewer forward_search failed ({final_error})"
-
-	log(f"forward_search failed for handle={handle}: {reason}; diagnostics={json.dumps(forward_diagnostics, separators=(',', ':'))}")
-	return {
-		"status": "error",
-		"error": reason if isinstance(reason, str) else "viewer forward_search failed",
-		"status_details": build_forward_search_result_details(
-			request_id,
-			False,
-			reason,
-			handle,
-			backend,
-			False,
-			"backend_unavailable",
-			diagnostics=forward_diagnostics,
-		),
-	}
 def protocol_directories() -> Dict[str, str]:
 	return {
 		"base": str(tmpdir()),
