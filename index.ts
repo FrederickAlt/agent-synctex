@@ -20,8 +20,13 @@ import {
 	type InlinePreviewRenderState,
 } from "./src/modules/preview/inline_preview_metadata.ts";
 import { createTerminalRefreshPolicy } from "./src/modules/preview/terminal_refresh_policy.ts";
-import { applyLatexPreamble } from "./src/modules/latex/latex_preamble.ts";
 import { createInlinePreviewRenderer } from "./src/modules/preview/inline_preview_renderer.ts";
+import {
+	createShowLatexPreviewPipeline,
+	type ShowLatexCallOptions,
+	type ShowLatexCompiledPreview,
+	type ShowLatexPreviewResult,
+} from "./src/modules/preview/show_latex_pipeline.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./src/modules/preview/kitty_placeholder_image.ts";
 import { describePdfJumpFailureContext, jumpToTrackedPdf } from "./src/modules/pdf_tracking/pdf_tracking.ts";
 import {
@@ -74,18 +79,6 @@ interface PipelineArtifactStatus {
 interface PipelineStatusSnapshot {
 	pdf: PipelineArtifactStatus;
 	ready: PipelineArtifactStatus;
-}
-
-interface ShowLatexPreviewResult {
-	text: string;
-	pdfPath: string;
-}
-
-interface ShowLatexCallOptions {
-	writeReady?: boolean;
-	writeFixed?: boolean;
-	cropToContent?: boolean;
-	suppressPageNumbers?: boolean;
 }
 
 const MCP_TMPDIR = process.env.MCP_TMPDIR ?? "/tmp/codex-show-latex";
@@ -1045,114 +1038,29 @@ const SetLatexPreambleParams = Type.Object(
 
 const SynctexCallbackCommandParams = Type.Object({}, { additionalProperties: false });
 
-interface ParsedShowLatexInput {
-	latexSource: string;
-	compiler?: LatexCompiler;
-	inline?: boolean;
-}
-
-function unquoteFrontMatterScalar(value: string): string {
-	const trimmed = value.trim();
-	if (trimmed.length >= 2) {
-		const first = trimmed[0];
-		const last = trimmed[trimmed.length - 1];
-		if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-			return trimmed.slice(1, -1);
+const showLatexPreviewPipeline = createShowLatexPreviewPipeline({
+	resolveLatexCompiler,
+	callShowLatex: (latexSource, compiler, synctexEditorCommand, signal, options) => {
+		if (!existsSync(MCP_SCRIPT_PATH)) {
+			throw new Error(`MCP script not found at ${MCP_SCRIPT_PATH}`);
 		}
-	}
-	return trimmed;
-}
-
-function parseFrontMatterBoolean(key: string, value: string): boolean {
-	const normalized = unquoteFrontMatterScalar(value).toLowerCase();
-	if (["true", "yes", "on", "1"].includes(normalized)) return true;
-	if (["false", "no", "off", "0"].includes(normalized)) return false;
-	throw new Error(`Invalid show_latex front matter value for ${key}: expected true or false`);
-}
-
-function parseShowLatexInput(rawInput: string): ParsedShowLatexInput {
-	const input = rawInput.replace(/^\uFEFF/, "");
-	const frontMatter = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(input);
-	if (!frontMatter) {
-		return { latexSource: input };
-	}
-
-	const parsed: ParsedShowLatexInput = {
-		latexSource: input.slice(frontMatter[0].length),
-	};
-
-	for (const rawLine of frontMatter[1].split(/\r?\n/)) {
-		const line = rawLine.trim();
-		if (!line || line.startsWith("#")) continue;
-		const separator = line.indexOf(":");
-		if (separator < 0) {
-			throw new Error(`Invalid show_latex front matter line: ${rawLine}`);
-		}
-
-		const key = line.slice(0, separator).trim();
-		const value = line.slice(separator + 1).trim();
-		switch (key) {
-			case "compiler":
-				parsed.compiler = resolveLatexCompiler(unquoteFrontMatterScalar(value));
-				break;
-			case "inline":
-				parsed.inline = parseFrontMatterBoolean(key, value);
-				break;
-			default:
-				throw new Error(`Unsupported show_latex front matter key: ${key}`);
-		}
-	}
-
-	return parsed;
-}
-
-function compactShowLatexArguments(parsed: ParsedShowLatexInput): Record<string, unknown> {
-	const result: Record<string, unknown> = { source: parsed.latexSource };
-	if (parsed.compiler !== undefined) result.compiler = parsed.compiler;
-	if (parsed.inline !== undefined) result.inline = parsed.inline;
-	return result;
-}
+		return mcpClient.callShowLatex(
+			latexSource,
+			compiler,
+			synctexEditorCommand,
+			signal,
+			options,
+		);
+	},
+	readLatexPreamble: () => readLatexPreambleFromTmpdir(),
+	rememberInlinePreviewRenderState,
+	rasterizePdfPages,
+	mergeInlinePreviewArtifacts,
+	buildInlinePreviewToolPayload,
+});
 
 function prepareShowLatexArguments(args: unknown): Record<string, unknown> {
-	if (typeof args === "string") {
-		return compactShowLatexArguments(parseShowLatexInput(args));
-	}
-
-	if (args && typeof args === "object" && !Array.isArray(args)) {
-		const record = args as Record<string, unknown>;
-		const source = record.source ?? record.latex_source ?? record.latex ?? record.body ?? record.content ?? record.text ?? record.input;
-		const result: Record<string, unknown> = {};
-		if (source !== undefined) result.source = source;
-		if (record.compiler !== undefined) result.compiler = record.compiler;
-		if (record.inline !== undefined) result.inline = record.inline;
-		return Object.keys(result).length ? result : record;
-	}
-
-	return args as Record<string, unknown>;
-}
-
-async function compileAndPreviewLatex(
-	latexSource: string,
-	compiler?: LatexCompiler,
-	synctexEditorCommand?: string,
-	signal?: AbortSignal,
-	options: ShowLatexCallOptions = {},
-): Promise<ShowLatexPreviewResult> {
-	if (!latexSource.trim()) {
-		throw new Error("latex_source must be a non-empty string");
-	}
-
-	if (!existsSync(MCP_SCRIPT_PATH)) {
-		throw new Error(`MCP script not found at ${MCP_SCRIPT_PATH}`);
-	}
-
-	return mcpClient.callShowLatex(
-		applyLatexPreamble(latexSource, readLatexPreambleFromTmpdir(), { cropToContent: options.cropToContent, suppressPageNumbers: options.suppressPageNumbers }),
-		compiler,
-		synctexEditorCommand,
-		signal,
-		options,
-	);
+	return showLatexPreviewPipeline.prepareShowLatexArguments(args);
 }
 
 async function executeShowLatexPreviewTool(
@@ -1167,7 +1075,7 @@ async function executeShowLatexPreviewTool(
 	let compiler: LatexCompiler | undefined;
 	let synctexCommand = "";
 	let previewPdfPath = "";
-	let preview: ShowLatexPreviewResult;
+	let preview: ShowLatexCompiledPreview;
 	let inline = true;
 
 	try {
@@ -1182,14 +1090,14 @@ async function executeShowLatexPreviewTool(
 			synctexCommand = server.command;
 		}
 
-		preview = await compileAndPreviewLatex(
+		preview = await showLatexPreviewPipeline.compileAndPreviewLatex({
 			latexSource,
 			compiler,
-			inline ? undefined : synctexCommand,
+			inline,
 			signal,
-			{ writeReady: false, writeFixed: !inline, cropToContent: false, suppressPageNumbers: inline },
-		);
-		previewPdfPath = preview.pdfPath;
+			synctexEditorCommand: inline ? undefined : synctexCommand,
+		});
+		previewPdfPath = preview.previewPdfPath;
 	} catch (error) {
 		throw latexToolFailure(toolName, "LaTeX preview compilation failed", {
 			compiler: compiler ?? compilerParam ?? DEFAULT_LATEX_COMPILER,
@@ -1202,11 +1110,9 @@ async function executeShowLatexPreviewTool(
 		}, error);
 	}
 
-	if (inline) {
-		const pageArtifacts = await rasterizePdfPages(preview.pdfPath, { dpi: 150, signal });
-		const artifacts = await mergeInlinePreviewArtifacts(pageArtifacts, { signal });
-		const previewId = rememberInlinePreviewRenderState({ pdf: preview.pdfPath, previews: artifacts });
-		return buildInlinePreviewToolPayload(preview.pdfPath, previewId, artifacts);
+	if (preview.inline) {
+		const inlineResult = await showLatexPreviewPipeline.buildInlinePreviewResult(preview, signal);
+		return inlineResult.payload;
 	}
 
 	try {
@@ -1224,7 +1130,7 @@ async function executeShowLatexPreviewTool(
 			details: {
 				pdf: trackedPdf.path,
 				pdf_id: trackedPdf.id,
-				operation_pdf: preview.pdfPath,
+				operation_pdf: previewPdfPath,
 				inline: false,
 				synctex_callback_command: synctexCommand,
 			},
@@ -1395,7 +1301,7 @@ export default function (pi: ExtensionAPI) {
 		prepareArguments: prepareShowLatexArguments,
 		renderResult: renderShowLatexResult,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const parsed = parseShowLatexInput(String(params.source ?? ""));
+			const parsed = showLatexPreviewPipeline.parseShowLatexInput(String(params.source ?? ""));
 			return executeShowLatexPreviewTool("show-latex", parsed.latexSource, params.compiler ?? parsed.compiler, params.inline ?? parsed.inline, signal, ctx);
 		},
 	});
