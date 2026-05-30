@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyLatexPreamble } from "../../src/modules/latex_preamble.ts";
+import { applyLatexPreamble } from "../../../src/modules/latex/latex_preamble.ts";
 
 const SIMPLE_PREAMBLE = String.raw`\documentclass{article}`;
 

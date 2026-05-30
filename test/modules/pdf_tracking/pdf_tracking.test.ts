@@ -13,7 +13,7 @@ import {
 	normalizePdfFilePath,
 	openAndTrackPdf,
 	PdfTracker,
-} from "./pdf_tracking.ts";
+} from "../../../src/modules/pdf_tracking/pdf_tracking.ts";
 
 function tempDir(): string {
 	return mkdtempSync(join(tmpdir(), "pdf-tracking-test-"));

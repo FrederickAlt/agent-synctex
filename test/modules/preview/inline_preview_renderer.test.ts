@@ -3,18 +3,18 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildKittyPlaceholderImageRender } from "./kitty_placeholder_image.ts";
-import { KittyPlaceholderOracle } from "./kitty_placeholder_oracle.ts";
-import { INLINE_PREVIEW_DIR } from "./inline_preview.ts";
-import { inlinePreviewRenderStateFromDetails, type InlinePreviewRenderState } from "./inline_preview_metadata.ts";
+import { buildKittyPlaceholderImageRender } from "../../../src/modules/preview/kitty_placeholder_image.ts";
+import { KittyPlaceholderOracle } from "../../../src/modules/preview/kitty_placeholder_oracle.ts";
+import { INLINE_PREVIEW_DIR } from "../../../src/modules/preview/inline_preview.ts";
+import { inlinePreviewRenderStateFromDetails, type InlinePreviewRenderState } from "../../../src/modules/preview/inline_preview_metadata.ts";
 import {
 	createInlinePreviewRenderer,
 	type InlinePreviewRenderCacheEvent,
 	type InlinePreviewRenderContainer,
 	type InlinePreviewRenderComponent,
 	type InlinePreviewRenderEnvironment,
-} from "./inline_preview_renderer.ts";
-import { TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY } from "./terminal_refresh_policy.ts";
+} from "../../../src/modules/preview/inline_preview_renderer.ts";
+import { TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY } from "../../../src/modules/preview/terminal_refresh_policy.ts";
 
 function makeFakeContainer(): InlinePreviewRenderContainer & { children: InlinePreviewRenderComponent[] } {
 	const children: InlinePreviewRenderComponent[] = [];

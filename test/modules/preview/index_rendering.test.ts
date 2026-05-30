@@ -14,17 +14,17 @@ import {
 	TERMINAL_FOCUS_REFRESH_EPOCH_STATE_KEY,
 	type TerminalRefreshInvalidationOptions,
 	type TerminalRefreshInvalidationRegistry,
-} from "./terminal_refresh_policy.ts";
+} from "../../../src/modules/preview/terminal_refresh_policy.ts";
 import {
 	createInlinePreviewRenderer,
 	type InlinePreviewRenderCacheEvent,
 	type InlinePreviewRenderComponent,
 	type InlinePreviewRenderContainer,
-} from "./inline_preview_renderer.ts";
-import { KittyPlaceholderOracle } from "./kitty_placeholder_oracle.ts";
-import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
-import { inlinePreviewRenderStateFromDetails } from "./inline_preview_metadata.ts";
-import { INLINE_PREVIEW_DIR } from "./inline_preview.ts";
+} from "../../../src/modules/preview/inline_preview_renderer.ts";
+import { KittyPlaceholderOracle } from "../../../src/modules/preview/kitty_placeholder_oracle.ts";
+import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "../../../src/modules/preview/kitty_placeholder_image.ts";
+import { inlinePreviewRenderStateFromDetails } from "../../../src/modules/preview/inline_preview_metadata.ts";
+import { INLINE_PREVIEW_DIR } from "../../../src/modules/preview/inline_preview.ts";
 
 const FOCUS_IN_SEQUENCE = "\x1b[I";
 const FOCUS_OUT_SEQUENCE = "\x1b[O";

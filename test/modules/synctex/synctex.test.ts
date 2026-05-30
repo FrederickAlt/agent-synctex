@@ -10,7 +10,7 @@ import {
 	createSynctexCallbackCommand,
 	formatSynctexPasteBlock,
 	SynctexCallbackServer,
-} from "./synctex.ts";
+} from "../../../src/modules/synctex/synctex.ts";
 
 function tempDir(): string {
 	return mkdtempSync(join(tmpdir(), "synctex-test-"));
