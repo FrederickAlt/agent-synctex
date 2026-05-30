@@ -38,6 +38,7 @@ RESULTS_NAME = "viewer-results"
 STATE_NAME = "viewer-state.json"
 LOG_NAME = "viewer.log"
 BACKEND_NAME = "zathura"
+VIEWER_BACKEND_ENV = "VIEWER_SERVICE_BACKEND"
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 32 * 1024
@@ -451,6 +452,208 @@ def find_viewer() -> str:
 	return BACKEND_NAME
 
 
+def _read_bool_env(name: str, default: bool = True) -> bool:
+	value = os.environ.get(name)
+	if value is None:
+		return default
+	return value.strip().lower() not in {"", "0", "false", "f", "no", "off", "n"}
+
+
+class ViewerBackendAdapter:
+	def __init__(self, name: str, capabilities: Dict[str, bool]):
+		self.name = name
+		self.capabilities = capabilities
+
+	def supports(self, operation: str) -> bool:
+		return bool(self.capabilities.get(operation, False))
+
+	def resolve_path(self) -> str:
+		return self.name
+
+	def is_available(self) -> bool:
+		path = self.resolve_path()
+		return Path(path).exists() and os.access(path, os.X_OK)
+
+	def status(self, request_id: str, operation: str) -> Dict[str, Any]:
+		return build_status_details(request_id, operation, backend=self)
+
+	def open(self, request_id: str, details: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+		return {
+			"status": "error",
+			"error": f"backend {self.name} does not support open",
+			"status_details": build_open_result_details(
+				request_id,
+				None,
+				False,
+				False,
+				None,
+				None,
+				"unsupported_operation",
+				backend=self,
+				supported=False,
+			),
+		}
+
+
+class ZathuraViewerBackend(ViewerBackendAdapter):
+	def __init__(self) -> None:
+		super().__init__(BACKEND_NAME, VIEWER_OPEN_CAPABILITIES)
+
+	def resolve_path(self) -> str:
+		return find_viewer()
+
+	def open(self, request_id: str, details: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+		return open_pdf_with_viewer(request_id, details, state, self)
+
+
+class FakeViewerBackend(ViewerBackendAdapter):
+	def __init__(self) -> None:
+		super().__init__(
+			"fake-viewer",
+			{
+				"open": _read_bool_env("FAKE_VIEWER_OPEN", True),
+				"close": False,
+				"forward_search": False,
+				"inverse_search": False,
+				"reuse": _read_bool_env("FAKE_VIEWER_REUSE", True),
+			},
+		)
+		self._mode = os.environ.get("FAKE_VIEWER_BACKEND_MODE", "ok")
+		self._open_count = 0
+		self._open_sessions: Dict[str, str] = {}
+
+	def resolve_path(self) -> str:
+		return self.name
+
+	def is_available(self) -> bool:
+		return self._mode not in {"backend_unavailable", "service_unavailable"}
+
+	def status(self, request_id: str, operation: str) -> Dict[str, Any]:
+		return build_status_details(
+			request_id,
+			operation,
+			backend=self,
+			service_available=self._mode != "service_unavailable",
+		)
+
+	def open(self, request_id: str, details: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+		if not self.is_available():
+			return {
+				"status": "error",
+				"error": "viewer backend is unavailable",
+				"status_details": build_open_result_details(
+					request_id,
+					None,
+					False,
+					False,
+					None,
+					"backend unavailable",
+					"backend_unavailable",
+					backend=self,
+					supported=self.supports("open"),
+					service_available=False,
+				),
+			}
+		if not self.supports("open"):
+			return {
+				"status": "error",
+				"error": "open operation is disabled",
+				"status_details": build_open_result_details(
+					request_id,
+					None,
+					False,
+					False,
+					None,
+					None,
+					"unsupported_operation",
+					backend=self,
+					supported=False,
+				),
+			}
+
+		error = validate_open_request_details(details)
+		if error:
+			return {
+				"status": "error",
+				"error": error,
+				"status_details": build_open_result_details(
+					request_id,
+					None,
+					False,
+					False,
+					None,
+					None,
+					"callback_invalid" if "callback" in error else "invalid_request",
+					backend=self,
+					service_available=True,
+				),
+			}
+
+		reuse_existing = details.get("reuse_existing", True)
+		if not isinstance(reuse_existing, bool):
+			reuse_existing = True
+		pdf_path = details["pdf_path"]
+		if not isinstance(pdf_path, str):
+			return {
+				"status": "error",
+				"error": "pdf_path must be a string",
+				"status_details": build_open_result_details(
+					request_id,
+					None,
+					False,
+					False,
+					None,
+					None,
+					"invalid_request",
+					backend=self,
+					service_available=True,
+				),
+			}
+
+		handle = None
+		reused = False
+		if reuse_existing:
+			handle = self._open_sessions.get(pdf_path)
+			if handle is not None:
+				reused = True
+		if handle is None:
+			self._open_count += 1
+			handle = f"{self.name}:fake:{self._open_count}"
+			self._open_sessions[pdf_path] = handle
+
+		return {
+			"status": "ok",
+			"status_details": build_open_result_details(
+				request_id,
+				handle,
+				True,
+				reused,
+				123456,
+				None,
+				backend=self,
+			),
+		}
+
+
+_VIEWER_BACKEND: Optional[ViewerBackendAdapter] = None
+
+
+def select_viewer_backend() -> ViewerBackendAdapter:
+	backend_name = os.environ.get(VIEWER_BACKEND_ENV, BACKEND_NAME)
+	if backend_name in {"fake", "fake-viewer"}:
+		return FakeViewerBackend()
+	if backend_name in {"zathura", BACKEND_NAME}:
+		return ZathuraViewerBackend()
+	return ZathuraViewerBackend()
+
+
+def viewer_backend() -> ViewerBackendAdapter:
+	global _VIEWER_BACKEND
+	if _VIEWER_BACKEND is None:
+		_VIEWER_BACKEND = select_viewer_backend()
+	return _VIEWER_BACKEND
+
+
 def _pid_alive(pid: int) -> bool:
 	if pid <= 0:
 		return False
@@ -650,13 +853,17 @@ def build_open_result_details(
 	pid: Optional[int],
 	pid_diagnostic: Optional[str],
 	error_code: Optional[str] = None,
+	*,
+	backend: Optional["ViewerBackendAdapter"] = None,
+	supported: bool = True,
+	service_available: bool = True,
 ) -> Dict[str, Any]:
 	details = {
 		"protocol_version": PROTOCOL_VERSION,
-		"supported": True,
-		"service_available": True,
-		"backend": BACKEND_NAME,
-		"capabilities": VIEWER_OPEN_CAPABILITIES,
+		"supported": bool(supported),
+		"service_available": bool(service_available),
+		"backend": backend.name if backend else BACKEND_NAME,
+		"capabilities": backend.capabilities if backend else VIEWER_OPEN_CAPABILITIES,
 		"owned": bool(owned),
 		"reused": bool(reused),
 		"protocol_directories": protocol_directories(),
@@ -800,7 +1007,26 @@ def _run_forward_search_command(
 	return completed, None, args
 
 
-def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any]) -> Dict[str, Any]:
+def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[str, Any], backend: Optional[ViewerBackendAdapter] = None) -> Dict[str, Any]:
+	if backend is None:
+		backend = viewer_backend()
+	if not backend.supports("open"):
+		return {
+			"status": "error",
+			"error": f"backend {backend.name} does not support open",
+			"status_details": build_open_result_details(
+				request_id,
+				None,
+				False,
+				False,
+				None,
+				None,
+				"unsupported_operation",
+				backend=backend,
+				supported=False,
+			),
+		}
+
 	error = validate_open_request_details(details)
 	if error:
 		return {
@@ -814,6 +1040,7 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 				None,
 				None,
 				"callback_invalid" if "callback" in error else "invalid_request",
+				backend=backend,
 			),
 		}
 
@@ -831,6 +1058,7 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 				None,
 				None,
 				"invalid_pdf",
+				backend=backend,
 			),
 		}
 
@@ -842,14 +1070,23 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 	if not isinstance(require_persistent_viewer, bool):
 		require_persistent_viewer = False
 
-	viewer_path = find_viewer()
+	viewer_path = backend.resolve_path()
 	backend_available = Path(viewer_path).exists() and os.access(viewer_path, os.X_OK)
 	if not backend_available:
 		os.close(pdf_fd)
 		return {
 			"status": "error",
 			"error": "viewer backend is unavailable",
-			"status_details": build_open_result_details(request_id, None, False, False, None, "backend unavailable", "backend_unavailable"),
+			"status_details": build_open_result_details(
+				request_id,
+				None,
+				False,
+				False,
+				None,
+				"backend unavailable",
+				"backend_unavailable",
+				backend=backend,
+			),
 		}
 
 	reused = False
@@ -896,10 +1133,11 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 				reused,
 				session.get("pid"),
 				None,
+				backend=backend,
 			),
 		}
 
-	handle = f"{BACKEND_NAME}:{request_id}:{int(time.time_ns())}"
+	handle = f"{backend.name}:{request_id}:{int(time.time_ns())}"
 	callback_command = build_synctex_callback_command(callback)
 	# Launch Zathura with the canonical PDF path rather than /proc/self/fd/<fd>.
 	# Zathura records the opened filename in its D-Bus state and uses that filename
@@ -915,7 +1153,16 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 		return {
 			"status": "error",
 			"error": f"failed to launch viewer: {exc}",
-			"status_details": build_open_result_details(request_id, handle, False, False, None, str(exc), "launch_failed"),
+			"status_details": build_open_result_details(
+				request_id,
+				handle,
+				False,
+				False,
+				None,
+				str(exc),
+				"launch_failed",
+				backend=backend,
+			),
 		}
 	os.close(pdf_fd)
 
@@ -937,7 +1184,7 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 		OPEN_SESSIONS[normalized_pdf_path] = {
 			"handle": handle,
 			"pid": owned_pid,
-			"backend": BACKEND_NAME,
+			"backend": backend.name,
 			"backend_path": backend_path,
 			"callback": dict(callback),
 			"owned": True,
@@ -958,6 +1205,7 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 				owned_pid,
 				pid_diagnostic,
 				"launch_failed",
+				backend=backend,
 			),
 		}
 
@@ -970,6 +1218,7 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 			reused,
 			owned_pid,
 			pid_diagnostic,
+			backend=backend,
 		),
 	}
 
@@ -1549,18 +1798,26 @@ def add_state_event(state: Dict[str, Any], message: str) -> None:
 	state["events"].append(message)
 
 
-def build_status_details(request_id: str, operation: str) -> Dict[str, Any]:
-	viewer = find_viewer()
+def build_status_details(
+	request_id: str,
+	operation: str,
+	*,
+	backend: Optional["ViewerBackendAdapter"] = None,
+	supported: bool = True,
+	service_available: bool = True,
+) -> Dict[str, Any]:
 	state = read_state()
-	backend_available = Path(viewer).exists() and os.access(viewer, os.X_OK)
+	backend_name = backend.name if backend else BACKEND_NAME
+	backend_path = backend.resolve_path() if backend else find_viewer()
+	backend_available = bool(backend.is_available()) if backend else (Path(backend_path).exists() and os.access(backend_path, os.X_OK))
 	return {
 		"protocol_version": PROTOCOL_VERSION,
-		"supported": True,
-		"service_available": True,
+		"supported": bool(supported),
+		"service_available": bool(service_available),
 		"backend": {
-			"name": BACKEND_NAME,
+			"name": backend_name,
 			"available": bool(backend_available),
-			"path": viewer,
+			"path": backend_path,
 		},
 		"protocol_directories": protocol_directories(),
 		"diagnostics": {
@@ -1614,14 +1871,15 @@ def scan_requests(now_ns: Optional[int] = None) -> int:
 		now_ns = time.time_ns()
 
 	processed = 0
+	backend = viewer_backend()
 	state = read_state()
 	state["protocol_version"] = PROTOCOL_VERSION
 	state["protocol_directories"] = protocol_directories()
 	state["last_scan_ns"] = now_ns
 	state["service_started_ns"] = SERVICE_STARTED_NS
 	state["service_available"] = True
-	state["backend_name"] = BACKEND_NAME
-	state["backend_path"] = find_viewer()
+	state["backend_name"] = backend.name
+	state["backend_path"] = backend.resolve_path()
 	for path in sorted(path_requests().iterdir(), key=lambda p: p.name):
 		request = parse_request(path, now_ns)
 		if request is None:
@@ -1632,15 +1890,15 @@ def scan_requests(now_ns: Optional[int] = None) -> int:
 		req_path = request_path(request_id)
 
 		if operation == OPEN_REQUEST_OPERATION:
-			open_result = open_pdf_with_viewer(request_id, request["details"], state)
+			open_result = backend.open(request_id, request["details"], state)
 			status = open_result.get("status", "error")
 			error = open_result.get("error")
 			status_details = open_result.get("status_details", {
 				"protocol_version": PROTOCOL_VERSION,
 				"supported": False,
 				"service_available": False,
-				"backend": BACKEND_NAME,
-				"capabilities": VIEWER_OPEN_CAPABILITIES,
+				"backend": backend.name,
+				"capabilities": backend.capabilities,
 				"owned": False,
 				"reused": False,
 				"handle": "",
@@ -1701,33 +1959,23 @@ def scan_requests(now_ns: Optional[int] = None) -> int:
 
 		if operation != "status":
 			error = f"unsupported operation: {operation}"
-			viewer_path = find_viewer()
 			write_status_result(
 				request_id,
 				operation,
 				"error",
-				{
-					"protocol_version": PROTOCOL_VERSION,
-					"supported": False,
-					"service_available": True,
-					"backend": {
-						"name": BACKEND_NAME,
-						"available": Path(viewer_path).exists() and os.access(viewer_path, os.X_OK),
-						"path": viewer_path,
-					},
-					"protocol_directories": protocol_directories(),
-					"diagnostics": {"log_tail": read_tail(path_log()), "recent_events": list(state.get("events", []))},
-					"service_instance_started_ns": SERVICE_STARTED_NS,
-					"request_id": request_id,
-					"operation": operation,
-				},
+				build_status_details(
+					request_id,
+					operation,
+					backend=backend,
+					supported=False,
+				),
 				error,
 			)
 			add_state_event(state, f"unsupported operation request_id={request_id} operation={operation}")
 			safe_unlink(req_path)
 			continue
 
-		details = build_status_details(request_id, operation)
+		details = backend.status(request_id, operation)
 		write_status_result(request_id, operation, "ok", details)
 		add_state_event(state, f"handled status request_id={request_id}")
 		safe_unlink(req_path)
@@ -1742,7 +1990,7 @@ def main() -> int:
 	if "--status" in sys.argv:
 		ensure_secure_tmpdir(create=True)
 		ensure_protocol_dirs()
-		status = build_status_details("cli", "status")
+		status = viewer_backend().status("cli", "status")
 		print(json.dumps({"protocol_version": PROTOCOL_VERSION, "status": status}, separators=(",", ":")))
 		return 0
 	if "--check" in sys.argv:
