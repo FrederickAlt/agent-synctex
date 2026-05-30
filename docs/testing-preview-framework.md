@@ -179,6 +179,24 @@ Real Zathura behavior still needs an opt-in smoke test because D-Bus and SyncTeX
 
 Do not treat direct `zathura ...` commands launched from an agent `bash` tool as equivalent to the real service path: those commands run in the agent sandbox, while the viewer service runs in the user's desktop session. Use `~/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py --status`, `viewer.log`, and the tool error logs under the preview temp directory for diagnostics.
 
+### Brokered real-service iteration
+
+When the project-local Firejail include is installed, agents in this repo may have access to a narrow host broker via
+`pdf-preview-servicectl` and `~/.cache/pdf-preview-servicectl/broker.sock`. Use it only for this viewer-service smoke
+loop:
+
+```bash
+pdf-preview-servicectl sync
+pdf-preview-servicectl restart
+pdf-preview-servicectl status
+pdf-preview-servicectl logs
+```
+
+This broker exists solely to sync/restart/status/log the PDF preview viewer service so real open/close/SyncTeX behavior
+can be tested outside the sandbox. It is not a general host-control channel. Do not use it for unrelated commands,
+unrelated services, or any purpose other than maintaining/testing the PDF viewer service used by `open_pdf`, `close_pdf`,
+`jump_pdf`, `show_latex(inline=false)`, and `compile_latex_file(open_pdf=true)`.
+
 ## Verification commands
 
 - Full: `npm run verify`

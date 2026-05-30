@@ -86,6 +86,26 @@ The service protocol uses `/tmp/codex-show-latex/viewer-requests`, `/tmp/codex-s
 and `/tmp/codex-show-latex/viewer-state.json` (all under the mode-0700 base directory). External open/close/jump requests
 require the viewer service and are handled only by the unsandboxed helper.
 
+### Project-local service broker
+
+For development in this repo, a narrow host-side broker may be available through the project Firejail include:
+
+```bash
+pdf-preview-servicectl sync
+pdf-preview-servicectl restart
+pdf-preview-servicectl status
+pdf-preview-servicectl logs
+```
+
+The broker socket is project-specific at `~/.cache/pdf-preview-servicectl/broker.sock`; it is intentionally not
+placed under the shared show-latex cache. Its purpose is only to let this project sync the known viewer helper
+files, restart/status the single `codex-show-latex-viewer.service`, and read its diagnostics without exposing the
+user session D-Bus to the agent sandbox.
+
+Do **not** broaden or repurpose this broker. It is a narrow privileged escape hatch for maintaining/testing the PDF
+preview viewer service only: opening PDFs, closing PDFs, and SyncTeX/forward-search behavior. It must not be used for
+unrelated host commands, unrelated services, or non-viewer automation.
+
 ### Viewer troubleshooting
 
 - **Timeout / service not processing requests**: if `open_pdf`, `close_pdf`, `jump_pdf`, `show_latex(inline=false)`, or `compile_latex_file(open_pdf=true)` fail with
