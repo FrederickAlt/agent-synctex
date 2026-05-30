@@ -8,8 +8,8 @@ import {
 	kittyTransmitVirtualPlacementCommand,
 	renderKittyPlaceholderImageLines,
 	wrapKittySequenceForTmux,
-} from "./kitty_placeholder_image.ts";
-import { KittyPlaceholderOracle } from "./kitty_placeholder_oracle.ts";
+} from "../../../src/modules/preview/kitty_placeholder_image.ts";
+import { KittyPlaceholderOracle } from "../../../src/modules/preview/kitty_placeholder_oracle.ts";
 
 const PNG_BASE64 = "iVBORw0KGgo=";
 

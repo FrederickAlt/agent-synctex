@@ -11,10 +11,10 @@ import {
 	INLINE_PREVIEW_MAX_IMAGE_SIZE_BYTES,
 	safeInlinePreviewPngPath,
 	type InlinePreviewRenderState,
-} from "./inline_preview_metadata.ts";
-import { buildInlinePreviewToolPayload } from "./inline_preview_payload.ts";
-import { INLINE_PREVIEW_DIR } from "./inline_preview.ts";
-import { type InlinePreviewArtifact } from "./inline_preview.ts";
+} from "../../../src/modules/preview/inline_preview_metadata.ts";
+import { buildInlinePreviewToolPayload } from "../../../src/modules/preview/inline_preview_payload.ts";
+import { INLINE_PREVIEW_DIR } from "../../../src/modules/preview/inline_preview.ts";
+import { type InlinePreviewArtifact } from "../../../src/modules/preview/inline_preview.ts";
 
 test("inline preview metadata validation filters safe paths and dimensions", () => {
 	mkdirSync(INLINE_PREVIEW_DIR, { recursive: true });

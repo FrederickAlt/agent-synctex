@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { calculateInlineDisplayColumns, mergeInlinePreviewArtifacts, rasterizePdfPage, rasterizePdfPages } from "./inline_preview.ts";
+import { calculateInlineDisplayColumns, mergeInlinePreviewArtifacts, rasterizePdfPage, rasterizePdfPages } from "../../../src/modules/preview/inline_preview.ts";
 
 function tempDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));

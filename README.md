@@ -45,8 +45,8 @@ resolve without using the backend service.
 ## Files
 
 - `index.ts` — Pi extension entry point.
-- `pdf_tracking.ts` — PDF validation, viewer-service-aware session tracking helpers.
-- `synctex.ts` and `scripts/pi_synctex_callback.mjs` — session-scoped inverse SyncTeX IPC and Zathura callback forwarding.
+- `src/modules/pdf_tracking/pdf_tracking.ts` — PDF validation, viewer-service-aware session tracking helpers.
+- `src/modules/synctex/synctex.ts` and `scripts/pi_synctex_callback.mjs` — session-scoped inverse SyncTeX IPC and Zathura callback forwarding.
 - `scripts/show_latex_mcp.py` — copied service bridge used by the extension.
 - `scripts/show_latex_viewer.py` and `systemd/codex-show-latex-viewer.service` — helper service files (viewer service + `pi_synctex_callback.mjs`).
 

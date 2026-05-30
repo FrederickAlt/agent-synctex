@@ -12,19 +12,19 @@ import {
 	calculateInlineDisplayColumns,
 	mergeInlinePreviewArtifacts,
 	rasterizePdfPages,
-} from "./inline_preview.ts";
-import { buildInlinePreviewToolPayload } from "./inline_preview_payload.ts";
+} from "./src/modules/preview/inline_preview.ts";
+import { buildInlinePreviewToolPayload } from "./src/modules/preview/inline_preview_payload.ts";
 import {
 	safeInlinePreviewPngPath,
 	inlinePreviewRenderStateFromDetails as lookupInlinePreviewRenderStateFromDetails,
 	type InlinePreviewRenderState,
-} from "./inline_preview_metadata.ts";
-import { createTerminalRefreshPolicy } from "./terminal_refresh_policy.ts";
-import { applyLatexPreamble } from "./src/modules/latex_preamble.ts";
-import { createInlinePreviewRenderer } from "./inline_preview_renderer.ts";
-import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./kitty_placeholder_image.ts";
-import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./pdf_tracking.ts";
-import { readSourceLine, SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./synctex.ts";
+} from "./src/modules/preview/inline_preview_metadata.ts";
+import { createTerminalRefreshPolicy } from "./src/modules/preview/terminal_refresh_policy.ts";
+import { applyLatexPreamble } from "./src/modules/latex/latex_preamble.ts";
+import { createInlinePreviewRenderer } from "./src/modules/preview/inline_preview_renderer.ts";
+import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./src/modules/preview/kitty_placeholder_image.ts";
+import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./src/modules/pdf_tracking/pdf_tracking.ts";
+import { readSourceLine, SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./src/modules/synctex/synctex.ts";
 import { ViewerServiceClient, type ViewerServiceOpenResult } from "./viewer_service.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";

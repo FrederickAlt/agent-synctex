@@ -204,10 +204,10 @@ unrelated services, or any purpose other than maintaining/testing the PDF viewer
   - `node --test preview_pipeline.test.ts`
   - `node --test viewer_service.test.ts`
   - `node --test show_latex.test.ts compile_latex_file.test.ts`
-  - `node --test inline_preview_renderer.test.ts`
-  - `node --test kitty_placeholder_image.test.ts`
-  - `node --test kitty_placeholder_oracle.test.ts`
-  - `node --test index_rendering.test.ts`
+  - `node --test test/modules/preview/inline_preview_renderer.test.ts`
+  - `node --test test/modules/preview/kitty_placeholder_image.test.ts`
+  - `node --test test/modules/preview/kitty_placeholder_oracle.test.ts`
+  - `node --test test/modules/preview/index_rendering.test.ts`
 
 ## Constraints and limitations
 
