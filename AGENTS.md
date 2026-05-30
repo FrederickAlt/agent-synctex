@@ -4,6 +4,11 @@ Before changing any preview rendering, refresh policy, or Kitty placeholder logi
 
 - docs/testing-preview-framework.md
 
+After the Pi adapter/module refactors (#25-36), keep index.ts as a composition root:
+- `src/modules/pi_adapter/pi_adapter.ts` should remain the thin Pi dispatch adapter.
+- viewer protocol logic belongs in `src/modules/viewer_service.ts` and service adapter behavior in `scripts/show_latex_viewer.py`.
+- avoid reintroducing direct viewer-command spawning in production TypeScript; use `viewer_guardrails.test.ts` as the regression check.
+
 Use this guide when touching:
 - `src/modules/preview/inline_preview_renderer.ts`
 - `src/modules/preview/kitty_placeholder_oracle.ts`

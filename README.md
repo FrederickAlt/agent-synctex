@@ -42,13 +42,35 @@ remain on disk.
 File compiles are spawned directly by the extension so normal LaTeX project-relative includes/assets
 resolve without using the backend service.
 
+## Module layout (post-refactor)
+
+- `index.ts` — Pi composition root and tool wiring.
+- `src/modules/pi_adapter/pi_adapter.ts` — **thin** Pi adapter facade (`createUniversalToolFacade`, `registerTracerTools`) used for universal tool dispatch.
+- `src/modules/latex/latex_file_compiler.ts` and `src/modules/latex/latex_preamble.ts` — universal LaTeX compiler + preamble application logic shared by preview+file compile flows.
+- `src/modules/preview/` — universal preview modules:
+  - `show_latex_pipeline.ts` parses front matter, executes MCP show-latex flow, and builds inline artifacts.
+  - `inline_preview*` modules rasterize PDFs, cache state, render preview output, and validate Kitty placeholder output.
+  - `terminal_refresh_policy.ts` manages terminal/kitty refresh invalidation behavior for inline previews.
+- `src/modules/synctex/synctex.ts` — session-scoped inverse SyncTeX callback server and click parsing helpers.
+- `src/modules/viewer_service.ts` — agent-agnostic viewer-service protocol client (`open`/`close`/`forward_search`) and result validation.
+- `src/modules/pdf_tracking/pdf_tracking.ts` + `src/modules/pdf_session/pdf_session.ts` — protocol-agnostic PDF open/jump/close session orchestration and per-Pi-context tracking metadata.
+- `scripts/show_latex_viewer.py` + `systemd/codex-show-latex-viewer.service` — service runtime with a backend adapter wrapper (default Zathura).
+- `scripts/pi_synctex_callback.mjs` and `scripts/show_latex_mcp.py` — callback bridge and legacy MCP helper used by the extension process.
+
 ## Files
 
-- `index.ts` — Pi extension entry point.
-- `src/modules/pdf_tracking/pdf_tracking.ts` — PDF validation, viewer-service-aware session tracking helpers.
-- `src/modules/synctex/synctex.ts` and `scripts/pi_synctex_callback.mjs` — session-scoped inverse SyncTeX IPC and Zathura callback forwarding.
-- `scripts/show_latex_mcp.py` — copied service bridge used by the extension.
-- `scripts/show_latex_viewer.py` and `systemd/codex-show-latex-viewer.service` — helper service files (viewer service + `pi_synctex_callback.mjs`).
+- `index.ts` — Pi extension entry point / composition root.
+- `src/modules/pi_adapter/pi_adapter.ts` — thin Pi tool facade and registration helper.
+- `src/modules/latex/latex_file_compiler.ts` — compile orchestration and validation for local `.tex` files.
+- `src/modules/latex/latex_preamble.ts` — preamble merge/normalization helpers.
+- `src/modules/preview/*` — preview pipeline, inline rendering, placeholder/image adapters, and terminal refresh handling.
+- `src/modules/synctex/synctex.ts` — session-scoped SyncTeX callback socket support.
+- `src/modules/pdf_tracking/pdf_tracking.ts` — shared PDF tracking, open/jump/close metadata state.
+- `src/modules/pdf_session/pdf_session.ts` — per-context wrapper around tracking with Pi-session callbacks.
+- `src/modules/viewer_service.ts` — protocol client for the unsandboxed viewer service.
+- `scripts/show_latex_viewer.py` — service runtime and viewer-backend wrapper.
+- `scripts/pi_synctex_callback.mjs` and `scripts/show_latex_mcp.py` — callback script bridge + compatibility MCP shim.
+- `systemd/codex-show-latex-viewer.service` — user unit for the unsandboxed service.
 
 ## Install in Pi
 
@@ -85,6 +107,11 @@ cat /tmp/codex-show-latex/viewer.log
 The service protocol uses `/tmp/codex-show-latex/viewer-requests`, `/tmp/codex-show-latex/viewer-results`,
 and `/tmp/codex-show-latex/viewer-state.json` (all under the mode-0700 base directory). External open/close/jump requests
 require the viewer service and are handled only by the unsandboxed helper.
+
+`show_latex_viewer.py` exposes a backend-wrapper layer via `ViewerBackendAdapter`. The default backend adapter is
+`ZathuraViewerBackend` (backend name `zathura`, executable lookup path `/usr/bin/zathura` then `PATH`). A test
+or local override backend can be selected with `VIEWER_SERVICE_BACKEND` (`fake` / `fake-viewer` for mocked adapter,
+`zathura` for default behavior).
 
 ### Project-local service broker
 
@@ -168,16 +195,20 @@ In headless/non-interactive sessions the callback never submits a message automa
 
 ## Development
 
-Install dev dependencies once with `npm install`, then run `npm run verify` to typecheck and execute the Node built-in test suite. Unit tests avoid real Zathura/LaTeX dependencies by using temp files and fake helper commands. They validate the extension protocol and a headless fake viewer service, but they do not prove real Zathura D-Bus/SyncTeX forward-search behavior.
+Install dev dependencies once with `npm install`, then run `npm run verify` to typecheck and execute the Node built-in test suite. Unit tests avoid real Zathura/LaTeX dependencies by using temp files and fake helper commands. They validate the extension protocol and a headless fake viewer service, but they do not prove real Zathura D-Bus/SyncTeX behavior.
 
-For service changes, also run a manual smoke test from Pi after installing/restarting the user service from the current checkout:
+For service and viewer behavior, also run a manual smoke test from Pi after installing/restarting the user service from the current checkout (this remains a human-only verification and is not covered by `npm run verify`):
 
-1. `show_latex` with `inline=false` opens a Zathura window through the service.
-2. `compile_latex_file(..., open_pdf=true)` on a repo-local `.tex` file returns a `pdf_id` and opens the compiled PDF.
-3. `jump_pdf(pdf_id, line)` forward-searches to a source line.
-4. `close_pdf(pdf_id)` closes the service-owned viewer.
+1. `show_latex` default inline flow shows an inline preview artifact in Pi UI.
+2. `show_latex` with `inline=false` opens a Zathura window through the service.
+3. `compile_latex_file(path/to/file.tex, {"open_pdf": true})` returns `pdf_id` and opens the compiled PDF through the service.
+4. `jump_pdf(pdf_id, line)` forwards to the service and jumps the viewer to the matching source location.
+5. Trigger a SyncTeX click in the viewer (e.g. click a body equation): the editor should receive a pasted block like `PDF click: path/to/file.tex:NN` with the source line.
+6. `close_pdf(pdf_id)` requests close; only service-owned handles should terminate the expected window while unowned/reused views remain untouched.
 
 When diagnosing that smoke test, prefer service logs/status over sandboxed shell invocations of `zathura`, because bare commands run from the agent sandbox do not exercise the same unsandboxed service environment. Inline previews require either `mutool` (from `mupdf-tools`) or `pdftoppm` (from `poppler-utils`) at runtime; optional whitespace trimming uses ImageMagick's `magick` when available. Actual terminal image display requires Pi/TUI image support in the current terminal (Kitty, Ghostty, WezTerm, or iTerm2; tmux/screen generally disable it).
+
+Also keep `viewer_guardrails.test.ts` in mind: it is the explicit regression guard that extension-side code never spawns or probes GUI viewers directly.
 
 ## Compiler selection
 

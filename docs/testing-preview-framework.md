@@ -170,14 +170,18 @@ The default test suite is intentionally headless. It uses fake viewer backends a
 - owned viewer PID tracking, stale/exited process handling, and close cleanup;
 - forward-search command construction and diagnostic propagation.
 
-Real Zathura behavior still needs an opt-in smoke test because D-Bus and SyncTeX behavior cannot be fully represented by fake processes. After installing the current checkout's service files and restarting `codex-show-latex-viewer.service`, run from Pi:
+Real Zathura behavior still needs an opt-in smoke test because D-Bus and SyncTeX behavior cannot be fully represented by fake processes. After installing the current checkout's service files and restarting `codex-show-latex-viewer.service`, run from Pi (remaining manual HITL check for human validation):
 
-1. `show_latex` with `inline=false` and confirm a viewer opens through the service.
-2. `compile_latex_file(..., open_pdf=true)` on a repo-local `.tex` file and record the returned `pdf_id`.
-3. `jump_pdf(pdf_id, line)` and confirm forward-search moves the viewer to the source line.
-4. `close_pdf(pdf_id)` and confirm the service-owned viewer closes.
+1. `show_latex` (default inline flow) and confirm an inline artifact is rendered in the Pi result.
+2. `show_latex` with `inline=false` and confirm a viewer opens through the service.
+3. `compile_latex_file(<repo-local.tex>, {"open_pdf": true})` and confirm a `pdf_id` is returned and opens in the service-controlled viewer.
+4. `jump_pdf(pdf_id, line)` and confirm forward-search moves the viewer to the source line.
+5. Click a clickable PDF region in the opened viewer and confirm the session receives a pasted block `PDF click: path/to/file.tex:LINE`.
+6. `close_pdf(pdf_id)` and confirm the service-owned viewer closes, with unowned/reused handles acknowledged as not closed.
 
 Do not treat direct `zathura ...` commands launched from an agent `bash` tool as equivalent to the real service path: those commands run in the agent sandbox, while the viewer service runs in the user's desktop session. Use `~/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py --status`, `viewer.log`, and the tool error logs under the preview temp directory for diagnostics.
+
+A dedicated runtime guardrail test (`viewer_guardrails.test.ts`) enforces that extension production code never directly controls GUI viewers (no direct `zathura`/`evince` spawns, no session discovery via `/proc`, no raw session-env probing). Keep it green whenever the viewer path changes.
 
 ### Brokered real-service iteration
 
@@ -208,6 +212,7 @@ unrelated services, or any purpose other than maintaining/testing the PDF viewer
   - `node --test test/modules/preview/kitty_placeholder_image.test.ts`
   - `node --test test/modules/preview/kitty_placeholder_oracle.test.ts`
   - `node --test test/modules/preview/index_rendering.test.ts`
+  - `node --test viewer_guardrails.test.ts`
 
 ## Constraints and limitations
 
