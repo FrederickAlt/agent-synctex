@@ -28,16 +28,16 @@ import {
 	type ShowLatexPreviewResult,
 } from "./src/modules/preview/show_latex_pipeline.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./src/modules/preview/kitty_placeholder_image.ts";
-import { describePdfJumpFailureContext, jumpToTrackedPdf } from "./src/modules/pdf_tracking/pdf_tracking.ts";
 import {
 	clearPdfTrackerForContext,
+	closeTrackedPdfForContext,
 	contextSessionKey,
-	getPdfTrackerForContext,
+	describePdfJumpFailureContextForContext,
+	jumpTrackedPdfForContext,
 	openTrackedPdfForContext,
 	openTrackedPdfForContextFromViewerService,
-	closeTrackedPdfForContext,
 } from "./src/modules/pdf_session/pdf_session.ts";
-import { readSourceLine, SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./src/modules/synctex/synctex.ts";
+import { SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./src/modules/synctex/synctex.ts";
 import { ViewerServiceClient, type ViewerServiceOpenResult } from "./src/modules/viewer_service.ts";
 import {
 	createUniversalToolFacade,
@@ -1444,31 +1444,33 @@ export default function (pi: ExtensionAPI) {
 				}
 				const server = await ensureSynctexCallbacks(ctx);
 				synctexCommand = server.command;
-				const pdfTracker = getPdfTrackerForContext(ctx);
-				const trackedPdf = pdfTracker.getById(pdfId);
-				const serviceOpener = trackedPdf?.viewerHandle !== undefined && trackedPdf.viewerBackend !== undefined
-					? async (path: string, openSignal: AbortSignal | undefined) => {
-						const callbackConfig = (await ensureSynctexCallbacks(ctx!)).callbackConfig;
-						const response = await openPdfThroughViewerService(path, callbackConfig, openSignal);
-						return {
-							pid: response.pid,
-							viewerHandle: response.handle,
-							viewerBackend: response.backend,
-							viewerOwned: response.owned,
-							viewerCapabilities: response.capabilities,
-						};
-					}
-					: undefined;
-
-				const result = await jumpToTrackedPdf(
+				const result = await jumpTrackedPdfForContext(
+					ctx,
 					pdfId,
 					line,
 					sourceFile,
-					pdfTracker,
 					signal,
 					{
 						synctexEditorCommand: synctexCommand || undefined,
-						requestForwardSearch: async (viewerHandle, viewerBackend, sourceFilePath, jumpLine, synctexPid, jumpSignal) => {
+						opener: async (path: string, openSignal: AbortSignal | undefined) => {
+							const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
+							const response = await openPdfThroughViewerService(path, callbackConfig, openSignal);
+							return {
+								pid: response.pid,
+								viewerHandle: response.handle,
+								viewerBackend: response.backend,
+								viewerOwned: response.owned,
+								viewerCapabilities: response.capabilities,
+							};
+						},
+						requestForwardSearch: async (
+							viewerHandle,
+							viewerBackend,
+							sourceFilePath,
+							jumpLine,
+							synctexPid,
+							jumpSignal,
+						) => {
 							const response = await viewerServiceClient.requestForwardSearch(
 								viewerHandle,
 								viewerBackend,
@@ -1479,13 +1481,12 @@ export default function (pi: ExtensionAPI) {
 							);
 							return { handled: response.handled, reason: response.reason };
 						},
-						opener: serviceOpener,
+						cwd: ctx.cwd,
 					},
 				);
-				const sourceLine = readSourceLine(result.sourceFile, result.line, process.cwd()) ?? "";
 				return {
-					content: [{ type: "text", text: `line ${result.line} contains:\n${sourceLine}` }],
-					details: { pdf_id: pdfId, line, source: result.sourceFile, pdf: result.pdf, reopened: result.reopened, source_line: sourceLine },
+					content: [{ type: "text", text: `line ${result.line} contains:\n${result.sourceLine}` }],
+					details: { pdf_id: pdfId, line, source: result.sourceFile, pdf: result.pdf, reopened: result.reopened, source_line: result.sourceLine },
 				};
 			} catch (error) {
 				const failureContext: Record<string, unknown> = {
@@ -1495,7 +1496,7 @@ export default function (pi: ExtensionAPI) {
 					synctex_callback_command: synctexCommand,
 				};
 				if (ctx && pdfId > 0) {
-					failureContext.jump_failure_context = describePdfJumpFailureContext(pdfId, getPdfTrackerForContext(ctx), synctexCommand || undefined);
+					failureContext.jump_failure_context = describePdfJumpFailureContextForContext(ctx, pdfId, synctexCommand || undefined);
 				}
 				throw latexToolFailure("jump-pdf", "PDF jump failed", failureContext, error);
 			}

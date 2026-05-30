@@ -1,7 +1,11 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { readSourceLine } from "../synctex/synctex.ts";
 import {
 	closeTrackedPdf,
+	describePdfJumpFailureContext,
+	jumpToTrackedPdf,
 	type PdfCloseResult,
+	type PdfJumpResult,
 	type PdfOpenResult,
 	PdfTracker,
 	type TrackedPdf,
@@ -157,6 +161,84 @@ export async function openTrackedPdfForContextFromViewerService(
 	return trackOpenResultFromViewerService(tracker, pdfPath, synctexEditorCommand, {
 		...normalizedOpenResult,
 	});
+}
+
+export interface PdfSessionForwardSearchResult {
+	handled: boolean;
+	reason?: string;
+}
+
+export type PdfSessionForwardSearch = (
+	viewerHandle: string,
+	viewerBackend: string,
+	sourceFile: string,
+	line: number,
+	synctexPid?: number,
+	signal?: AbortSignal,
+) => Promise<PdfSessionForwardSearchResult>;
+
+export type PdfSessionJumpSourceReader = (sourceFile: string, line: number, cwd: string) => string | undefined;
+
+export interface PdfSessionJumpOptions {
+	synctexEditorCommand?: string;
+	requestForwardSearch: PdfSessionForwardSearch;
+	opener?: PdfSessionOpen;
+	sourceLineReader?: PdfSessionJumpSourceReader;
+	cwd?: string;
+}
+
+export interface PdfSessionJumpResult extends PdfJumpResult {
+	sourceLine: string;
+}
+
+export async function jumpTrackedPdfForContext(
+	ctx: ExtensionContext | undefined,
+	pdfId: number,
+	line: number,
+	sourceFile: string | undefined,
+	signal: AbortSignal | undefined,
+	options: PdfSessionJumpOptions,
+): Promise<PdfSessionJumpResult> {
+	const tracker = getPdfTrackerForContext(ctx);
+	const result = await jumpToTrackedPdf(
+		pdfId,
+		line,
+		sourceFile,
+		tracker,
+		signal,
+		{
+			synctexEditorCommand: options.synctexEditorCommand,
+			opener: options.opener ? async (path: string, openSignal: AbortSignal | undefined) => {
+				const rawResult = await options.opener!(path, openSignal);
+				return toPdfOpenResult(rawResult);
+			} : undefined,
+			requestForwardSearch: async (viewerHandle, viewerBackend, sourceFilePath, jumpLine, synctexPid, jumpSignal) => {
+				const response = await options.requestForwardSearch(
+					viewerHandle,
+					viewerBackend,
+					sourceFilePath,
+					jumpLine,
+					synctexPid,
+					jumpSignal,
+				);
+				return { handled: response.handled, reason: response.reason };
+			},
+		},
+	);
+
+	const sourceLine = (options.sourceLineReader ?? readSourceLine)(result.sourceFile, result.line, options.cwd ?? process.cwd());
+	return {
+		...result,
+		sourceLine: sourceLine ?? "",
+	};
+}
+
+export function describePdfJumpFailureContextForContext(
+	ctx: ExtensionContext | undefined,
+	pdfId: number,
+	currentSynctexEditorCommand?: string,
+): string {
+	return describePdfJumpFailureContext(pdfId, getPdfTrackerForContext(ctx), currentSynctexEditorCommand);
 }
 
 export async function closeTrackedPdfForContext(
