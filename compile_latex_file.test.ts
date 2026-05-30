@@ -285,10 +285,9 @@ process.on("SIGTERM", () => {
 });
 `;
 
-const MCP_TMPDIR = process.env.MCP_TMPDIR ?? mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-service-"));
-if (!process.env.MCP_TMPDIR) {
-	process.env.MCP_TMPDIR = MCP_TMPDIR;
-}
+const ORIGINAL_MCP_TMPDIR = process.env.MCP_TMPDIR;
+const MCP_TMPDIR = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-service-"));
+process.env.MCP_TMPDIR = MCP_TMPDIR;
 const MCP_REQUESTS_DIR = join(MCP_TMPDIR, "viewer-requests");
 const MCP_RESULTS_DIR = join(MCP_TMPDIR, "viewer-results");
 const MCP_OPEN_REQUEST_LOG = join(MCP_TMPDIR, "open-request-summary.json");
@@ -361,6 +360,12 @@ function cleanupRuntimeStubs(): void {
 }
 
 after(() => {
+	if (typeof ORIGINAL_MCP_TMPDIR === "undefined") {
+		delete process.env.MCP_TMPDIR;
+	} else {
+		process.env.MCP_TMPDIR = ORIGINAL_MCP_TMPDIR;
+	}
+	rmSync(MCP_TMPDIR, { recursive: true, force: true });
 	cleanupRuntimeStubs();
 });
 
@@ -489,7 +494,7 @@ async function withFakeViewerService(failOpen: boolean, fn: () => Promise<void>)
 	mkdirSync(MCP_RESULTS_DIR, { recursive: true, mode: 0o700 });
 	writeFileSync(scriptPath, FAKE_VIEWER_SERVICE_SCRIPT, { mode: 0o700 });
 	fakeViewerServiceProcess = spawn(process.execPath, [scriptPath], {
-		env: { ...process.env, FAKE_VIEWER_OPEN_FAIL: failOpen ? "1" : "0" },
+		env: { ...process.env, MCP_TMPDIR, FAKE_VIEWER_OPEN_FAIL: failOpen ? "1" : "0" },
 		stdio: ["ignore", "ignore", "ignore"],
 	});
 

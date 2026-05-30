@@ -488,6 +488,20 @@ def _find_viewer_pid_for_pdf(viewer_path: str, pdf_paths: list[str]) -> Optional
 	return None
 
 
+def _read_process_stderr_if_finished(process: subprocess.Popen) -> Optional[str]:
+	if process.poll() is None or process.stderr is None:
+		return None
+	try:
+		_stdin, stderr = process.communicate(timeout=0)
+	except Exception:
+		return None
+	if isinstance(stderr, bytes):
+		return stderr.decode("utf-8", errors="replace").strip()
+	if isinstance(stderr, str):
+		return stderr.strip()
+	return None
+
+
 def _snapshot_process_identity(pid: int) -> Optional[Dict[str, Any]]:
 	if pid <= 0:
 		return None
@@ -694,13 +708,30 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 				handle = None
 			else:
 				current_pid = session.get("pid")
-				if current_pid and _pid_alive(current_pid) and _is_process_identity_match(current_pid, session):
+				session_process = session.get("process")
+				if not isinstance(current_pid, int):
+					OPEN_SESSIONS.pop(normalized_pdf_path, None)
+					handle = None
+				elif isinstance(session_process, subprocess.Popen):
+					if session_process.poll() is not None:
+						try:
+							session_process.wait(timeout=0)
+						except Exception:
+							pass
+						OPEN_SESSIONS.pop(normalized_pdf_path, None)
+						handle = None
+					elif _is_process_identity_match(current_pid, session):
+						reused = True
+					else:
+						OPEN_SESSIONS.pop(normalized_pdf_path, None)
+						handle = None
+				elif _pid_alive(current_pid) and _is_process_identity_match(current_pid, session):
 					reused = True
 				else:
 					OPEN_SESSIONS.pop(normalized_pdf_path, None)
 					handle = None
 
-	if reuse_existing and handle and session:
+	if reuse_existing and handle and session and reused:
 		os.close(pdf_fd)
 		return {
 			"status": "ok",
@@ -717,10 +748,10 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 	handle = f"{BACKEND_NAME}:{request_id}:{int(time.time_ns())}"
 	callback_command = build_synctex_callback_command(callback)
 	fd_argument = f"/proc/self/fd/{pdf_fd}"
-	args = [viewer_path, "--fork", fd_argument, f"--synctex-editor-command={callback_command}"]
+	args = [viewer_path, f"--synctex-editor-command={callback_command}", fd_argument]
 	process = None
 	try:
-		process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, pass_fds=(pdf_fd,))
+		process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(pdf_fd,))
 	except Exception as exc:
 		os.close(pdf_fd)
 		return {
@@ -732,28 +763,31 @@ def open_pdf_with_viewer(request_id: str, details: Dict[str, Any], _state: Dict[
 	os.close(pdf_fd)
 
 	time.sleep(0.05)
-	owned_pid = process.pid
-	owned = _pid_alive(process.pid or -1)
+	owned_pid = process.pid if isinstance(process.pid, int) else None
+	owned = isinstance(owned_pid, int) and process.poll() is None
+	owned_process = process if owned else None
 	pid_diagnostic = None
 	if not owned:
 		owned_pid = _find_viewer_pid_for_pdf(viewer_path, [normalized_pdf_path, fd_argument])
 		if owned_pid is None:
 			owned = False
-			if process.stderr is not None:
-				pid_diagnostic = process.stderr.read().decode("utf-8", errors="replace").strip()
+			pid_diagnostic = _read_process_stderr_if_finished(process)
 		else:
 			owned = True
 
 	backend_path = str(Path(viewer_path).resolve())
-	OPEN_SESSIONS[normalized_pdf_path] = {
-		"handle": handle,
-		"pid": owned_pid,
-		"backend": BACKEND_NAME,
-		"backend_path": backend_path,
-		"callback": dict(callback),
-		"owned": bool(owned),
-		"process_identity": _snapshot_process_identity(owned_pid) if isinstance(owned_pid, int) else None,
-	}
+	if owned:
+		OPEN_SESSIONS[normalized_pdf_path] = {
+			"handle": handle,
+			"pid": owned_pid,
+			"backend": BACKEND_NAME,
+			"backend_path": backend_path,
+			"callback": dict(callback),
+			"owned": True,
+			"process_identity": _snapshot_process_identity(owned_pid) if isinstance(owned_pid, int) else None,
+		}
+		if owned_process is not None:
+			OPEN_SESSIONS[normalized_pdf_path]["process"] = owned_process
 
 	if require_persistent_viewer and not owned:
 		return {
@@ -869,7 +903,176 @@ def close_pdf_in_viewer(request_id: str, details: Dict[str, Any], _state: Dict[s
 		}
 
 	pid = matched_session.get("pid")
-	if not isinstance(pid, int) or not _pid_alive(pid):
+	if not isinstance(pid, int):
+		OPEN_SESSIONS.pop(matched_path, None)
+		return {
+			"status": "ok",
+			"status_details": build_close_result_details(
+				request_id,
+				False,
+				"not_running",
+				handle,
+				backend,
+				True,
+			),
+		}
+
+	service_process = matched_session.get("process")
+	if isinstance(service_process, subprocess.Popen):
+		if service_process.poll() is not None:
+			try:
+				service_process.wait(timeout=0)
+			except Exception:
+				pass
+			OPEN_SESSIONS.pop(matched_path, None)
+			return {
+				"status": "ok",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"not_running",
+					handle,
+					backend,
+					True,
+				),
+			}
+
+		try:
+			service_process.terminate()
+		except PermissionError:
+			return {
+				"status": "error",
+				"error": f"could not send SIGTERM to viewer pid {pid}",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"backend_unavailable",
+					handle,
+					backend,
+					True,
+					"backend_unavailable",
+				),
+			}
+		except ProcessLookupError:
+			OPEN_SESSIONS.pop(matched_path, None)
+			return {
+				"status": "ok",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"not_running",
+					handle,
+					backend,
+					True,
+				),
+			}
+		except Exception:
+			return {
+				"status": "error",
+				"error": f"could not send SIGTERM to viewer pid {pid}",
+				"status_details": build_close_result_details(
+					request_id,
+					False,
+					"backend_unavailable",
+					handle,
+					backend,
+					True,
+					"backend_unavailable",
+				),
+			}
+
+		try:
+			service_process.wait(timeout=1.0)
+		except subprocess.TimeoutExpired:
+			try:
+				service_process.kill()
+			except PermissionError:
+				return {
+					"status": "error",
+					"error": f"could not send SIGKILL to viewer pid {pid}",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"backend_unavailable",
+						handle,
+						backend,
+						True,
+						"backend_unavailable",
+					),
+				}
+			except ProcessLookupError:
+				OPEN_SESSIONS.pop(matched_path, None)
+				return {
+					"status": "ok",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"not_running",
+						handle,
+						backend,
+						True,
+					),
+				}
+			except Exception:
+				return {
+					"status": "error",
+					"error": f"could not send SIGKILL to viewer pid {pid}",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"backend_unavailable",
+						handle,
+						backend,
+						True,
+						"backend_unavailable",
+					),
+				}
+
+			try:
+				service_process.wait(timeout=1.0)
+			except subprocess.TimeoutExpired:
+				return {
+					"status": "error",
+					"error": f"viewer did not exit after SIGTERM/SIGKILL for pid {pid}",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"backend_unavailable",
+						handle,
+						backend,
+						True,
+						"backend_unavailable",
+					),
+				}
+			except Exception:
+				return {
+					"status": "error",
+					"error": f"could not verify termination of viewer pid {pid}",
+					"status_details": build_close_result_details(
+						request_id,
+						False,
+						"backend_unavailable",
+						handle,
+						backend,
+						True,
+						"backend_unavailable",
+					),
+				}
+
+		OPEN_SESSIONS.pop(matched_path, None)
+		return {
+			"status": "ok",
+			"status_details": build_close_result_details(
+				request_id,
+				True,
+				None,
+				handle,
+				backend,
+				True,
+			),
+		}
+
+	if not _pid_alive(pid):
 		OPEN_SESSIONS.pop(matched_path, None)
 		return {
 			"status": "ok",

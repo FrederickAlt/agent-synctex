@@ -20,7 +20,6 @@ const EXCLUDED_DIRS = new Set([
 	"types",
 	"scripts",
 	"systemd",
-	"codex-show-latex-secure-split",
 ]);
 
 const FORBIDDEN_LEGACY_IDENTIFIERS = new Map<string, string>([

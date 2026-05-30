@@ -62,15 +62,17 @@ pi -e /path/to/pdf-preview
 Keep the checked-out `scripts/` directory with the extension. The inverse SyncTeX callback helper
 is `scripts/pi_synctex_callback.mjs`; it is spawned on demand by Zathura callback commands and is
 not a systemd service. The preview viewer helper remains `scripts/show_latex_viewer.py` (or the
-installed `codex-show-latex-viewer.service` from the secure-split package). That unsandboxed service owns
+installed `systemd/codex-show-latex-viewer.service` from this repository). That unsandboxed service owns
 all GUI/reader behavior; the sandboxed extension writes viewer-service protocol requests only. The extension
 never edits `~/.config/zathura/zathurarc` automatically.
 
 Viewer-service setup/status:
 
 ```bash
-# install/start the packaged user service
-(cd codex-show-latex-secure-split && ./install.sh)
+# install/start the packaged user service from the repo assets
+cp "$(pwd)/systemd/codex-show-latex-viewer.service" "$HOME/.config/systemd/user/codex-show-latex-viewer.service"
+systemctl --user daemon-reload
+systemctl --user enable --now codex-show-latex-viewer.service
 
 systemctl --user status codex-show-latex-viewer.service
 ~/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py --status

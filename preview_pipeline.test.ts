@@ -3,16 +3,18 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 
 function runPython(script: string): string {
+	const env = { ...process.env };
+	delete env.MCP_TMPDIR;
 	const result = spawnSync("python3", ["-c", script], {
 		cwd: process.cwd(),
 		encoding: "utf8",
-		env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+		env: { ...env, PYTHONDONTWRITEBYTECODE: "1" },
 	});
 	assert.equal(result.status, 0, result.stderr);
 	return result.stdout;
 }
 
-test("show_latex writes operation-scoped ready descriptors with matching SyncTeX commands", () => {
+test("legacy standalone MCP writes operation-scoped ready descriptors with matching SyncTeX commands", () => {
 	const output = runPython(String.raw`
 import json
 import tempfile
@@ -81,7 +83,7 @@ print(json.dumps({
 	assert.ok(descriptors.second_fixed_tex.includes("second"));
 });
 
-test("show_latex can suppress ready descriptor while still producing PDFs", () => {
+test("legacy standalone MCP can suppress ready descriptor while still producing PDFs", () => {
 	const output = runPython(String.raw`
 import json
 import tempfile
@@ -140,7 +142,7 @@ print(json.dumps({
 	assert.ok(result.fixed_pdf_after_ready.includes("zathura"));
 });
 
-test("MCP show_latex accepts write_ready false and returns PDF details", () => {
+test("legacy standalone MCP show_latex accepts write_ready false and returns PDF details", () => {
 	const output = runPython(String.raw`
 import json
 import tempfile
@@ -266,7 +268,7 @@ print(json.dumps({
 	assert.ok(typeof result.result.status_details.service_available === "boolean");
 });
 
-test("viewer service open request returns structured open result and tracks reusable sessions", () => {
+test("viewer service open request tracks PID and reuses handle for matching opens", () => {
 	const output = runPython(String.raw`
 import json
 import os
@@ -288,66 +290,151 @@ viewer.ensure_protocol_dirs()
 
 dir = tmp / "bin"
 dir.mkdir()
+backend_argv_log = dir / "fakezathura-argv.log"
+os.environ["FAKE_BACKEND_ARGV_LOG"] = str(backend_argv_log)
 zathura = dir / viewer.BACKEND_NAME
-zathura.write_text("#!/bin/sh\nwhile true; do sleep 0.1; done\n")
+zathura.write_text("""#!/usr/bin/env python3
+import os
+import sys
+import time
+from pathlib import Path
+
+log_path = os.environ.get("FAKE_BACKEND_ARGV_LOG")
+if log_path:
+    Path(log_path).open("a", encoding="utf-8").write(" ".join(sys.argv) + "\\n")
+
+if "--fork" in sys.argv:
+    pid = os.fork()
+    if pid != 0:
+        os._exit(0)
+
+while True:
+    time.sleep(0.1)
+""")
 os.chmod(zathura, 0o700)
 os.environ["PATH"] = f"{dir}:{os.environ.get('PATH', '')}"
+
 pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
-pdf.write_bytes(b"%PDF-1.7\\n")
+pdf.write_bytes(b"%PDF-1.7\n")
+pdf_key = str(pdf.resolve())
 callback = {
     "kind": viewer.SYNCTEX_CALLBACK_KIND,
     "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
     "socket_path": "/tmp/synctex.sock",
     "token": "abc123",
 }
-request_id = "open-first"
-viewer.atomic_write_text(
-    viewer.request_path(request_id),
-    json.dumps({
-        "protocol_version": viewer.PROTOCOL_VERSION,
-        "request_id": request_id,
-        "operation": "open",
-        "created_at_ns": int(time.time_ns()),
-        "details": {"pdf_path": str(pdf), "callback": callback},
-    }),
-    mode=0o600,
-)
-processed_first = viewer.scan_requests()
-first = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
 
-request_id_2 = "open-second"
-viewer.atomic_write_text(
-    viewer.request_path(request_id_2),
-    json.dumps({
-        "protocol_version": viewer.PROTOCOL_VERSION,
-        "request_id": request_id_2,
-        "operation": "open",
-        "created_at_ns": int(time.time_ns()),
-        "details": {"pdf_path": str(pdf), "callback": callback},
-    }),
-    mode=0o600,
-)
-processed_second = viewer.scan_requests()
-second = json.loads(viewer.result_path(request_id_2).read_text(encoding="utf-8"))
-
-tracked = viewer.OPEN_SESSIONS.get(str(pdf), {})
-pid = tracked.get("pid")
-if pid is not None:
+def pid_alive(pid: int) -> bool:
     try:
-        os.kill(int(pid), signal.SIGKILL)
+        os.kill(int(pid), 0)
+        return True
     except OSError:
-        pass
-print(json.dumps({
-    "processed_first": processed_first,
-    "processed_second": processed_second,
-    "first_status": first["status"],
-    "second_status": second["status"],
-    "first_reused": first["status_details"].get("reused", False),
-    "second_reused": second["status_details"].get("reused", False),
-    "same_handle": first["status_details"].get("handle") == second["status_details"].get("handle"),
-    "tracker_has_path": str(pdf) in viewer.OPEN_SESSIONS,
-    "tracker_handle": tracked.get("handle"),
-}))
+        return False
+
+
+def reap_pid(pid: int) -> None:
+    for signal_to_send in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, signal_to_send)
+        except OSError:
+            return
+        for _ in range(40):
+            try:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError:
+                break
+            if waited != 0:
+                return
+            time.sleep(0.05)
+
+
+def cmdline_has_fork(cmdline: object | None) -> bool:
+    if not isinstance(cmdline, list):
+        return False
+    return any(part == "--fork" for part in cmdline)
+
+launched_pids: list[int] = []
+
+try:
+    request_id = "open-first"
+    viewer.atomic_write_text(
+        viewer.request_path(request_id),
+        json.dumps({
+            "protocol_version": viewer.PROTOCOL_VERSION,
+            "request_id": request_id,
+            "operation": "open",
+            "created_at_ns": int(time.time_ns()),
+            "details": {"pdf_path": str(pdf), "callback": callback},
+        }),
+        mode=0o600,
+    )
+    processed_first = viewer.scan_requests()
+    first = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+    first_open_pid = first["status_details"].get("pid")
+    if isinstance(first_open_pid, int):
+        launched_pids.append(first_open_pid)
+
+    request_id_2 = "open-second"
+    viewer.atomic_write_text(
+        viewer.request_path(request_id_2),
+        json.dumps({
+            "protocol_version": viewer.PROTOCOL_VERSION,
+            "request_id": request_id_2,
+            "operation": "open",
+            "created_at_ns": int(time.time_ns()),
+            "details": {"pdf_path": str(pdf), "callback": callback},
+        }),
+        mode=0o600,
+    )
+    processed_second = viewer.scan_requests()
+    second = json.loads(viewer.result_path(request_id_2).read_text(encoding="utf-8"))
+
+    first_details = first["status_details"]
+    second_details = second["status_details"]
+    first_pid = first_details.get("pid")
+    second_pid = second_details.get("pid")
+    if isinstance(second_pid, int):
+        launched_pids.append(second_pid)
+
+    tracked = viewer.OPEN_SESSIONS.get(pdf_key, {})
+    tracker_pid = tracked.get("pid")
+    tracker_handle = tracked.get("handle")
+    invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+
+    tracked_identity = None
+    if isinstance(first_pid, int):
+        tracked_identity = viewer._snapshot_process_identity(first_pid)
+    tracked_cmdline = tracked_identity.get("cmdline", []) if isinstance(tracked_identity, dict) else []
+
+    print(json.dumps({
+        "processed_first": processed_first,
+        "processed_second": processed_second,
+        "first_status": first["status"],
+        "second_status": second["status"],
+        "first_reused": first_details.get("reused", False),
+        "second_reused": second_details.get("reused", False),
+        "first_handle": first_details.get("handle", ""),
+        "second_handle": second_details.get("handle", ""),
+        "same_handle": first_details.get("handle") == second_details.get("handle"),
+        "first_pid": first_pid if isinstance(first_pid, int) else None,
+        "second_pid": second_pid if isinstance(second_pid, int) else None,
+        "tracker_has_path": pdf_key in viewer.OPEN_SESSIONS,
+        "tracker_handle": tracker_handle,
+        "tracked_pid": tracker_pid if isinstance(tracker_pid, int) else None,
+        "same_pid": first_pid == second_pid,
+        "tracker_matches_pid": isinstance(first_pid, int) and tracker_pid == first_pid,
+        "first_pid_alive_after_open": pid_alive(first_pid) if isinstance(first_pid, int) else False,
+        "second_pid_alive_after_open": pid_alive(second_pid) if isinstance(second_pid, int) else False,
+        "invocation_count": len(invocation_lines),
+        "invocation_lines": invocation_lines,
+        "invocation_has_fork": any("--fork" in entry for entry in invocation_lines),
+        "tracked_cmdline_has_no_fork": not cmdline_has_fork(tracked_cmdline),
+    }))
+finally:
+    for pid in set(launched_pids):
+        reap_pid(pid)
 `);
 	const result = JSON.parse(output) as {
 		processed_first: number;
@@ -356,9 +443,22 @@ print(json.dumps({
 		second_status: string;
 		first_reused: boolean;
 		second_reused: boolean;
+		first_handle: string;
+		second_handle: string;
 		same_handle: boolean;
+		first_pid: number | null;
+		second_pid: number | null;
 		tracker_has_path: boolean;
 		tracker_handle: string;
+		tracked_pid: number | null;
+		same_pid: boolean;
+		tracker_matches_pid: boolean;
+		first_pid_alive_after_open: boolean;
+		second_pid_alive_after_open: boolean;
+		invocation_count: number;
+		invocation_lines: string[];
+		invocation_has_fork: boolean;
+		tracked_cmdline_has_no_fork: boolean;
 	};
 
 	assert.equal(result.processed_first, 1);
@@ -368,14 +468,30 @@ print(json.dumps({
 	assert.equal(result.first_reused, false);
 	assert.equal(result.second_reused, true);
 	assert.equal(result.same_handle, true);
+	assert.equal(result.first_handle.length > 0, true);
+	assert.equal(result.second_handle.length > 0, true);
+	assert.equal(result.first_handle, result.second_handle);
+	assert.equal(typeof result.first_pid, "number");
+	assert.equal(result.first_pid, result.second_pid);
+	assert.equal(result.same_pid, true);
 	assert.equal(result.tracker_has_path, true);
-	assert.ok(result.tracker_handle.length > 0);
+	assert.equal(result.tracker_handle.length > 0, true);
+	assert.equal(result.tracker_handle, result.first_handle);
+	assert.equal(result.tracker_matches_pid, true);
+	assert.equal(result.first_pid_alive_after_open, true);
+	assert.equal(result.second_pid_alive_after_open, true);
+	assert.equal(result.tracked_pid, result.first_pid);
+	assert.equal(result.invocation_count, 1);
+	assert.equal(result.invocation_has_fork, false);
+	assert.equal(result.invocation_lines.length, 1);
+	assert.equal(result.tracked_cmdline_has_no_fork, true);
 });
 
 test("viewer service open request can skip reuse when reuse_existing=false", () => {
 	const output = runPython(String.raw`
 import json
 import os
+import signal
 import tempfile
 import types
 import time
@@ -393,59 +509,117 @@ viewer.ensure_protocol_dirs()
 
 dir = tmp / "bin"
 dir.mkdir()
+backend_argv_log = dir / "fakezathura-argv.log"
+os.environ["FAKE_BACKEND_ARGV_LOG"] = str(backend_argv_log)
 zathura = dir / viewer.BACKEND_NAME
-zathura.write_text("#!/bin/sh\nwhile true; do sleep 0.1; done\n")
+zathura.write_text("""#!/usr/bin/env python3
+import os
+import sys
+import time
+from pathlib import Path
+
+log_path = os.environ.get("FAKE_BACKEND_ARGV_LOG")
+if log_path:
+    Path(log_path).open("a", encoding="utf-8").write(" ".join(sys.argv) + "\\n")
+
+if "--fork" in sys.argv:
+    pid = os.fork()
+    if pid != 0:
+        os._exit(0)
+
+while True:
+    time.sleep(0.1)
+""")
 os.chmod(zathura, 0o700)
 os.environ["PATH"] = f"{dir}:{os.environ.get('PATH', '')}"
 pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
-pdf.write_bytes(b"%PDF-1.7\\n")
+pdf.write_bytes(b"%PDF-1.7\n")
 callback = {
     "kind": viewer.SYNCTEX_CALLBACK_KIND,
     "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
     "socket_path": "/tmp/synctex.sock",
     "token": "abc123",
 }
-request_id = "open-first"
-viewer.atomic_write_text(
-    viewer.request_path(request_id),
-    json.dumps({
-        "protocol_version": viewer.PROTOCOL_VERSION,
-        "request_id": request_id,
-        "operation": "open",
-        "created_at_ns": int(time.time_ns()),
-        "details": {"pdf_path": str(pdf), "callback": callback},
-    }),
-    mode=0o600,
-)
-processed_first = viewer.scan_requests()
-first = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
 
-request_id_2 = "open-third"
-viewer.atomic_write_text(
-    viewer.request_path(request_id_2),
-    json.dumps({
-        "protocol_version": viewer.PROTOCOL_VERSION,
-        "request_id": request_id_2,
-        "operation": "open",
-        "created_at_ns": int(time.time_ns()),
-        "details": {"pdf_path": str(pdf), "callback": callback, "reuse_existing": False},
-    }),
-    mode=0o600,
-)
-processed_second = viewer.scan_requests()
-second = json.loads(viewer.result_path(request_id_2).read_text(encoding="utf-8"))
 
-print(json.dumps({
-    "processed_first": processed_first,
-    "processed_second": processed_second,
-    "first_status": first["status"],
-    "second_status": second["status"],
-    "first_reused": first["status_details"].get("reused", False),
-    "second_reused": second["status_details"].get("reused", False),
-    "first_handle": first["status_details"].get("handle", ""),
-    "second_handle": second["status_details"].get("handle", ""),
-    "tracker_has_path": str(Path(pdf).resolve()) in viewer.OPEN_SESSIONS,
-}))
+def reap_pid(pid: int) -> None:
+    for signal_to_send in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, signal_to_send)
+        except OSError:
+            return
+        for _ in range(40):
+            try:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError:
+                break
+            if waited != 0:
+                return
+            time.sleep(0.05)
+
+launched_pids: list[int] = []
+
+try:
+    request_id = "open-first"
+    viewer.atomic_write_text(
+        viewer.request_path(request_id),
+        json.dumps({
+            "protocol_version": viewer.PROTOCOL_VERSION,
+            "request_id": request_id,
+            "operation": "open",
+            "created_at_ns": int(time.time_ns()),
+            "details": {"pdf_path": str(pdf), "callback": callback},
+        }),
+        mode=0o600,
+    )
+    processed_first = viewer.scan_requests()
+    first = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+    first_open_pid = first["status_details"].get("pid")
+    if isinstance(first_open_pid, int):
+        launched_pids.append(first_open_pid)
+
+    request_id_2 = "open-third"
+    viewer.atomic_write_text(
+        viewer.request_path(request_id_2),
+        json.dumps({
+            "protocol_version": viewer.PROTOCOL_VERSION,
+            "request_id": request_id_2,
+            "operation": "open",
+            "created_at_ns": int(time.time_ns()),
+            "details": {"pdf_path": str(pdf), "callback": callback, "reuse_existing": False},
+        }),
+        mode=0o600,
+    )
+    processed_second = viewer.scan_requests()
+    second = json.loads(viewer.result_path(request_id_2).read_text(encoding="utf-8"))
+
+    first_pid = first["status_details"].get("pid")
+    second_pid = second["status_details"].get("pid")
+    if isinstance(second_pid, int):
+        launched_pids.append(second_pid)
+
+    invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+
+    print(json.dumps({
+        "processed_first": processed_first,
+        "processed_second": processed_second,
+        "first_status": first["status"],
+        "second_status": second["status"],
+        "first_reused": first["status_details"].get("reused", False),
+        "second_reused": second["status_details"].get("reused", False),
+        "first_handle": first["status_details"].get("handle", ""),
+        "second_handle": second["status_details"].get("handle", ""),
+        "tracker_has_path": str(Path(pdf).resolve()) in viewer.OPEN_SESSIONS,
+        "first_pid": first_pid if isinstance(first_pid, int) else None,
+        "second_pid": second_pid if isinstance(second_pid, int) else None,
+        "invocation_count": len(invocation_lines),
+        "invocation_lines": invocation_lines,
+    }))
+finally:
+    for pid in set(launched_pids):
+        reap_pid(pid)
 `);
 	const result = JSON.parse(output) as {
 		processed_first: number;
@@ -457,6 +631,10 @@ print(json.dumps({
 		first_handle: string;
 		second_handle: string;
 		tracker_has_path: boolean;
+		first_pid: number | null;
+		second_pid: number | null;
+		invocation_count: number;
+		invocation_lines: string[];
 	};
 
 	assert.equal(result.processed_first, 1);
@@ -467,6 +645,419 @@ print(json.dumps({
 	assert.equal(result.second_reused, false);
 	assert.equal(result.first_handle === result.second_handle, false);
 	assert.equal(result.tracker_has_path, true);
+	assert.equal(typeof result.first_pid, "number");
+	assert.equal(typeof result.second_pid, "number");
+	assert.equal(result.first_pid !== result.second_pid, true);
+	assert.equal(result.invocation_count, 2);
+	assert.equal(result.invocation_lines.every((line) => !line.includes("--fork")), true);
+});
+
+test("viewer service does not reuse exited backend sessions", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-exited-open-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+bin_dir = tmp / "bin"
+bin_dir.mkdir()
+backend_argv_log = bin_dir / "fakezathura-argv.log"
+os.environ["FAKE_BACKEND_ARGV_LOG"] = str(backend_argv_log)
+zathura = bin_dir / viewer.BACKEND_NAME
+zathura.write_text("""#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+log_path = os.environ.get("FAKE_BACKEND_ARGV_LOG")
+if log_path:
+    Path(log_path).open("a", encoding="utf-8").write(" ".join(sys.argv) + "\\n")
+raise SystemExit(0)
+""")
+os.chmod(zathura, 0o700)
+os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\n")
+callback = {
+    "kind": viewer.SYNCTEX_CALLBACK_KIND,
+    "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+    "socket_path": "/tmp/synctex.sock",
+    "token": "abc123",
+}
+
+def write_open(request_id: str):
+    viewer.atomic_write_text(
+        viewer.request_path(request_id),
+        json.dumps({
+            "protocol_version": viewer.PROTOCOL_VERSION,
+            "request_id": request_id,
+            "operation": "open",
+            "created_at_ns": int(time.time_ns()),
+            "details": {"pdf_path": str(pdf), "callback": callback},
+        }),
+        mode=0o600,
+    )
+    processed = viewer.scan_requests()
+    result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+    return processed, result
+
+processed_first, first = write_open("open-exited-first")
+processed_second, second = write_open("open-exited-second")
+invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+pdf_key = str(pdf.resolve())
+
+print(json.dumps({
+    "processed_first": processed_first,
+    "processed_second": processed_second,
+    "first_status": first["status"],
+    "second_status": second["status"],
+    "first_owned": first["status_details"].get("owned"),
+    "second_owned": second["status_details"].get("owned"),
+    "first_reused": first["status_details"].get("reused"),
+    "second_reused": second["status_details"].get("reused"),
+    "same_handle": first["status_details"].get("handle") == second["status_details"].get("handle"),
+    "tracker_has_path": pdf_key in viewer.OPEN_SESSIONS,
+    "invocation_count": len(invocation_lines),
+    "invocation_has_fork": any("--fork" in line for line in invocation_lines),
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed_first: number;
+		processed_second: number;
+		first_status: string;
+		second_status: string;
+		first_owned: boolean;
+		second_owned: boolean;
+		first_reused: boolean;
+		second_reused: boolean;
+		same_handle: boolean;
+		tracker_has_path: boolean;
+		invocation_count: number;
+		invocation_has_fork: boolean;
+	};
+
+	assert.equal(result.processed_first, 1);
+	assert.equal(result.processed_second, 1);
+	assert.equal(result.first_status, "ok");
+	assert.equal(result.second_status, "ok");
+	assert.equal(result.first_owned, false);
+	assert.equal(result.second_owned, false);
+	assert.equal(result.first_reused, false);
+	assert.equal(result.second_reused, false);
+	assert.equal(result.same_handle, false);
+	assert.equal(result.tracker_has_path, false);
+	assert.equal(result.invocation_count, 2);
+	assert.equal(result.invocation_has_fork, false);
+});
+
+test("viewer service close request reports not_running after owned backend exits", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-close-exited-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+bin_dir = tmp / "bin"
+bin_dir.mkdir()
+zathura = bin_dir / viewer.BACKEND_NAME
+zathura.write_text("""#!/usr/bin/env python3
+import time
+time.sleep(0.15)
+""")
+os.chmod(zathura, 0o700)
+os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\n")
+callback = {
+    "kind": viewer.SYNCTEX_CALLBACK_KIND,
+    "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+    "socket_path": "/tmp/synctex.sock",
+    "token": "abc123",
+}
+pdf_key = str(pdf.resolve())
+
+viewer.atomic_write_text(
+    viewer.request_path("open-then-exit"),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": "open-then-exit",
+        "operation": "open",
+        "created_at_ns": int(time.time_ns()),
+        "details": {"pdf_path": str(pdf), "callback": callback},
+    }),
+    mode=0o600,
+)
+processed_open = viewer.scan_requests()
+open_result = json.loads(viewer.result_path("open-then-exit").read_text(encoding="utf-8"))
+handle = open_result["status_details"].get("handle")
+pid = open_result["status_details"].get("pid")
+if not isinstance(handle, str) or not isinstance(pid, int):
+    raise RuntimeError("open did not return handle and pid")
+
+time.sleep(0.3)
+viewer.atomic_write_text(
+    viewer.request_path("close-after-exit"),
+    json.dumps({
+        "protocol_version": viewer.PROTOCOL_VERSION,
+        "request_id": "close-after-exit",
+        "operation": "close",
+        "created_at_ns": int(time.time_ns()),
+        "details": {"handle": handle, "backend": "fakezathura"},
+    }),
+    mode=0o600,
+)
+processed_close = viewer.scan_requests()
+close_result = json.loads(viewer.result_path("close-after-exit").read_text(encoding="utf-8"))
+
+print(json.dumps({
+    "processed_open": processed_open,
+    "processed_close": processed_close,
+    "open_status": open_result["status"],
+    "close_status": close_result["status"],
+    "open_owned": open_result["status_details"].get("owned"),
+    "closed": close_result["status_details"].get("closed"),
+    "reason": close_result["status_details"].get("reason"),
+    "session_still_tracked": pdf_key in viewer.OPEN_SESSIONS,
+}))
+`);
+	const result = JSON.parse(output) as {
+		processed_open: number;
+		processed_close: number;
+		open_status: string;
+		close_status: string;
+		open_owned: boolean;
+		closed: boolean;
+		reason: string;
+		session_still_tracked: boolean;
+	};
+
+	assert.equal(result.processed_open, 1);
+	assert.equal(result.processed_close, 1);
+	assert.equal(result.open_status, "ok");
+	assert.equal(result.close_status, "ok");
+	assert.equal(result.open_owned, true);
+	assert.equal(result.closed, false);
+	assert.equal(result.reason, "not_running");
+	assert.equal(result.session_still_tracked, false);
+});
+
+test("viewer service close request terminates tracked backend process", () => {
+	const output = runPython(String.raw`
+import json
+import os
+import signal
+import tempfile
+import types
+import time
+from pathlib import Path
+
+script = Path("scripts/show_latex_viewer.py")
+viewer = types.ModuleType("show_latex_viewer")
+viewer.__file__ = str(script)
+exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), viewer.__dict__)
+
+tmp = Path(tempfile.mkdtemp(prefix="preview-viewer-close-"))
+viewer.DEFAULT_TMPDIR = str(tmp)
+viewer.BACKEND_NAME = "fakezathura"
+viewer.ensure_protocol_dirs()
+
+dir = tmp / "bin"
+dir.mkdir()
+backend_argv_log = dir / "fakezathura-argv.log"
+os.environ["FAKE_BACKEND_ARGV_LOG"] = str(backend_argv_log)
+zathura = dir / viewer.BACKEND_NAME
+zathura.write_text("""#!/usr/bin/env python3
+import os
+import sys
+import time
+from pathlib import Path
+
+log_path = os.environ.get("FAKE_BACKEND_ARGV_LOG")
+if log_path:
+    Path(log_path).open("a", encoding="utf-8").write(" ".join(sys.argv) + "\\n")
+
+if "--fork" in sys.argv:
+    pid = os.fork()
+    if pid != 0:
+        os._exit(0)
+
+while True:
+    time.sleep(0.1)
+""")
+os.chmod(zathura, 0o700)
+os.environ["PATH"] = f"{dir}:{os.environ.get('PATH', '')}"
+
+pdf = Path(tempfile.mkstemp(prefix="doc-", suffix=".pdf", dir=str(tmp))[1])
+pdf.write_bytes(b"%PDF-1.7\n")
+callback = {
+    "kind": viewer.SYNCTEX_CALLBACK_KIND,
+    "transport": viewer.SYNCTEX_CALLBACK_TRANSPORT,
+    "socket_path": "/tmp/synctex.sock",
+    "token": "abc123",
+}
+
+pdf_key = str(pdf.resolve())
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def reap_pid(pid: int) -> None:
+    for signal_to_send in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, signal_to_send)
+        except OSError:
+            return
+        for _ in range(40):
+            try:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError:
+                break
+            if waited != 0:
+                return
+            time.sleep(0.05)
+
+
+def cmdline_has_fork(cmdline: object | None) -> bool:
+    if not isinstance(cmdline, list):
+        return False
+    return any(part == "--fork" for part in cmdline)
+
+pid = None
+try:
+    request_id = "open-for-close"
+    viewer.atomic_write_text(
+        viewer.request_path(request_id),
+        json.dumps({
+            "protocol_version": viewer.PROTOCOL_VERSION,
+            "request_id": request_id,
+            "operation": "open",
+            "created_at_ns": int(time.time_ns()),
+            "details": {"pdf_path": str(pdf), "callback": callback},
+        }),
+        mode=0o600,
+    )
+    processed_open = viewer.scan_requests()
+    open_result = json.loads(viewer.result_path(request_id).read_text(encoding="utf-8"))
+    handle = open_result["status_details"].get("handle")
+    pid = open_result["status_details"].get("pid")
+    open_session = viewer.OPEN_SESSIONS.get(pdf_key, {})
+    expected_identity = open_session.get("process_identity")
+    expected_cmdline = expected_identity.get("cmdline") if isinstance(expected_identity, dict) else []
+
+    invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+    alive_before_close = isinstance(pid, int) and pid_alive(pid)
+
+    if not isinstance(handle, str) or not isinstance(pid, int):
+        raise RuntimeError("open request did not return a handle and pid")
+
+    request_id_close = "close-matching"
+    viewer.atomic_write_text(
+        viewer.request_path(request_id_close),
+        json.dumps({
+            "protocol_version": viewer.PROTOCOL_VERSION,
+            "request_id": request_id_close,
+            "operation": "close",
+            "created_at_ns": int(time.time_ns()),
+            "details": {
+                "handle": handle,
+                "backend": "fakezathura",
+            },
+        }),
+        mode=0o600,
+    )
+    processed_close = viewer.scan_requests()
+    close_result = json.loads(viewer.result_path(request_id_close).read_text(encoding="utf-8"))
+
+    deadline = time.time() + 2.0
+    while isinstance(pid, int) and pid_alive(pid) and time.time() < deadline:
+        time.sleep(0.05)
+    alive_after_close = isinstance(pid, int) and pid_alive(pid)
+
+    print(json.dumps({
+        "processed_open": processed_open,
+        "processed_close": processed_close,
+        "open_status": open_result["status"],
+        "close_status": close_result["status"],
+        "closed": close_result["status_details"].get("closed"),
+        "reason": close_result["status_details"].get("reason"),
+        "backend_identity_ok": close_result["status_details"].get("backend_identity_ok"),
+        "pid": pid,
+        "alive_before_close": alive_before_close,
+        "alive_after_close": alive_after_close,
+        "session_still_tracked": pdf_key in viewer.OPEN_SESSIONS,
+        "invocation_count": len(invocation_lines),
+        "invocation_has_fork": any("--fork" in entry for entry in invocation_lines),
+        "tracked_cmdline_has_no_fork": not cmdline_has_fork(expected_cmdline),
+    }))
+finally:
+    if isinstance(pid, int):
+        reap_pid(pid)
+`);
+	const result = JSON.parse(output) as {
+		processed_open: number;
+		processed_close: number;
+		open_status: string;
+		close_status: string;
+		closed: boolean;
+		reason: null | string;
+		backend_identity_ok: boolean;
+		pid: number;
+		alive_before_close: boolean;
+		alive_after_close: boolean;
+		session_still_tracked: boolean;
+		invocation_count: number;
+		invocation_has_fork: boolean;
+		tracked_cmdline_has_no_fork: boolean;
+	};
+
+	assert.equal(result.processed_open, 1);
+	assert.equal(result.processed_close, 1);
+	assert.equal(result.open_status, "ok");
+	assert.equal(result.close_status, "ok");
+	assert.equal(result.closed, true);
+	assert.equal(result.backend_identity_ok, true);
+	assert.equal(result.reason, null);
+	assert.ok(Number.isInteger(result.pid));
+	assert.equal(result.alive_before_close, true);
+	assert.equal(result.alive_after_close, false);
+	assert.equal(result.session_still_tracked, false);
+	assert.equal(result.invocation_count, 1);
+	assert.equal(result.invocation_has_fork, false);
+	assert.equal(result.tracked_cmdline_has_no_fork, true);
 });
 
 test("viewer service close request does not SIGTERM on identity mismatch", () => {

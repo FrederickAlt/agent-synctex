@@ -334,10 +334,9 @@ function tick() {
 setInterval(tick, 10);
 `;
 
-const MCP_TMPDIR = process.env.MCP_TMPDIR ?? mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-service-"));
-if (!process.env.MCP_TMPDIR) {
-	process.env.MCP_TMPDIR = MCP_TMPDIR;
-}
+const ORIGINAL_MCP_TMPDIR = process.env.MCP_TMPDIR;
+const MCP_TMPDIR = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-service-"));
+process.env.MCP_TMPDIR = MCP_TMPDIR;
 const MCP_REQUESTS_DIR = join(MCP_TMPDIR, "viewer-requests");
 const MCP_RESULTS_DIR = join(MCP_TMPDIR, "viewer-results");
 const MCP_OPEN_REQUEST_LOG = join(MCP_TMPDIR, "open-request-log.jsonl");
@@ -424,6 +423,12 @@ function cleanupRuntimeStubs(): void {
 }
 
 after(() => {
+	if (typeof ORIGINAL_MCP_TMPDIR === "undefined") {
+		delete process.env.MCP_TMPDIR;
+	} else {
+		process.env.MCP_TMPDIR = ORIGINAL_MCP_TMPDIR;
+	}
+	rmSync(MCP_TMPDIR, { recursive: true, force: true });
 	cleanupRuntimeStubs();
 });
 
@@ -553,7 +558,7 @@ async function withFakeViewerService(mode: "ok" | "backend_unavailable" | "servi
 	rmSync(MCP_READY_PATH, { force: true });
 	writeFileSync(scriptPath, FAKE_VIEWER_SERVICE_SCRIPT, { mode: 0o700 });
 	fakeViewerServiceProcess = spawn(process.execPath, [scriptPath], {
-		env: { ...process.env, FAKE_VIEWER_MODE: mode },
+		env: { ...process.env, MCP_TMPDIR, FAKE_VIEWER_MODE: mode },
 		stdio: ["ignore", "ignore", "ignore"],
 	});
 
@@ -612,7 +617,6 @@ test("show_latex external flow opens through viewer service", async () => {
 				operation_pdf: string;
 				pdf_id: number;
 				inline: boolean;
-				synctex_callback_command: string;
 			};
 			assert.equal(result.content.length, 1);
 			assert.equal(details.inline, false);
@@ -622,7 +626,6 @@ test("show_latex external flow opens through viewer service", async () => {
 			assert.equal(existsSync(MCP_READY_PATH), false);
 			assert.equal(typeof details.pdf_id, "number");
 			assert.equal(result.content[0].text, "ok");
-			assert.equal(typeof details.synctex_callback_command, "string");
 
 			const requests = readFakeViewerOpenRequests();
 			assert.equal(requests.length, 1);

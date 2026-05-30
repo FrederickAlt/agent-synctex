@@ -22,7 +22,7 @@ from pathlib import Path
 os.umask(0o077)
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-SERVER_NAME = "codex-show-latex-secure-split"
+SERVER_NAME = "codex-show-latex-mcp"
 SERVER_VERSION = "2.1.0"
 PROTOCOL_VERSION = "2025-06-18"
 
