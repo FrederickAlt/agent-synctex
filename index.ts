@@ -26,6 +26,11 @@ import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } fr
 import { closeTrackedPdf, describePdfJumpFailureContext, jumpToTrackedPdf, openAndTrackPdf, PdfTracker } from "./src/modules/pdf_tracking/pdf_tracking.ts";
 import { readSourceLine, SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./src/modules/synctex/synctex.ts";
 import { ViewerServiceClient, type ViewerServiceOpenResult } from "./src/modules/viewer_service.ts";
+import {
+	createUniversalToolFacade,
+	registerTracerTools,
+	type TracerToolDefinition,
+} from "./src/modules/pi_adapter/pi_adapter.ts";
 interface McpEnvelope {
 	jsonrpc?: "2.0";
 	id?: string | number;
@@ -1969,21 +1974,8 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: "compile_latex_file",
-		label: "Compile LaTeX File",
-		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a viewer-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external viewer state. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles.",
-		promptSnippet: "Compile a local LaTeX file as PDF",
-		promptGuidelines: [
-			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
-			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without requesting external viewer state; set open_pdf=true only when the user wants the compiled PDF opened/tracked by the viewer service immediately.",
-			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling.",
-			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
-			"For multi-file LaTeX projects, compile the root file that produces the PDF, such as main.tex, and use open_pdf=true only when a viewer-service-tracked PDF is needed. The returned pdf_id identifies the resulting PDF/viewer and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
-			"On failure this tool returns only a short error message and writes details to a temporary log file.",
-		],
-		parameters: CompileLatexFileParams,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+	const compileLatexFileToolFacade = createUniversalToolFacade({
+		"compile_latex_file": async (_toolCallId, params, signal, _onUpdate, ctx) => {
 			let requestedPath = "";
 			let latexFilePath = "";
 			let pdfPath = "";
@@ -2085,6 +2077,24 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 	});
+
+	const compileLatexFileTool: TracerToolDefinition = {
+		name: "compile_latex_file",
+		label: "Compile LaTeX File",
+		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a viewer-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external viewer state. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles.",
+		promptSnippet: "Compile a local LaTeX file as PDF",
+		promptGuidelines: [
+			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
+			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without requesting external viewer state; set open_pdf=true only when the user wants the compiled PDF opened/tracked by the viewer service immediately.",
+			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling.",
+			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
+			"For multi-file LaTeX projects, compile the root file that produces the PDF, such as main.tex, and use open_pdf=true only when a viewer-service-tracked PDF is needed. The returned pdf_id identifies the resulting PDF/viewer and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
+			"On failure this tool returns only a short error message and writes details to a temporary log file.",
+		],
+		parameters: CompileLatexFileParams,
+	};
+
+	registerTracerTools(pi, compileLatexFileToolFacade, [compileLatexFileTool]);
 
 	pi.registerTool({
 		name: "set_latex_preamble",
