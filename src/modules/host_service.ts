@@ -210,7 +210,6 @@ export class HostServicePdfIdRegistry {
 	clear(): void {
 		this.activeRecords.clear();
 		this.staleRecords.clear();
-		this.closedRecords.clear();
 	}
 
 	private allocatePdfId(): number {
