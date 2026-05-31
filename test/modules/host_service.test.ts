@@ -175,9 +175,10 @@ test("host service client surfaces malformed response payloads", async () => {
 test("host service client surfaces server error envelopes as service errors", async () => {
 	const baseDir = temporaryDir("host-service-error-envelope-");
 	const socketPath = join(baseDir, "host-service.sock");
+	const fixedRequestId = "fixed-request-id";
 	const serverErrorResponse = JSON.stringify({
 		protocol_version: 1,
-		request_id: "",
+		request_id: fixedRequestId,
 		operation: "status",
 		status: "error",
 		generated_at_ns: Date.now() * 1_000_000,
@@ -189,9 +190,9 @@ test("host service client surfaces server error envelopes as service errors", as
 			service_name: "agent-synctex-test-error",
 			socket_path: socketPath,
 			service_instance_started_ns: Date.now() * 1_000_000,
-			service_instance_id: "",
+			service_instance_id: "service-instance-id",
 			workspace_context: { cwd: "/" },
-			request_id: "",
+			request_id: fixedRequestId,
 			operation: "status",
 			uptime_ns: 0,
 			total_requests: 0,
@@ -210,7 +211,11 @@ test("host service client surfaces server error envelopes as service errors", as
 		});
 	});
 
-	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+		requestIdFactory: () => fixedRequestId,
+	});
 	let observed: unknown;
 	try {
 		await client.requestStatus({ cwd: baseDir });
@@ -228,6 +233,152 @@ test("host service client surfaces server error envelopes as service errors", as
 	assert.match(observed.message, /code=invalid_workspace_context/);
 	assert.doesNotMatch(observed.message, /Malformed host service response payload/);
 });
+
+test("host service client rejects malformed response with mismatched request ids", async () => {
+	const baseDir = temporaryDir("host-service-mismatch-request-id-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const expectedRequestId = "expected-request-id";
+	const responseRequestId = "unexpected-request-id";
+	const malformedResponse = JSON.stringify({
+		protocol_version: 1,
+		request_id: responseRequestId,
+		operation: "status",
+		status: "ok",
+		generated_at_ns: Date.now() * 1_000_000,
+		status_details: {
+			protocol_version: 1,
+			supported: true,
+			service_available: true,
+			service_name: "agent-synctex-test-mismatch",
+			socket_path: socketPath,
+			service_instance_started_ns: Date.now() * 1_000_000,
+			service_instance_id: "instance-id",
+			workspace_context: { cwd: baseDir },
+			request_id: responseRequestId,
+			operation: "status",
+			uptime_ns: 1,
+			total_requests: 1,
+		},
+	}) + "\n";
+	const malformedServer = createServer((socket) => {
+		socket.end(malformedResponse, () => {
+			socket.destroy();
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		malformedServer.once("error", reject);
+		malformedServer.listen(socketPath, () => {
+			resolve();
+		});
+	});
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+		requestIdFactory: () => expectedRequestId,
+	});
+	await assert.rejects(() => client.requestStatus({ cwd: baseDir }), /Malformed host service response payload/);
+	await new Promise<void>((resolve) => {
+		malformedServer.close(() => resolve());
+	});
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
+test("host service client rejects malformed response with non-status operation", async () => {
+	const baseDir = temporaryDir("host-service-bad-operation-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const expectedRequestId = "status-request-id";
+	const malformedResponse = JSON.stringify({
+		protocol_version: 1,
+		request_id: expectedRequestId,
+		operation: "status_not_supported",
+		status: "ok",
+		generated_at_ns: Date.now() * 1_000_000,
+		status_details: {
+			protocol_version: 1,
+			supported: true,
+			service_available: true,
+			service_name: "agent-synctex-test-bad-op",
+			socket_path: socketPath,
+			service_instance_started_ns: Date.now() * 1_000_000,
+			service_instance_id: "instance-id",
+			workspace_context: { cwd: baseDir },
+			request_id: expectedRequestId,
+			operation: "status_not_supported",
+			uptime_ns: 1,
+			total_requests: 1,
+		},
+	}) + "\n";
+	const badOperationServer = createServer((socket) => {
+		socket.end(malformedResponse, () => {
+			socket.destroy();
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		badOperationServer.once("error", reject);
+		badOperationServer.listen(socketPath, () => {
+			resolve();
+		});
+	});
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+		requestIdFactory: () => expectedRequestId,
+	});
+	await assert.rejects(() => client.requestStatus({ cwd: baseDir }), /Malformed host service response payload/);
+	await new Promise<void>((resolve) => {
+		badOperationServer.close(() => resolve());
+	});
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
+test("host service client rejects malformed response with mismatched status_details protocol version", async () => {
+	const baseDir = temporaryDir("host-service-bad-details-version-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const expectedRequestId = "details-version-request-id";
+	const malformedResponse = JSON.stringify({
+		protocol_version: 1,
+		request_id: expectedRequestId,
+		operation: "status",
+		status: "ok",
+		generated_at_ns: Date.now() * 1_000_000,
+		status_details: {
+			protocol_version: 0,
+			supported: true,
+			service_available: true,
+			service_name: "agent-synctex-test-bad-version",
+			socket_path: socketPath,
+			service_instance_started_ns: Date.now() * 1_000_000,
+			service_instance_id: "instance-id",
+			workspace_context: { cwd: baseDir },
+			request_id: expectedRequestId,
+			operation: "status",
+			uptime_ns: 1,
+			total_requests: 1,
+		},
+	}) + "\n";
+	const badVersionServer = createServer((socket) => {
+		socket.end(malformedResponse, () => {
+			socket.destroy();
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		badVersionServer.once("error", reject);
+		badVersionServer.listen(socketPath, () => {
+			resolve();
+		});
+	});
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+		requestIdFactory: () => expectedRequestId,
+	});
+	await assert.rejects(() => client.requestStatus({ cwd: baseDir }), /Malformed host service response payload/);
+	await new Promise<void>((resolve) => {
+		badVersionServer.close(() => resolve());
+	});
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
 
 test("host service rejects missing workspace context", async () => {
 	const socketPath = join(temporaryDir("host-service-validate-"), "host-service.sock");

@@ -97,10 +97,11 @@ export class HostServiceClient {
 		requestTimeoutMs?: number,
 	): Promise<HostServiceStatusResponseDetails> {
 		const context = normalizeWorkspaceContext(workspaceContext);
+		const requestId = this.makeRequestId();
 		const response = await this.request(
 			{
 				protocol_version: PROTOCOL_VERSION,
-				request_id: this.makeRequestId(),
+				request_id: requestId,
 				operation: "status",
 				created_at_ns: Date.now() * 1_000_000,
 				workspace_context: context,
@@ -108,12 +109,12 @@ export class HostServiceClient {
 			signal,
 			requestTimeoutMs ?? this.requestTimeoutMs,
 		);
+		if (!isValidStatusResponse(response, requestId)) {
+			throw new Error(`Malformed host service status response payload: ${JSON.stringify(response)}`);
+		}
 		if (response.status !== "ok") {
 			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
 			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
-		}
-		if (!isValidStatusResponse(response)) {
-			throw new Error(`Malformed host service status response payload: ${JSON.stringify(response)}`);
 		}
 		return response.status_details;
 	}
@@ -185,7 +186,7 @@ export class HostServiceClient {
 				const lineBreak = raw.indexOf("\n");
 				if (lineBreak < 0) return;
 				try {
-					const response = parseResponse(raw.slice(0, lineBreak).trim());
+					const response = parseResponse(raw.slice(0, lineBreak).trim(), request.request_id);
 					finish(response);
 				} catch (error) {
 					finish(error instanceof Error ? error : new Error(String(error)));
@@ -210,7 +211,7 @@ export class HostServiceClient {
 			const finishIfNotSettled = () => {
 				if (!settled && raw.trim()) {
 					try {
-						const response = parseResponse(raw.trim());
+						const response = parseResponse(raw.trim(), request.request_id);
 						finish(response);
 					} catch (error) {
 						finish(error instanceof Error ? error : new Error(String(error)));
@@ -333,16 +334,19 @@ export class HostServiceServer {
 	}
 
 	private respondToRequest(raw: string, socket: Socket): void {
+		let requestPayload: unknown;
 		let request: HostServiceStatusRequest;
 		try {
-			request = validateStatusRequest(parseRequest(raw));
+			requestPayload = parseRequest(raw);
+			request = validateStatusRequest(requestPayload);
 		} catch (error) {
+			const requestId = getRequestIdFromPayload(requestPayload);
 			socket.end(buildErrorResponse(
 				this.protocolVersion,
 				this.socketPath,
 				this.serviceName,
 				this.serviceInstanceId,
-				"",
+				requestId,
 				error instanceof Error ? error.message : String(error),
 				"invalid_request",
 			));
@@ -470,14 +474,21 @@ function parseRequest(raw: string): unknown {
 	}
 }
 
-function parseResponse(raw: string): HostServiceResponseEnvelope {
+function getRequestIdFromPayload(payload: unknown): string {
+	if (isStringRecord(payload) && typeof payload.request_id === "string") {
+		return payload.request_id;
+	}
+	return "";
+}
+
+function parseResponse(raw: string, expectedRequestId: string): HostServiceResponseEnvelope {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
-	if (!isValidStatusResponse(parsed)) {
+	if (!isValidStatusResponse(parsed, expectedRequestId)) {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
 	return parsed;
@@ -511,20 +522,20 @@ function validateStatusRequest(value: unknown): HostServiceStatusRequest {
 	};
 }
 
-function isValidStatusResponse(response: unknown): response is HostServiceResponseEnvelope {
+function isValidStatusResponse(response: unknown, expectedRequestId: string): response is HostServiceResponseEnvelope {
 	if (!isStringRecord(response)) {
 		return false;
 	}
 	if (typeof response.protocol_version !== "number" || response.protocol_version !== PROTOCOL_VERSION) {
 		return false;
 	}
-	if (typeof response.request_id !== "string") {
+	if (typeof response.request_id !== "string" || response.request_id !== expectedRequestId) {
 		return false;
 	}
 	if (response.status !== "ok" && response.status !== "error") {
 		return false;
 	}
-	if (typeof response.operation !== "string" || !response.operation) {
+	if (response.operation !== "status") {
 		return false;
 	}
 	if (typeof response.generated_at_ns !== "number") {
@@ -537,7 +548,7 @@ function isValidStatusResponse(response: unknown): response is HostServiceRespon
 	if (!isStringRecord(details)) {
 		return false;
 	}
-	if (typeof details.protocol_version !== "number") {
+	if (typeof details.protocol_version !== "number" || details.protocol_version !== PROTOCOL_VERSION) {
 		return false;
 	}
 	if (typeof details.supported !== "boolean") {
@@ -555,16 +566,16 @@ function isValidStatusResponse(response: unknown): response is HostServiceRespon
 	if (typeof details.service_instance_started_ns !== "number") {
 		return false;
 	}
-	if (typeof details.service_instance_id !== "string") {
+	if (typeof details.service_instance_id !== "string" || !details.service_instance_id) {
 		return false;
 	}
 	if (!isValidWorkspaceContext(details.workspace_context)) {
 		return false;
 	}
-	if (typeof details.request_id !== "string") {
+	if (typeof details.request_id !== "string" || details.request_id !== expectedRequestId) {
 		return false;
 	}
-	if (details.operation !== response.operation) {
+	if (details.operation !== "status") {
 		return false;
 	}
 	if (typeof details.uptime_ns !== "number") {
@@ -576,17 +587,7 @@ function isValidStatusResponse(response: unknown): response is HostServiceRespon
 	if (details.error_code !== undefined && typeof details.error_code !== "string") {
 		return false;
 	}
-	const isError = response.status === "error";
-	if (!isError && response.request_id.trim().length === 0) {
-		return false;
-	}
-	if (!isError && !details.request_id.trim()) {
-		return false;
-	}
-	if (!isError && !details.service_instance_id) {
-		return false;
-	}
-	if (isError && response.error === undefined) {
+	if (response.status === "error" && response.error === undefined) {
 		return false;
 	}
 	return true;
