@@ -475,28 +475,10 @@ function parseResponse(raw: string): HostServiceResponseEnvelope {
 	} catch {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
-	if (!isStringRecord(parsed)) {
+	if (!isValidStatusResponse(parsed)) {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
-	if (typeof parsed.protocol_version !== "number" || parsed.protocol_version !== PROTOCOL_VERSION) {
-		throw new Error(`Malformed host service response payload: ${raw}`);
-	}
-	if (typeof parsed.request_id !== "string") {
-		throw new Error(`Malformed host service response payload: ${raw}`);
-	}
-	if (parsed.status !== "ok" && parsed.status !== "error") {
-		throw new Error(`Malformed host service response payload: ${raw}`);
-	}
-	if (typeof parsed.operation !== "string" || !parsed.operation) {
-		throw new Error(`Malformed host service response payload: ${raw}`);
-	}
-	if (typeof parsed.generated_at_ns !== "number") {
-		throw new Error(`Malformed host service response payload: ${raw}`);
-	}
-	if (!isStringRecord(parsed.status_details)) {
-		throw new Error(`Malformed host service response payload: ${raw}`);
-	}
-	return parsed as HostServiceResponseEnvelope;
+	return parsed;
 }
 
 function validateStatusRequest(value: unknown): HostServiceStatusRequest {
@@ -527,21 +509,71 @@ function validateStatusRequest(value: unknown): HostServiceStatusRequest {
 	};
 }
 
-function isValidStatusResponse(response: HostServiceResponseEnvelope): boolean {
+function isValidStatusResponse(response: unknown): response is HostServiceResponseEnvelope {
+	if (!isStringRecord(response)) {
+		return false;
+	}
+	if (typeof response.protocol_version !== "number" || response.protocol_version !== PROTOCOL_VERSION) {
+		return false;
+	}
+	if (typeof response.request_id !== "string" || !response.request_id.trim()) {
+		return false;
+	}
+	if (response.status !== "ok" && response.status !== "error") {
+		return false;
+	}
+	if (typeof response.operation !== "string" || !response.operation) {
+		return false;
+	}
+	if (typeof response.generated_at_ns !== "number") {
+		return false;
+	}
 	const details = response.status_details;
-	if (!isStringRecord(details)) return false;
-	if (typeof details.protocol_version !== "number") return false;
-	if (typeof details.supported !== "boolean") return false;
-	if (typeof details.service_available !== "boolean") return false;
-	if (typeof details.service_name !== "string" || !details.service_name) return false;
-	if (typeof details.socket_path !== "string" || !details.socket_path) return false;
-	if (typeof details.service_instance_started_ns !== "number") return false;
-	if (typeof details.service_instance_id !== "string" || !details.service_instance_id) return false;
-	if (!isValidWorkspaceContext(details.workspace_context)) return false;
-	if (typeof details.request_id !== "string" || !details.request_id) return false;
-	if (details.operation !== "status") return false;
-	if (typeof details.uptime_ns !== "number") return false;
-	if (typeof details.total_requests !== "number") return false;
+	if (!isStringRecord(details)) {
+		return false;
+	}
+	if (typeof details.protocol_version !== "number") {
+		return false;
+	}
+	if (typeof details.supported !== "boolean") {
+		return false;
+	}
+	if (typeof details.service_available !== "boolean") {
+		return false;
+	}
+	if (typeof details.service_name !== "string" || !details.service_name) {
+		return false;
+	}
+	if (typeof details.socket_path !== "string" || !details.socket_path) {
+		return false;
+	}
+	if (typeof details.service_instance_started_ns !== "number") {
+		return false;
+	}
+	if (typeof details.service_instance_id !== "string" || !details.service_instance_id) {
+		return false;
+	}
+	if (!isValidWorkspaceContext(details.workspace_context)) {
+		return false;
+	}
+	if (typeof details.request_id !== "string" || !details.request_id) {
+		return false;
+	}
+	if (details.operation !== "status") {
+		return false;
+	}
+	if (typeof details.uptime_ns !== "number") {
+		return false;
+	}
+	if (typeof details.total_requests !== "number") {
+		return false;
+	}
+	if (response.error !== undefined && typeof response.error !== "string") {
+		return false;
+	}
+	if (details.error_code !== undefined && typeof details.error_code !== "string") {
+		return false;
+	}
 	return true;
 }
 
