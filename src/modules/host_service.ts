@@ -311,7 +311,7 @@ export class HostServiceServer {
 		const handleData = (chunk: string | Buffer) => {
 			raw += String(chunk);
 			if (raw.length > MAX_PAYLOAD_BYTES) {
-				socket.end(buildErrorResponse(this.protocolVersion, this.socketPath, this.serviceName, "", "request too large", "invalid_request"));
+				socket.end(buildErrorResponse(this.protocolVersion, this.socketPath, this.serviceName, this.serviceInstanceId, "", "request too large", "invalid_request"));
 				socket.destroy();
 				return;
 			}
@@ -341,6 +341,7 @@ export class HostServiceServer {
 				this.protocolVersion,
 				this.socketPath,
 				this.serviceName,
+				this.serviceInstanceId,
 				"",
 				error instanceof Error ? error.message : String(error),
 				"invalid_request",
@@ -353,6 +354,7 @@ export class HostServiceServer {
 				this.protocolVersion,
 				this.socketPath,
 				this.serviceName,
+				this.serviceInstanceId,
 				request.request_id,
 				`unsupported operation: ${request.operation}`,
 				"unsupported_operation",
@@ -516,7 +518,7 @@ function isValidStatusResponse(response: unknown): response is HostServiceRespon
 	if (typeof response.protocol_version !== "number" || response.protocol_version !== PROTOCOL_VERSION) {
 		return false;
 	}
-	if (typeof response.request_id !== "string" || !response.request_id.trim()) {
+	if (typeof response.request_id !== "string") {
 		return false;
 	}
 	if (response.status !== "ok" && response.status !== "error") {
@@ -526,6 +528,9 @@ function isValidStatusResponse(response: unknown): response is HostServiceRespon
 		return false;
 	}
 	if (typeof response.generated_at_ns !== "number") {
+		return false;
+	}
+	if (response.error !== undefined && typeof response.error !== "string") {
 		return false;
 	}
 	const details = response.status_details;
@@ -550,16 +555,16 @@ function isValidStatusResponse(response: unknown): response is HostServiceRespon
 	if (typeof details.service_instance_started_ns !== "number") {
 		return false;
 	}
-	if (typeof details.service_instance_id !== "string" || !details.service_instance_id) {
+	if (typeof details.service_instance_id !== "string") {
 		return false;
 	}
 	if (!isValidWorkspaceContext(details.workspace_context)) {
 		return false;
 	}
-	if (typeof details.request_id !== "string" || !details.request_id) {
+	if (typeof details.request_id !== "string") {
 		return false;
 	}
-	if (details.operation !== "status") {
+	if (details.operation !== response.operation) {
 		return false;
 	}
 	if (typeof details.uptime_ns !== "number") {
@@ -568,10 +573,20 @@ function isValidStatusResponse(response: unknown): response is HostServiceRespon
 	if (typeof details.total_requests !== "number") {
 		return false;
 	}
-	if (response.error !== undefined && typeof response.error !== "string") {
+	if (details.error_code !== undefined && typeof details.error_code !== "string") {
 		return false;
 	}
-	if (details.error_code !== undefined && typeof details.error_code !== "string") {
+	const isError = response.status === "error";
+	if (!isError && response.request_id.trim().length === 0) {
+		return false;
+	}
+	if (!isError && !details.request_id.trim()) {
+		return false;
+	}
+	if (!isError && !details.service_instance_id) {
+		return false;
+	}
+	if (isError && response.error === undefined) {
 		return false;
 	}
 	return true;
@@ -581,6 +596,7 @@ function buildErrorResponse(
 	protocolVersion: number,
 	socketPath: string,
 	serviceName: string,
+	serviceInstanceId: string,
 	requestId: string,
 	errorText: string,
 	errorCode: string,
@@ -600,7 +616,7 @@ function buildErrorResponse(
 			service_name: serviceName,
 			socket_path: socketPath,
 			service_instance_started_ns: nowNs,
-			service_instance_id: "",
+			service_instance_id: serviceInstanceId,
 			workspace_context: FALLBACK_WORKSPACE_CONTEXT,
 			request_id: requestId,
 			operation: "status",

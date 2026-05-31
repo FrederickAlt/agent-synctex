@@ -172,6 +172,63 @@ test("host service client surfaces malformed response payloads", async () => {
 	}
 });
 
+test("host service client surfaces server error envelopes as service errors", async () => {
+	const baseDir = temporaryDir("host-service-error-envelope-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const serverErrorResponse = JSON.stringify({
+		protocol_version: 1,
+		request_id: "",
+		operation: "status",
+		status: "error",
+		generated_at_ns: Date.now() * 1_000_000,
+		error: "invalid workspace_context; cwd is required",
+		status_details: {
+			protocol_version: 1,
+			supported: false,
+			service_available: false,
+			service_name: "agent-synctex-test-error",
+			socket_path: socketPath,
+			service_instance_started_ns: Date.now() * 1_000_000,
+			service_instance_id: "",
+			workspace_context: { cwd: "/" },
+			request_id: "",
+			operation: "status",
+			uptime_ns: 0,
+			total_requests: 0,
+			error_code: "invalid_workspace_context",
+		},
+	}) + "\n";
+	const errorServer = createServer((socket) => {
+		socket.end(serverErrorResponse, () => {
+			socket.destroy();
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		errorServer.once("error", reject);
+		errorServer.listen(socketPath, () => {
+			resolve();
+		});
+	});
+
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+	let observed: unknown;
+	try {
+		await client.requestStatus({ cwd: baseDir });
+	} catch (error) {
+		observed = error;
+	} finally {
+		await new Promise<void>((resolve) => {
+			errorServer.close(() => resolve());
+		});
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /invalid workspace_context; cwd is required/);
+	assert.match(observed.message, /code=invalid_workspace_context/);
+	assert.doesNotMatch(observed.message, /Malformed host service response payload/);
+});
+
 test("host service rejects missing workspace context", async () => {
 	const socketPath = join(temporaryDir("host-service-validate-"), "host-service.sock");
 	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-validate" });
