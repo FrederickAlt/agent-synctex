@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createConnection, createServer, type Server } from "node:net";
 import {
+	chmodSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -29,6 +30,37 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
 	});
+}
+
+function writeFakeLatexCompiler(binDir: string, options: { exitCode?: number; withLog?: boolean } = {}): string {
+	const exitCode = options.exitCode ?? 0;
+	const withLog = options.withLog ?? true;
+	mkdirSync(binDir, { mode: 0o700, recursive: true });
+	const compilerPath = join(binDir, "lualatex");
+	writeFileSync(compilerPath, `#!/bin/sh
+set -eu
+tex_file=""
+prev=""
+out_dir=""
+for arg in "$@"; do
+  if [ "$prev" = "-output-directory" ]; then
+    out_dir="$arg"
+  fi
+  tex_file="$arg"
+  prev="$arg"
+done
+base="\${tex_file##*/}"
+name="\${base%.*}"
+out_dir="\${out_dir:-$(pwd)}"
+mkdir -p "$out_dir"${withLog ? `
+if [ ! -z "$out_dir" ]; then
+  echo "fake compiler output" > "$out_dir/$name.log"
+fi` : ""}
+touch "$out_dir/$name.pdf"
+exit ${exitCode}
+`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+	return compilerPath;
 }
 
 async function waitForFile(path: string, timeoutMs = 500): Promise<void> {
@@ -94,6 +126,46 @@ function readFromSocket(path: string, timeoutMs = 300): Promise<string> {
 	});
 }
 
+async function writeHostServiceRequest(
+	path: string,
+	request: Record<string, unknown>,
+	timeoutMs = 300,
+): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const socket = createConnection({ path });
+		let raw = "";
+		const timer = setTimeout(() => {
+			socket.destroy();
+			reject(new Error("socket roundtrip timed out"));
+		}, timeoutMs);
+		timer.unref?.();
+
+		socket.setEncoding("utf8");
+		socket.on("connect", () => {
+			socket.write(`${JSON.stringify(request)}\n`);
+		});
+		socket.on("data", (chunk) => {
+			raw += String(chunk);
+		});
+		socket.on("error", (error) => {
+			clearTimeout(timer);
+			if (raw.length > 0) {
+				resolve(raw);
+				return;
+			}
+			reject(error);
+		});
+		socket.on("close", () => {
+			clearTimeout(timer);
+			if (!raw.length) {
+				reject(new Error("socket closed without payload"));
+				return;
+			}
+			resolve(raw);
+		});
+	});
+}
+
 function startOrphanSocketServer(path: string): Promise<import("node:child_process").ChildProcess> {
 	const script = `
 		const { createServer } = require("node:net");
@@ -144,6 +216,281 @@ test("host service status request returns service health details over unix socke
 
 	assert.equal(existsSync(socketPath), false, "socket file should be cleaned up on stop");
 });
+
+
+test("host service compiles an existing latex file with explicit workspace context", async () => {
+	const baseDir = temporaryDir("host-service-compile-success-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-test" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const result = await client.requestCompileLatexFile(
+			{
+				latex_file_path: "paper.tex",
+				compiler: "lualatex",
+				clean: false,
+			},
+		{ cwd: baseDir },
+		);
+		assert.equal(result.operation, "compile_latex_file");
+		assert.equal(result.supported, true);
+		assert.equal(result.source, join(baseDir, "paper.tex"));
+		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(result.log, join(baseDir, "paper.log"));
+		assert.equal(result.clean, false);
+		assert.equal(result.cleaned_artifacts.length, 0);
+		assert.ok(result.artifact_paths.includes(join(baseDir, "paper.pdf")));
+		assert.ok(result.artifact_paths.includes(join(baseDir, "paper.log")));
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service compile_latex_file operation surfaces compiler failures", async () => {
+	const baseDir = temporaryDir("host-service-compile-failure-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"), { exitCode: 7 });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-failure" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+
+	try {
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /LaTeX compile failed/);
+		assert.match(observed.message, /code=compile_failed/);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service compile_latex_file rejects malformed payloads", async () => {
+	const baseDir = temporaryDir("host-service-compile-malformed-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-malformed" });
+	await server.start();
+
+	const requestPayload = {
+		protocol_version: 1,
+		request_id: "bad-request-id",
+		operation: "compile_latex_file",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: { cwd: baseDir },
+	};
+	const raw = await writeHostServiceRequest(socketPath, requestPayload as Record<string, unknown>);
+	const response = JSON.parse(raw.trim());
+
+	await server.stop();
+	rmSync(baseDir, { recursive: true, force: true });
+
+	assert.equal(response.request_id, "bad-request-id");
+	assert.equal(response.status, "error");
+	assert.equal(response.status_details.error_code, "invalid_request");
+	assert.match(response.error, /missing compile details/);
+});
+
+
+test("host service compile_latex_file includes raw source path for invalid compile workspace", async () => {
+	const baseDir = temporaryDir("host-service-compile-malformed-workspace-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-workspace-raw" });
+	await server.start();
+
+	const requestPayload = {
+		protocol_version: 1,
+		request_id: "workspace-request-id",
+		operation: "compile_latex_file",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: { cwd: "relative/path", workspace_root: "relative-root" },
+		details: {
+			latex_file_path: "paper.tex",
+		},
+	};
+	const raw = await writeHostServiceRequest(socketPath, requestPayload as Record<string, unknown>);
+	const response = JSON.parse(raw.trim());
+
+	await server.stop();
+	rmSync(baseDir, { recursive: true, force: true });
+
+	assert.equal(response.operation, "compile_latex_file");
+	assert.equal(response.status, "error");
+	assert.equal(response.status_details.source, "paper.tex");
+	assert.equal(response.status_details.log, "paper.log");
+	assert.equal(response.status_details.error_code, "invalid_request");
+	assert.match(response.error, /workspace_context.cwd must be absolute for compile_latex_file/);
+});
+
+
+test("host service compile_latex_file rejects invalid compiler values", async () => {
+	const baseDir = temporaryDir("host-service-compile-invalid-compiler-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-bad-compiler" });
+	await server.start();
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\\n\\begin{document}\\nhi\\end{document}\\n");
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: 123 }, { cwd: baseDir });
+	} catch (error) {
+		observed = error;
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /compiler must be a string/);
+});
+
+
+test("host service compile_latex_file rejects unsupported compiler strings", async () => {
+	const baseDir = temporaryDir("host-service-compile-unsupported-compiler-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-unsupported-compiler" });
+	await server.start();
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\\n\\begin{document}\\nhi\\end{document}\\n");
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "bogus" }, { cwd: baseDir });
+	} catch (error) {
+		observed = error;
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /compiler must be one of:/);
+	assert.match(observed.message, /code=compile_failed/);
+});
+
+
+test("host service compile_latex_file keeps clean=true artifacts in report", async () => {
+	const baseDir = temporaryDir("host-service-compile-clean-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\\n\\begin{document}\\nclean\\end{document}\\n");
+	writeFileSync(join(baseDir, "paper.aux"), "old aux");
+	writeFileSync(join(baseDir, "paper.log"), "old log");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-clean" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const result = await client.requestCompileLatexFile(
+			{
+				latex_file_path: "paper.tex",
+				clean: true,
+			},
+			{ cwd: baseDir },
+		);
+		assert.equal(result.clean, true);
+		assert.equal(result.cleaned_artifacts.includes(join(baseDir, "paper.aux")), true);
+		assert.equal(result.cleaned_artifacts.includes(join(baseDir, "paper.log")), true);
+		assert.equal(result.artifact_paths.includes(join(baseDir, "paper.pdf")), true);
+		assert.equal(result.artifact_paths.includes(join(baseDir, "paper.log")), true);
+		assert.equal(result.artifact_paths.includes(join(baseDir, "paper.aux")), false);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service compile_latex_file filters missing artifacts", async () => {
+	const baseDir = temporaryDir("host-service-compile-filter-artifacts-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"), { withLog: false });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\\n\\begin{document}\\nhi\\end{document}\\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-filter-artifacts" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const result = await client.requestCompileLatexFile({ latex_file_path: "paper.tex" }, { cwd: baseDir });
+		assert.equal(result.artifact_paths.includes(join(baseDir, "paper.pdf")), true);
+		assert.equal(result.artifact_paths.includes(join(baseDir, "paper.log")), false);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service compile_latex_file requires absolute workspace cwd", async () => {
+	const baseDir = temporaryDir("host-service-compile-absolute-cwd-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-absolute" });
+	await server.start();
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\\n\\begin{document}\\nhi\\end{document}\\n");
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex" }, { cwd: "relative/path" });
+	} catch (error) {
+		observed = error;
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /must be absolute for compile_latex_file/);
+});
+
 
 test("host service client surfaces malformed response payloads", async () => {
 	const baseDir = temporaryDir("host-service-malformed-");
