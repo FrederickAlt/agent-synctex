@@ -24,6 +24,14 @@ export interface HostServiceStatusRequest {
 	workspace_context: HostServiceWorkspaceContext;
 }
 
+export interface HostServiceViewerBackendCapabilities {
+	open: boolean;
+	close: boolean;
+	forward_search: boolean;
+	inverse_search: boolean;
+	reuse: boolean;
+}
+
 export interface HostServiceStatusResponseDetails {
 	protocol_version: number;
 	supported: boolean;
@@ -38,6 +46,9 @@ export interface HostServiceStatusResponseDetails {
 	uptime_ns: number;
 	total_requests: number;
 	error_code?: string;
+	viewer_backend_name?: string;
+	viewer_backend_available?: boolean;
+	viewer_backend_capabilities?: HostServiceViewerBackendCapabilities;
 }
 
 export interface HostServiceResponseEnvelope {
@@ -56,10 +67,23 @@ export interface HostServiceClientOptions {
 	requestIdFactory?: () => string;
 }
 
+export interface ViewerBackendAdapter {
+	readonly name: string;
+	readonly capabilities: HostServiceViewerBackendCapabilities;
+	isAvailable(): boolean;
+}
+
+export interface FakeViewerBackendOptions {
+	name?: string;
+	available?: boolean;
+	capabilities?: Partial<HostServiceViewerBackendCapabilities>;
+}
+
 export interface HostServiceServerOptions {
 	socketPath?: string;
 	serviceName?: string;
 	serviceInstanceId?: string;
+	viewerBackend?: ViewerBackendAdapter;
 }
 
 const PROTOCOL_VERSION = 1;
@@ -75,6 +99,45 @@ const MAX_PAYLOAD_BYTES = 16_384;
 const STARTUP_SOCKET_CHECK_TIMEOUT_MS = 250;
 const ACTIVE_CONNECTION_TIMEOUT_MS = 10_000;
 const FALLBACK_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
+
+const DEFAULT_FAKE_VIEWER_BACKEND_NAME = "fake-viewer";
+const DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES: HostServiceViewerBackendCapabilities = {
+	open: true,
+	close: true,
+	forward_search: true,
+	inverse_search: false,
+	reuse: true,
+};
+
+function cloneCapabilities(overrides?: Partial<HostServiceViewerBackendCapabilities>): HostServiceViewerBackendCapabilities {
+	return {
+		open: overrides?.open ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.open,
+		close: overrides?.close ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.close,
+		forward_search: overrides?.forward_search ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.forward_search,
+		inverse_search: overrides?.inverse_search ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.inverse_search,
+		reuse: overrides?.reuse ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.reuse,
+	};
+}
+
+export class FakeViewerBackend implements ViewerBackendAdapter {
+	readonly name: string;
+	readonly capabilities: HostServiceViewerBackendCapabilities;
+	private available: boolean;
+
+	constructor(options: FakeViewerBackendOptions = {}) {
+		this.name = options.name ?? DEFAULT_FAKE_VIEWER_BACKEND_NAME;
+		this.available = options.available ?? true;
+		this.capabilities = cloneCapabilities(options.capabilities);
+	}
+
+	isAvailable(): boolean {
+		return this.available;
+	}
+
+	setAvailable(available: boolean): void {
+		this.available = available;
+	}
+}
 
 export function defaultHostServiceSocketPath(): string {
 	return DEFAULT_HOST_SERVICE_SOCKET_PATH;
@@ -233,6 +296,7 @@ export class HostServiceServer {
 	readonly socketPath: string;
 	readonly serviceName: string;
 	private readonly protocolVersion = PROTOCOL_VERSION;
+	private readonly viewerBackend: ViewerBackendAdapter;
 	private server: Server | null = null;
 	private startedAtNs = 0;
 	private serviceInstanceId: string;
@@ -244,6 +308,7 @@ export class HostServiceServer {
 		this.socketPath = resolve(options.socketPath ?? DEFAULT_HOST_SERVICE_SOCKET_PATH);
 		this.serviceName = options.serviceName ?? "agent-synctex-host-service";
 		this.serviceInstanceId = options.serviceInstanceId ?? `host-service-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+		this.viewerBackend = options.viewerBackend ?? new FakeViewerBackend();
 	}
 
 	async start(): Promise<void> {
@@ -368,6 +433,7 @@ export class HostServiceServer {
 
 		this.totalRequests += 1;
 		const nowNs = Date.now() * 1_000_000;
+		const viewerBackendAvailable = this.viewerBackend.isAvailable();
 		const response: HostServiceResponseEnvelope = {
 			protocol_version: this.protocolVersion,
 			request_id: request.request_id,
@@ -377,7 +443,7 @@ export class HostServiceServer {
 			status_details: {
 				protocol_version: this.protocolVersion,
 				supported: true,
-				service_available: true,
+				service_available: viewerBackendAvailable,
 				service_name: this.serviceName,
 				socket_path: this.socketPath,
 				service_instance_started_ns: this.startedAtNs,
@@ -387,6 +453,9 @@ export class HostServiceServer {
 				operation: request.operation,
 				uptime_ns: nowNs - this.startedAtNs,
 				total_requests: this.totalRequests,
+				viewer_backend_name: this.viewerBackend.name,
+				viewer_backend_available: viewerBackendAvailable,
+				viewer_backend_capabilities: this.viewerBackend.capabilities,
 			},
 		};
 		socket.end(`${JSON.stringify(response)}\n`);
@@ -587,10 +656,32 @@ function isValidStatusResponse(response: unknown, expectedRequestId: string): re
 	if (details.error_code !== undefined && typeof details.error_code !== "string") {
 		return false;
 	}
+	if (details.viewer_backend_name !== undefined && typeof details.viewer_backend_name !== "string") {
+		return false;
+	}
+	if (details.viewer_backend_available !== undefined && typeof details.viewer_backend_available !== "boolean") {
+		return false;
+	}
+	if (details.viewer_backend_capabilities !== undefined && !isValidViewerBackendCapabilities(details.viewer_backend_capabilities)) {
+		return false;
+	}
 	if (response.status === "error" && response.error === undefined) {
 		return false;
 	}
 	return true;
+}
+
+function isValidViewerBackendCapabilities(value: unknown): value is HostServiceViewerBackendCapabilities {
+	if (!isStringRecord(value)) {
+		return false;
+	}
+	return (
+		typeof value.open === "boolean"
+		&& typeof value.close === "boolean"
+		&& typeof value.forward_search === "boolean"
+		&& typeof value.inverse_search === "boolean"
+		&& typeof value.reuse === "boolean"
+	);
 }
 
 function buildErrorResponse(
