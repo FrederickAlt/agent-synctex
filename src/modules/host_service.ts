@@ -61,6 +61,31 @@ export interface HostServiceResponseEnvelope {
 	status_details: HostServiceStatusResponseDetails;
 }
 
+export interface HostServiceManagedViewerRecord {
+	id: number;
+	pdfPath: string;
+	viewerHandle: string;
+	viewerBackend: string;
+	viewerOwned: boolean;
+	createdAtNs: number;
+	metadata?: Record<string, unknown>;
+}
+
+export interface HostServiceManagedViewerRecordInput {
+	pdfPath: string;
+	viewerHandle: string;
+	viewerBackend: string;
+	viewerOwned: boolean;
+	metadata?: Record<string, unknown>;
+}
+
+export interface HostServicePdfIdRegistryOptions {
+	minPdfId?: number;
+	maxPdfId?: number;
+	makePdfId?: () => number;
+	maxAllocationAttempts?: number;
+}
+
 export interface HostServiceClientOptions {
 	socketPath?: string;
 	requestTimeoutMs?: number;
@@ -99,6 +124,11 @@ const MAX_PAYLOAD_BYTES = 16_384;
 const STARTUP_SOCKET_CHECK_TIMEOUT_MS = 250;
 const ACTIVE_CONNECTION_TIMEOUT_MS = 10_000;
 const FALLBACK_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
+export const MIN_ACTIVE_PDF_ID = 1;
+export const MAX_ACTIVE_PDF_ID = 99_999_999;
+const DEFAULT_MIN_ACTIVE_PDF_ID = MIN_ACTIVE_PDF_ID;
+const DEFAULT_MAX_ACTIVE_PDF_ID = MAX_ACTIVE_PDF_ID;
+const DEFAULT_ACTIVE_PDF_ID_ALLOCATION_ATTEMPTS = 64;
 
 const DEFAULT_FAKE_VIEWER_BACKEND_NAME = "fake-viewer";
 const DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES: HostServiceViewerBackendCapabilities = {
@@ -141,6 +171,135 @@ export class FakeViewerBackend implements ViewerBackendAdapter {
 
 export function defaultHostServiceSocketPath(): string {
 	return DEFAULT_HOST_SERVICE_SOCKET_PATH;
+}
+
+export class HostServicePdfIdRegistry {
+	private readonly minPdfId: number;
+	private readonly maxPdfId: number;
+	private readonly makePdfId: () => number;
+	private readonly maxAllocationAttempts: number;
+	private readonly activeRecords = new Map<number, HostServiceManagedViewerRecord>();
+	private readonly staleRecords = new Map<number, HostServiceManagedViewerRecord>();
+	private readonly closedRecords = new Map<number, HostServiceManagedViewerRecord>();
+
+	constructor(options: HostServicePdfIdRegistryOptions = {}) {
+		this.minPdfId = options.minPdfId ?? DEFAULT_MIN_ACTIVE_PDF_ID;
+		this.maxPdfId = options.maxPdfId ?? DEFAULT_MAX_ACTIVE_PDF_ID;
+		if (
+			!Number.isInteger(this.minPdfId) ||
+			!Number.isInteger(this.maxPdfId) ||
+			this.minPdfId < MIN_ACTIVE_PDF_ID ||
+			this.maxPdfId > MAX_ACTIVE_PDF_ID ||
+			this.maxPdfId < this.minPdfId
+		) {
+			throw new Error("invalid pdf id range");
+		}
+		this.makePdfId = options.makePdfId ?? (() => this.minPdfId + Math.floor(Math.random() * (this.maxPdfId - this.minPdfId + 1)));
+		this.maxAllocationAttempts = options.maxAllocationAttempts ?? DEFAULT_ACTIVE_PDF_ID_ALLOCATION_ATTEMPTS;
+		if (!Number.isInteger(this.maxAllocationAttempts) || this.maxAllocationAttempts <= 0) {
+			throw new Error("invalid maxAllocationAttempts");
+		}
+	}
+
+	trackRecord(record: HostServiceManagedViewerRecordInput): HostServiceManagedViewerRecord {
+		const id = this.allocatePdfId();
+		const nowNs = Date.now() * 1_000_000;
+		const managedRecord: HostServiceManagedViewerRecord = {
+			id,
+			pdfPath: record.pdfPath,
+			viewerHandle: record.viewerHandle,
+			viewerBackend: record.viewerBackend,
+			viewerOwned: record.viewerOwned,
+			createdAtNs: nowNs,
+			metadata: record.metadata,
+		};
+		this.activeRecords.set(id, managedRecord);
+		return managedRecord;
+	}
+
+	registerRecord(record: HostServiceManagedViewerRecordInput): HostServiceManagedViewerRecord {
+		return this.trackRecord(record);
+	}
+
+	get activeCount(): number {
+		return this.activeRecords.size;
+	}
+
+	getActiveRecord(pdfId: number): HostServiceManagedViewerRecord {
+		const activeRecord = this.activeRecords.get(pdfId);
+		if (activeRecord) {
+			return activeRecord;
+		}
+		if (this.staleRecords.has(pdfId)) {
+			throw new Error(`Stale pdf_id=${pdfId}: reopen this PDF record before retrying`);
+		}
+		if (this.closedRecords.has(pdfId)) {
+			throw new Error(`Closed pdf_id=${pdfId}: this record has been removed and is no longer active`);
+		}
+		throw new Error(`Unknown pdf_id=${pdfId}: no active pdf record found`);
+	}
+
+	markRecordStale(pdfId: number): HostServiceManagedViewerRecord {
+		const activeRecord = this.activeRecords.get(pdfId);
+		if (!activeRecord) {
+			this.getActiveRecord(pdfId); // throws clear, classification-rich error for non-active IDs
+			throw new Error(`Unable to mark pdf_id=${pdfId} as stale`);
+		}
+		this.activeRecords.delete(pdfId);
+		this.staleRecords.set(pdfId, activeRecord);
+		return activeRecord;
+	}
+
+	removeRecord(pdfId: number): HostServiceManagedViewerRecord {
+		const activeRecord = this.activeRecords.get(pdfId);
+		if (activeRecord) {
+			this.activeRecords.delete(pdfId);
+			this.closedRecords.set(pdfId, activeRecord);
+			return activeRecord;
+		}
+		if (this.staleRecords.has(pdfId)) {
+			throw new Error(`Stale pdf_id=${pdfId}: reopen this PDF record before retrying`);
+		}
+		if (this.closedRecords.has(pdfId)) {
+			throw new Error(`Closed pdf_id=${pdfId}: this record has been removed and is no longer active`);
+		}
+		throw new Error(`Unknown pdf_id=${pdfId}: no active pdf record found`);
+	}
+
+	closeRecord(pdfId: number): HostServiceManagedViewerRecord {
+		return this.removeRecord(pdfId);
+	}
+
+	clear(): void {
+		this.activeRecords.clear();
+		this.staleRecords.clear();
+	}
+
+	private allocatePdfId(): number {
+		const collisions: number[] = [];
+		for (let attempt = 0; attempt < this.maxAllocationAttempts; attempt += 1) {
+			const candidate = this.makePdfId();
+			if (
+				!Number.isInteger(candidate) ||
+				candidate < MIN_ACTIVE_PDF_ID ||
+				candidate > MAX_ACTIVE_PDF_ID ||
+				candidate < this.minPdfId ||
+				candidate > this.maxPdfId
+			) {
+				throw new Error(`Invalid generated pdf_id=${String(candidate)}; expected integer in ${this.minPdfId}..${this.maxPdfId}`);
+			}
+			if (
+				this.activeRecords.has(candidate) ||
+				this.staleRecords.has(candidate) ||
+				this.closedRecords.has(candidate)
+			) {
+				collisions.push(candidate);
+				continue;
+			}
+			return candidate;
+		}
+		throw new Error(`Unable to allocate unique active pdf_id after ${this.maxAllocationAttempts} attempts (collisions: ${collisions.join(", ")})`);
+	}
 }
 
 export class HostServiceClient {
