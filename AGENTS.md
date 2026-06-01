@@ -35,3 +35,7 @@ the host-service helper artifacts without raw access to the user session D-Bus. 
 privileged escape hatch. Do not use it for anything except maintaining/testing the PDF host service that
 supports PDF open, close, and SyncTeX/forward-search operations. Do not repurpose the broker, broaden its
 permissions, or use it for arbitrary host commands.
+
+For normal runtime, this repo expects the user-systemd unit at `systemd/show-latex.service` and unit name
+`show-latex.service` (or `pdf-preview-servicectl` if your local setup targets that unit). `npm run
+host-service:start` remains a foreground debug invocation, not the default long-running flow.

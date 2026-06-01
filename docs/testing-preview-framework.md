@@ -172,7 +172,7 @@ open/reuse/close/forward-search behavior without launching a real GUI. Use this 
 - forward-search command construction and diagnostic propagation.
 
 Real Zathura behavior still needs an opt-in smoke test because D-Bus and SyncTeX behavior cannot be fully represented by fake processes.
-From Pi, run the standard host-service flow after start:
+From Pi, start the normal host unit with `systemctl --user restart show-latex.service` (or `pdf-preview-servicectl restart` if your local broker targets it), then run:
 
 1. `show_latex` (default inline flow) and confirm an inline artifact is rendered in the Pi result.
 2. `show_latex` with `inline=false` and confirm the host service opens a viewer.
@@ -199,9 +199,11 @@ pdf-preview-servicectl logs
 ```
 
 This broker exists solely to sync/restart/status/log host-service support files so real open/close/SyncTeX behavior
-can be tested outside the sandbox. It is not a general host-control channel. Do not use it for unrelated commands,
-unrelated services, or any purpose other than maintaining/testing the PDF host service used by `open_pdf`, `close_pdf`,
-`jump_pdf`, `show_latex(inline=false)`, and `compile_latex_file(open_pdf=true)`. 
+can be tested outside the sandbox. It is not a general host-control channel and should forward to the same
+`show-latex.service` workflow (for example `pdf-preview-servicectl restart`, `pdf-preview-servicectl status`, and `pdf-preview-servicectl logs`).
+Do not use it for unrelated commands, unrelated services, or any purpose other than maintaining/testing the PDF host
+service used by `open_pdf`, `close_pdf`, `jump_pdf`, `show_latex(inline=false)`, and
+`compile_latex_file(open_pdf=true)`. 
 
 ## Verification commands
 

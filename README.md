@@ -78,18 +78,20 @@ pi -e /path/to/pdf-preview
 
 Keep the checked-out `scripts/` directory with the extension. The inverse SyncTeX callback helper
 is `scripts/pi_synctex_callback.mjs`; it is spawned on demand by Zathura callback commands and is
-not a systemd service. The default runtime uses the host service process from this repository. The extension
-never edits `~/.config/zathura/zathurarc` automatically.
+not a direct part of extension tool code.
 
-Host service setup/status:
+Host service setup/status for normal runtime is a user systemd unit from this repo:
 
 ```bash
-npm run host-service:start
-npm run host-service:status
+systemctl --user enable --now show-latex.service
+systemctl --user status show-latex.service
 ```
 
-`npm run host-service:start` starts the host service in the foreground and blocks until it receives SIGINT or SIGTERM. During HITL, run it in a separate terminal (or background with a tracked PID) so you can still run tool calls in another shell.
-If your project has `pdf-preview-servicectl`, you can also use `pdf-preview-servicectl restart`, `pdf-preview-servicectl status`, and `pdf-preview-servicectl logs`.
+`npm run host-service:start` and `npm run host-service:status` are foreground debug helpers that run the same
+TypeScript Host Service directly; they are useful for HITL but are not the normal daemon entrypoint.
+During HITL, run them in a separate terminal (or background with a tracked PID).
+If your project has `pdf-preview-servicectl`, it targets `show-latex.service` for host-service maintenance
+commands (`restart`, `status`, and `logs`).
 
 The host service exposes sockets under `/tmp/codex-show-latex` and logs under `/tmp/codex-show-latex/*.log`; host-service status logs should be consulted when open/close/jump requests fail unexpectedly.
 Before first start, `npm run host-service:status` may return ENOENT when the service runtime directory has not been created yet; this is expected.
@@ -119,7 +121,7 @@ unrelated host commands, unrelated services, or non-viewer automation.
 ### Viewer troubleshooting
 
 - **Timeout / service not processing requests**: if `open_pdf`, `close_pdf`, `jump_pdf`, `show_latex(inline=false)`, or `compile_latex_file(open_pdf=true)` fail with
-  `Host service request timed out: is the host service running?`, run `npm run host-service:start` and rerun the operation.
+  `Host service request timed out: is the host service running?`, restart the normal unit with `systemctl --user restart show-latex.service` (or `npm run host-service:start` for foreground debug) and rerun the operation.
 - **Backend unavailable**: failures like `viewer backend is unavailable` or `(code=backend_unavailable)` usually mean
   the configured backend command is missing/unlaunchable. Run
   `npm run host-service:status` and check returned backend/daemon diagnostics before restarting the service.
@@ -161,7 +163,7 @@ In headless/non-interactive sessions the callback never submits a message automa
 
 Install dev dependencies once with `npm install`, then run `npm run verify` to typecheck and execute the Node built-in test suite. Unit tests avoid real Zathura/LaTeX dependencies by using temp files and fake helper commands. They validate the extension protocol and a headless host-service workflow, but they do not prove real Zathura D-Bus/SyncTeX behavior.
 
-For service and viewer behavior, also run a manual smoke test from Pi after starting/restarting the Host Service from the current checkout (for example `npm run host-service:start`; this remains a human-only verification and is not covered by `npm run verify`):
+For service and viewer behavior, also run a manual smoke test from Pi after starting/restarting the host daemon via `systemctl --user restart show-latex.service` (or `npm run host-service:start` for foreground debug; this remains a human-only verification and is not covered by `npm run verify`):
 
 1. `show_latex` default inline flow shows an inline preview artifact in Pi UI.
 2. `show_latex` with `inline=false` opens a Zathura window through the TypeScript Host Service backend.

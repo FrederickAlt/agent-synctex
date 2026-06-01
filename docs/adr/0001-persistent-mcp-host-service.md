@@ -22,6 +22,7 @@ Pi and other clients act as frontends to this service. Pi may preserve richer fr
 
 ## Consequences
 
+- Normal host daemon execution is expected as a user-systemd unit `show-latex.service` (via `systemd/show-latex.service`), with `npm run host-service:start` reserved for foreground debug.
 - PDF IDs can remain valid across individual tool calls and client interactions until service restart or close.
 - Multiple agents can use the same host service while receiving distinct random active PDF IDs.
 - Viewer open, jump, close, and callback routing are centralized.

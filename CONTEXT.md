@@ -33,6 +33,7 @@ The Host Service communicates over a local Unix socket and exposes the main runt
 
 Because the Host Service is long-running and may serve multiple agents/projects, requests that depend on relative paths or project defaults must include explicit workspace context. The service should not rely on its own process working directory as the caller's project context.
 
+Normal runtime is the user-systemd unit `show-latex.service` (from `systemd/show-latex.service`); the `npm run host-service:start` path is a foreground debug flow for smoke and HITL.
 The stable integration surface is MCP. Developer convenience scripts such as `agent-synctex ...` are for debugging/smoke testing rather than the primary user workflow.
 
 The previous separate viewer-service role has been absorbed into the Host Service (with compatibility helpers retained only for legacy parity).
