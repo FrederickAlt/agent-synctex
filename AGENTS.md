@@ -1,5 +1,16 @@
 # AGENTS
 
+## Test environment setup
+
+Fresh git worktrees do not include `node_modules`. Before treating test failures as environment/sandbox problems, install dependencies and rerun verification:
+
+```bash
+npm ci || npm install
+npm run verify
+```
+
+If `npm run verify` fails with `tsc: not found` or `ERR_MODULE_NOT_FOUND: typescript`, the worktree dependencies are incomplete; run the install command above and retry.
+
 Before changing any preview rendering, refresh policy, or Kitty placeholder logic in this repo, read:
 
 - docs/testing-preview-framework.md
