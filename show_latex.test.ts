@@ -4,8 +4,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { spawn } from "node:child_process";
 import * as ts from "typescript";
+import { FakeViewerBackend, HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 
@@ -98,265 +98,10 @@ const TYPEBOX_STUB_SOURCE = `export const Type = {
 };
 `;
 
-const FAKE_VIEWER_SERVICE_SCRIPT = String.raw`const fs = require("node:fs");
-const path = require("node:path");
-
-const baseDir = process.env.MCP_TMPDIR || "/tmp/codex-show-latex";
-const mode = process.env.FAKE_VIEWER_MODE || "ok";
-const protocolDirectories = {
-	base: baseDir,
-	requests: path.join(baseDir, "viewer-requests"),
-	results: path.join(baseDir, "viewer-results"),
-	state: path.join(baseDir, "viewer-state.json"),
-};
-const capabilities = {
-	open: true,
-	close: true,
-	forward_search: true,
-	inverse_search: true,
-	reuse: true,
-};
-const serviceStartedNs = Number(process.hrtime.bigint());
-const openRequestLogPath = path.join(baseDir, "open-request-log.jsonl");
-const deprecatedDetailKeys = ["synctex_callback_command", "synctex_editor_command", "zathura_args"];
-const openSessions = {};
-let openCount = 0;
-
-function writeResult(filePath, response) {
-	const tempPath = filePath + ".tmp";
-	fs.writeFileSync(tempPath, JSON.stringify(response), { mode: 0o600 });
-	fs.renameSync(tempPath, filePath);
-}
-
-function appendRequestLog(entry) {
-	const serialized = JSON.stringify(entry) + "\n";
-	fs.appendFileSync(openRequestLogPath, serialized);
-}
-
-function validateOpenRequest(request) {
-	const details = request?.details;
-	if (!details || typeof details !== "object") {
-		return "open request details must be an object";
-	}
-	const forbiddenFields = deprecatedDetailKeys.filter((field) => Object.prototype.hasOwnProperty.call(details, field));
-	if (forbiddenFields.length > 0) {
-		return "open request details contain deprecated fields: " + forbiddenFields.join(",");
-	}
-	const callback = details.callback;
-	if (!callback || typeof callback !== "object") {
-		return "callback must be an object";
-	}
-	if (callback.kind !== "pi-synctex-callback-v1") {
-		return "callback.kind must be pi-synctex-callback-v1";
-	}
-	if (callback.transport !== "unix") {
-		return "callback.transport must be unix";
-	}
-	if (typeof callback.socket_path !== "string" || callback.socket_path.length === 0) {
-		return "callback.socket_path must be a non-empty string";
-	}
-	if (typeof callback.token !== "string" || callback.token.length === 0) {
-		return "callback.token must be a non-empty string";
-	}
-	if (typeof details.pdf_path !== "string" || details.pdf_path.length === 0) {
-		return "pdf_path must be a non-empty string";
-	}
-	return null;
-}
-
-function responseBase(requestId) {
-	return {
-		protocol_version: 1,
-		supported: true,
-		service_available: true,
-		backend: "fake-viewer",
-		protocol_directories: protocolDirectories,
-		service_instance_started_ns: serviceStartedNs,
-		request_id: requestId,
-		operation: "open",
-	};
-}
-
-function writeOpenRequestSummary(requestId, details, callback, validationError, reused) {
-	appendRequestLog({
-		request_id: requestId,
-		detail_keys: details && typeof details === "object" ? Object.keys(details) : [],
-		pdf_path: details && typeof details === "object" ? details.pdf_path : null,
-		callback: callback && typeof callback === "object" ? {
-			kind: callback.kind,
-			transport: callback.transport,
-			socket_path: callback.socket_path,
-			token: callback.token,
-		} : null,
-		validation_error: validationError || null,
-		reused,
-		mode,
-	});
-}
-
-function handleOpenRequest(request) {
-	const requestId = request.request_id;
-	if (typeof requestId !== "string" || requestId.length === 0) return;
-	const responsePath = path.join(protocolDirectories.results, requestId + ".json");
-	const details = request.details;
-	const callback = details && typeof details === "object" ? details.callback : undefined;
-	const validationError = validateOpenRequest(request);
-	const pdfPath = details && typeof details === "object" ? details.pdf_path : undefined;
-	const reused = typeof pdfPath === "string" && Object.prototype.hasOwnProperty.call(openSessions, pdfPath);
-	writeOpenRequestSummary(requestId, details, callback, validationError, reused);
-
-	if (validationError) {
-		writeResult(responsePath, {
-			protocol_version: 1,
-			request_id: requestId,
-			operation: "open",
-			status: "error",
-			generated_at_ns: Number(process.hrtime.bigint()),
-			status_details: {
-				...responseBase(requestId),
-				owned: false,
-				reused: false,
-				backend_identity_ok: true,
-				capabilities,
-				error_code: "invalid_open_request",
-			},
-			error: validationError,
-		});
-		return;
-	}
-
-	if (mode === "backend_unavailable") {
-		writeResult(responsePath, {
-			protocol_version: 1,
-			request_id: requestId,
-			operation: "open",
-			status: "error",
-			generated_at_ns: Number(process.hrtime.bigint()),
-			status_details: {
-				...responseBase(requestId),
-				owned: false,
-				reused: false,
-				backend_identity_ok: false,
-				capabilities,
-				error_code: "backend_unavailable",
-				service_available: false,
-			},
-			error: "fake viewer backend unavailable",
-		});
-		return;
-	}
-
-	if (mode === "service_unavailable") {
-		writeResult(responsePath, {
-			protocol_version: 1,
-			request_id: requestId,
-			operation: "open",
-			status: "error",
-			generated_at_ns: Number(process.hrtime.bigint()),
-			status_details: {
-				protocol_version: 1,
-				supported: false,
-				service_available: false,
-				backend: "fake-viewer",
-				backend_identity_ok: false,
-				protocol_directories: protocolDirectories,
-				service_instance_started_ns: serviceStartedNs,
-				request_id: requestId,
-				operation: "open",
-				owned: false,
-				reused: false,
-				capabilities,
-				error_code: "service_unavailable",
-			},
-			error: "viewer service unavailable",
-		});
-		return;
-	}
-
-	if (mode === "hang") {
-		return;
-	}
-
-	const handle = (() => {
-		if (!reused) {
-			openCount += 1;
-			openSessions[pdfPath] = "fake-viewer-open-" + String(openCount);
-		}
-		return openSessions[pdfPath];
-	})();
-
-	writeResult(responsePath, {
-		protocol_version: 1,
-		request_id: requestId,
-		operation: "open",
-		status: "ok",
-		generated_at_ns: Number(process.hrtime.bigint()),
-		status_details: {
-			...responseBase(requestId),
-			owned: true,
-			reused,
-			capabilities,
-			backend_identity_ok: true,
-			handle,
-			pid: 123456,
-		},
-	});
-}
-
-function handleRequest(fileName) {
-	if (!fileName.endsWith(".json")) return;
-	const requestPath = path.join(protocolDirectories.requests, fileName);
-	let payload;
-	try {
-		payload = JSON.parse(fs.readFileSync(requestPath, "utf8"));
-	} catch {
-		fs.rmSync(requestPath, { force: true });
-		return;
-	}
-	if (payload.operation === "open") {
-		handleOpenRequest(payload);
-	}
-	fs.rmSync(requestPath, { force: true });
-}
-
-function tick() {
-	let requestFiles;
-	try {
-		requestFiles = fs.readdirSync(protocolDirectories.requests);
-	} catch {
-		return;
-	}
-	for (const entry of requestFiles) {
-		handleRequest(entry);
-	}
-}
-
-setInterval(tick, 10);
-`;
-
 const ORIGINAL_MCP_TMPDIR = process.env.MCP_TMPDIR;
 const MCP_TMPDIR = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-service-"));
 process.env.MCP_TMPDIR = MCP_TMPDIR;
-const MCP_REQUESTS_DIR = join(MCP_TMPDIR, "viewer-requests");
-const MCP_RESULTS_DIR = join(MCP_TMPDIR, "viewer-results");
-const MCP_OPEN_REQUEST_LOG = join(MCP_TMPDIR, "open-request-log.jsonl");
 const MCP_FIXED_PREVIEW_PDF_PATH = resolve(MCP_TMPDIR, "show-latex.pdf");
-const MCP_READY_PATH = resolve(MCP_TMPDIR, "show-latex.ready");
-
-type FakeViewerOpenRequestRecord = {
-	request_id: string;
-	validation_error: string | null;
-	callback: {
-		kind: string;
-		transport: string;
-		socket_path: string;
-		token: string;
-	} | null;
-	detail_keys: string[];
-	pdf_path: string | null;
-	reused: boolean;
-	mode: string;
-};
 
 type CompiledShowLatexApi = {
 	registerTool: (tool: { name: string; [key: string]: unknown }) => void;
@@ -371,6 +116,7 @@ type CompiledShowLatexModule = {
 type SessionLifecycleHandler = (_event: unknown, ctx: unknown) => Promise<unknown> | unknown;
 
 type ShowLatexTool = {
+	name: string;
 	execute: (
 		_toolCallId: string,
 		params: Record<string, unknown>,
@@ -380,11 +126,14 @@ type ShowLatexTool = {
 	) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
 };
 
+type ShowLatexToolSet = {
+	showLatex: ShowLatexTool;	jumpPdf: ShowLatexTool;	closePdf: ShowLatexTool;	setLatexPreamble: ShowLatexTool;
+};
+
 let sessionShutdownHandler: SessionLifecycleHandler | undefined;
 let compiledIndexModule: Promise<CompiledShowLatexModule> | undefined;
 let runtimeModulesInstalled = false;
 let runtimeModulesRoot: string | undefined;
-let fakeViewerServiceProcess: ReturnType<typeof spawn> | undefined;
 
 function ensureRuntimeStubsInstalled(): void {
 	if (runtimeModulesInstalled) return;
@@ -466,14 +215,28 @@ async function loadCompiledShowLatexModule(): Promise<CompiledShowLatexModule> {
 	return compiledIndexModule;
 }
 
-async function captureShowLatexTool(): Promise<ShowLatexTool> {
+async function captureTools(): Promise<ShowLatexToolSet> {
 	const extensionModule = await loadCompiledShowLatexModule();
-	let capturedTool: ShowLatexTool | undefined;
+	let capturedShowLatex: ShowLatexTool | undefined;
+	let capturedJumpPdf: ShowLatexTool | undefined;
+	let capturedClosePdf: ShowLatexTool | undefined;
+	let capturedSetLatexPreamble: ShowLatexTool | undefined;
 
 	extensionModule.default({
 		registerTool(tool) {
 			if (tool.name === "show_latex") {
-				capturedTool = tool as unknown as ShowLatexTool;
+				capturedShowLatex = tool as unknown as ShowLatexTool;
+				return;
+			}
+			if (tool.name === "jump_pdf") {
+				capturedJumpPdf = tool as unknown as ShowLatexTool;
+				return;
+			}
+			if (tool.name === "close_pdf") {
+				capturedClosePdf = tool as unknown as ShowLatexTool;
+			}
+			if (tool.name === "set_latex_preamble") {
+				capturedSetLatexPreamble = tool as unknown as ShowLatexTool;
 			}
 		},
 		registerCommand() {},
@@ -484,13 +247,30 @@ async function captureShowLatexTool(): Promise<ShowLatexTool> {
 		},
 	});
 
-	if (!capturedTool) {
+	if (!capturedShowLatex) {
 		throw new Error("show_latex tool was not registered by index module");
 	}
+	if (!capturedJumpPdf) {
+		throw new Error("jump_pdf tool was not registered by index module");
+	}
+	if (!capturedClosePdf) {
+		throw new Error("close_pdf tool was not registered by index module");
+	}
+	if (!capturedSetLatexPreamble) {
+		throw new Error("set_latex_preamble tool was not registered by index module");
+	}
 
-	return capturedTool;
+	return {
+		showLatex: capturedShowLatex,
+		jumpPdf: capturedJumpPdf,
+		closePdf: capturedClosePdf,
+		setLatexPreamble: capturedSetLatexPreamble,
+	};
 }
 
+async function captureShowLatexTool(): Promise<ShowLatexTool> {
+	return (await captureTools()).showLatex;
+}
 function writeFakeCompiler(binDir: string, shouldFail = false): string {
 	const compilerPath = resolve(binDir, "lualatex");
 	const script = shouldFail
@@ -508,6 +288,72 @@ const source = process.argv[process.argv.length - 1];
 if (!source) process.exit(1);
 const pdf = path.resolve(process.cwd(), source.replace(/\\.tex$/, \".pdf\"));
 fs.writeFileSync(pdf, "%PDF-1.7\\n");
+`;
+	writeFileSync(compilerPath, script, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+	return compilerPath;
+}
+
+function writeFakeMutool(binDir: string): string {
+	const mutoolPath = resolve(binDir, "mutool");
+	const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/h2MAAAAASUVORK5CYII=";
+	const script = `#!/usr/bin/env node
+const fs = require(\"node:fs\");
+const command = process.argv[2];
+const args = process.argv.slice(3);
+if (command === \"info\") {
+\tconsole.log(\"Pages: 1\");
+\tprocess.exit(0);
+}
+if (command === \"draw\") {
+\tconst outputIndex = args.indexOf(\"-o\");
+\tif (outputIndex < 0 || !args[outputIndex + 1]) process.exit(1);
+\tconst outputPath = args[outputIndex + 1];
+\tconst buffer = Buffer.from(\"${pngBase64}\", \"base64\");
+\tfs.writeFileSync(outputPath, buffer);
+\tprocess.exit(0);
+}
+process.exit(1);
+`;
+	writeFileSync(mutoolPath, script, { mode: 0o700 });
+	chmodSync(mutoolPath, 0o700);
+	return mutoolPath;
+}
+
+function writeFakeCompilerWithSourceCapture(binDir: string, captureFile: string): string {
+	const compilerPath = resolve(binDir, "lualatex");
+	const capturedFile = JSON.stringify(captureFile);
+	const script = `#!/usr/bin/env node
+const fs = require(\"node:fs\");
+const path = require(\"node:path\");
+const source = process.argv[process.argv.length - 1];
+if (!source) process.exit(1);
+const pdf = path.resolve(process.cwd(), source.replace(/\\.tex$/, \".pdf\"));
+fs.writeFileSync(pdf, \"%PDF-1.7\\n\");
+const sourceText = fs.readFileSync(source, \"utf8\");
+fs.writeFileSync(${capturedFile}, sourceText);
+`;
+	writeFileSync(compilerPath, script, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+	return compilerPath;
+}
+
+function writeFakeCompilerWithSynctexArtifacts(binDir: string): string {
+	const compilerPath = resolve(binDir, "lualatex");
+	const script = `#!/usr/bin/env node
+const fs = require(\"node:fs\");
+const path = require(\"node:path\");
+const zlib = require(\"node:zlib\");
+const source = process.argv[process.argv.length - 1];
+if (!source) process.exit(1);
+const pdf = path.resolve(process.cwd(), source.replace(/\\.tex$/, \".pdf\"));
+const base = pdf.slice(0, -4);
+fs.writeFileSync(pdf, \"%PDF-1.7\\n\");
+const synctex = base + ".synctex";
+const synctexGz = base + ".synctex.gz";
+const synctexContent = "SyncTeX Version:1\\nInput:1:" + pdf + "\\n";
+fs.writeFileSync(synctex, synctexContent);
+fs.writeFileSync(synctexGz, zlib.gzipSync(synctexContent));
 `;
 	writeFileSync(compilerPath, script, { mode: 0o700 });
 	chmodSync(compilerPath, 0o700);
@@ -538,61 +384,232 @@ function createSessionContext(cwd: string) {
 	};
 }
 
-function readFakeViewerOpenRequests(): FakeViewerOpenRequestRecord[] {
-	if (!existsSync(MCP_OPEN_REQUEST_LOG)) return [];
-	const raw = readFileSync(MCP_OPEN_REQUEST_LOG, "utf8").trim();
-	if (!raw.length) return [];
-	return raw
-		.split(/\r?\n/)
-		.filter((line) => line.length > 0)
-		.map((line) => JSON.parse(line) as FakeViewerOpenRequestRecord);
+type HostServiceOpenRequestRecord = {
+	requestId: string;
+	details?: Record<string, unknown>;
+	errors: string | null;
+	reused: boolean;
+};
+
+class RecordingFakeViewerBackend extends FakeViewerBackend {
+	openRequests: HostServiceOpenRequestRecord[] = [];
+
+	override async open(requestId: string, details: Record<string, unknown>): Promise<{ status: "ok" | "error"; error?: string; status_details: Record<string, unknown> }> {
+		const response = await super.open(requestId, details);
+		const statusDetails = (response as { status_details?: Record<string, unknown> }).status_details;
+		this.openRequests.push({
+			requestId,
+			details,
+			errors: response.status === "error" ? (response.error ?? null) : null,
+			reused: Boolean(statusDetails?.reused),
+		});
+		return response as { status: "ok" | "error"; error?: string; status_details: Record<string, unknown> };
+	}
 }
 
-async function withFakeViewerService(mode: "ok" | "backend_unavailable" | "service_unavailable" | "hang", fn: () => Promise<void>): Promise<void> {
-	const serviceDir = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-viewer-service-"));
-	const scriptPath = resolve(serviceDir, "service.js");
-	mkdirSync(MCP_TMPDIR, { recursive: true, mode: 0o700 });
-	mkdirSync(MCP_REQUESTS_DIR, { recursive: true, mode: 0o700 });
-	mkdirSync(MCP_RESULTS_DIR, { recursive: true, mode: 0o700 });
-	rmSync(MCP_OPEN_REQUEST_LOG, { force: true });
-	rmSync(MCP_READY_PATH, { force: true });
-	writeFileSync(scriptPath, FAKE_VIEWER_SERVICE_SCRIPT, { mode: 0o700 });
-	fakeViewerServiceProcess = spawn(process.execPath, [scriptPath], {
-		env: { ...process.env, MCP_TMPDIR, FAKE_VIEWER_MODE: mode },
-		stdio: ["ignore", "ignore", "ignore"],
-	});
+class BackendUnavailableFakeViewerBackend extends RecordingFakeViewerBackend {
+	override isAvailable(): boolean {
+		return false;
+	}
+}
 
-	await new Promise<void>((resolveProcessStart) => setTimeout(resolveProcessStart, 25));
+class ServiceUnavailableFakeViewerBackend extends RecordingFakeViewerBackend {
+	override async open(requestId: string, details: Record<string, unknown>): Promise<{ status: "ok" | "error"; error?: string; status_details: Record<string, unknown> }> {
+		const response = await super.open(requestId, details);
+		if (response.status === "error") {
+			return response as { status: "ok" | "error"; error?: string; status_details: Record<string, unknown> };
+		}
+		return {
+			status: "error",
+			error: "fake viewer service unavailable",
+			status_details: {
+				...(response.status_details as Record<string, unknown>),
+				error_code: "service_unavailable",
+				reason: "fake viewer backend service unavailable",
+			},
+		};
+	}
+}
 
-	try {
-		await fn();
-	} finally {
-		await new Promise<void>((resolveStop) => {
-			const proc = fakeViewerServiceProcess;
-			if (!proc || proc.exitCode !== null) {
-				resolveStop();
-				return;
-			}
+class FakeForwardSearchViewerBackend extends RecordingFakeViewerBackend {
+	readonly forwardSearchCalls: Array<Record<string, unknown>> = [];
 
-			let stopped = false;
-			const finish = () => {
-				if (stopped) return;
-				stopped = true;
-				resolveStop();
+	override async forwardSearch(_requestId: string, details: Record<string, unknown>): Promise<{ status: "ok" | "error"; error?: string; status_details: Record<string, unknown> }> {
+		this.forwardSearchCalls.push({ ...details });
+		const handle = typeof details.handle === "string" ? details.handle : undefined;
+		const handleOk = typeof handle === "string" && handle.length > 0;
+		if (!handleOk) {
+			return {
+				status: "error",
+				error: "missing handle",
+				status_details: {
+					protocol_version: 1,
+					supported: false,
+					service_available: true,
+					backend: this.name,
+					backend_path: this.name,
+					handle,
+					handled: false,
+					error_code: "invalid_request",
+					reason: "missing handle",
+				},
 			};
-			proc.once("exit", finish);
-			proc.kill("SIGTERM");
-			setTimeout(() => {
-				if (!stopped) proc.kill("SIGKILL");
-				setTimeout(finish, 25);
-			}, 50);
-		});
-		fakeViewerServiceProcess = undefined;
+		}
+		return {
+			status: "ok",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: this.name,
+				backend_path: this.name,
+				backend_identity_ok: true,
+				handle,
+				handled: true,
+				reason: "forward search handled",
+			},
+		};
+	}
+}
+
+class SidecarValidatingFakeViewerBackend extends FakeForwardSearchViewerBackend {
+	override async open(requestId: string, details: Record<string, unknown>): Promise<{ status: "ok" | "error"; error?: string; status_details: Record<string, unknown> }> {
+		const response = await super.open(requestId, details);
+		if (response.status === "error") {
+			return response as { status: "ok" | "error"; error?: string; status_details: Record<string, unknown> };
+		}
+
+		const pdfPath = typeof details.pdf_path === "string" ? details.pdf_path : "";
+		const base = pdfPath.toLowerCase().endsWith(".pdf") ? pdfPath.slice(0, -4) : pdfPath;
+		const hasSidecar = existsSync(`${base}.synctex`) || existsSync(`${base}.synctex.gz`);
+		if (!hasSidecar) {
+			return {
+				status: "error",
+				error: "missing SyncTeX sidecar for fixed preview PDF",
+				status_details: {
+					...(response.status_details as Record<string, unknown>),
+					error_code: "invalid_request",
+					reason: "missing SyncTeX sidecar",
+				},
+			};
+		}
+		return response as { status: "ok" | "error"; error?: string; status_details: Record<string, unknown> };
+	}
+}
+
+class HangingFakeViewerBackend extends RecordingFakeViewerBackend {
+	override async open(): Promise<{ status: "ok" | "error"; status_details: Record<string, unknown> }> {
+		return await new Promise(() => undefined);
+	}
+}
+
+type HostServiceMode = "ok" | "backend_unavailable" | "hang" | "service_unavailable";
+
+async function withHostService(mode: HostServiceMode, fn: (backend: { openRequests: HostServiceOpenRequestRecord[] }) => Promise<void>, backendOverride?: FakeViewerBackend): Promise<void> {
+	const serviceDir = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-service-"));
+	const socketPath = resolve(serviceDir, "host-service.sock");
+	const previousSocketPath = process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+	const defaultBackend = mode === "backend_unavailable"
+		? new BackendUnavailableFakeViewerBackend({ name: "fake-host-backend", capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true } })
+		: mode === "hang"
+			? new HangingFakeViewerBackend({ name: "fake-host-backend", capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true } })
+			: mode === "service_unavailable"
+				? new ServiceUnavailableFakeViewerBackend({ name: "fake-host-backend", capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true } })
+				: new RecordingFakeViewerBackend({ name: "fake-host-backend", capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true } });
+	const backend = backendOverride ?? defaultBackend;
+	const hostServiceServer = new HostServiceServer({ socketPath, serviceName: "agent-synctex-show-latex", viewerBackend: backend as FakeViewerBackend });
+	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = socketPath;
+	await hostServiceServer.start();
+	try {
+		await fn(backend as { openRequests: HostServiceOpenRequestRecord[] });
+	} finally {
+		if (previousSocketPath === undefined) {
+			delete process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+		} else {
+			process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = previousSocketPath;
+		}
+		await hostServiceServer.stop();
 		rmSync(serviceDir, { recursive: true, force: true });
 	}
 }
 
-test("show_latex external flow opens through viewer service", async () => {
+type HostServiceClientCallCounters = {
+	compileLatexSnippet: number;
+	compileLatexFile: number;	rasterizePdf: number;	openPdf: number;	closePdf: number;	jumpPdf: number;	status: number;
+};
+
+function withHostServiceClientCallTracing(): { counters: HostServiceClientCallCounters; restore(): void } {
+	const proto = HostServiceClient.prototype as {
+		requestCompileLatexSnippet: HostServiceClient["requestCompileLatexSnippet"];
+		requestCompileLatexFile: HostServiceClient["requestCompileLatexFile"];
+		requestRasterizePdf: HostServiceClient["requestRasterizePdf"];
+		requestOpenPdf: HostServiceClient["requestOpenPdf"];
+		requestClosePdf: HostServiceClient["requestClosePdf"];
+		requestJumpPdf: HostServiceClient["requestJumpPdf"];
+		requestStatus: HostServiceClient["requestStatus"];
+	};
+	const counters: HostServiceClientCallCounters = {
+		compileLatexSnippet: 0,
+		compileLatexFile: 0,
+		rasterizePdf: 0,
+		openPdf: 0,
+		closePdf: 0,
+		jumpPdf: 0,
+		status: 0,
+	};
+
+	const originalCompileLatexSnippet = proto.requestCompileLatexSnippet;
+	const originalCompileLatexFile = proto.requestCompileLatexFile;
+	const originalRasterize = proto.requestRasterizePdf;
+	const originalOpenPdf = proto.requestOpenPdf;
+	const originalClosePdf = proto.requestClosePdf;
+	const originalJumpPdf = proto.requestJumpPdf;
+	const originalStatus = proto.requestStatus;
+
+	proto.requestCompileLatexSnippet = async function (...args) {
+		counters.compileLatexSnippet += 1;
+		return originalCompileLatexSnippet.apply(this, args);
+	};
+	proto.requestCompileLatexFile = async function (...args) {
+		counters.compileLatexFile += 1;
+		return originalCompileLatexFile.apply(this, args);
+	};
+	proto.requestRasterizePdf = async function (...args) {
+		counters.rasterizePdf += 1;
+		return originalRasterize.apply(this, args);
+	};
+	proto.requestOpenPdf = async function (...args) {
+		counters.openPdf += 1;
+		return originalOpenPdf.apply(this, args);
+	};
+	proto.requestClosePdf = async function (...args) {
+		counters.closePdf += 1;
+		return originalClosePdf.apply(this, args);
+	};
+	proto.requestJumpPdf = async function (...args) {
+		counters.jumpPdf += 1;
+		return originalJumpPdf.apply(this, args);
+	};
+	proto.requestStatus = async function (...args) {
+		counters.status += 1;
+		return originalStatus.apply(this, args);
+	};
+
+	return {
+		counters,
+		restore() {
+			proto.requestCompileLatexSnippet = originalCompileLatexSnippet;
+			proto.requestCompileLatexFile = originalCompileLatexFile;
+			proto.requestRasterizePdf = originalRasterize;
+			proto.requestOpenPdf = originalOpenPdf;
+			proto.requestClosePdf = originalClosePdf;
+			proto.requestJumpPdf = originalJumpPdf;
+			proto.requestStatus = originalStatus;
+		},
+	};
+}
+
+test("show_latex external flow opens through host service", async () => {
 	const { root, sourceContent } = withTemporaryProject();
 	const tool = await captureShowLatexTool();
 	const originalPath = process.env.PATH ?? "";
@@ -603,7 +620,7 @@ test("show_latex external flow opens through viewer service", async () => {
 	const context = createSessionContext(root);
 
 	try {
-		await withFakeViewerService("ok", async () => {
+		await withHostService("ok", async (backend) => {
 			const result = await tool.execute(
 				"show-latex-external-open",
 				{ source: sourceContent, inline: false },
@@ -623,20 +640,19 @@ test("show_latex external flow opens through viewer service", async () => {
 			assert.equal(details.pdf, MCP_FIXED_PREVIEW_PDF_PATH);
 			assert.equal(details.operation_pdf === MCP_FIXED_PREVIEW_PDF_PATH, false);
 			assert.equal(existsSync(MCP_FIXED_PREVIEW_PDF_PATH), true);
-			assert.equal(existsSync(MCP_READY_PATH), false);
 			assert.equal(typeof details.pdf_id, "number");
 			assert.equal(result.content[0].text, "ok");
 
-			const requests = readFakeViewerOpenRequests();
-			assert.equal(requests.length, 1);
-			assert.equal(requests[0].validation_error, null);
-			assert.equal(requests[0].pdf_path, MCP_FIXED_PREVIEW_PDF_PATH);
-			assert.equal(requests[0].detail_keys.includes("callback"), true);
-			assert.equal(requests[0].detail_keys.includes("pdf_path"), true);
-			assert.equal(requests[0].detail_keys.includes("synctex_callback_command"), false);
-			assert.equal(requests[0].detail_keys.includes("synctex_editor_command"), false);
-			assert.equal(requests[0].detail_keys.includes("zathura_args"), false);
-			assert.equal(requests[0].callback?.kind, "pi-synctex-callback-v1");
+			assert.equal(backend.openRequests.length, 1);
+			const request = backend.openRequests[0];
+			assert.equal(request.errors, null);
+			const requestDetailKeys = Object.keys(request.details ?? {});
+			assert.equal(requestDetailKeys.includes("callback"), true);
+			assert.equal(requestDetailKeys.includes("pdf_path"), true);
+			assert.equal(requestDetailKeys.includes("reuse_existing"), true);
+			assert.equal(requestDetailKeys.includes("require_persistent_viewer"), true);
+			const callback = (request.details as { callback?: { kind?: unknown } } | undefined)?.callback as { kind?: unknown } | undefined;
+			assert.equal(callback?.kind, "pi-synctex-callback-v1");
 		});
 	} finally {
 		await runSessionShutdown(context);
@@ -656,7 +672,7 @@ test("show_latex external flow always sends an explicit open request", async () 
 	const context = createSessionContext(root);
 
 	try {
-		await withFakeViewerService("ok", async () => {
+		await withHostService("ok", async (backend) => {
 			const first = await tool.execute("show-latex-open-first", { source: sourceContent, inline: false }, undefined, undefined, context);
 			const second = await tool.execute("show-latex-open-second", { source: sourceContent, inline: false }, undefined, undefined, context);
 
@@ -666,12 +682,11 @@ test("show_latex external flow always sends an explicit open request", async () 
 			assert.equal(typeof firstDetails.pdf_id, "number");
 			assert.equal(firstDetails.pdf_id, secondDetails.pdf_id);
 
-			const requests = readFakeViewerOpenRequests();
-			assert.equal(requests.length, 2);
-			assert.equal(requests[0].pdf_path, MCP_FIXED_PREVIEW_PDF_PATH);
-			assert.equal(requests[1].pdf_path, MCP_FIXED_PREVIEW_PDF_PATH);
-			assert.equal(requests[1].reused, true);
-			assert.equal(requests[0].request_id === requests[1].request_id, false);
+			assert.equal(backend.openRequests.length, 2);
+			assert.equal(backend.openRequests[0].details?.pdf_path, MCP_FIXED_PREVIEW_PDF_PATH);
+			assert.equal(backend.openRequests[1].details?.pdf_path, MCP_FIXED_PREVIEW_PDF_PATH);
+			assert.equal(backend.openRequests[1].reused, true);
+			assert.equal(backend.openRequests[0].requestId === backend.openRequests[1].requestId, false);
 		});
 	} finally {
 		await runSessionShutdown(context);
@@ -691,7 +706,7 @@ test("show_latex external flow distinguishes service timeout", async () => {
 	const context = createSessionContext(root);
 
 	try {
-		await withFakeViewerService("hang", async () => {
+		await withHostService("hang", async () => {
 			try {
 				await tool.execute("show-latex-open-timeout", { source: sourceContent, inline: false }, undefined, undefined, context);
 				assert.fail("expected show_latex timeout to throw");
@@ -719,7 +734,7 @@ test("show_latex external flow distinguishes backend open failure", async () => 
 	const context = createSessionContext(root);
 
 	try {
-		await withFakeViewerService("backend_unavailable", async () => {
+		await withHostService("backend_unavailable", async () => {
 			try {
 				await tool.execute("show-latex-open-backend", { source: sourceContent, inline: false }, undefined, undefined, context);
 				assert.fail("expected show_latex open failure");
@@ -747,13 +762,15 @@ test("show_latex external flow distinguishes service unavailable", async () => {
 	const context = createSessionContext(root);
 
 	try {
-		await withFakeViewerService("service_unavailable", async () => {
+		await withHostService("service_unavailable", async (backend) => {
 			try {
-				await tool.execute("show-latex-open-service-unavailable", { source: sourceContent, inline: false }, undefined, undefined, context);
-				assert.fail("expected show_latex service-unavailable failure");
+				await tool.execute("show-latex-open-service", { source: sourceContent, inline: false }, undefined, undefined, context);
+				assert.fail("expected show_latex open failure");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				assert.equal(/Viewer service unavailable while opening preview \(code=service_unavailable\)/.test(message), true);
+				assert.equal(/Viewer service unavailable while opening preview/.test(message), true);
+				assert.equal(/code=service_unavailable/.test(message), true);
+				assert.equal(backend.openRequests.length, 1);
 			}
 		});
 	} finally {
@@ -773,19 +790,192 @@ test("show_latex external compile failure is reported distinctly", async () => {
 	process.env.PATH = `${binDir}:${originalPath}`;
 	const context = createSessionContext(root);
 
-	rmSync(MCP_OPEN_REQUEST_LOG, { force: true });
+	try {
+		await withHostService("ok", async (backend) => {
+			try {
+				await tool.execute("show-latex-compile-failure", { source: "\\begin{document}bad\\end{document}", inline: false }, undefined, undefined, context);
+				assert.fail("expected show_latex compile failure");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				assert.equal(/LaTeX preview compilation failed/.test(message), true);
+				assert.equal(/Viewer service/.test(message), false);
+				assert.equal(backend.openRequests.length, 0);
+			}
+		});
+	} finally {
+		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("show_latex external flow supports jump_pdf and close_pdf through host service", async () => {
+	const { root, sourceContent } = withTemporaryProject();
+	const { showLatex, jumpPdf, closePdf } = await captureTools();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompiler(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+	const context = createSessionContext(root);
 
 	try {
-		try {
-			await tool.execute("show-latex-compile-failure", { source: "\\begin{document}bad\\end{document}", inline: false }, undefined, undefined, context);
-			assert.fail("expected show_latex compile failure");
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			assert.equal(/LaTeX preview compilation failed/.test(message), true);
-			assert.equal(/Viewer service/.test(message), false);
-			assert.equal(readFakeViewerOpenRequests().length, 0);
-		}
+		const backend = new FakeForwardSearchViewerBackend({ name: "fake-host-backend", capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true } });
+		await withHostService("ok", async () => {
+			const openResult = await showLatex.execute(
+				"show-latex-jump-open",
+				{ source: sourceContent, inline: false },
+				undefined,
+				undefined,
+				context,
+			);
+			const openDetails = openResult.details as { pdf_id: number; pdf: string };
+			assert.equal(openDetails.pdf_id > 0, true);
+
+			const jumpResult = await jumpPdf.execute(
+				"show-latex-jump",
+				{ pdf_id: openDetails.pdf_id, line: 1 },
+				undefined,
+				undefined,
+				context,
+			);
+			const jumpDetails = jumpResult.details as { source_line?: string; pdf: string; source?: string };
+			assert.equal(jumpDetails.pdf, openDetails.pdf);
+			assert.equal(typeof jumpDetails.source, "string");
+			assert.equal(jumpDetails.source?.endsWith("snippet.tex"), true);
+			assert.equal(typeof jumpDetails.source_line, "string");
+			assert.equal(jumpResult.content[0].text.includes("line 1 contains:"), true);
+
+			const closeResult = await closePdf.execute(
+				"show-latex-close",
+				{ pdf_id: openDetails.pdf_id },
+				undefined,
+				undefined,
+				context,
+			);
+			const closeDetails = closeResult.details as { closed: boolean; pdf_id: number; pdf: string };
+			assert.equal(closeDetails.pdf_id, openDetails.pdf_id);
+			assert.equal(closeDetails.pdf, openDetails.pdf);
+			assert.equal(closeDetails.closed, true);
+		}, backend);
 	} finally {
+		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("show_latex external flow copies SyncTeX sidecars to fixed preview path", async () => {
+	const { root, sourceContent } = withTemporaryProject();
+	const tool = await captureShowLatexTool();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompilerWithSynctexArtifacts(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+	const context = createSessionContext(root);
+
+	try {
+		const backend = new SidecarValidatingFakeViewerBackend({
+			name: "fake-host-backend",
+			capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+		});
+		await withHostService("ok", async () => {
+			const result = await tool.execute(
+				"show-latex-external-sidecar",
+				{ source: sourceContent, inline: false },
+				undefined,
+				undefined,
+				context,
+			);
+			const openDetails = result.details as { pdf_id: number; pdf: string };
+			assert.equal(openDetails.pdf_id > 0, true);
+			const fixedBase = MCP_FIXED_PREVIEW_PDF_PATH.endsWith(".pdf")
+				? MCP_FIXED_PREVIEW_PDF_PATH.slice(0, -4)
+				: MCP_FIXED_PREVIEW_PDF_PATH;
+			assert.equal(existsSync(`${fixedBase}.synctex`) || existsSync(`${fixedBase}.synctex.gz`), true);
+			assert.equal(backend.openRequests.length, 1);
+		}, backend);
+	} finally {
+		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("set_latex_preamble is honored by host-service snippet compilation", async () => {
+	const { root, sourceContent } = withTemporaryProject();
+	const { showLatex, setLatexPreamble } = await captureTools();
+	const capturedSourcePath = resolve(root, "captured-snippet-source.txt");
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompilerWithSourceCapture(binDir, capturedSourcePath);
+	process.env.PATH = `${binDir}:${originalPath}`;
+	const context = createSessionContext(root);
+
+	try {
+		const preamble = "\\usepackage{array}";
+		await withHostService("ok", async () => {
+			const preambleResult = await setLatexPreamble.execute(
+				"show-latex-set-preamble",
+				{
+					latex_preamble: preamble,
+				},
+				undefined,
+				undefined,
+				context,
+			);
+			assert.equal((preambleResult as { details: { preambleLength?: number } }).details?.preambleLength, preamble.length);
+
+			await showLatex.execute(
+				"show-latex-inline-preamble",
+				{ source: sourceContent, inline: false },
+				undefined,
+				undefined,
+				context,
+			);
+			const renderedSource = readFileSync(capturedSourcePath, "utf8");
+			assert.equal(renderedSource.includes(preamble), true);
+		});
+	} finally {
+		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("show_latex inline flow routes through host service rasterization", async () => {
+	const { root, sourceContent } = withTemporaryProject();
+	const tool = await captureShowLatexTool();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompiler(binDir);
+	writeFakeMutool(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+	const context = createSessionContext(root);
+	const trace = withHostServiceClientCallTracing();
+
+	try {
+		await withHostService("ok", async (backend) => {
+			const result = await tool.execute("show-latex-inline", { source: sourceContent, inline: true }, undefined, undefined, context);
+			const details = result.details as {
+				inline?: boolean;
+				inline_previews?: unknown[];
+				image_path?: string;
+			};
+			assert.equal(details.inline, true);
+			assert.equal(details.inline_previews?.length, 1);
+			assert.equal((details.image_path?.length ?? 0) > 0, true);
+			assert.equal(backend.openRequests.length, 0);
+		});
+		assert.equal(trace.counters.compileLatexSnippet, 1);
+		assert.equal(trace.counters.rasterizePdf, 1);
+		assert.equal(trace.counters.openPdf, 0);
+		assert.equal(trace.counters.compileLatexFile, 0);
+	} finally {
+		trace.restore();
 		await runSessionShutdown(context);
 		process.env.PATH = originalPath;
 		rmSync(root, { recursive: true, force: true });

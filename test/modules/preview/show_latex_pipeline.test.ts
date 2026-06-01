@@ -11,11 +11,11 @@ import type { LatexCompiler } from "../../../src/modules/latex/latex_file_compil
 
 function createFakePipeline(dependencies?: Partial<ShowLatexPipelineDependencies>) {
 	let sourceCalls: string[] = [];
-	let optionsCalls: Array<{ writeFixed?: boolean; suppressPageNumbers?: boolean; cropToContent?: boolean; writeReady?: boolean }> = [];
+	let optionsCalls: Array<{ writeFixed?: boolean; suppressPageNumbers?: boolean; cropToContent?: boolean; writeReady?: boolean; workspaceContext?: { cwd: string; workspace_root?: string; session_id?: string } }> = [];
+	let rasterizeCalls: Array<{ pdfPath: string; dpi?: number; workspaceContext?: { cwd: string; workspace_root?: string; session_id?: string } }> = [];
 	let synctexCommands: Array<string | undefined> = [];
 	const inlineStateIds = ["inline-preview-id"];
 	let nextStateIndex = 0;
-	let rasterizeCalls: Array<{ pdfPath: string; dpi?: number }> = [];
 	const pipeline = createShowLatexPreviewPipeline({
 		resolveLatexCompiler: (compiler) => (compiler ? (typeof compiler === "string" ? (compiler as LatexCompiler) : "lualatex") : undefined),
 		callShowLatex: async (latexSource, _compiler, synctexEditorCommand, _signal, options) => {
@@ -25,12 +25,12 @@ function createFakePipeline(dependencies?: Partial<ShowLatexPipelineDependencies
 			return {
 				text: `tex:${sourceCalls.length}`,
 				pdfPath: `/tmp/show-latex-${sourceCalls.length}.pdf`,
+				sourcePath: `/tmp/show-latex-${sourceCalls.length}.tex`,
 			};
 		},
-		readLatexPreamble: () => "\\usepackage{custom}\\n\\usepackage{custom2}",
 		rememberInlinePreviewRenderState: () => inlineStateIds[nextStateIndex++] ?? "inline-preview-id",
-		rasterizePdfPages: async (pdfPath, { dpi } = {}) => {
-			rasterizeCalls.push({ pdfPath, dpi });
+		rasterizePdfPages: async (pdfPath, { dpi, workspaceContext } = {}) => {
+			rasterizeCalls.push({ pdfPath, dpi, workspaceContext });
 			const artifact: InlinePreviewArtifact = {
 				pngPath: "/tmp/page-1.png",
 				page: 1,
@@ -98,7 +98,7 @@ test("prepareShowLatexArguments extracts source aliases for string input with in
 	assert.equal(prepared.inline, false);
 });
 
-test("applies inline preamble options for crop/page-number behavior and write options", async () => {
+test("passes raw source to host-service compile and forwards page-number options", async () => {
 	const { pipeline, getState } = createFakePipeline();
 	const request: ShowLatexPipelineCompileRequest = {
 		latexSource: "sample body",
@@ -110,16 +110,15 @@ test("applies inline preamble options for crop/page-number behavior and write op
 	const { sourceCalls, optionsCalls, synctexCommands } = getState();
 	assert.equal(inlineResult.inline, true);
 	assert.equal(sourceCalls.length, 1);
+	assert.equal(sourceCalls[0], "sample body");
 	assert.equal(synctexCommands[0], undefined);
 	assert.equal(optionsCalls[0].suppressPageNumbers, true);
 	assert.equal(optionsCalls[0].writeFixed, false);
 	assert.equal(optionsCalls[0].cropToContent, false);
-	assert.ok(sourceCalls[0].includes("AtBeginDocument"));
-	assert.ok(sourceCalls[0].includes("\\makeatletter"));
-	assert.ok(!sourceCalls[0].includes("\\begin{preview}"));
 
 	const externalResult = await pipeline.compileAndPreviewLatex({ ...request, inline: false });
 	assert.equal(externalResult.inline, false);
+	assert.equal(sourceCalls[1], "sample body");
 	assert.equal(getState().optionsCalls[1].suppressPageNumbers, false);
 	assert.equal(getState().optionsCalls[1].writeFixed, true);
 });
@@ -161,6 +160,22 @@ test("buildInlinePreviewResult renders inline payload and remembers state", asyn
 	assert.equal(inlinePayload.payload.details.pdf, "/tmp/operation-preview.pdf");
 	assert.equal(inlinePayload.payload.details.inline_previews.length, 2);
 	assert.match(inlinePayload.payload.content[0].text, /image_path=\/tmp\/page-1\.png/);
+});
+
+test("passes workspace context through compile and inline rasterize paths", async () => {
+	const { pipeline, getState } = createFakePipeline();
+	const workspaceContext = { cwd: "/tmp/example", workspace_root: "/tmp/example", session_id: "session-xyz" };
+
+	const compiled = await pipeline.compileAndPreviewLatex({
+		latexSource: "sample body",
+		inline: true,
+		workspaceContext,
+	});
+	await pipeline.buildInlinePreviewResult(compiled);
+
+	const { optionsCalls, rasterizeCalls } = getState();
+	assert.deepEqual(optionsCalls[0].workspaceContext, workspaceContext);
+	assert.deepEqual(rasterizeCalls[0].workspaceContext, workspaceContext);
 });
 
 
