@@ -1624,6 +1624,39 @@ test("host service open_pdf returns backend-provided invalid-PDF errors", async 
 	}
 });
 
+
+test("host service client surfaces invalid_request for malformed open_pdf payloads", async () => {
+	const baseDir = temporaryDir("host-service-open-pdf-invalid-request-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	let observed: unknown;
+	try {
+		await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{
+				pdf_path: 123 as unknown as string,
+				callback: "bad" as unknown as {
+					kind: "pi-synctex-callback-v1";
+					transport: "unix";
+					socket_path: string;
+					token: string;
+				},
+			},
+		);
+	} catch (error) {
+		observed = error;
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /code=invalid_request/);
+	assert.doesNotMatch(observed.message, /Malformed host service open_pdf response payload/);
+});
+
 test("host service open_pdf returns backend-unavailable errors", async () => {
 	const baseDir = temporaryDir("host-service-open-backend-unavailable-");
 	const socketPath = join(baseDir, "host-service.sock");

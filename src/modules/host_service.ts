@@ -3013,7 +3013,7 @@ function buildViewerOperationErrorResponse(
 	};
 	if (operation === "open_pdf") {
 		(base.status_details as Record<string, unknown>).backend = "unknown";
-		(base.status_details as Record<string, unknown>).backend_path = "";
+		(base.status_details as Record<string, unknown>).backend_path = "unknown";
 		(base.status_details as Record<string, unknown>).capabilities = {
 			open: false,
 			close: false,
