@@ -27,11 +27,20 @@ import { readSourceLine } from "./synctex/synctex.ts";
 import {
 	FakeViewerBackend,
 	type FakeViewerBackendOptions,
-	type ViewerBackendAdapter,
 	ZathuraViewerBackend,
 } from "./host_service_viewer_backends.ts";
+import type {
+	HostServiceCallbackTarget,
+	HostServiceViewerBackendCapabilities,
+	ViewerBackendAdapter,
+} from "./host_service_viewer_protocol.ts";
 export { FakeViewerBackend, ZathuraViewerBackend };
-export type { FakeViewerBackendOptions, ViewerBackendAdapter };
+export type {
+	FakeViewerBackendOptions,
+	HostServiceCallbackTarget,
+	HostServiceViewerBackendCapabilities,
+	ViewerBackendAdapter,
+};
 export interface HostServiceWorkspaceContext {
 	cwd: string;
 	workspace_root?: string;
@@ -44,14 +53,6 @@ export interface HostServiceStatusRequest {
 	operation: "status";
 	created_at_ns: number;
 	workspace_context: HostServiceWorkspaceContext;
-}
-
-export interface HostServiceViewerBackendCapabilities {
-	open: boolean;
-	close: boolean;
-	forward_search: boolean;
-	inverse_search: boolean;
-	reuse: boolean;
 }
 
 export interface HostServiceCompileRequest {
@@ -114,13 +115,6 @@ export interface HostServiceRasterizeResponseDetails {
 	artifacts: HostServiceRasterizeArtifact[];
 	artifact_paths: string[];
 	error_code?: string;
-}
-
-export interface HostServiceCallbackTarget {
-	kind: "pi-synctex-callback-v1";
-	transport: "unix";
-	socket_path: string;
-	token: string;
 }
 
 export interface HostServiceRegisterCallbackTargetRequest {
