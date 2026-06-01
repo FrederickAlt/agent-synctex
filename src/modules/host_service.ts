@@ -16,6 +16,19 @@ export interface HostServiceWorkspaceContext {
 	session_id?: string;
 }
 
+export type HostServiceOperation =
+	| "status"
+	| "register_callback_target"
+	| "unregister_callback_target"
+	| "resolve_callback_target";
+
+export interface HostServiceCallbackTarget {
+	kind: "pi-synctex-callback-v1";
+	transport: "unix";
+	socket_path: string;
+	token: string;
+}
+
 export interface HostServiceStatusRequest {
 	protocol_version: number;
 	request_id: string;
@@ -24,7 +37,48 @@ export interface HostServiceStatusRequest {
 	workspace_context: HostServiceWorkspaceContext;
 }
 
-export interface HostServiceStatusResponseDetails {
+export interface HostServiceRegisterCallbackTargetRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "register_callback_target";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+	target_id: string;
+	target: HostServiceCallbackTarget;
+	stale_after_ms?: number;
+}
+
+export interface HostServiceCallbackTargetRegistration {
+	target_id: string;
+	target: HostServiceCallbackTarget;
+	stale_after_ms?: number;
+}
+
+export interface HostServiceUnregisterCallbackTargetRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "unregister_callback_target";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+	target_id: string;
+}
+
+export interface HostServiceResolveCallbackTargetRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "resolve_callback_target";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+	target_id: string;
+}
+
+export type HostServiceRequest =
+	| HostServiceStatusRequest
+	| HostServiceRegisterCallbackTargetRequest
+	| HostServiceUnregisterCallbackTargetRequest
+	| HostServiceResolveCallbackTargetRequest;
+
+interface HostServiceBaseResponseDetails {
 	protocol_version: number;
 	supported: boolean;
 	service_available: boolean;
@@ -34,20 +88,51 @@ export interface HostServiceStatusResponseDetails {
 	service_instance_id: string;
 	workspace_context: HostServiceWorkspaceContext;
 	request_id: string;
-	operation: "status";
+	operation: HostServiceOperation;
 	uptime_ns: number;
 	total_requests: number;
 	error_code?: string;
 }
 
+export interface HostServiceStatusResponseDetails extends HostServiceBaseResponseDetails {
+	operation: "status";
+}
+
+export interface HostServiceRegisterCallbackTargetResponseDetails extends HostServiceBaseResponseDetails {
+	operation: "register_callback_target";
+	target_id?: string;
+	callback_registered?: boolean;
+	callback_replaced?: boolean;
+	target?: HostServiceCallbackTarget;
+}
+
+export interface HostServiceUnregisterCallbackTargetResponseDetails extends HostServiceBaseResponseDetails {
+	operation: "unregister_callback_target";
+	target_id?: string;
+	removed?: boolean;
+}
+
+export interface HostServiceResolveCallbackTargetResponseDetails extends HostServiceBaseResponseDetails {
+	operation: "resolve_callback_target";
+	target_id?: string;
+	callback_available?: boolean;
+	target?: HostServiceCallbackTarget;
+}
+
+export type HostServiceResponseDetails =
+	| HostServiceStatusResponseDetails
+	| HostServiceRegisterCallbackTargetResponseDetails
+	| HostServiceUnregisterCallbackTargetResponseDetails
+	| HostServiceResolveCallbackTargetResponseDetails;
+
 export interface HostServiceResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
-	operation: string;
+	operation: HostServiceOperation;
 	status: "ok" | "error";
 	generated_at_ns: number;
 	error?: string;
-	status_details: HostServiceStatusResponseDetails;
+	status_details: HostServiceResponseDetails;
 }
 
 export interface HostServiceClientOptions {
@@ -75,6 +160,11 @@ const MAX_PAYLOAD_BYTES = 16_384;
 const STARTUP_SOCKET_CHECK_TIMEOUT_MS = 250;
 const ACTIVE_CONNECTION_TIMEOUT_MS = 10_000;
 const FALLBACK_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
+
+interface HostServiceStoredCallbackTarget {
+	target: HostServiceCallbackTarget;
+	staleAfterNs?: number;
+}
 
 export function defaultHostServiceSocketPath(): string {
 	return DEFAULT_HOST_SERVICE_SOCKET_PATH;
@@ -116,11 +206,103 @@ export class HostServiceClient {
 			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
 			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
 		}
-		return response.status_details;
+		return response.status_details as HostServiceStatusResponseDetails;
+	}
+
+	async requestRegisterCallbackTarget(
+		workspaceContext: HostServiceWorkspaceContext,
+		registration: HostServiceCallbackTargetRegistration,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceRegisterCallbackTargetResponseDetails> {
+		const context = normalizeWorkspaceContext(workspaceContext);
+		const requestId = this.makeRequestId();
+		const response = await this.request(
+			{
+				protocol_version: PROTOCOL_VERSION,
+				request_id: requestId,
+				operation: "register_callback_target",
+				created_at_ns: Date.now() * 1_000_000,
+				workspace_context: context,
+				target_id: registration.target_id,
+				target: registration.target,
+				stale_after_ms: registration.stale_after_ms,
+			},
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (!isValidRegisterCallbackTargetResponse(response, requestId)) {
+			throw new Error(`Malformed host service register_callback_target response payload: ${JSON.stringify(response)}`);
+		}
+		if (response.status !== "ok") {
+			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
+			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+		}
+		return response.status_details as HostServiceRegisterCallbackTargetResponseDetails;
+	}
+
+	async requestUnregisterCallbackTarget(
+		workspaceContext: HostServiceWorkspaceContext,
+		targetId: string,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceUnregisterCallbackTargetResponseDetails> {
+		const context = normalizeWorkspaceContext(workspaceContext);
+		const requestId = this.makeRequestId();
+		const response = await this.request(
+			{
+				protocol_version: PROTOCOL_VERSION,
+				request_id: requestId,
+				operation: "unregister_callback_target",
+				created_at_ns: Date.now() * 1_000_000,
+				workspace_context: context,
+				target_id: targetId,
+			},
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (!isValidUnregisterCallbackTargetResponse(response, requestId)) {
+			throw new Error(`Malformed host service unregister_callback_target response payload: ${JSON.stringify(response)}`);
+		}
+		if (response.status !== "ok") {
+			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
+			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+		}
+		return response.status_details as HostServiceUnregisterCallbackTargetResponseDetails;
+	}
+
+	async requestResolveCallbackTarget(
+		workspaceContext: HostServiceWorkspaceContext,
+		targetId: string,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceResolveCallbackTargetResponseDetails> {
+		const context = normalizeWorkspaceContext(workspaceContext);
+		const requestId = this.makeRequestId();
+		const response = await this.request(
+			{
+				protocol_version: PROTOCOL_VERSION,
+				request_id: requestId,
+				operation: "resolve_callback_target",
+				created_at_ns: Date.now() * 1_000_000,
+				workspace_context: context,
+				target_id: targetId,
+			},
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (!isValidResolveCallbackTargetResponse(response, requestId)) {
+			throw new Error(`Malformed host service resolve_callback_target response payload: ${JSON.stringify(response)}`);
+		}
+		if (response.status !== "ok") {
+			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
+			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+		}
+		return response.status_details as HostServiceResolveCallbackTargetResponseDetails;
 	}
 
 	private async request(
-		request: HostServiceStatusRequest,
+		request: HostServiceRequest,
 		signal: AbortSignal | undefined,
 		requestTimeoutMs: number,
 	): Promise<HostServiceResponseEnvelope> {
@@ -186,7 +368,7 @@ export class HostServiceClient {
 				const lineBreak = raw.indexOf("\n");
 				if (lineBreak < 0) return;
 				try {
-					const response = parseResponse(raw.slice(0, lineBreak).trim(), request.request_id);
+					const response = parseResponse(raw.slice(0, lineBreak).trim(), request.request_id, request.operation);
 					finish(response);
 				} catch (error) {
 					finish(error instanceof Error ? error : new Error(String(error)));
@@ -211,7 +393,7 @@ export class HostServiceClient {
 			const finishIfNotSettled = () => {
 				if (!settled && raw.trim()) {
 					try {
-						const response = parseResponse(raw.trim(), request.request_id);
+						const response = parseResponse(raw.trim(), request.request_id, request.operation);
 						finish(response);
 					} catch (error) {
 						finish(error instanceof Error ? error : new Error(String(error)));
@@ -239,6 +421,7 @@ export class HostServiceServer {
 	private totalRequests = 0;
 	private socketOwnedByServer = false;
 	private readonly activeConnections = new Set<Socket>();
+	private readonly callbackTargets = new Map<string, HostServiceStoredCallbackTarget>();
 
 	constructor(options: HostServiceServerOptions = {}) {
 		this.socketPath = resolve(options.socketPath ?? DEFAULT_HOST_SERVICE_SOCKET_PATH);
@@ -286,6 +469,7 @@ export class HostServiceServer {
 			socket.destroy();
 		}
 		if (!server) {
+			this.callbackTargets.clear();
 			this.removeSocketPath();
 			return;
 		}
@@ -299,6 +483,7 @@ export class HostServiceServer {
 				resolve();
 			});
 		});
+		this.callbackTargets.clear();
 		this.removeSocketPath();
 	}
 
@@ -335,61 +520,175 @@ export class HostServiceServer {
 
 	private respondToRequest(raw: string, socket: Socket): void {
 		let requestPayload: unknown;
-		let request: HostServiceStatusRequest;
+		let request: HostServiceRequest;
 		try {
 			requestPayload = parseRequest(raw);
-			request = validateStatusRequest(requestPayload);
+			request = parseHostServiceRequest(requestPayload);
 		} catch (error) {
 			const requestId = getRequestIdFromPayload(requestPayload);
+			const message = error instanceof Error ? error.message : String(error);
+			const errorCode = message.startsWith("unsupported operation:") ? "unsupported_operation" : "invalid_request";
 			socket.end(buildErrorResponse(
 				this.protocolVersion,
 				this.socketPath,
 				this.serviceName,
 				this.serviceInstanceId,
 				requestId,
-				error instanceof Error ? error.message : String(error),
-				"invalid_request",
-			));
-			return;
-		}
-
-		if (request.operation !== "status") {
-			socket.end(buildErrorResponse(
-				this.protocolVersion,
-				this.socketPath,
-				this.serviceName,
-				this.serviceInstanceId,
-				request.request_id,
-				`unsupported operation: ${request.operation}`,
-				"unsupported_operation",
+				message,
+				errorCode,
+				getOperationFromPayload(requestPayload),
 			));
 			return;
 		}
 
 		this.totalRequests += 1;
 		const nowNs = Date.now() * 1_000_000;
-		const response: HostServiceResponseEnvelope = {
-			protocol_version: this.protocolVersion,
-			request_id: request.request_id,
-			operation: request.operation,
-			status: "ok",
-			generated_at_ns: nowNs,
-			status_details: {
-				protocol_version: this.protocolVersion,
-				supported: true,
-				service_available: true,
-				service_name: this.serviceName,
-				socket_path: this.socketPath,
-				service_instance_started_ns: this.startedAtNs,
-				service_instance_id: this.serviceInstanceId,
-				workspace_context: request.workspace_context,
-				request_id: request.request_id,
-				operation: request.operation,
-				uptime_ns: nowNs - this.startedAtNs,
-				total_requests: this.totalRequests,
-			},
-		};
+		let response: HostServiceResponseEnvelope;
+		switch (request.operation) {
+			case "status": {
+				response = {
+					protocol_version: this.protocolVersion,
+					request_id: request.request_id,
+					operation: request.operation,
+					status: "ok",
+					generated_at_ns: nowNs,
+					status_details: {
+						protocol_version: this.protocolVersion,
+						supported: true,
+						service_available: true,
+						service_name: this.serviceName,
+						socket_path: this.socketPath,
+						service_instance_started_ns: this.startedAtNs,
+						service_instance_id: this.serviceInstanceId,
+						workspace_context: request.workspace_context,
+						request_id: request.request_id,
+						operation: request.operation,
+						uptime_ns: nowNs - this.startedAtNs,
+						total_requests: this.totalRequests,
+					},
+				};
+				break;
+			}
+			case "register_callback_target": {
+				this.pruneCallbackTargets();
+				const targetRecord = {
+					target: request.target,
+					staleAfterNs: resolveStaleAfterNs(request.stale_after_ms),
+				};
+				const replaced = this.callbackTargets.has(request.target_id);
+				this.callbackTargets.set(request.target_id, targetRecord);
+				response = {
+					protocol_version: this.protocolVersion,
+					request_id: request.request_id,
+					operation: request.operation,
+					status: "ok",
+					generated_at_ns: nowNs,
+					status_details: {
+						protocol_version: this.protocolVersion,
+						supported: true,
+						service_available: true,
+						service_name: this.serviceName,
+						socket_path: this.socketPath,
+						service_instance_started_ns: this.startedAtNs,
+						service_instance_id: this.serviceInstanceId,
+						workspace_context: request.workspace_context,
+						request_id: request.request_id,
+						operation: request.operation,
+						target_id: request.target_id,
+						callback_registered: true,
+						callback_replaced: replaced,
+						target: targetRecord.target,
+						uptime_ns: nowNs - this.startedAtNs,
+						total_requests: this.totalRequests,
+					},
+				};
+				break;
+			}
+			case "unregister_callback_target": {
+				this.pruneCallbackTargets();
+				const removed = this.callbackTargets.delete(request.target_id);
+				response = {
+					protocol_version: this.protocolVersion,
+					request_id: request.request_id,
+					operation: request.operation,
+					status: "ok",
+					generated_at_ns: nowNs,
+					status_details: {
+						protocol_version: this.protocolVersion,
+						supported: true,
+						service_available: true,
+						service_name: this.serviceName,
+						socket_path: this.socketPath,
+						service_instance_started_ns: this.startedAtNs,
+						service_instance_id: this.serviceInstanceId,
+						workspace_context: request.workspace_context,
+						request_id: request.request_id,
+						operation: request.operation,
+						target_id: request.target_id,
+						removed,
+						uptime_ns: nowNs - this.startedAtNs,
+						total_requests: this.totalRequests,
+					},
+				};
+				break;
+			}
+			case "resolve_callback_target": {
+				this.pruneCallbackTargets();
+				const target = this.resolveCallbackTarget(request.target_id);
+				const targetAvailable = target !== undefined;
+				response = {
+					protocol_version: this.protocolVersion,
+					request_id: request.request_id,
+					operation: request.operation,
+					status: "ok",
+					generated_at_ns: nowNs,
+					status_details: {
+						protocol_version: this.protocolVersion,
+						supported: true,
+						service_available: true,
+						service_name: this.serviceName,
+						socket_path: this.socketPath,
+						service_instance_started_ns: this.startedAtNs,
+						service_instance_id: this.serviceInstanceId,
+						workspace_context: request.workspace_context,
+						request_id: request.request_id,
+						operation: request.operation,
+						target_id: request.target_id,
+						callback_available: targetAvailable,
+						target: targetAvailable ? target : undefined,
+						uptime_ns: nowNs - this.startedAtNs,
+						total_requests: this.totalRequests,
+					},
+				};
+				break;
+			}
+		}
 		socket.end(`${JSON.stringify(response)}\n`);
+	}
+
+	private resolveCallbackTarget(targetId: string): HostServiceCallbackTarget | undefined {
+		const stored = this.callbackTargets.get(targetId);
+		if (!stored) {
+			return undefined;
+		}
+		if (!isSocketUsable(stored.target.socket_path)) {
+			this.callbackTargets.delete(targetId);
+			return undefined;
+		}
+		return stored.target;
+	}
+
+	private pruneCallbackTargets(): void {
+		const nowNs = Date.now() * 1_000_000;
+		for (const [targetId, stored] of this.callbackTargets) {
+			if (stored.staleAfterNs !== undefined && stored.staleAfterNs > 0 && nowNs > stored.staleAfterNs) {
+				this.callbackTargets.delete(targetId);
+				continue;
+			}
+			if (!isSocketUsable(stored.target.socket_path)) {
+				this.callbackTargets.delete(targetId);
+			}
+		}
 	}
 
 	private async prepareSocketPath(): Promise<void> {
@@ -481,20 +780,20 @@ function getRequestIdFromPayload(payload: unknown): string {
 	return "";
 }
 
-function parseResponse(raw: string, expectedRequestId: string): HostServiceResponseEnvelope {
+function parseResponse(raw: string, expectedRequestId: string, expectedOperation: HostServiceOperation): HostServiceResponseEnvelope {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
-	if (!isValidStatusResponse(parsed, expectedRequestId)) {
+	if (!isValidResponseForOperation(parsed, expectedRequestId, expectedOperation)) {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
 	return parsed;
 }
 
-function validateStatusRequest(value: unknown): HostServiceStatusRequest {
+function parseHostServiceRequest(value: unknown): HostServiceRequest {
 	if (!isStringRecord(value)) {
 		throw new Error("invalid request payload");
 	}
@@ -504,8 +803,8 @@ function validateStatusRequest(value: unknown): HostServiceStatusRequest {
 	if (typeof value.request_id !== "string" || !value.request_id.trim()) {
 		throw new Error("missing request_id");
 	}
-	if (value.operation !== "status") {
-		throw new Error(`unsupported operation: ${String(value.operation)}`);
+	if (typeof value.operation !== "string") {
+		throw new Error("missing operation");
 	}
 	if (typeof value.created_at_ns !== "number") {
 		throw new Error("missing created_at_ns");
@@ -513,13 +812,82 @@ function validateStatusRequest(value: unknown): HostServiceStatusRequest {
 	if (!isValidWorkspaceContext(value.workspace_context)) {
 		throw new Error("invalid workspace_context");
 	}
-	return {
-		protocol_version: PROTOCOL_VERSION,
-		request_id: value.request_id,
-		operation: "status",
-		created_at_ns: value.created_at_ns,
-		workspace_context: value.workspace_context,
-	};
+	switch (value.operation) {
+		case "status": {
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "status",
+				created_at_ns: value.created_at_ns,
+				workspace_context: value.workspace_context,
+			};
+		}
+		case "register_callback_target": {
+			if (typeof value.target_id !== "string" || !value.target_id.trim()) {
+				throw new Error("invalid target_id");
+			}
+			if (!isValidCallbackTarget(value.target)) {
+				throw new Error("invalid callback target");
+			}
+			const staleAfterMs = value.stale_after_ms;
+			if (staleAfterMs !== undefined) {
+				if (typeof staleAfterMs !== "number" || !Number.isInteger(staleAfterMs) || staleAfterMs <= 0) {
+					throw new Error("invalid stale_after_ms");
+				}
+			}
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "register_callback_target",
+				created_at_ns: value.created_at_ns,
+				workspace_context: value.workspace_context,
+				target_id: value.target_id,
+				target: value.target,
+				stale_after_ms: staleAfterMs,
+			};
+		}
+		case "unregister_callback_target": {
+			if (typeof value.target_id !== "string" || !value.target_id.trim()) {
+				throw new Error("invalid target_id");
+			}
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "unregister_callback_target",
+				created_at_ns: value.created_at_ns,
+				workspace_context: value.workspace_context,
+				target_id: value.target_id,
+			};
+		}
+		case "resolve_callback_target": {
+			if (typeof value.target_id !== "string" || !value.target_id.trim()) {
+				throw new Error("invalid target_id");
+			}
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "resolve_callback_target",
+				created_at_ns: value.created_at_ns,
+				workspace_context: value.workspace_context,
+				target_id: value.target_id,
+			};
+		}
+	}
+	throw new Error(`unsupported operation: ${String(value.operation)}`);
+}
+
+function isValidResponseForOperation(response: unknown, expectedRequestId: string, operation: HostServiceOperation): response is HostServiceResponseEnvelope {
+	switch (operation) {
+		case "status":
+			return isValidStatusResponse(response, expectedRequestId);
+		case "register_callback_target":
+			return isValidRegisterCallbackTargetResponse(response, expectedRequestId);
+		case "unregister_callback_target":
+			return isValidUnregisterCallbackTargetResponse(response, expectedRequestId);
+		case "resolve_callback_target":
+			return isValidResolveCallbackTargetResponse(response, expectedRequestId);
+	}
+	return false;
 }
 
 function isValidStatusResponse(response: unknown, expectedRequestId: string): response is HostServiceResponseEnvelope {
@@ -593,6 +961,175 @@ function isValidStatusResponse(response: unknown, expectedRequestId: string): re
 	return true;
 }
 
+function isValidRegisterCallbackTargetResponse(response: unknown, expectedRequestId: string): response is HostServiceResponseEnvelope {
+	if (!isValidCommonCallbackResponse(response, expectedRequestId, "register_callback_target")) {
+		return false;
+	}
+	const details = response.status_details as unknown as Record<string, unknown>;
+	if (response.status === "ok") {
+		if (typeof details.target_id !== "string" || !details.target_id) {
+			return false;
+		}
+		if (typeof details.callback_registered !== "boolean") {
+			return false;
+		}
+		if (typeof details.callback_replaced !== "boolean") {
+			return false;
+		}
+		if (!isValidCallbackTarget(details.target)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function isValidUnregisterCallbackTargetResponse(response: unknown, expectedRequestId: string): response is HostServiceResponseEnvelope {
+	if (!isValidCommonCallbackResponse(response, expectedRequestId, "unregister_callback_target")) {
+		return false;
+	}
+	const details = response.status_details as unknown as Record<string, unknown>;
+	if (response.status === "ok") {
+		if (typeof details.target_id !== "string" || !details.target_id) {
+			return false;
+		}
+		if (typeof details.removed !== "boolean") {
+			return false;
+		}
+	}
+	return true;
+}
+
+function isValidResolveCallbackTargetResponse(response: unknown, expectedRequestId: string): response is HostServiceResponseEnvelope {
+	if (!isValidCommonCallbackResponse(response, expectedRequestId, "resolve_callback_target")) {
+		return false;
+	}
+	const details = response.status_details as unknown as Record<string, unknown>;
+	if (response.status === "ok") {
+		if (typeof details.target_id !== "string" || !details.target_id) {
+			return false;
+		}
+		if (typeof details.callback_available !== "boolean") {
+			return false;
+		}
+		if (details.callback_available && details.target === undefined) {
+			return false;
+		}
+		if (details.callback_available && !isValidCallbackTarget(details.target)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function isValidCommonCallbackResponse(
+	response: unknown,
+	expectedRequestId: string,
+	operation: Extract<HostServiceOperation, "register_callback_target" | "unregister_callback_target" | "resolve_callback_target">,
+): response is HostServiceResponseEnvelope {
+	if (!isStringRecord(response)) {
+		return false;
+	}
+	if (typeof response.protocol_version !== "number" || response.protocol_version !== PROTOCOL_VERSION) {
+		return false;
+	}
+	if (typeof response.request_id !== "string" || response.request_id !== expectedRequestId) {
+		return false;
+	}
+	if (response.status !== "ok" && response.status !== "error") {
+		return false;
+	}
+	if (response.operation !== operation) {
+		return false;
+	}
+	if (typeof response.generated_at_ns !== "number") {
+		return false;
+	}
+	if (response.error !== undefined && typeof response.error !== "string") {
+		return false;
+	}
+	const details = response.status_details;
+	if (!isStringRecord(details)) {
+		return false;
+	}
+	if (typeof details.protocol_version !== "number" || details.protocol_version !== PROTOCOL_VERSION) {
+		return false;
+	}
+	if (typeof details.supported !== "boolean") {
+		return false;
+	}
+	if (typeof details.service_available !== "boolean") {
+		return false;
+	}
+	if (typeof details.service_name !== "string" || !details.service_name) {
+		return false;
+	}
+	if (typeof details.socket_path !== "string" || !details.socket_path) {
+		return false;
+	}
+	if (typeof details.service_instance_started_ns !== "number") {
+		return false;
+	}
+	if (typeof details.service_instance_id !== "string" || !details.service_instance_id) {
+		return false;
+	}
+	if (!isValidWorkspaceContext(details.workspace_context)) {
+		return false;
+	}
+	if (typeof details.request_id !== "string" || details.request_id !== expectedRequestId) {
+		return false;
+	}
+	if (details.operation !== operation) {
+		return false;
+	}
+	if (typeof details.uptime_ns !== "number") {
+		return false;
+	}
+	if (typeof details.total_requests !== "number") {
+		return false;
+	}
+	if (details.error_code !== undefined && typeof details.error_code !== "string") {
+		return false;
+	}
+	if (response.status === "error" && response.error === undefined) {
+		return false;
+	}
+	return true;
+}
+
+function isValidCallbackTarget(value: unknown): value is HostServiceCallbackTarget {
+	if (!isStringRecord(value)) {
+		return false;
+	}
+	if (value.kind !== "pi-synctex-callback-v1") {
+		return false;
+	}
+	if (value.transport !== "unix") {
+		return false;
+	}
+	if (typeof value.socket_path !== "string" || !value.socket_path) {
+		return false;
+	}
+	if (typeof value.token !== "string" || !value.token) {
+		return false;
+	}
+	return true;
+}
+
+function getOperationFromPayload(payload: unknown): HostServiceOperation {
+	if (isStringRecord(payload) && typeof payload.operation === "string") {
+		const operation = payload.operation;
+		if (
+			operation === "status"
+			|| operation === "register_callback_target"
+			|| operation === "unregister_callback_target"
+			|| operation === "resolve_callback_target"
+		) {
+			return operation;
+		}
+	}
+	return "status";
+}
+
 function buildErrorResponse(
 	protocolVersion: number,
 	socketPath: string,
@@ -601,12 +1138,13 @@ function buildErrorResponse(
 	requestId: string,
 	errorText: string,
 	errorCode: string,
+	operation: HostServiceOperation = "status",
 ): string {
 	const nowNs = Date.now() * 1_000_000;
 	const response: HostServiceResponseEnvelope = {
 		protocol_version: protocolVersion,
 		request_id: requestId,
-		operation: "status",
+		operation,
 		status: "error",
 		generated_at_ns: nowNs,
 		error: errorText,
@@ -620,13 +1158,27 @@ function buildErrorResponse(
 			service_instance_id: serviceInstanceId,
 			workspace_context: FALLBACK_WORKSPACE_CONTEXT,
 			request_id: requestId,
-			operation: "status",
+			operation,
 			uptime_ns: 0,
 			total_requests: 0,
 			error_code: errorCode,
 		},
 	};
 	return `${JSON.stringify(response)}\n`;
+}
+
+function resolveStaleAfterNs(staleAfterMs: number | undefined): number | undefined {
+	if (staleAfterMs === undefined) return undefined;
+	return Date.now() * 1_000_000 + staleAfterMs * 1_000_000;
+}
+
+function isSocketUsable(socketPath: string): boolean {
+	try {
+		const st = lstatSync(socketPath);
+		return st.isSocket();
+	} catch {
+		return false;
+	}
 }
 
 function ensureDirectory(path: string): void {

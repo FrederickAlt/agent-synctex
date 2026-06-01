@@ -234,6 +234,65 @@ test("host service client surfaces server error envelopes as service errors", as
 	assert.doesNotMatch(observed.message, /Malformed host service response payload/);
 });
 
+test("host service client validates callback response operation", async () => {
+	const baseDir = temporaryDir("host-service-bad-callback-response-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const expectedRequestId = "callback-response-request-id";
+	const mismatchedResponse = JSON.stringify({
+		protocol_version: 1,
+		request_id: expectedRequestId,
+		operation: "status",
+		status: "ok",
+		generated_at_ns: Date.now() * 1_000_000,
+		status_details: {
+			protocol_version: 1,
+			supported: true,
+			service_available: true,
+			service_name: "agent-synctex-test-callback-response",
+			socket_path: socketPath,
+			service_instance_started_ns: Date.now() * 1_000_000,
+			service_instance_id: "instance-id",
+			workspace_context: { cwd: baseDir },
+			request_id: expectedRequestId,
+			operation: "status",
+			target_id: "pi-editor",
+			callback_available: true,
+			target: {
+				kind: "pi-synctex-callback-v1",
+				transport: "unix",
+				socket_path: "/tmp/callback.sock",
+				token: "token",
+			},
+			uptime_ns: 1,
+			total_requests: 1,
+		},
+	}) + "\n";
+	const mismatchedServer = createServer((socket) => {
+		socket.end(mismatchedResponse, () => {
+			socket.destroy();
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		mismatchedServer.once("error", reject);
+		mismatchedServer.listen(socketPath, () => {
+			resolve();
+		});
+	});
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+		requestIdFactory: () => expectedRequestId,
+	});
+	await assert.rejects(
+		() => client.requestResolveCallbackTarget({ cwd: baseDir }, "pi-editor"),
+		/Malformed host service response payload/,
+	);
+	await new Promise<void>((resolve) => {
+		mismatchedServer.close(() => resolve());
+	});
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
 test("host service client rejects malformed response with mismatched request ids", async () => {
 	const baseDir = temporaryDir("host-service-mismatch-request-id-");
 	const socketPath = join(baseDir, "host-service.sock");
@@ -458,5 +517,153 @@ test("host service replaces stale socket on startup", async () => {
 	assert.equal(status.service_name, "agent-synctex-orphan");
 	await hostServer.stop();
 
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
+test("host service supports callback target register, replace, and unregister", async () => {
+	const baseDir = temporaryDir("host-service-callback-register-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-callback" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	const targetPath = join(baseDir, "callback.sock");
+	const callbackListener = createServer();
+	await new Promise<void>((resolve) => {
+		callbackListener.listen(targetPath, resolve);
+	});
+	const baseTarget = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: targetPath,
+		token: "alpha-token",
+	};
+
+	const first = await client.requestRegisterCallbackTarget(
+		{ cwd: baseDir },
+		{
+			target_id: "pi-editor",
+			target: baseTarget,
+		},
+	);
+	assert.equal(first.target_id, "pi-editor");
+	assert.equal(first.callback_registered, true);
+	assert.equal(first.callback_replaced, false);
+	assert.equal(first.target?.token, "alpha-token");
+
+	const second = await client.requestRegisterCallbackTarget(
+		{ cwd: baseDir },
+		{
+			target_id: "pi-editor",
+			target: {
+				...baseTarget,
+				token: "beta-token",
+			},
+		},
+	);
+	assert.equal(second.target_id, "pi-editor");
+	assert.equal(second.callback_replaced, true);
+	assert.equal(second.target?.token, "beta-token");
+
+	const unregistered = await client.requestUnregisterCallbackTarget({ cwd: baseDir }, "pi-editor");
+	assert.equal(unregistered.target_id, "pi-editor");
+	assert.equal(unregistered.removed, true);
+	const recheck = await client.requestUnregisterCallbackTarget({ cwd: baseDir }, "pi-editor");
+	assert.equal(recheck.target_id, "pi-editor");
+	assert.equal(recheck.removed, false);
+
+	const resolved = await client.requestResolveCallbackTarget({ cwd: baseDir }, "pi-editor");
+	assert.equal(resolved.operation, "resolve_callback_target");
+	assert.equal(resolved.callback_available, false);
+	assert.equal(resolved.target_id, "pi-editor");
+
+	await server.stop();
+	await new Promise<void>((resolve) => {
+		callbackListener.close(() => resolve());
+	});
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
+test("host service degrades missing and stale callback targets", async () => {
+	const baseDir = temporaryDir("host-service-callback-stale-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-callback-stale" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	const missing = await client.requestResolveCallbackTarget({ cwd: baseDir }, "missing-target");
+	assert.equal(missing.callback_available, false);
+	assert.equal(missing.target_id, "missing-target");
+
+	const callbackSocket = join(baseDir, "callback.sock");
+	const callbackListener = createServer();
+	await new Promise<void>((resolve) => {
+		callbackListener.listen(callbackSocket, resolve);
+	});
+
+	const shortLived = await client.requestRegisterCallbackTarget(
+		{ cwd: baseDir },
+		{
+			target_id: "short-lived",
+			target: {
+				kind: "pi-synctex-callback-v1",
+				transport: "unix",
+				socket_path: callbackSocket,
+				token: "stale-token",
+			},
+			stale_after_ms: 1,
+		},
+	);
+	assert.equal(shortLived.callback_replaced, false);
+	assert.equal(shortLived.callback_registered, true);
+	await sleep(10);
+	const stale = await client.requestResolveCallbackTarget({ cwd: baseDir }, "short-lived");
+	assert.equal(stale.callback_available, false);
+	assert.equal(stale.target_id, "short-lived");
+	await new Promise<void>((resolve) => {
+		callbackListener.close(() => resolve());
+	});
+
+	await server.stop();
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
+test("host service validates callback registration protocol", async () => {
+	const baseDir = temporaryDir("host-service-callback-validation-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-callback-validation" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	await assert.rejects(
+		() => client.requestRegisterCallbackTarget({ cwd: "" }, {
+			target_id: "bad-request",
+			target: {
+				kind: "pi-synctex-callback-v1",
+				transport: "unix",
+				socket_path: "/tmp/callback.sock",
+				token: "token",
+			},
+		}),
+		/invalid workspace_context/,
+	);
+
+	await assert.rejects(
+		() => client.requestRegisterCallbackTarget(
+			{ cwd: baseDir },
+			{
+				target_id: "bad-target",
+				target: {
+					kind: "not-a-real-kind",
+					transport: "unix",
+					socket_path: join(baseDir, "callback.sock"),
+					token: "token",
+				},
+			} as any,
+		),
+		/invalid callback target/,
+	);
+
+	await server.stop();
 	rmSync(baseDir, { recursive: true, force: true });
 });
