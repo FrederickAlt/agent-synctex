@@ -2,9 +2,6 @@
 whitelist ${HOME}/.local/bin/pdf-preview-servicectl
 read-only ${HOME}/.local/bin/pdf-preview-servicectl
 
-whitelist ${HOME}/plugins/codex-show-latex-mcp/scripts
-read-write ${HOME}/plugins/codex-show-latex-mcp/scripts
-
 whitelist ${HOME}/.cache/show-latex
 read-write ${HOME}/.cache/show-latex
 
