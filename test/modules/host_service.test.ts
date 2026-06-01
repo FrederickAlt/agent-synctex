@@ -211,6 +211,54 @@ class RecordingFakeViewerBackend extends FakeViewerBackend {
 	}
 }
 
+class ValidatingFakeViewerBackend extends FakeViewerBackend {
+	async open(requestId: string, details: Record<string, unknown>): ReturnType<FakeViewerBackend["open"]> {
+		const pdfPath = typeof details.pdf_path === "string" ? details.pdf_path : undefined;
+		if (pdfPath) {
+			let header = "";
+			try {
+				header = readFileSync(pdfPath, "utf8");
+			} catch {
+				return {
+					status: "error",
+					error: "pdf_path is not a PDF file",
+					status_details: {
+						protocol_version: 1,
+						supported: true,
+						service_available: true,
+						backend: this.name,
+						backend_path: this.name,
+						capabilities: this.capabilities,
+						owned: false,
+						reused: false,
+						error_code: "invalid_pdf",
+						reason: "pdf_path is not a PDF file",
+					},
+				};
+			}
+			if (!header.startsWith("%PDF-")) {
+				return {
+					status: "error",
+					error: "pdf_path is not a PDF file",
+					status_details: {
+						protocol_version: 1,
+						supported: true,
+						service_available: true,
+						backend: this.name,
+						backend_path: this.name,
+						capabilities: this.capabilities,
+						owned: false,
+						reused: false,
+						error_code: "invalid_pdf",
+						reason: "pdf_path is not a PDF file",
+					},
+				};
+			}
+		}
+		return super.open(requestId, details);
+	}
+}
+
 async function writeHostServiceRequest(
 	path: string,
 	request: Record<string, unknown>,
@@ -1461,7 +1509,7 @@ test("host service status reflects backend availability for health checks", asyn
 
 });
 
-test("host service open resolves relative PDF paths and reuses sessions for matching callback", async () => {
+test("host service open_pdf resolves relative PDF paths and tracks managed records for reuse", async () => {
 	const baseDir = temporaryDir("host-service-open-reuse-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const pdfPath = join(baseDir, "sample.pdf");
@@ -1481,7 +1529,7 @@ test("host service open resolves relative PDF paths and reuses sessions for matc
 	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
 
 	try {
-		const firstOpen = await client.requestOpen(
+		const firstOpen = await client.requestOpenPdf(
 			{ cwd: baseDir },
 			{
 				pdf_path: "sample.pdf",
@@ -1492,9 +1540,23 @@ test("host service open resolves relative PDF paths and reuses sessions for matc
 		assert.equal(firstOpen.reused, false);
 		assert.equal(firstOpen.owned, true);
 		assert.equal(typeof firstOpen.handle, "string");
+		if (firstOpen.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const firstOpenPdfId = firstOpen.pdf_id;
+		assert.equal(firstOpenPdfId >= 1, true);
+		assert.equal(typeof firstOpenPdfId, "number");
+		assert.equal(typeof firstOpen.managed_record?.id, "number");
+		assert.equal(firstOpen.managed_record?.id, firstOpenPdfId);
+		assert.equal(firstOpen.managed_record?.viewerHandle, firstOpen.handle);
+		assert.equal(firstOpen.managed_record?.viewerBackend, firstOpen.backend);
+		assert.equal(firstOpen.managed_record?.viewerOwned, firstOpen.owned);
+		assert.equal(firstOpen.managed_record?.pdfPath, pdfPath);
+		assert.equal(firstOpen.managed_record?.callback?.token, callback.token);
+		assert.equal(firstOpen.managed_record?.capabilities?.open, true);
 		assert.equal(backend.openedDetails.length, 1);
 		assert.equal(backend.openedDetails[0]!.pdf_path, pdfPath);
-		const secondOpen = await client.requestOpen(
+		const secondOpen = await client.requestOpenPdf(
 			{ cwd: baseDir },
 			{
 				pdf_path: "sample.pdf",
@@ -1503,8 +1565,9 @@ test("host service open resolves relative PDF paths and reuses sessions for matc
 			},
 		);
 		assert.equal(secondOpen.reused, true);
+		assert.equal(secondOpen.pdf_id, firstOpenPdfId);
 		assert.equal(secondOpen.handle, firstOpen.handle);
-		const thirdOpen = await client.requestOpen(
+		const thirdOpen = await client.requestOpenPdf(
 			{ cwd: baseDir },
 			{
 				pdf_path: "sample.pdf",
@@ -1516,10 +1579,156 @@ test("host service open resolves relative PDF paths and reuses sessions for matc
 			},
 		);
 		assert.equal(thirdOpen.reused, false);
+		assert.notEqual(thirdOpen.pdf_id, firstOpenPdfId);
 		assert.notEqual(thirdOpen.handle, firstOpen.handle);
 		assert.equal(backend.openedDetails.length, 3);
 		assert.equal(backend.openedDetails[1]!.pdf_path, pdfPath);
 		assert.equal(backend.openedDetails[2]!.pdf_path, pdfPath);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service open_pdf returns backend-provided invalid-PDF errors", async () => {
+	const baseDir = temporaryDir("host-service-open-invalid-pdf-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "not-pdf.txt");
+	writeFileSync(pdfPath, "just text\n");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	const backend = new ValidatingFakeViewerBackend();
+	const server = new HostServiceServer({ socketPath, viewerBackend: backend });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		await assert.rejects(
+			() => client.requestOpenPdf(
+				{ cwd: baseDir },
+				{
+					pdf_path: "not-pdf.txt",
+					callback,
+					reuse_existing: true,
+				},
+			),
+			/invalid_pdf/,
+		);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service client surfaces invalid_request for malformed open_pdf payloads", async () => {
+	const baseDir = temporaryDir("host-service-open-pdf-invalid-request-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	let observed: unknown;
+	try {
+		await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{
+				pdf_path: 123 as unknown as string,
+				callback: "bad" as unknown as {
+					kind: "pi-synctex-callback-v1";
+					transport: "unix";
+					socket_path: string;
+					token: string;
+				},
+			},
+		);
+	} catch (error) {
+		observed = error;
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /code=invalid_request/);
+	assert.doesNotMatch(observed.message, /Malformed host service open_pdf response payload/);
+});
+
+test("host service open_pdf returns backend-unavailable errors", async () => {
+	const baseDir = temporaryDir("host-service-open-backend-unavailable-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	const backend = new FakeViewerBackend({ available: false });
+	const server = new HostServiceServer({ socketPath, viewerBackend: backend });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		await assert.rejects(
+			() => client.requestOpenPdf(
+				{ cwd: baseDir },
+				{
+					pdf_path: "sample.pdf",
+					callback,
+					reuse_existing: true,
+				},
+			),
+			/backend_unavailable/,
+		);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service open_pdf allocates active pdf ids from random range", async () => {
+	const baseDir = temporaryDir("host-service-open-id-range-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const backend = new RecordingFakeViewerBackend();
+	const server = new HostServiceServer({ socketPath, viewerBackend: backend });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	const callbackBase = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+	};
+
+	try {
+		const pdfIds = new Set<number>();
+		for (let i = 0; i < 5; i += 1) {
+			const pdfPath = join(baseDir, `sample-${i}.pdf`);
+			writeFileSync(pdfPath, "%PDF-1.4\n");
+			const response = await client.requestOpenPdf(
+				{ cwd: baseDir },
+				{
+					pdf_path: `sample-${i}.pdf`,
+					callback: {
+						...callbackBase,
+						token: `token-${i}`,
+					},
+					reuse_existing: true,
+				},
+			);
+			if (response.pdf_id === undefined) {
+				throw new Error("host service open response did not include pdf_id");
+			}
+			const pdfId = response.pdf_id;
+			assert.equal(pdfId >= 1 && pdfId <= 99_999_999, true);
+			pdfIds.add(pdfId);
+		}
+		assert.equal(pdfIds.size, 5);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
