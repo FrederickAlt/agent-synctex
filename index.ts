@@ -1555,10 +1555,6 @@ export default function (pi: ExtensionAPI) {
 			try {
 				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
 				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
-				const workspaceHostServiceClient = new HostServiceClient({
-					socketPath: hostServiceSocketPath(),
-					requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
-				});
 				const result = await closeTrackedPdfForContext(
 					ctx,
 					pdfId,
@@ -1566,7 +1562,11 @@ export default function (pi: ExtensionAPI) {
 						return viewerServiceClient.requestClosePdf(viewerHandle, viewerBackend, closeSignal);
 					},
 					signal,
-					async (hostPdfId, closeSignal) => {
+					async (hostPdfId, hostServiceSocketPath, closeSignal) => {
+						const workspaceHostServiceClient = new HostServiceClient({
+							socketPath: hostServiceSocketPath,
+							requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+						});
 						const closeResponse = await workspaceHostServiceClient.requestClosePdf(workspaceContext, hostPdfId, closeSignal);
 						return {
 							closed: closeResponse.closed,
@@ -1624,10 +1624,6 @@ export default function (pi: ExtensionAPI) {
 				const server = await ensureSynctexCallbacks(ctx);
 				synctexCommand = server.command;
 				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
-				const workspaceHostServiceClient = new HostServiceClient({
-					socketPath: hostServiceSocketPath(),
-					requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
-				});
 				const result = await jumpTrackedPdfForContext(
 					ctx,
 					pdfId,
@@ -1665,20 +1661,30 @@ export default function (pi: ExtensionAPI) {
 							);
 							return { handled: response.handled, reason: response.reason };
 						},
-						requestJumpFromHostService: async (hostPdfId, hostSourceFile, jumpLine, jumpSignal) => {
-							const hostResponse = await workspaceHostServiceClient.requestJumpPdf(
-								workspaceContext,
-								{ pdf_id: hostPdfId, line: jumpLine, source_file: hostSourceFile },
-								jumpSignal,
-							);
-							return {
-								handled: hostResponse.handled,
-								source_file: hostResponse.source_file,
-								source_line: hostResponse.source_line,
-								reopened: hostResponse.reopened,
-							};
-						},
-						cwd: ctx.cwd,
+						requestJumpFromHostService: async (
+						hostPdfId,
+						hostServiceSocketPath,
+						hostSourceFile,
+						jumpLine,
+						jumpSignal,
+					) => {
+						const workspaceHostServiceClient = new HostServiceClient({
+							socketPath: hostServiceSocketPath,
+							requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+						});
+						const hostResponse = await workspaceHostServiceClient.requestJumpPdf(
+							workspaceContext,
+							{ pdf_id: hostPdfId, line: jumpLine, source_file: hostSourceFile },
+							jumpSignal,
+						);
+						return {
+							handled: hostResponse.handled,
+							source_file: hostResponse.source_file,
+							source_line: hostResponse.source_line,
+							reopened: hostResponse.reopened,
+						};
+					},
+					cwd: ctx.cwd,
 					},
 				);
 				return {
@@ -1811,6 +1817,7 @@ export default function (pi: ExtensionAPI) {
 					},
 					compileResponse.source,
 					synctexCommand,
+					{ reuseTrackedPdf: false },
 				);
 				openResult = {
 					pdf_id: trackedPdf.id,

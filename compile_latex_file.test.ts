@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
 import { closeTrackedPdfForContext, jumpTrackedPdfForContext } from "./src/modules/pdf_session/pdf_session.ts";
-import { FakeViewerBackend, HostServiceServer } from "./src/modules/host_service.ts";
+import { FakeViewerBackend, HostServicePdfIdRegistry, HostServiceServer } from "./src/modules/host_service.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 
@@ -340,12 +340,17 @@ async function runSessionShutdown(ctx: unknown): Promise<void> {
 	await sessionShutdownHandler("session_shutdown", ctx);
 }
 
-async function withHostService<T>(backend: FakeViewerBackend, fn: () => Promise<T>): Promise<T> {
+async function withHostService<T>(
+	backend: FakeViewerBackend,
+	fn: () => Promise<T>,
+	options: { managedViewerRecords?: HostServicePdfIdRegistry } = {},
+): Promise<T> {
 	const serviceDir = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-service-"));
 	const socketPath = resolve(serviceDir, "host_service.sock");
 	const server = new HostServiceServer({
 		socketPath,
 		viewerBackend: backend,
+		...(options.managedViewerRecords === undefined ? {} : { managedViewerRecords: options.managedViewerRecords }),
 	});
 	const previousSocketPath = process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
 	await server.start();
@@ -365,6 +370,14 @@ async function withHostService<T>(backend: FakeViewerBackend, fn: () => Promise<
 
 function withHostServiceDefault<T>(fn: () => Promise<T>): Promise<T> {
 	return withHostService(new FakeViewerBackend(), fn);
+}
+
+function makeFixedHostServicePdfIdRegistry(pdfId: number): HostServicePdfIdRegistry {
+	return new HostServicePdfIdRegistry({
+		minPdfId: pdfId,
+		maxPdfId: pdfId,
+		makePdfId: () => pdfId,
+	});
 }
 
 async function withHostServiceUnavailable<T>(fn: () => Promise<T>): Promise<T> {
@@ -673,6 +686,100 @@ test("compile_latex_file(open_pdf=true) can be followed by registered jump_pdf a
 			assert.equal(closeDetails.pdf, compileDetails.pdf);
 			assert.equal(closeDetails.closed, true);
 		});
+	} finally {
+		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("compile_latex_file(open_pdf=true) refreshes host-service metadata after service restart", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tools = await captureTools();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompiler(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+
+	const context = createSessionContext(root);
+	const sourceLine = "\\begin{document}ok\\end{document}";
+	let trackedPdfId = 0;
+	try {
+		await runSessionStart(context);
+
+		await withHostService(
+			new FakeJumpableViewerBackend(),
+			async () => {
+				const firstCompile = await tools.compileTool.execute(
+					"compile-latex-file-restart-1",
+					{ latex_file_path: sourcePath, open_pdf: true },
+					undefined,
+					undefined,
+					context,
+				);
+				const firstDetails = firstCompile.details as { pdf_id: number; pdf: string; source: string };
+				trackedPdfId = firstDetails.pdf_id;
+				assert.equal(firstDetails.pdf, resolve(root, "paper.pdf"));
+				assert.equal(firstDetails.source, sourcePath);
+			},
+			{ managedViewerRecords: makeFixedHostServicePdfIdRegistry(1001) },
+		);
+
+		await withHostService(
+			new FakeJumpableViewerBackend(),
+			async () => {
+				const secondCompile = await tools.compileTool.execute(
+					"compile-latex-file-restart-2",
+					{ latex_file_path: sourcePath, open_pdf: true },
+					undefined,
+					undefined,
+					context,
+				);
+				const secondDetails = secondCompile.details as { pdf_id: number; pdf: string; source: string };
+				assert.equal(secondDetails.pdf_id, trackedPdfId);
+				assert.equal(secondDetails.pdf, resolve(root, "paper.pdf"));
+				assert.equal(secondDetails.source, sourcePath);
+
+				const jumpResult = await tools.jumpPdfTool.execute(
+					"jump-latex-file-open-restart",
+					{
+						pdf_id: trackedPdfId,
+						line: 1,
+						source_file: sourcePath,
+					},
+					undefined,
+					undefined,
+					context,
+				);
+				const jumpDetails = jumpResult.details as {
+					pdf_id: number;
+					pdf: string;
+					source: string;
+					reopened: boolean;
+					source_line: string;
+				};
+
+				const closeResult = await tools.closePdfTool.execute(
+					"close-latex-file-open-restart",
+					{ pdf_id: trackedPdfId },
+					undefined,
+					undefined,
+					context,
+				);
+				const closeDetails = closeResult.details as { pdf: string; closed: boolean };
+
+				assert.equal(jumpDetails.pdf_id, trackedPdfId);
+				assert.equal(jumpDetails.pdf, resolve(root, "paper.pdf"));
+				assert.equal(jumpDetails.source, sourcePath);
+				assert.equal(jumpDetails.source_line, sourceLine);
+				assert.equal(jumpResult.content[0].text, `line 1 contains:\n${sourceLine}`);
+				assert.equal(jumpDetails.reopened === true || jumpDetails.reopened === false, true);
+				assert.equal(closeDetails.pdf, resolve(root, "paper.pdf"));
+				assert.equal(closeDetails.closed, true);
+			},
+			{ managedViewerRecords: makeFixedHostServicePdfIdRegistry(2222) },
+		);
 	} finally {
 		await runSessionShutdown(context);
 		process.env.PATH = originalPath;

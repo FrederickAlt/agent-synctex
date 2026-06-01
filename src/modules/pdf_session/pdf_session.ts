@@ -66,7 +66,7 @@ export type PdfSessionClose = (
 	signal?: AbortSignal,
 ) => Promise<{ closed: boolean; reason?: string }>;
 
-export type PdfSessionCloseFromHostService = (hostServicePdfId: number, signal?: AbortSignal) => Promise<{ closed: boolean; reason?: string }>;
+export type PdfSessionCloseFromHostService = (hostServicePdfId: number, hostServiceSocketPath: string, signal?: AbortSignal) => Promise<{ closed: boolean; reason?: string }>;
 
 function toPdfOpenResult(openResult: PdfSessionOpenResult | void): PdfOpenResult | void {
 	if (!openResult) return undefined;
@@ -134,6 +134,10 @@ export function clearPdfTrackers(): void {
 	pdfTrackersByContext.clear();
 }
 
+export interface OpenTrackedPdfOptions {
+	reuseTrackedPdf?: boolean;
+}
+
 export async function openTrackedPdfForContext(
 	ctx: ExtensionContext | undefined,
 	pdfFilePath: string,
@@ -141,6 +145,7 @@ export async function openTrackedPdfForContext(
 	opener: PdfSessionOpen,
 	defaultSourceFile?: string,
 	synctexEditorCommand?: string,
+	options: OpenTrackedPdfOptions = {},
 ): Promise<TrackedPdf> {
 	const tracker = getPdfTrackerForContext(ctx);
 	return openAndTrackPdf(
@@ -150,6 +155,7 @@ export async function openTrackedPdfForContext(
 		async (path: string, openSignal: AbortSignal | undefined) => toPdfOpenResult(await opener(path, openSignal)),
 		defaultSourceFile,
 		synctexEditorCommand,
+		options.reuseTrackedPdf ?? true,
 	);
 }
 
@@ -192,7 +198,13 @@ export interface PdfSessionJumpOptions {
 	requestForwardSearch: PdfSessionForwardSearch;
 	opener?: PdfSessionOpen;
 	sourceLineReader?: PdfSessionJumpSourceReader;
-	requestJumpFromHostService?: (hostServicePdfId: number, sourceFile: string, line: number, signal?: AbortSignal) => Promise<{
+	requestJumpFromHostService?: (
+		hostServicePdfId: number,
+		hostServiceSocketPath: string,
+		sourceFile: string,
+		line: number,
+		signal?: AbortSignal,
+	) => Promise<{
 		handled?: boolean;
 		source_file?: string;
 		source_line?: string;
@@ -238,8 +250,14 @@ export async function jumpTrackedPdfForContext(
 				return { handled: response.handled, reason: response.reason };
 			},
 			requestJumpFromHostService: options.requestJumpFromHostService
-				? async (hostServicePdfId, sourceFile, jumpLine, jumpSignal) => {
-					const response = await options.requestJumpFromHostService!(hostServicePdfId, sourceFile, jumpLine, jumpSignal);
+				? async (hostServicePdfId, hostServiceSocketPath, sourceFile, jumpLine, jumpSignal) => {
+					const response = await options.requestJumpFromHostService!(
+						hostServicePdfId,
+						hostServiceSocketPath,
+						sourceFile,
+						jumpLine,
+						jumpSignal,
+					);
 					return {
 						handled: response.handled,
 						source_file: response.source_file,

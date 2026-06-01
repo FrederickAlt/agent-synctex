@@ -68,14 +68,20 @@ const PDF_HEADER = "%PDF-";
 
 interface PdfCloseOptions {
 	requestClose?: (viewerHandle: string, viewerBackend: string, signal?: AbortSignal) => Promise<PdfServiceCloseResult>;
-	requestCloseFromHostService?: (hostServicePdfId: number, signal?: AbortSignal) => Promise<PdfServiceCloseResult>;
+	requestCloseFromHostService?: (hostServicePdfId: number, hostServiceSocketPath: string, signal?: AbortSignal) => Promise<PdfServiceCloseResult>;
 }
 
 interface PdfJumpOptions {
 	opener?: PdfOpener;
 	requestForwardSearch?: (viewerHandle: string, viewerBackend: string, sourceFile: string, line: number, synctexPid?: number, signal?: AbortSignal) => Promise<PdfServiceForwardSearchResult>;
 	synctexEditorCommand?: string;
-	requestJumpFromHostService?: (hostServicePdfId: number, sourceFile: string, line: number, signal?: AbortSignal) => Promise<{
+	requestJumpFromHostService?: (
+		hostServicePdfId: number,
+		hostServiceSocketPath: string,
+		sourceFile: string,
+		line: number,
+		signal?: AbortSignal,
+	) => Promise<{
 		handled?: boolean;
 		source_file?: string;
 		source_line?: string;
@@ -414,7 +420,14 @@ export async function closeTrackedPdf(
 		if (!options.requestCloseFromHostService) {
 			throw new Error(`Tracked pdf_id=${pdfId} requires host service close but no host service close handler is configured.`);
 		}
-		const serviceResult = await options.requestCloseFromHostService(trackedPdf.hostServicePdfId, signal);
+		if (trackedPdf.hostServiceSocketPath === undefined) {
+			throw new Error(`Tracked pdf_id=${pdfId} has host service metadata without an active socket path.`);
+		}
+		const serviceResult = await options.requestCloseFromHostService(
+			trackedPdf.hostServicePdfId,
+			trackedPdf.hostServiceSocketPath,
+			signal,
+		);
 		tracker.untrackById(pdfId);
 		return {
 			pdf: trackedPdf.path,
@@ -452,11 +465,12 @@ export async function openAndTrackPdf(
 	opener?: PdfOpener,
 	defaultSourceFile?: string,
 	synctexEditorCommand?: string,
+	reuseExistingPdf = true,
 ): Promise<TrackedPdf> {
 	const pdfPath = normalizePdfFilePath(pdfFilePath);
 	const sourceFile = defaultSourceFile ?? inferDefaultSourceFileForPdf(pdfPath);
 	const reusableTrackedPdf = tracker.getByPath(pdfPath);
-	if (reusableTrackedPdf?.viewerHandle !== undefined && reusableTrackedPdf.viewerBackend !== undefined) {
+	if (reuseExistingPdf && reusableTrackedPdf?.viewerHandle !== undefined && reusableTrackedPdf.viewerBackend !== undefined) {
 		return tracker.markReopened(reusableTrackedPdf.id, reusableTrackedPdf.pid, sourceFile, synctexEditorCommand) ?? reusableTrackedPdf;
 	}
 
@@ -520,8 +534,12 @@ export async function jumpToTrackedPdf(
 		if (!options.requestJumpFromHostService) {
 			throw new Error(`Tracked pdf_id=${pdfId} requires host service jump but no jump handler is configured.`);
 		}
+		if (trackedPdf.hostServiceSocketPath === undefined) {
+			throw new Error(`Tracked pdf_id=${pdfId} has host service metadata without an active socket path.`);
+		}
 		const hostServiceJump = await options.requestJumpFromHostService(
 			trackedPdf.hostServicePdfId,
+			trackedPdf.hostServiceSocketPath,
 			resolvedSourceFile,
 			line,
 			signal,
