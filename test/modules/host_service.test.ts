@@ -21,6 +21,7 @@ import {
 	HostServiceClient,
 	HostServiceServer,
 } from "../../src/modules/host_service.ts";
+import { INLINE_PREVIEW_DIR } from "../../src/modules/preview/inline_preview.ts";
 
 function temporaryDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));
@@ -65,6 +66,60 @@ exit ${exitCode}
 `, { mode: 0o700 });
 	chmodSync(compilerPath, 0o700);
 	return compilerPath;
+}
+
+function createMiniPng(width: number, height: number): Buffer {
+	const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+	const ihdrLength = Buffer.alloc(4);
+	ihdrLength.writeUInt32BE(13, 0);
+	const ihdrType = Buffer.from("IHDR");
+	const ihdrData = Buffer.alloc(13);
+	ihdrData.writeUInt32BE(width, 0);
+	ihdrData.writeUInt32BE(height, 4);
+	ihdrData[8] = 8;
+	ihdrData[9] = 6;
+	ihdrData[10] = 0;
+	ihdrData[11] = 0;
+	ihdrData[12] = 0;
+	const ihdrCrc = Buffer.alloc(4);
+	const iendLength = Buffer.alloc(4);
+	iendLength.writeUInt32BE(0, 0);
+	const iendType = Buffer.from("IEND");
+	const iendCrc = Buffer.alloc(4);
+	return Buffer.concat([
+		signature,
+		ihdrLength,
+		ihdrType,
+		ihdrData,
+		ihdrCrc,
+		iendLength,
+		iendType,
+		iendCrc,
+	]);
+}
+
+function writeFakeMutool(binDir: string, width = 64, height = 48): string {
+	const png = createMiniPng(width, height).toString("base64");
+	mkdirSync(binDir, { mode: 0o700, recursive: true });
+	const mutoolPath = join(binDir, "mutool");
+	writeFileSync(mutoolPath, `#!/bin/sh
+set -eu
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    out="$arg"
+    break
+  fi
+  prev="$arg"
+done
+if [ -z "$out" ]; then
+  exit 1
+fi
+printf '%s' '${png}' | base64 -d > "$out"
+`);
+	chmodSync(mutoolPath, 0o700);
+	return mutoolPath;
 }
 
 async function waitForFile(path: string, timeoutMs = 500): Promise<void> {
@@ -367,6 +422,124 @@ test("host service compile_latex_file includes raw source path for invalid compi
 	assert.match(response.error, /workspace_context.cwd must be absolute for compile_latex_file/);
 });
 
+test("host service rasterize request with missing payload details is rejected", async () => {
+	const baseDir = temporaryDir("host-service-rasterize-malformed-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-rasterize-malformed" });
+	await server.start();
+
+	const requestPayload = {
+		protocol_version: 1,
+		request_id: "rasterize-malformed-request-id",
+		operation: "rasterize",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: { cwd: baseDir },
+	};
+	const raw = await writeHostServiceRequest(socketPath, requestPayload as Record<string, unknown>);
+	const response = JSON.parse(raw.trim());
+
+	await server.stop();
+	rmSync(baseDir, { recursive: true, force: true });
+
+	assert.equal(response.operation, "rasterize");
+	assert.equal(response.status, "error");
+	assert.equal(response.status_details.error_code, "invalid_request");
+	assert.match(response.error, /missing rasterize details/);
+});
+
+test("host service rasterize missing pdf returns host-service invalid_request code", async () => {
+	const baseDir = temporaryDir("host-service-rasterize-missing-pdf-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-rasterize-missing-pdf" });
+	await server.start();
+
+	const requestPayload = {
+		protocol_version: 1,
+		request_id: "rasterize-missing-pdf-id",
+		operation: "rasterize",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: { cwd: baseDir },
+		details: {
+			pdf_path: join(baseDir, "missing.pdf"),
+		},
+	};
+	const raw = await writeHostServiceRequest(socketPath, requestPayload as Record<string, unknown>);
+	const response = JSON.parse(raw.trim());
+
+	await server.stop();
+	rmSync(baseDir, { recursive: true, force: true });
+
+	assert.equal(response.operation, "rasterize");
+	assert.equal(response.status, "error");
+	assert.equal(response.status_details.error_code, "invalid_request");
+	assert.equal(response.status_details.pdf_path, join(baseDir, "missing.pdf"));
+	assert.equal(response.status_details.artifacts.length, 0);
+	assert.equal(response.status_details.artifact_paths.length, 0);
+	assert.match(response.error, /does not exist/);
+});
+
+test("host service rasterize rejects invalid page request as invalid_request", async () => {
+	const baseDir = temporaryDir("host-service-rasterize-invalid-page-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeMutool(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "sample.pdf"), "%PDF-1.4\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-rasterize-invalid-page" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	let observed: unknown;
+	try {
+		await client.requestRasterizePdf({ pdf_path: "sample.pdf", page: 0 }, { cwd: baseDir });
+	} catch (error) {
+		observed = error;
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /page must be a positive integer/);
+	assert.match(observed.message, /code=invalid_request/);
+	assert.doesNotMatch(observed.message, /Malformed host service response payload/);
+});
+
+test("host service rasterize returns artifact metadata", async () => {
+	const baseDir = temporaryDir("host-service-rasterize-success-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeMutool(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "sample.pdf"), "%PDF-1.4\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-rasterize-success" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const result = await client.requestRasterizePdf({ pdf_path: "sample.pdf" }, { cwd: baseDir });
+		assert.equal(result.operation, "rasterize");
+		assert.equal(result.supported, true);
+		assert.equal(result.service_available, true);
+		assert.equal(result.pdf_path, join(baseDir, "sample.pdf"));
+		assert.equal(result.artifact_paths.length, 1);
+		assert.equal(result.artifacts.length, 1);
+		assert.equal(result.artifacts[0].page, 1);
+		assert.equal(result.artifacts[0].renderer, "mutool");
+		assert.equal(existsSync(result.artifacts[0].pngPath), true);
+		assert.equal(result.artifact_paths[0], result.artifacts[0].pngPath);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
 
 test("host service compile_latex_snippet malformed requests avoid raw snippet in error details", async () => {
 	const baseDir = temporaryDir("host-service-snippet-malformed-");
@@ -973,6 +1146,132 @@ test("host service client rejects malformed response with non-status operation",
 	await assert.rejects(() => client.requestStatus({ cwd: baseDir }), /Malformed host service response payload/);
 	await new Promise<void>((resolve) => {
 		badOperationServer.close(() => resolve());
+	});
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
+test("host service client validates rasterize response artifact metadata", async () => {
+	const baseDir = temporaryDir("host-service-bad-rasterize-artifact-");
+	const socketPath = join(baseDir, "host-service.sock");
+	mkdirSync(INLINE_PREVIEW_DIR, { mode: 0o700, recursive: true });
+	const previewPng = join(INLINE_PREVIEW_DIR, "rasterize-artifact-invalid-page.png");
+	writeFileSync(previewPng, createMiniPng(16, 8));
+	const expectedRequestId = "rasterize-page-id";
+	const malformedResponse = JSON.stringify({
+		protocol_version: 1,
+		request_id: expectedRequestId,
+		operation: "rasterize",
+		status: "ok",
+		generated_at_ns: Date.now() * 1_000_000,
+		status_details: {
+			protocol_version: 1,
+			supported: true,
+			service_available: true,
+			workspace_context: { cwd: baseDir },
+			request_id: expectedRequestId,
+			operation: "rasterize",
+			pdf_path: join(baseDir, "sample.pdf"),
+			artifacts: [
+				{
+					pngPath: previewPng,
+					page: 0,
+					dpi: 150,
+					renderer: "mutool",
+					trimmed: false,
+					fullPageWidthPx: 16,
+					fullPageHeightPx: 8,
+					widthPx: 16,
+					heightPx: 8,
+				},
+			],
+			artifact_paths: [previewPng],
+		},
+	}) + "\n";
+	const malformedServer = createServer((socket) => {
+		socket.end(malformedResponse, () => {
+			socket.destroy();
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		malformedServer.once("error", reject);
+		malformedServer.listen(socketPath, () => {
+			resolve();
+		});
+	});
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+		requestIdFactory: () => expectedRequestId,
+	});
+	await assert.rejects(
+		() => client.requestRasterizePdf({ pdf_path: "sample.pdf" }, { cwd: baseDir }),
+		/Malformed host service response payload/,
+	);
+	await new Promise<void>((resolve) => {
+		malformedServer.close(() => resolve());
+	});
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
+test("host service client validates rasterize response artifact paths", async () => {
+	const baseDir = temporaryDir("host-service-bad-rasterize-artifact-path-");
+	const socketPath = join(baseDir, "host-service.sock");
+	mkdirSync(INLINE_PREVIEW_DIR, { mode: 0o700, recursive: true });
+	const previewPng = join(INLINE_PREVIEW_DIR, "rasterize-artifact-valid.png");
+	writeFileSync(previewPng, createMiniPng(16, 8));
+	const expectedRequestId = "rasterize-artifact-path-id";
+	const malformedResponse = JSON.stringify({
+		protocol_version: 1,
+		request_id: expectedRequestId,
+		operation: "rasterize",
+		status: "ok",
+		generated_at_ns: Date.now() * 1_000_000,
+		status_details: {
+			protocol_version: 1,
+			supported: true,
+			service_available: true,
+			workspace_context: { cwd: baseDir },
+			request_id: expectedRequestId,
+			operation: "rasterize",
+			pdf_path: join(baseDir, "sample.pdf"),
+			artifacts: [
+				{
+					pngPath: previewPng,
+					page: 1,
+					dpi: 150,
+					renderer: "mutool",
+					trimmed: false,
+					fullPageWidthPx: 16,
+					fullPageHeightPx: 8,
+					widthPx: 16,
+					heightPx: 8,
+				},
+			],
+			artifact_paths: [join(baseDir, "outside-preview.png")],
+		},
+	}) + "\n";
+	const malformedServer = createServer((socket) => {
+		socket.end(malformedResponse, () => {
+			socket.destroy();
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		malformedServer.once("error", reject);
+		malformedServer.listen(socketPath, () => {
+			resolve();
+		});
+	});
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+		requestIdFactory: () => expectedRequestId,
+	});
+	await assert.rejects(
+		() => client.requestRasterizePdf({ pdf_path: "sample.pdf" }, { cwd: baseDir }),
+		/Malformed host service response payload/,
+	);
+	await new Promise<void>((resolve) => {
+		malformedServer.close(() => resolve());
 	});
 	rmSync(baseDir, { recursive: true, force: true });
 });
