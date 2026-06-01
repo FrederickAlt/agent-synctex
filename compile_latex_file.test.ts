@@ -299,6 +299,27 @@ class FakeJumpableViewerBackend extends FakeViewerBackend {
 	}
 }
 
+class FakeUnvalidatedOpenViewerBackend extends FakeViewerBackend {
+	private nextHandle = 0;
+
+	async open(_requestId: string, _details: Record<string, unknown>): Promise<{ status: "ok"; status_details: Record<string, unknown> }> {
+		this.nextHandle += 1;
+		return {
+			status: "ok",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend_path: "fake-viewer",
+				owned: false,
+				reused: false,
+				pid: 123456,
+				handle: `fake-viewer:${this.nextHandle}`,
+			},
+		};
+	}
+}
+
 function writeFakeCompiler(binDir: string, options: FakeCompilerOptions = {}): string {
 	const {
 		exitCode = 0,
@@ -755,6 +776,91 @@ test("open_pdf exposes host-service PDF IDs and supports jump/close", async () =
 		await runSessionShutdown(context);
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test("open_pdf resolves relative pdf_file_path using session cwd", async () => {
+	const { root } = withTemporaryProject();
+	const tools = await captureTools();
+	const context = createSessionContext(root);
+	const sourcePdfPath = resolve(root, "relative.pdf");
+	writeFileSync(sourcePdfPath, "%PDF-1.7\\n");
+
+	const originalCwd = process.cwd();
+	const externalCwd = mkdtempSync(resolve(tmpdir(), "pdf-preview-open-test-"));
+	const fixedPdfId = 9001;
+	const records = makeFixedHostServicePdfIdRegistry(fixedPdfId);
+	try {
+		process.chdir(externalCwd);
+		await withHostService(
+			new FakeJumpableViewerBackend(),
+			async () => {
+				await runSessionStart(context);
+				const openResult = await tools.openPdfTool.execute(
+					"open-pdf-relative-cwd",
+					{ pdf_file_path: "relative.pdf" },
+					undefined,
+					undefined,
+					context,
+				);
+				const openDetails = openResult.details as { pdf_id: number; pdf: string };
+				assert.equal(openDetails.pdf_id, fixedPdfId);
+				assert.equal(openDetails.pdf, sourcePdfPath);
+				assert.equal(records.activeCount, 1);
+				const closeResult = await tools.closePdfTool.execute(
+					"close-pdf-relative-cwd",
+					{ pdf_id: openDetails.pdf_id },
+					undefined,
+					undefined,
+					context,
+				);
+				assert.equal(closeResult.details.closed, true);
+				assert.equal(records.activeCount, 0);
+			},
+			{ managedViewerRecords: records },
+		);
+	} finally {
+		process.chdir(originalCwd);
+		rmSync(externalCwd, { recursive: true, force: true });
+		await runSessionShutdown(context);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("open_pdf closes host-viewer when tracking fails after host open", async () => {
+	const { root } = withTemporaryProject();
+	const tools = await captureTools();
+	const context = createSessionContext(root);
+	const fixedPdfId = 9002;
+	const records = makeFixedHostServicePdfIdRegistry(fixedPdfId);
+	let openError: unknown;
+	try {
+		await withHostService(
+			new FakeUnvalidatedOpenViewerBackend(),
+			async () => {
+				await runSessionStart(context);
+				try {
+					await tools.openPdfTool.execute(
+						"open-pdf-tracking-failure",
+						{ pdf_file_path: "relative-missing.pdf" },
+						undefined,
+						undefined,
+						context,
+					);
+					assert.fail("open_pdf should reject when opened PDF cannot be tracked");
+				} catch (error) {
+					openError = error;
+				}
+				assert.equal(records.activeCount, 0);
+			},
+			{ managedViewerRecords: records },
+		);
+	} finally {
+		await runSessionShutdown(context);
+		rmSync(root, { recursive: true, force: true });
+	}
+	assert.equal(openError !== undefined, true);
+	const openMessage = openError instanceof Error ? openError.message : String(openError);
+	assert.equal(/Cannot stat PDF file/.test(openMessage), true);
 });
 
 test("jump_pdf and close_pdf surface errors for unknown or closed host-service IDs", async () => {

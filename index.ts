@@ -1517,27 +1517,37 @@ export default function (pi: ExtensionAPI) {
 					},
 					signal,
 				);
-				const trackedPdf = await openTrackedPdfForContext(
-					ctx,
-					requestedPath,
-					signal,
-					() => Promise.resolve({
-						pid: openResponse.pid,
-						viewerHandle: openResponse.handle,
-						viewerBackend: openResponse.backend,
-						viewerOwned: openResponse.owned,
-						viewerCapabilities: openResponse.capabilities,
-						hostServicePdfId: openResponse.pdf_id,
-						hostServiceSocketPath: socketPath,
-						hostServiceCallbackTargetId: callbackTargetId,
-					}),
-					undefined,
-					synctexCommand,
-					{
-						reuseTrackedPdf: false,
-						pdfId: openResponse.pdf_id,
-					},
-				);
+				const trackedPdfPath = resolve(workspaceContext.cwd, openResponse.managed_record?.pdfPath ?? requestedPath);
+				let trackedPdf: Awaited<ReturnType<typeof openTrackedPdfForContext>>;
+				try {
+					trackedPdf = await openTrackedPdfForContext(
+						ctx,
+						trackedPdfPath,
+						signal,
+						() => Promise.resolve({
+							pid: openResponse.pid,
+							viewerHandle: openResponse.handle,
+							viewerBackend: openResponse.backend,
+							viewerOwned: openResponse.owned,
+							viewerCapabilities: openResponse.capabilities,
+							hostServicePdfId: openResponse.pdf_id,
+							hostServiceSocketPath: socketPath,
+							hostServiceCallbackTargetId: callbackTargetId,
+						}),
+						undefined,
+						synctexCommand,
+						{
+							reuseTrackedPdf: false,
+							pdfId: openResponse.pdf_id,
+						},
+					);
+				} catch (error) {
+					if (openResponse.pdf_id !== undefined) {
+						await hostServiceClient.requestClosePdf(workspaceContext, openResponse.pdf_id, signal)
+							.catch(() => undefined);
+					}
+					throw error;
+				}
 				pdfPath = trackedPdf.path;
 
 				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
