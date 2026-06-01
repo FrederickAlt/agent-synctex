@@ -64,6 +64,9 @@ export interface HostServiceCompileRequest {
 		latex_file_path: string;
 		compiler?: unknown;
 		clean?: boolean;
+		open_pdf?: boolean;
+		callback_target_id?: string;
+		callback?: HostServiceCallbackTarget;
 	};
 }
 
@@ -78,6 +81,9 @@ export interface HostServiceCompileSnippetRequest {
 		compiler?: unknown;
 		suppress_page_numbers?: boolean;
 		crop_to_content?: boolean;
+		open_pdf?: boolean;
+		callback_target_id?: string;
+		callback?: HostServiceCallbackTarget;
 	};
 }
 
@@ -241,6 +247,8 @@ export interface HostServiceCompileResponseDetails {
 	artifact_paths: string[];
 	clean: boolean;
 	cleaned_artifacts: string[];
+	pdf_id?: number;
+	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
 }
 
@@ -257,6 +265,8 @@ export interface HostServiceCompileSnippetResponseDetails {
 	artifact_paths: string[];
 	clean: boolean;
 	cleaned_artifacts: string[];
+	pdf_id?: number;
+	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
 }
 
@@ -784,6 +794,9 @@ export class HostServiceClient {
 				latex_file_path: request.latex_file_path,
 				...(request.compiler === undefined ? {} : { compiler: request.compiler }),
 				...(request.clean === undefined ? {} : { clean: request.clean }),
+				...(request.open_pdf === undefined ? {} : { open_pdf: request.open_pdf }),
+				...(request.callback_target_id === undefined ? {} : { callback_target_id: request.callback_target_id }),
+				...(request.callback === undefined ? {} : { callback: request.callback }),
 			},
 		},
 			signal,
@@ -820,6 +833,9 @@ export class HostServiceClient {
 					? {}
 					: { suppress_page_numbers: request.suppress_page_numbers }),
 				...(request.crop_to_content === undefined ? {} : { crop_to_content: request.crop_to_content }),
+				...(request.open_pdf === undefined ? {} : { open_pdf: request.open_pdf }),
+				...(request.callback_target_id === undefined ? {} : { callback_target_id: request.callback_target_id }),
+				...(request.callback === undefined ? {} : { callback: request.callback }),
 			},
 		},
 			signal,
@@ -1633,12 +1649,82 @@ export class HostServiceServer {
 		}
 	}
 
+	private async resolveManagedOpenCallback(
+		workspaceContext: HostServiceWorkspaceContext,
+		callbackTargetId: string | undefined,
+		callbackTarget: HostServiceCallbackTarget | undefined,
+	): Promise<HostServiceCallbackTarget | undefined> {
+		if (callbackTargetId !== undefined) {
+			const targetId = callbackTargetRegistryKey(workspaceContext, callbackTargetId);
+			return await this.resolveCallbackTarget(targetId);
+		}
+		return callbackTarget;
+	}
+
+	private buildCompileOpenFailureResponse(
+		request: HostServiceCompileRequest | HostServiceCompileSnippetRequest,
+		source: string,
+		pdf: string,
+		log: string,
+		clean: boolean,
+		cleanedArtifacts: string[],
+		artifactPaths: string[],
+		errorText: string,
+		errorCode: string,
+		nowNs: number,
+	): HostServiceCompileResponseEnvelope | HostServiceCompileSnippetResponseEnvelope {
+		return {
+			protocol_version: this.protocolVersion,
+			request_id: request.request_id,
+			operation: request.operation,
+			status: "error",
+			generated_at_ns: nowNs,
+			error: errorText,
+			status_details: {
+				protocol_version: this.protocolVersion,
+				supported: false,
+				service_available: false,
+				workspace_context: request.workspace_context,
+				request_id: request.request_id,
+				operation: request.operation,
+				source,
+				pdf,
+				log,
+				clean,
+				cleaned_artifacts: cleanedArtifacts,
+				artifact_paths: artifactPaths,
+				error_code: errorCode,
+			},
+		} as HostServiceCompileResponseEnvelope | HostServiceCompileSnippetResponseEnvelope;
+	}
+
+	private async openCompiledPdfThroughManagedViewer(
+		requestId: string,
+		workspaceContext: HostServiceWorkspaceContext,
+		pdfPath: string,
+		callback: HostServiceCallbackTarget,
+	): Promise<HostServiceOpenResponseEnvelope> {
+		return this.openViewerRequest({
+			protocol_version: this.protocolVersion,
+			request_id: requestId,
+			operation: "open_pdf",
+			created_at_ns: Date.now() * 1_000_000,
+			workspace_context: workspaceContext,
+			details: {
+				pdf_path: pdfPath,
+				callback,
+				reuse_existing: true,
+				require_persistent_viewer: false,
+			},
+		});
+	}
+
 	private async compileLatexFileRequest(request: HostServiceCompileRequest): Promise<HostServiceResponseEnvelope> {
 		const requestedPath = request.details.latex_file_path;
 		const normalizedPath = normalizeLatexSourcePath(requestedPath, request.workspace_context.cwd);
-		const logPath = inferLatexLogPath(normalizedPath);
 		const shouldClean = request.details.clean === true;
 		const cleanArtifacts: string[] = [];
+		const resolvedLogPath = inferLatexLogPath(normalizedPath);
 
 		try {
 			const compileRequest: LatexFileCompileRequest = {
@@ -1648,11 +1734,69 @@ export class HostServiceServer {
 				cwd: request.workspace_context.cwd,
 			};
 			const result = await hostServiceLatexFileCompiler.compileLatexFile(compileRequest);
+			const resultLogPath = inferLatexLogPath(result.source);
 			const nowNs = Date.now() * 1_000_000;
 			for (const cleaned of result.cleanedArtifacts) {
 				cleanArtifacts.push(cleaned);
 			}
-			const artifactPaths = getExistingArtifacts(result.pdfPath, logPath);
+			const artifactPaths = getExistingArtifacts(result.pdfPath, resultLogPath);
+			let openResponse: HostServiceOpenResponseEnvelope | undefined;
+			if (request.details.open_pdf) {
+				const openCallback = await this.resolveManagedOpenCallback(
+					request.workspace_context,
+					request.details.callback_target_id,
+					request.details.callback,
+				);
+				if (openCallback === undefined) {
+					return this.buildCompileOpenFailureResponse(
+						request,
+						result.source,
+						result.pdfPath,
+						resultLogPath,
+						shouldClean,
+						cleanArtifacts,
+						artifactPaths,
+						"open_pdf callback configuration is missing or stale for this workspace",
+						"invalid_request",
+						nowNs,
+					);
+				}
+				try {
+					openResponse = await this.openCompiledPdfThroughManagedViewer(
+						request.request_id,
+						request.workspace_context,
+						result.pdfPath,
+						openCallback,
+					);
+				} catch (error) {
+					return this.buildCompileOpenFailureResponse(
+						request,
+						result.source,
+						result.pdfPath,
+						resultLogPath,
+						shouldClean,
+						cleanArtifacts,
+						artifactPaths,
+						error instanceof Error ? error.message : String(error),
+						"backend_unavailable",
+						nowNs,
+					);
+				}
+				if (openResponse !== undefined && openResponse.status === "error") {
+					return this.buildCompileOpenFailureResponse(
+						request,
+						result.source,
+						result.pdfPath,
+						resultLogPath,
+						shouldClean,
+						cleanArtifacts,
+						artifactPaths,
+						openResponse.error || "failed to open compiled PDF",
+						openResponse.status_details.error_code ?? "backend_unavailable",
+						nowNs,
+					);
+				}
+			}
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -1668,15 +1812,17 @@ export class HostServiceServer {
 					operation: request.operation,
 					source: result.source,
 					pdf: result.pdfPath,
-					log: logPath,
+					log: resultLogPath,
 					clean: shouldClean,
 					cleaned_artifacts: cleanArtifacts,
 					artifact_paths: artifactPaths,
+					pdf_id: openResponse?.status_details.pdf_id,
+					managed_record: openResponse?.status_details.managed_record,
 				},
 			};
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
-			const log = error instanceof LoggedToolError ? error.logPath : logPath;
+			const log = error instanceof LoggedToolError ? error.logPath : resolvedLogPath;
 			const nowNs = Date.now() * 1_000_000;
 			return {
 				protocol_version: this.protocolVersion,
@@ -1697,8 +1843,8 @@ export class HostServiceServer {
 					log: log,
 					clean: shouldClean,
 					cleaned_artifacts: cleanArtifacts,
-					artifact_paths: getExistingArtifacts(log),
 					error_code: extractCompileErrorCode(error),
+					artifact_paths: getExistingArtifacts(log),
 				},
 			};
 		}
@@ -1730,6 +1876,63 @@ export class HostServiceServer {
 			const logPath = inferLatexLogPath(result.source);
 			const nowNs = Date.now() * 1_000_000;
 			const artifactPaths = getExistingArtifacts(result.pdfPath, logPath);
+			let openResponse: HostServiceOpenResponseEnvelope | undefined;
+			if (request.details.open_pdf) {
+				const openCallback = await this.resolveManagedOpenCallback(
+					request.workspace_context,
+					request.details.callback_target_id,
+					request.details.callback,
+				);
+				if (openCallback === undefined) {
+					return this.buildCompileOpenFailureResponse(
+						request,
+						result.source,
+						result.pdfPath,
+						logPath,
+						shouldClean,
+						cleanArtifacts,
+						artifactPaths,
+						"open_pdf callback configuration is missing or stale for this workspace",
+						"invalid_request",
+						nowNs,
+					);
+				}
+				try {
+					openResponse = await this.openCompiledPdfThroughManagedViewer(
+						request.request_id,
+						request.workspace_context,
+						result.pdfPath,
+						openCallback,
+					);
+				} catch (error) {
+					return this.buildCompileOpenFailureResponse(
+						request,
+						result.source,
+						result.pdfPath,
+						logPath,
+						shouldClean,
+						cleanArtifacts,
+						artifactPaths,
+						error instanceof Error ? error.message : String(error),
+						"backend_unavailable",
+						nowNs,
+					);
+				}
+				if (openResponse !== undefined && openResponse.status === "error") {
+					return this.buildCompileOpenFailureResponse(
+						request,
+						result.source,
+						result.pdfPath,
+						logPath,
+						shouldClean,
+						cleanArtifacts,
+						artifactPaths,
+						openResponse.error || "failed to open compiled PDF",
+						openResponse.status_details.error_code ?? "backend_unavailable",
+						nowNs,
+					);
+				}
+			}
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -1749,6 +1952,8 @@ export class HostServiceServer {
 					clean: shouldClean,
 					cleaned_artifacts: cleanArtifacts,
 					artifact_paths: artifactPaths,
+					pdf_id: openResponse?.status_details.pdf_id,
+					managed_record: openResponse?.status_details.managed_record,
 				},
 			};
 		} catch (error) {
@@ -1775,13 +1980,12 @@ export class HostServiceServer {
 					log: log,
 					clean: shouldClean,
 					cleaned_artifacts: cleanArtifacts,
-					artifact_paths: getExistingArtifacts(log),
 					error_code: extractCompileErrorCode(error),
+					artifact_paths: getExistingArtifacts(log),
 				},
 			};
 		}
 	}
-
 	private async rasterizePdfRequest(request: HostServiceRasterizeRequest): Promise<HostServiceRasterizeResponseEnvelope> {
 		const shouldMerge = request.details.merge_pages !== false;
 		const pdfPath = isAbsolute(request.details.pdf_path)
@@ -2809,6 +3013,22 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 			if (rawDetails.clean !== undefined && typeof rawDetails.clean !== "boolean") {
 				throw new Error("clean must be a boolean");
 			}
+			if (rawDetails.open_pdf !== undefined && typeof rawDetails.open_pdf !== "boolean") {
+				throw new Error("open_pdf must be a boolean");
+			}
+			if (rawDetails.callback_target_id !== undefined && typeof rawDetails.callback_target_id !== "string") {
+				throw new Error("callback_target_id must be a non-empty string");
+			}
+			if (rawDetails.callback_target_id !== undefined && !rawDetails.callback_target_id.trim()) {
+				throw new Error("callback_target_id must be a non-empty string");
+			}
+			if (rawDetails.callback !== undefined && !isValidCallbackTarget(rawDetails.callback)) {
+				throw new Error("callback must be a valid callback target");
+			}
+			const openPdf = rawDetails.open_pdf === true;
+			if (openPdf && rawDetails.callback === undefined && rawDetails.callback_target_id === undefined) {
+				throw new Error("open_pdf requires callback or callback_target_id");
+			}
 			const workspaceContext = normalizeWorkspaceContextForCompile(value.workspace_context);
 			return {
 				protocol_version: PROTOCOL_VERSION,
@@ -2820,6 +3040,9 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 					latex_file_path: rawDetails.latex_file_path,
 					compiler: rawDetails.compiler,
 					clean: rawDetails.clean === true,
+					open_pdf: openPdf,
+					callback_target_id: rawDetails.callback_target_id,
+					callback: rawDetails.callback as HostServiceCallbackTarget | undefined,
 				},
 			};
 		}
@@ -2840,6 +3063,22 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 			if (rawDetails.crop_to_content !== undefined && typeof rawDetails.crop_to_content !== "boolean") {
 				throw new Error("crop_to_content must be a boolean");
 			}
+			if (rawDetails.open_pdf !== undefined && typeof rawDetails.open_pdf !== "boolean") {
+				throw new Error("open_pdf must be a boolean");
+			}
+			if (rawDetails.callback_target_id !== undefined && typeof rawDetails.callback_target_id !== "string") {
+				throw new Error("callback_target_id must be a non-empty string");
+			}
+			if (rawDetails.callback_target_id !== undefined && !rawDetails.callback_target_id.trim()) {
+				throw new Error("callback_target_id must be a non-empty string");
+			}
+			if (rawDetails.callback !== undefined && !isValidCallbackTarget(rawDetails.callback)) {
+				throw new Error("callback must be a valid callback target");
+			}
+			const openPdf = rawDetails.open_pdf === true;
+			if (openPdf && rawDetails.callback === undefined && rawDetails.callback_target_id === undefined) {
+				throw new Error("open_pdf requires callback or callback_target_id");
+			}
 			const workspaceContext = normalizeWorkspaceContextForSnippetCompile(value.workspace_context);
 			return {
 				protocol_version: PROTOCOL_VERSION,
@@ -2852,6 +3091,9 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 					compiler: rawDetails.compiler,
 					suppress_page_numbers: rawDetails.suppress_page_numbers,
 					crop_to_content: rawDetails.crop_to_content,
+					open_pdf: openPdf,
+					callback_target_id: rawDetails.callback_target_id,
+					callback: rawDetails.callback as HostServiceCallbackTarget | undefined,
 				},
 			};
 		}
@@ -3299,6 +3541,12 @@ function isValidCompileResponseLike(
 		return false;
 	}
 	if (!Array.isArray(details.artifact_paths) || !details.artifact_paths.every((entry) => typeof entry === "string")) {
+		return false;
+	}
+	if (details.pdf_id !== undefined && (typeof details.pdf_id !== "number" || !Number.isInteger(details.pdf_id) || details.pdf_id <= 0)) {
+		return false;
+	}
+	if (details.managed_record !== undefined && !isValidManagedViewerRecord(details.managed_record)) {
 		return false;
 	}
 	if (typeof details.error_code !== "undefined" && typeof details.error_code !== "string") {
