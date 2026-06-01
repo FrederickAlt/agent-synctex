@@ -307,6 +307,8 @@ export interface HostServiceOpenResponseDetails {
 	reused: boolean;
 	pid?: number;
 	pid_diagnostic?: string;
+	pdf_id?: number;
+	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
 	reason?: string;
 }
@@ -407,6 +409,13 @@ export interface HostServiceManagedViewerRecord {
 	viewerBackend: string;
 	viewerOwned: boolean;
 	createdAtNs: number;
+	callback?: HostServiceCallbackTarget;
+	pid?: number;
+	pidDiagnostic?: string;
+	reused?: boolean;
+	capabilities?: HostServiceViewerBackendCapabilities;
+	backendPath?: string;
+	defaultSourcePath?: string;
 	metadata?: Record<string, unknown>;
 }
 
@@ -415,6 +424,13 @@ export interface HostServiceManagedViewerRecordInput {
 	viewerHandle: string;
 	viewerBackend: string;
 	viewerOwned: boolean;
+	pid?: number;
+	pidDiagnostic?: string;
+	reused?: boolean;
+	capabilities?: HostServiceViewerBackendCapabilities;
+	backendPath?: string;
+	callback?: HostServiceCallbackTarget;
+	defaultSourcePath?: string;
 	metadata?: Record<string, unknown>;
 }
 
@@ -437,6 +453,7 @@ export interface HostServiceServerOptions {
 	serviceName?: string;
 	serviceInstanceId?: string;
 	viewerBackend?: ViewerBackendAdapter;
+	managedViewerRecords?: HostServicePdfIdRegistry;
 }
 
 const PROTOCOL_VERSION = 1;
@@ -512,6 +529,13 @@ export class HostServicePdfIdRegistry {
 			viewerBackend: record.viewerBackend,
 			viewerOwned: record.viewerOwned,
 			createdAtNs: nowNs,
+			pid: record.pid,
+			pidDiagnostic: record.pidDiagnostic,
+			reused: record.reused,
+			capabilities: record.capabilities,
+			backendPath: record.backendPath,
+			callback: record.callback,
+			defaultSourcePath: record.defaultSourcePath,
 			metadata: record.metadata,
 		};
 		this.activeRecords.set(id, managedRecord);
@@ -538,6 +562,15 @@ export class HostServicePdfIdRegistry {
 			throw new Error(`Closed pdf_id=${pdfId}: this record has been removed and is no longer active`);
 		}
 		throw new Error(`Unknown pdf_id=${pdfId}: no active pdf record found`);
+	}
+
+	findActiveRecord(predicate: (record: HostServiceManagedViewerRecord) => boolean): HostServiceManagedViewerRecord | undefined {
+		for (const record of this.activeRecords.values()) {
+			if (predicate(record)) {
+				return record;
+			}
+		}
+		return undefined;
 	}
 
 	markRecordStale(pdfId: number): HostServiceManagedViewerRecord {
@@ -1000,6 +1033,7 @@ export class HostServiceServer {
 	readonly serviceName: string;
 	private readonly protocolVersion = PROTOCOL_VERSION;
 	private readonly viewerBackend: ViewerBackendAdapter;
+	private readonly managedViewerRecords: HostServicePdfIdRegistry;
 	private server: Server | null = null;
 	private startedAtNs = 0;
 	private serviceInstanceId: string;
@@ -1013,6 +1047,7 @@ export class HostServiceServer {
 		this.serviceName = options.serviceName ?? "agent-synctex-host-service";
 		this.serviceInstanceId = options.serviceInstanceId ?? `host-service-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 		this.viewerBackend = options.viewerBackend ?? new ZathuraViewerBackend();
+		this.managedViewerRecords = options.managedViewerRecords ?? new HostServicePdfIdRegistry();
 	}
 
 	async start(): Promise<void> {
@@ -1056,6 +1091,7 @@ export class HostServiceServer {
 		}
 		if (!server) {
 			this.callbackTargets.clear();
+			this.managedViewerRecords.clear();
 			this.removeSocketPath();
 			return;
 		}
@@ -1070,6 +1106,7 @@ export class HostServiceServer {
 			});
 		});
 		this.callbackTargets.clear();
+		this.managedViewerRecords.clear();
 		this.removeSocketPath();
 	}
 
@@ -1586,7 +1623,96 @@ export class HostServiceServer {
 		const backendResult = await this.viewerBackend.open(request.request_id, request.details as Record<string, unknown>);
 		const nowNs = Date.now() * 1_000_000;
 		const backendDetails = backendResult.status_details as Record<string, unknown>;
+		const backendPath =
+			typeof backendDetails.backend_path === "string" && backendDetails.backend_path.trim()
+				? backendDetails.backend_path
+				: this.viewerBackend.name;
+		const capabilities = isValidViewerBackendCapabilities(backendDetails.capabilities)
+			? backendDetails.capabilities
+			: this.viewerBackend.capabilities;
+		const owned = Boolean(backendDetails.owned);
+		const reused = Boolean(backendDetails.reused);
+		const pid = typeof backendDetails.pid === "number" && Number.isInteger(backendDetails.pid) && backendDetails.pid > 0
+			? backendDetails.pid
+			: undefined;
+		const pidDiagnostic = typeof backendDetails.pid_diagnostic === "string" && backendDetails.pid_diagnostic.trim()
+			? backendDetails.pid_diagnostic
+			: undefined;
+		const handle = typeof backendDetails.handle === "string" && backendDetails.handle.trim()
+			? backendDetails.handle
+			: undefined;
 		if (backendResult.status === "ok") {
+			if (!handle) {
+				return {
+					protocol_version: this.protocolVersion,
+					request_id: request.request_id,
+					operation: "open",
+					status: "error",
+					generated_at_ns: nowNs,
+					error: "viewer backend response missing handle",
+					status_details: {
+						protocol_version: this.protocolVersion,
+						supported: false,
+						service_available: false,
+						workspace_context: request.workspace_context,
+						request_id: request.request_id,
+						operation: "open",
+						backend: this.viewerBackend.name,
+						backend_path: backendPath,
+						capabilities: this.viewerBackend.capabilities,
+						handle: undefined,
+						owned: false,
+						reused: false,
+						pid: undefined,
+						pid_diagnostic: undefined,
+						error_code: "internal_error",
+						reason: "viewer backend response missing handle",
+					},
+				};
+			}
+
+			const existingRecord = reused
+				? this.managedViewerRecords.findActiveRecord((record) =>
+					record.viewerHandle === handle
+						&& record.pdfPath === request.details.pdf_path
+						&& sameCallbackTarget(record.callback, request.details.callback),
+				)
+				: undefined;
+			const managedRecord = existingRecord
+				? (() => {
+					existingRecord.viewerOwned = owned;
+					existingRecord.reused = reused;
+					existingRecord.pid = pid;
+					existingRecord.pidDiagnostic = pidDiagnostic;
+					existingRecord.capabilities = capabilities;
+					existingRecord.backendPath = backendPath;
+					existingRecord.callback = request.details.callback;
+					existingRecord.metadata = {
+						...(existingRecord.metadata ?? {}),
+						backend_path: backendPath,
+						handle,
+					};
+					return existingRecord;
+				})()
+				: this.managedViewerRecords.trackRecord({
+					pdfPath: request.details.pdf_path,
+					viewerHandle: handle,
+					viewerBackend: this.viewerBackend.name,
+					viewerOwned: owned,
+					pid,
+					pidDiagnostic,
+					reused,
+					capabilities,
+					backendPath,
+					callback: request.details.callback,
+					metadata: {
+						backend_path: backendPath,
+						handle,
+						backend_name: this.viewerBackend.name,
+						callback_target_id: request.details.callback.socket_path,
+					},
+				});
+
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -1601,15 +1727,15 @@ export class HostServiceServer {
 					request_id: request.request_id,
 					operation: "open",
 					backend: this.viewerBackend.name,
-					backend_path: String(backendDetails.backend_path ?? this.viewerBackend.name),
-					capabilities: this.viewerBackend.capabilities,
-					handle: backendDetails.handle as string | undefined,
-					owned: Boolean(backendDetails.owned ?? false),
-					reused: Boolean(backendDetails.reused ?? false),
-					pid: typeof backendDetails.pid === "number" ? backendDetails.pid : undefined,
-					pid_diagnostic: typeof backendDetails.pid_diagnostic === "string" ? backendDetails.pid_diagnostic : undefined,
-					error_code: backendDetails.error_code as string | undefined,
-					reason: typeof backendDetails.reason === "string" ? backendDetails.reason : undefined,
+					backend_path: backendPath,
+					capabilities,
+					handle,
+					owned,
+					reused,
+					pid,
+					pid_diagnostic: pidDiagnostic,
+					pdf_id: managedRecord.id,
+					managed_record: managedRecord,
 				},
 			};
 		}
@@ -1628,14 +1754,16 @@ export class HostServiceServer {
 				request_id: request.request_id,
 				operation: "open",
 				backend: this.viewerBackend.name,
-				backend_path: String(backendDetails.backend_path ?? this.viewerBackend.name),
-				capabilities: this.viewerBackend.capabilities,
-				handle: backendDetails.handle as string | undefined,
-				owned: Boolean(backendDetails.owned ?? false),
-				reused: Boolean(backendDetails.reused ?? false),
-				pid: typeof backendDetails.pid === "number" ? backendDetails.pid : undefined,
-				pid_diagnostic: typeof backendDetails.pid_diagnostic === "string" ? backendDetails.pid_diagnostic : undefined,
-				error_code: (backendDetails.error_code as string | undefined) ?? "backend_unavailable",
+				backend_path: backendPath,
+				capabilities,
+				handle: handle,
+				owned,
+				reused,
+				pid,
+				pid_diagnostic: pidDiagnostic,
+				error_code: typeof backendDetails.error_code === "string"
+					? backendDetails.error_code
+					: "backend_unavailable",
 				reason: backendResult.error,
 			},
 		};
@@ -1698,6 +1826,16 @@ function isValidWorkspaceContext(value: unknown): value is HostServiceWorkspaceC
 	if (value.workspace_root !== undefined && typeof value.workspace_root !== "string") return false;
 	if (value.session_id !== undefined && typeof value.session_id !== "string") return false;
 	return true;
+}
+
+function sameCallbackTarget(left: HostServiceCallbackTarget | undefined, right: HostServiceCallbackTarget): boolean {
+	if (!left) return false;
+	return (
+		left.kind === right.kind
+		&& left.transport === right.transport
+		&& left.socket_path === right.socket_path
+		&& left.token === right.token
+	);
 }
 
 function normalizeWorkspaceContext(context: HostServiceWorkspaceContext): HostServiceWorkspaceContext {
@@ -2520,6 +2658,9 @@ function isValidOpenResponse(response: unknown, expectedRequestId: string): resp
 	if (details.error_code !== undefined && typeof details.error_code !== "string") return false;
 	if (response.status === "error" && typeof details.error_code !== "string") return false;
 	if (response.status === "ok" && details.error_code !== undefined) return false;
+	if (response.status === "ok" && details.pdf_id === undefined) return false;
+	if (response.status === "ok" && (typeof details.pdf_id !== "number" || !Number.isInteger(details.pdf_id) || details.pdf_id <= 0)) return false;
+	if (response.status === "ok" && details.managed_record !== undefined && !isValidManagedViewerRecord(details.managed_record)) return false;
 	if (response.status === "ok" && details.handle === undefined) return false;
 	return true;
 }
@@ -2588,6 +2729,55 @@ function isValidCallbackTarget(value: unknown): value is HostServiceCallbackTarg
 		return false;
 	}
 	if (typeof value.token !== "string" || !value.token) {
+		return false;
+	}
+	return true;
+}
+
+function isValidManagedViewerRecord(value: unknown): value is HostServiceManagedViewerRecord {
+	if (!isStringRecord(value)) {
+		return false;
+	}
+	if (typeof value.id !== "number" || !Number.isInteger(value.id) || value.id <= 0) {
+		return false;
+	}
+	if (typeof value.pdfPath !== "string" || !value.pdfPath) {
+		return false;
+	}
+	if (typeof value.viewerHandle !== "string" || !value.viewerHandle) {
+		return false;
+	}
+	if (typeof value.viewerBackend !== "string" || !value.viewerBackend) {
+		return false;
+	}
+	if (typeof value.viewerOwned !== "boolean") {
+		return false;
+	}
+	if (typeof value.createdAtNs !== "number" || !Number.isInteger(value.createdAtNs) || value.createdAtNs <= 0) {
+		return false;
+	}
+	if (value.pid !== undefined && (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0)) {
+		return false;
+	}
+	if (value.pidDiagnostic !== undefined && typeof value.pidDiagnostic !== "string") {
+		return false;
+	}
+	if (value.reused !== undefined && typeof value.reused !== "boolean") {
+		return false;
+	}
+	if (value.capabilities !== undefined && !isValidViewerBackendCapabilities(value.capabilities)) {
+		return false;
+	}
+	if (value.backendPath !== undefined && (typeof value.backendPath !== "string" || !value.backendPath)) {
+		return false;
+	}
+	if (value.callback !== undefined && !isValidCallbackTarget(value.callback)) {
+		return false;
+	}
+	if (value.defaultSourcePath !== undefined && (typeof value.defaultSourcePath !== "string" || !value.defaultSourcePath)) {
+		return false;
+	}
+	if (value.metadata !== undefined && !isStringRecord(value.metadata)) {
 		return false;
 	}
 	return true;
