@@ -1,4 +1,4 @@
-const DEFAULT_SNIPPET_PREAMBLE = [
+export const DEFAULT_SNIPPET_PREAMBLE = [
 	String.raw`\documentclass{article}`,
 	String.raw`\usepackage[utf8]{inputenc}`,
 	String.raw`\usepackage[T1]{fontenc}`,
