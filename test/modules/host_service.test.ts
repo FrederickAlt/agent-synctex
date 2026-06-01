@@ -487,6 +487,85 @@ class FakeForwardSearchTracker extends FakeViewerBackend {
 	}
 }
 
+class DeterministicManagedViewerBackend extends FakeForwardSearchTracker {
+	private openHandleCounter = 0;
+
+	async open(requestId: string, details: Record<string, unknown>): ReturnType<FakeViewerBackend["open"]> {
+		const pdfPath = typeof details.pdf_path === "string" ? details.pdf_path : undefined;
+		if (!pdfPath) {
+			return {
+				status: "error",
+				error: "missing pdf_path",
+				status_details: {
+					protocol_version: 1,
+					supported: false,
+					service_available: true,
+					backend: this.name,
+					backend_path: this.name,
+					owned: false,
+					reused: false,
+					error_code: "invalid_request",
+					capabilities: this.capabilities,
+				},
+			};
+		}
+		this.openHandleCounter += 1;
+		return {
+			status: "ok",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: this.name,
+				backend_path: this.name,
+				capabilities: this.capabilities,
+				handle: `managed-${this.openHandleCounter}`,
+				owned: true,
+				reused: false,
+				pid: 4242,
+			},
+		};
+	}
+
+	async close(_requestId: string, details: Record<string, unknown>): ReturnType<FakeViewerBackend["close"]> {
+		return {
+			status: "ok",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend: this.name,
+				backend_path: this.name,
+				backend_identity_ok: true,
+				handle: typeof details.handle === "string" ? details.handle : undefined,
+				closed: true,
+			},
+		};
+	}
+}
+
+class CountingOpenViewerBackend extends FakeViewerBackend {
+	public openCalls = 0;
+	public closeCalls = 0;
+
+	async open(_requestId: string, _details: Record<string, unknown>): ReturnType<FakeViewerBackend["open"]> {
+		this.openCalls += 1;
+		return super.open(_requestId, _details);
+	}
+
+	async close(_requestId: string, _details: Record<string, unknown>): ReturnType<FakeViewerBackend["close"]> {
+		this.closeCalls += 1;
+		return super.close(_requestId, _details);
+	}
+}
+
+class ThrowingViewerBackend extends FakeViewerBackend {
+	async open(): ReturnType<FakeViewerBackend["open"]> {
+		throw new Error("viewer backend exploded");
+	}
+}
+
+
 async function writeHostServiceRequest(
 	path: string,
 	request: Record<string, unknown>,
@@ -855,6 +934,428 @@ test("host service compile_latex_snippet malformed requests avoid raw snippet in
 	assert.equal(response.status_details.log, "");
 	assert.equal(response.status_details.error_code, "invalid_request");
 	assert.match(response.error, /missing compile details/);
+});
+
+test("host service compile_latex_file open_pdf requires callback or callback_target_id", async () => {
+	const baseDir = temporaryDir("host-service-open-pdf-requires-callback-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-open-requires-callback" });
+	await server.start();
+	const requestPayload = {
+		protocol_version: 1,
+		request_id: "compile-latex-file-open-missing-callback",
+		operation: "compile_latex_file",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: { cwd: baseDir },
+		details: {
+			latex_file_path: "paper.tex",
+			open_pdf: true,
+		},
+	};
+	const raw = await writeHostServiceRequest(socketPath, requestPayload as Record<string, unknown>);
+	const response = JSON.parse(raw.trim());
+	await server.stop();
+	rmSync(baseDir, { recursive: true, force: true });
+
+	assert.equal(response.operation, "compile_latex_file");
+	assert.equal(response.status, "error");
+	assert.equal(response.status_details.error_code, "invalid_request");
+	assert.match(response.error, /open_pdf requires callback or callback_target_id/);
+});
+
+test("host service compile_latex_file with managed open returns active id and jump/close", async () => {
+	const baseDir = temporaryDir("host-service-compile-open-success-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nHello\\end{document}\n");
+	const backend = new DeterministicManagedViewerBackend({
+		name: "agent-synctex-compile-open-backend",
+	});
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-compile-open-success",
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	const callbackSocketPath = join(baseDir, "callback.sock");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: callbackSocketPath,
+		token: "compile-open-token",
+	};
+	const callbackListener = createServer();
+	await new Promise<void>((resolve) => {
+		callbackListener.listen(callbackSocketPath, resolve);
+	});
+	await client.requestRegisterCallbackTarget(
+		{ cwd: baseDir },
+		{ target_id: "pi-editor", target: callback },
+	);
+	const expectedSource = join(baseDir, "paper.tex");
+
+	try {
+		const result = await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", open_pdf: true, callback_target_id: "pi-editor" },
+			{ cwd: baseDir },
+		);
+		assert.equal(result.operation, "compile_latex_file");
+		assert.equal(result.clean, false);
+		if (result.pdf_id === undefined) {
+			throw new Error("host service compile response did not include pdf_id");
+		}
+		const pdfId = result.pdf_id;
+		assert.equal(typeof pdfId, "number");
+		assert.equal(pdfId >= 1, true);
+		assert.equal(typeof result.managed_record?.id, "number");
+		assert.equal(result.managed_record?.id, pdfId);
+		assert.equal(result.managed_record?.pdfPath, result.pdf);
+		assert.equal(result.managed_record?.defaultSourcePath, expectedSource);
+		assert.equal(result.managed_record?.callback?.socket_path, callbackSocketPath);
+		assert.equal(backend.forwardSearchCalls.length, 0);
+		const jumpResponse = await client.requestJumpPdf({ cwd: baseDir }, { pdf_id: pdfId, line: 1 });
+		assert.equal(jumpResponse.handled, true);
+		assert.equal(jumpResponse.pdf_id, pdfId);
+		assert.equal(jumpResponse.source_file, expectedSource);
+		assert.equal(backend.forwardSearchCalls.length, 1);
+		assert.equal(backend.forwardSearchCalls[0]?.line, 1);
+		const closeResponse = await client.requestClosePdf({ cwd: baseDir }, pdfId);
+		assert.equal(closeResponse.closed, true);
+		assert.equal(closeResponse.pdf_id, pdfId);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		await new Promise<void>((resolve) => {
+			callbackListener.close(() => resolve());
+		});
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service compile_latex_file managed-open failure keeps compile successful", async () => {
+	const baseDir = temporaryDir("host-service-compile-open-fail-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nHello\\end{document}\n");
+	const backend = new FakeViewerBackend({ available: false });
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-compile-open-fail",
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	const callbackSocketPath = join(baseDir, "callback.sock");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: callbackSocketPath,
+		token: "compile-open-fail-token",
+	};
+	const callbackListener = createServer();
+	await new Promise<void>((resolve) => {
+		callbackListener.listen(callbackSocketPath, resolve);
+	});
+	await client.requestRegisterCallbackTarget(
+		{ cwd: baseDir },
+		{ target_id: "pi-editor", target: callback },
+	);
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", open_pdf: true, callback_target_id: "pi-editor" },
+			{ cwd: baseDir },
+		);
+	} catch (error) {
+		observed = error;
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		await new Promise<void>((resolve) => {
+			callbackListener.close(() => resolve());
+		});
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /backend_unavailable/);
+	assert.match(observed.message, /code=backend_unavailable/);
+	assert.doesNotMatch(observed.message, /compile_failed/);
+});
+
+test("host service compile_latex_file open_pdf avoids open on compile failure", async () => {
+	const baseDir = temporaryDir("host-service-compile-open-failure-no-open-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"), { exitCode: 1 });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nHello\\end{document}\n");
+	const backend = new CountingOpenViewerBackend({
+		name: "agent-synctex-compile-open-no-open-backend",
+	});
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-compile-open-no-open",
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	const callbackSocketPath = join(baseDir, "callback.sock");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: callbackSocketPath,
+		token: "compile-open-no-open-token",
+	};
+	const callbackListener = createServer();
+	await new Promise<void>((resolve) => {
+		callbackListener.listen(callbackSocketPath, resolve);
+	});
+	await client.requestRegisterCallbackTarget(
+		{ cwd: baseDir },
+		{ target_id: "pi-editor", target: callback },
+	);
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", open_pdf: true, callback_target_id: "pi-editor" },
+			{ cwd: baseDir },
+		);
+	} catch (error) {
+		observed = error;
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		await new Promise<void>((resolve) => {
+			callbackListener.close(() => resolve());
+		});
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /compile_failed/);
+	assert.equal(backend.openCalls, 0);
+	assert.equal(backend.closeCalls, 0);
+});
+
+test("host service compile_latex_file open_pdf rejects stale callback target", async () => {
+	const baseDir = temporaryDir("host-service-compile-open-stale-target-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nHello\\end{document}\n");
+	const backend = new CountingOpenViewerBackend({
+		name: "agent-synctex-compile-open-stale-target",
+	});
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-compile-open-stale-target",
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", open_pdf: true, callback_target_id: "ghost-target" },
+			{ cwd: baseDir },
+		);
+	} catch (error) {
+		observed = error;
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /invalid_request/);
+	assert.match(observed.message, /code=invalid_request/);
+	assert.equal(backend.openCalls, 0);
+	assert.equal(backend.closeCalls, 0);
+});
+
+test("host service compile_latex_snippet with managed open returns managed record", async () => {
+	const baseDir = temporaryDir("host-service-snippet-open-success-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	const backend = new DeterministicManagedViewerBackend({
+		name: "agent-synctex-snippet-open-backend",
+	});
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-snippet-open-success",
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	const callbackSocketPath = join(baseDir, "callback.sock");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: callbackSocketPath,
+		token: "snippet-open-token",
+	};
+	const callbackListener = createServer();
+	await new Promise<void>((resolve) => {
+		callbackListener.listen(callbackSocketPath, resolve);
+	});
+	await client.requestRegisterCallbackTarget(
+		{ cwd: baseDir },
+		{ target_id: "pi-editor", target: callback },
+	);
+	try {
+		const result = await client.requestCompileLatexSnippet(
+			{ latex_source: "\\section{Hello}", open_pdf: true, callback_target_id: "pi-editor" },
+			{ cwd: baseDir },
+		);
+		assert.equal(result.operation, "compile_latex_snippet");
+		if (result.pdf_id === undefined) {
+			throw new Error("host service compile snippet response did not include pdf_id");
+		}
+		assert.equal(typeof result.pdf_id, "number");
+		assert.equal(typeof result.managed_record?.id, "number");
+		assert.equal(result.managed_record?.id, result.pdf_id);
+		assert.equal(result.managed_record?.defaultSourcePath, result.source);
+		assert.equal(result.managed_record?.callback?.token, callback.token);
+		const closeResponse = await client.requestClosePdf({ cwd: baseDir }, result.pdf_id);
+		assert.equal(closeResponse.closed, true);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		await new Promise<void>((resolve) => {
+			callbackListener.close(() => resolve());
+		});
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service compile_latex_snippet with explicit inline callback returns managed record", async () => {
+	const baseDir = temporaryDir("host-service-snippet-open-inline-callback-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	const backend = new DeterministicManagedViewerBackend({
+		name: "agent-synctex-snippet-inline-callback-backend",
+	});
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-snippet-inline-callback",
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	const callbackSocketPath = join(baseDir, "callback.sock");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: callbackSocketPath,
+		token: "snippet-inline-token",
+	};
+	const callbackListener = createServer();
+	await new Promise<void>((resolve) => {
+		callbackListener.listen(callbackSocketPath, resolve);
+	});
+	try {
+		const result = await client.requestCompileLatexSnippet(
+			{ latex_source: "\\section{Hello}", open_pdf: true, callback },
+			{ cwd: baseDir },
+		);
+		assert.equal(result.operation, "compile_latex_snippet");
+		if (result.pdf_id === undefined) {
+			throw new Error("host service compile snippet response did not include pdf_id");
+		}
+		assert.equal(typeof result.pdf_id, "number");
+		assert.equal(typeof result.managed_record?.id, "number");
+		assert.equal(result.managed_record?.id, result.pdf_id);
+		assert.equal(result.managed_record?.defaultSourcePath, result.source);
+		assert.equal(result.managed_record?.callback?.token, callback.token);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		await new Promise<void>((resolve) => {
+			callbackListener.close(() => resolve());
+		});
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service compile_latex_snippet managed-open failure keeps compile successful", async () => {
+	const baseDir = temporaryDir("host-service-snippet-open-fail-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	const backend = new FakeViewerBackend({ available: false });
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-snippet-open-fail",
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	const callbackSocketPath = join(baseDir, "callback.sock");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: callbackSocketPath,
+		token: "snippet-open-fail-token",
+	};
+	const callbackListener = createServer();
+	await new Promise<void>((resolve) => {
+		callbackListener.listen(callbackSocketPath, resolve);
+	});
+	await client.requestRegisterCallbackTarget(
+		{ cwd: baseDir },
+		{ target_id: "pi-editor", target: callback },
+	);
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexSnippet(
+			{ latex_source: "\\section{Hello}", open_pdf: true, callback_target_id: "pi-editor" },
+			{ cwd: baseDir },
+		);
+	} catch (error) {
+		observed = error;
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		await new Promise<void>((resolve) => {
+			callbackListener.close(() => resolve());
+		});
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /backend_unavailable/);
+	assert.match(observed.message, /code=backend_unavailable/);
+	assert.doesNotMatch(observed.message, /compile_failed/);
 });
 
 
