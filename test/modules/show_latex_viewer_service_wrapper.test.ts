@@ -261,6 +261,57 @@ test("show_latex_viewer fake backend routes forward_search through adapter", asy
 	});
 });
 
+test("show_latex_viewer fake backend exits cleanly on SIGTERM", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-fake-shutdown-"));
+	const service = spawn(PYTHON_BIN, [SERVICE_SCRIPT], {
+		env: {
+			...process.env,
+			MCP_TMPDIR: serviceBaseDir,
+			VIEWER_SERVICE_BACKEND: "fake",
+		},
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	let stderr = "";
+
+	try {
+		if (service.stderr !== null) {
+			service.stderr.on("data", (chunk) => {
+				stderr += chunk.toString("utf8");
+			});
+		}
+		await waitForServiceDirs(serviceBaseDir);
+
+		const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				service.kill("SIGKILL");
+				reject(new Error("timeout waiting for fake viewer service exit during shutdown test"));
+			}, 1200);
+			service.once("exit", (code, signal) => {
+				clearTimeout(timer);
+				resolve({ code, signal });
+			});
+			service.kill("SIGTERM");
+		});
+
+		assert.equal(exit.code, 0);
+		assert.equal(exit.signal, null);
+		assert.equal(stderr.includes("AttributeError"), false);
+		assert.equal(stderr.includes("Traceback"), false);
+	} finally {
+		if (service.exitCode === null) {
+			service.kill("SIGKILL");
+		}
+		await new Promise<void>((resolve) => {
+			if (service.exitCode !== null) {
+				resolve();
+				return;
+			}
+			service.once("exit", () => resolve());
+		});
+		rmSync(serviceBaseDir, { recursive: true, force: true });
+	}
+});
+
 
 test("show_latex_viewer zathura backend reuses persistent open sessions", async () => {
 	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-open-"));
@@ -328,6 +379,113 @@ test("show_latex_viewer zathura backend reuses persistent open sessions", async 
 	);
 });
 
+test("show_latex_viewer zathura backend closes prior owned session when callback changes or reuse is disabled", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-replace-"));
+	const fakeViewer = join(serviceBaseDir, "zathura");
+	writeFakeZathuraViewerBinary(fakeViewer);
+	const pdfPath = join(serviceBaseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n", { mode: 0o600 });
+
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/show-latex-zathura-replace-callback.sock",
+		token: "alpha-token",
+	};
+	const otherCallback = {
+		...callback,
+		token: "different-token",
+	};
+
+	await withViewerService(
+		{
+			VIEWER_SERVICE_BACKEND: "zathura",
+			ZATHURA_VIEWER_PATH: fakeViewer,
+		},
+		async (baseDir) => {
+			const openRequestBase = {
+				callback,
+				pdf_path: pdfPath,
+			};
+			const openRequestDifferent = {
+				callback: otherCallback,
+				pdf_path: pdfPath,
+			};
+
+			writeResultRequest(baseDir, "zathura-open-a", "open", openRequestBase);
+			const first = await waitForViewerResult(baseDir, "zathura-open-a");
+			assert.equal(first.status, "ok");
+			const firstPid = typeof first.status_details.pid === "number" ? first.status_details.pid : undefined;
+			assert.equal(typeof firstPid, "number");
+
+			writeResultRequest(baseDir, "zathura-open-b", "open", openRequestDifferent);
+			const second = await waitForViewerResult(baseDir, "zathura-open-b");
+			assert.equal(second.status, "ok");
+			assert.notEqual(second.status_details.handle, first.status_details.handle);
+			await waitForProcessExit(firstPid);
+
+			writeResultRequest(baseDir, "zathura-open-c", "open", { ...openRequestBase, reuse_existing: false });
+			const third = await waitForViewerResult(baseDir, "zathura-open-c");
+			assert.equal(third.status, "ok");
+			assert.notEqual(third.status_details.handle, second.status_details.handle);
+			await waitForProcessExit(second.status_details.pid);
+		},
+		serviceBaseDir,
+	);
+});
+
+test("show_latex_viewer service stop closes owned viewer processes", async () => {
+	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-shutdown-"));
+	const fakeViewer = join(serviceBaseDir, "zathura");
+	writeFakeZathuraViewerBinary(fakeViewer);
+	const pdfPath = join(serviceBaseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n", { mode: 0o600 });
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/show-latex-zathura-shutdown-callback.sock",
+		token: "zathura-token",
+	};
+
+	const service = spawn(PYTHON_BIN, [SERVICE_SCRIPT], {
+		env: {
+			...process.env,
+			MCP_TMPDIR: serviceBaseDir,
+			VIEWER_SERVICE_BACKEND: "zathura",
+			ZATHURA_VIEWER_PATH: fakeViewer,
+		},
+		stdio: ["ignore", "ignore", "ignore"],
+	});
+	try {
+		await waitForServiceDirs(serviceBaseDir);
+		writeResultRequest(serviceBaseDir, "shutdown-open", "open", {
+			callback,
+			pdf_path: pdfPath,
+		});
+		const opened = await waitForViewerResult(serviceBaseDir, "shutdown-open");
+		assert.equal(opened.status, "ok");
+		const pid = opened.status_details.pid;
+		assert.equal(typeof pid, "number");
+
+		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				service.kill("SIGKILL");
+				reject(new Error("timeout waiting for viewer service exit during shutdown test"));
+			}, 1200);
+			service.once("exit", () => {
+				clearTimeout(timer);
+				resolve();
+			});
+			service.kill("SIGTERM");
+		});
+		await waitForProcessExit(pid);
+	} finally {
+		if (service.exitCode === null) {
+			service.kill("SIGKILL");
+		}
+		rmSync(serviceBaseDir, { recursive: true, force: true });
+	}
+});
 
 test("show_latex_viewer zathura backend executes forward_search with synctex command args", async () => {
 	const serviceBaseDir = mkdtempSync(join(tmpdir(), "viewer-service-zathura-forward-args-"));
