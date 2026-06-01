@@ -136,6 +136,7 @@ export function clearPdfTrackers(): void {
 
 export interface OpenTrackedPdfOptions {
 	reuseTrackedPdf?: boolean;
+	pdfId?: number;
 }
 
 export async function openTrackedPdfForContext(
@@ -155,7 +156,10 @@ export async function openTrackedPdfForContext(
 		async (path: string, openSignal: AbortSignal | undefined) => toPdfOpenResult(await opener(path, openSignal)),
 		defaultSourceFile,
 		synctexEditorCommand,
-		options.reuseTrackedPdf ?? true,
+		{
+			reuseTrackedPdf: options.reuseTrackedPdf ?? true,
+			pdfId: options.pdfId,
+		},
 	);
 }
 

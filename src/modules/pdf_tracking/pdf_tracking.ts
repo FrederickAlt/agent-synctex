@@ -278,6 +278,11 @@ export function inferDefaultSourceFileForPdf(pdfFilePath: string): string | unde
 
 export type PdfOpener = (pdfFilePath: string, signal?: AbortSignal) => Promise<PdfOpenResult | void>;
 
+export interface OpenAndTrackPdfOptions {
+	reuseTrackedPdf?: boolean;
+	pdfId?: number;
+}
+
 function normalizeOpenResult(rawResult: PdfOpenResult | void): PdfOpenResult {
 	if (!rawResult) return {};
 	return {
@@ -311,10 +316,15 @@ export class PdfTracker {
 		pid?: number,
 		synctexEditorCommand?: string,
 		viewerOpenResult: PdfOpenResult = {},
+		overridePdfId?: number,
 	): TrackedPdf {
 		const now = Date.now();
+		const pdfId = overridePdfId ?? this.nextPdfId;
+		if (overridePdfId !== undefined && this.trackedPdfsById.has(overridePdfId)) {
+			this.untrackById(overridePdfId);
+		}
 		const trackedPdf: TrackedPdf = {
-			id: this.nextPdfId,
+			id: pdfId,
 			path: normalizedPdfPath,
 			sourceFile: defaultSourceFile,
 			pid,
@@ -329,7 +339,9 @@ export class PdfTracker {
 			openedAtMs: now,
 			lastOpenedAtMs: now,
 		};
-		this.nextPdfId += 1;
+		if (overridePdfId === undefined) {
+			this.nextPdfId += 1;
+		}
 		const pathEntries = this.trackedPdfsByPath.get(normalizedPdfPath) ?? [];
 		pathEntries.push(trackedPdf);
 		this.trackedPdfsByPath.set(normalizedPdfPath, pathEntries);
@@ -465,17 +477,40 @@ export async function openAndTrackPdf(
 	opener?: PdfOpener,
 	defaultSourceFile?: string,
 	synctexEditorCommand?: string,
-	reuseExistingPdf = true,
+	options: OpenAndTrackPdfOptions = {},
 ): Promise<TrackedPdf> {
+	const { reuseTrackedPdf = true, pdfId: overridePdfId } = options;
 	const pdfPath = normalizePdfFilePath(pdfFilePath);
 	const sourceFile = defaultSourceFile ?? inferDefaultSourceFileForPdf(pdfPath);
 	const reusableTrackedPdf = tracker.getByPath(pdfPath);
-	if (reuseExistingPdf && reusableTrackedPdf?.viewerHandle !== undefined && reusableTrackedPdf.viewerBackend !== undefined) {
+	if (
+		reusableTrackedPdf?.id === overridePdfId
+		&& reusableTrackedPdf?.viewerHandle !== undefined
+		&& reusableTrackedPdf.viewerBackend !== undefined
+	) {
+		return tracker.markReopened(reusableTrackedPdf.id, reusableTrackedPdf.pid, sourceFile, synctexEditorCommand) ?? reusableTrackedPdf;
+	}
+	if (
+		overridePdfId === undefined
+		&& reuseTrackedPdf
+		&& reusableTrackedPdf?.viewerHandle !== undefined
+		&& reusableTrackedPdf.viewerBackend !== undefined
+	) {
 		return tracker.markReopened(reusableTrackedPdf.id, reusableTrackedPdf.pid, sourceFile, synctexEditorCommand) ?? reusableTrackedPdf;
 	}
 
 	if (!opener) {
 		throw new Error("openAndTrackPdf requires a viewer-service opener. Direct Zathura opening is not supported in this flow.");
+	}
+	const staleTrackedPdf = tracker.getByPath(pdfPath);
+	if (overridePdfId !== undefined && staleTrackedPdf && staleTrackedPdf.id !== overridePdfId) {
+		tracker.untrackById(staleTrackedPdf.id);
+	}
+	if (overridePdfId !== undefined && tracker.getById(overridePdfId) !== undefined) {
+		const staleById = tracker.getById(overridePdfId);
+		if (staleById?.path !== undefined && staleById.path !== pdfPath) {
+			tracker.untrackById(overridePdfId);
+		}
 	}
 
 	const pendingOpen = tracker.getPendingOpen(pdfPath);
@@ -487,14 +522,19 @@ export async function openAndTrackPdf(
 		return trackedPdf;
 	}
 
-	const staleTrackedPdf = tracker.getByPath(pdfPath);
 	const openPromise = (async () => {
 		const openerResult = await opener(pdfPath, signal);
 		const normalizedResult = requireViewerServiceMetadata(normalizeOpenResult(openerResult));
+		if (overridePdfId !== undefined) {
+			const existingById = tracker.getById(overridePdfId);
+			if (existingById) {
+				return tracker.markReopened(existingById.id, normalizedResult.pid, sourceFile, synctexEditorCommand, normalizedResult) ?? existingById;
+			}
+		}
 		if (staleTrackedPdf && tracker.getById(staleTrackedPdf.id)) {
 			return tracker.markReopened(staleTrackedPdf.id, normalizedResult.pid, sourceFile, synctexEditorCommand, normalizedResult) ?? staleTrackedPdf;
 		}
-		return tracker.trackOpenedPdf(pdfPath, sourceFile, normalizedResult.pid, synctexEditorCommand, normalizedResult);
+		return tracker.trackOpenedPdf(pdfPath, sourceFile, normalizedResult.pid, synctexEditorCommand, normalizedResult, overridePdfId);
 	})();
 	tracker.setPendingOpen(pdfPath, openPromise);
 	try {
