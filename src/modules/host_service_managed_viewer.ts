@@ -9,8 +9,8 @@ import type {
 	HostServiceManagedViewerRecordInput,
 	HostServiceOpenRequest,
 	HostServiceOpenResponseEnvelope,
-	HostServicePdfIdRegistry,
-} from "./host_service.ts";
+	HostServicePdfIdRegistryLike,
+} from "./host_service_protocol.ts";
 import type {
 	HostServiceCallbackTarget,
 	HostServiceViewerBackendCapabilities,
@@ -44,12 +44,12 @@ function isValidViewerBackendCapabilities(value: unknown): value is HostServiceV
 
 export class HostServiceManagedViewerService {
 	private readonly viewerBackend: ViewerBackendAdapter;
-	private readonly managedViewerRecords: HostServicePdfIdRegistry;
+	private readonly managedViewerRecords: HostServicePdfIdRegistryLike;
 	private readonly protocolVersion: number;
 
 	constructor(options: {
 		viewerBackend: ViewerBackendAdapter;
-		managedViewerRecords: HostServicePdfIdRegistry;
+		managedViewerRecords: HostServicePdfIdRegistryLike;
 		protocolVersion: number;
 	}) {
 		this.viewerBackend = options.viewerBackend;
