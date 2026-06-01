@@ -1303,7 +1303,20 @@ export class HostServiceServer {
 		});
 	}
 
+	private async closeViewerBackendSessions(): Promise<void> {
+		const closeAll = this.viewerBackend.closeAll;
+		if (typeof closeAll !== "function") {
+			return;
+		}
+		try {
+			await closeAll.call(this.viewerBackend);
+		} catch {
+			// best effort: session shutdown should be resilient and prefer process teardown continuity
+		}
+	}
+
 	async stop(): Promise<void> {
+		await this.closeViewerBackendSessions();
 		const server = this.server;
 		this.server = null;
 		for (const socket of this.activeConnections) {

@@ -21,6 +21,7 @@ import {
 	HostServiceClient,
 	HostServicePdfIdRegistry,
 	HostServiceServer,
+	ZathuraViewerBackend,
 } from "../../src/modules/host_service.ts";
 import { INLINE_PREVIEW_DIR } from "../../src/modules/preview/inline_preview.ts";
 
@@ -36,6 +37,26 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
 	});
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 1200): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isProcessAlive(pid)) {
+			return;
+		}
+		await sleep(25);
+	}
+	throw new Error(`timed out waiting for process ${pid} to exit`);
 }
 
 function writeFakeLatexCompiler(binDir: string, options: { exitCode?: number; withLog?: boolean } = {}): string {
@@ -67,6 +88,21 @@ exit ${exitCode}
 `, { mode: 0o700 });
 	chmodSync(compilerPath, 0o700);
 	return compilerPath;
+}
+
+function writeFakeZathuraViewerBinary(path: string): void {
+	const script = `#!/usr/bin/env bash
+set -eu
+trap 'exit 0' INT TERM
+while true; do
+	if [ "$PPID" -eq 1 ]; then
+		exit 0
+	fi
+	sleep 0.05
+	done
+`;
+	writeFileSync(path, script, { encoding: "utf8", mode: 0o700 });
+	chmodSync(path, 0o700);
 }
 
 function createMiniPng(width: number, height: number): Buffer {
@@ -257,6 +293,44 @@ class ValidatingFakeViewerBackend extends FakeViewerBackend {
 			}
 		}
 		return super.open(requestId, details);
+	}
+}
+
+class CloseTrackingFakeViewerBackend extends FakeViewerBackend {
+	public closeCalled: string[] = [];
+	public closeAllCalled = false;
+	public openHandleSequence: string[] = [];
+
+	async open(
+		requestId: string,
+		details: Record<string, unknown>,
+	): ReturnType<FakeViewerBackend["open"]> {
+		const result = await super.open(requestId, details);
+		if (result.status === "ok") {
+			const handle = result.status_details.handle;
+			if (typeof handle === "string") {
+				this.openHandleSequence.push(handle);
+			}
+		}
+		return result;
+	}
+
+	async close(
+		requestId: string,
+		details: Record<string, unknown>,
+	): ReturnType<FakeViewerBackend["close"]> {
+		const handle = typeof details.handle === "string" ? details.handle : "unknown";
+		this.closeCalled.push(handle);
+		return super.close(requestId, details);
+	}
+
+	async closeAll(requestId = "service-shutdown"): Promise<void> {
+		this.closeAllCalled = true;
+		for (const handle of [...this.openHandleSequence]) {
+			if (!this.closeCalled.includes(handle)) {
+				await this.close(requestId, { handle, backend: this.name });
+			}
+		}
 	}
 }
 
@@ -2357,6 +2431,99 @@ test("host service open_pdf resolves relative PDF paths and tracks managed recor
 		assert.equal(backend.openedDetails[2]!.pdf_path, pdfPath);
 	} finally {
 		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service stop disposes backend sessions on shutdown", async () => {
+	const baseDir = temporaryDir("host-service-backend-shutdown-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	const backend = new CloseTrackingFakeViewerBackend();
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		const openResponse = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: "sample.pdf", callback, reuse_existing: true },
+		);
+		assert.equal(openResponse.reused, false);
+		await server.stop();
+		assert.equal(backend.closeAllCalled, true);
+		assert.equal(backend.closeCalled.length, 1);
+		if (openResponse.handle !== undefined) {
+			assert.equal(backend.closeCalled[0], openResponse.handle);
+		}
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("zathura backend closes previous owned session on replacement and replacement without reuse", async () => {
+	const baseDir = temporaryDir("host-service-zathura-replace-");
+	const binDir = join(baseDir, "bin");
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const zathuraPath = join(binDir, "zathura");
+	writeFakeZathuraViewerBinary(zathuraPath);
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	const backend = new ZathuraViewerBackend({ executablePath: zathuraPath, nodePath: process.execPath });
+	const callbackA = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback-a.sock"),
+		token: "alpha-token",
+	};
+	const callbackB = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback-b.sock"),
+		token: "beta-token",
+	};
+
+	try {
+		const firstOpen = await backend.open("first", { pdf_path: pdfPath, callback: callbackA, reuse_existing: true });
+		assert.equal(firstOpen.status, "ok");
+		const rawFirstPid = (firstOpen.status_details as { pid?: number }).pid;
+		if (typeof rawFirstPid !== "number") {
+			throw new Error("first open response did not include a process id");
+		}
+		const firstPid = rawFirstPid;
+
+		const secondOpen = await backend.open("second", { pdf_path: pdfPath, callback: callbackB, reuse_existing: true });
+		assert.equal(secondOpen.status, "ok");
+		const rawSecondPid = (secondOpen.status_details as { pid?: number }).pid;
+		if (typeof rawSecondPid !== "number") {
+			throw new Error("second open response did not include a process id");
+		}
+		const secondPid = rawSecondPid;
+		assert.notEqual(firstPid, secondPid);
+		await waitForProcessExit(firstPid);
+
+		const thirdOpen = await backend.open("third", { pdf_path: pdfPath, callback: callbackB, reuse_existing: false });
+		assert.equal(thirdOpen.status, "ok");
+		const rawThirdPid = (thirdOpen.status_details as { pid?: number }).pid;
+		if (typeof rawThirdPid !== "number") {
+			throw new Error("third open response did not include a process id");
+		}
+		const thirdPid = rawThirdPid;
+		assert.equal(typeof thirdPid, "number");
+		assert.notEqual(secondPid, thirdPid);
+		await waitForProcessExit(secondPid);
+	} finally {
+		await backend.closeAll();
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });
