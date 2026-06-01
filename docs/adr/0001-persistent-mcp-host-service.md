@@ -26,6 +26,6 @@ Pi and other clients act as frontends to this service. Pi may preserve richer fr
 - PDF IDs can remain valid across individual tool calls and client interactions until service restart or close.
 - Multiple agents can use the same host service while receiving distinct random active PDF IDs.
 - Viewer open, jump, close, and callback routing are centralized.
-- The previous narrow viewer-service role has been absorbed into the MCP host service; only legacy compatibility paths remain.
+- The previous narrow viewer-service role has been absorbed into the MCP host service; the Host Service now owns and enforces these legacy behaviors directly.
 - The service needs lifecycle, restart, cleanup, state validation, and stale-handle handling.
 - The service is a trusted local host integration process and must expose only narrow, validated operations.
