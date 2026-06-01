@@ -270,7 +270,7 @@ export class HostServiceClient {
 					const response = parseResponse(
 						raw.slice(0, lineBreak).trim(),
 						request.request_id,
-						request.operation,
+						operation,
 					);
 					finish(response);
 				} catch (error) {
@@ -299,7 +299,7 @@ export class HostServiceClient {
 						const response = parseResponse(
 							raw.trim(),
 							request.request_id,
-							request.operation,
+							operation,
 						);
 						finish(response);
 					} catch (error) {
@@ -461,7 +461,6 @@ export class HostServiceServer {
 				));
 				return;
 			}
-
 			if (request.operation === "status") {
 				this.totalRequests += 1;
 				const nowNs = Date.now() * 1_000_000;
@@ -490,22 +489,22 @@ export class HostServiceServer {
 				return;
 			}
 
-			if (request.operation !== "compile_latex_file") {
-				socket.end(buildErrorResponse(
-					this.protocolVersion,
-					this.socketPath,
-					this.serviceName,
-					this.serviceInstanceId,
-					request.request_id,
-					`unsupported operation: ${request.operation}`,
-					"unsupported_operation",
-				));
+			if (request.operation === "compile_latex_file") {
+				this.totalRequests += 1;
+				const response = await this.compileLatexFileRequest(request);
+				socket.end(`${JSON.stringify(response)}\n`);
 				return;
 			}
 
-			this.totalRequests += 1;
-			const response = await this.compileLatexFileRequest(request);
-			socket.end(`${JSON.stringify(response)}\n`);
+			socket.end(buildErrorResponse(
+				this.protocolVersion,
+				this.socketPath,
+				this.serviceName,
+				this.serviceInstanceId,
+				getRequestIdFromPayload(requestPayload),
+				`unsupported operation: ${getRequestOperationFromPayload(requestPayload)}`,
+				"unsupported_operation",
+			));
 		})().catch(() => {
 			socket.end(buildErrorResponse(
 				this.protocolVersion,
@@ -698,9 +697,11 @@ function getRequestIdFromPayload(payload: unknown): string {
 	return "";
 }
 
-function parseResponse(raw: string, expectedRequestId: string, expectedOperation: "status"): HostServiceStatusResponseEnvelope;
-function parseResponse(raw: string, expectedRequestId: string, expectedOperation: "compile_latex_file"): HostServiceCompileResponseEnvelope;
-function parseResponse(raw: string, expectedRequestId: string, expectedOperation: HostServiceOperation): HostServiceResponseEnvelope {
+function parseResponse<TOperation extends HostServiceOperation>(
+	raw: string,
+	expectedRequestId: string,
+	expectedOperation: TOperation,
+): HostServiceResponseForOperation<TOperation> {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
@@ -710,7 +711,7 @@ function parseResponse(raw: string, expectedRequestId: string, expectedOperation
 	if (!isValidHostServiceResponse(parsed, expectedRequestId, expectedOperation)) {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
-	return parsed;
+	return parsed as HostServiceResponseForOperation<TOperation>;
 }
 
 function validateHostServiceRequest(value: unknown): HostServiceRequest {
@@ -769,16 +770,6 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 	throw new Error(`unsupported operation: ${String(value.operation)}`);
 }
 
-function isValidHostServiceResponse(
-	value: unknown,
-	expectedRequestId: string,
-	expectedOperation: "status",
-): value is HostServiceStatusResponseEnvelope;
-function isValidHostServiceResponse(
-	value: unknown,
-	expectedRequestId: string,
-	expectedOperation: "compile_latex_file",
-): value is HostServiceCompileResponseEnvelope;
 function isValidHostServiceResponse(
 	value: unknown,
 	expectedRequestId: string,
