@@ -36,6 +36,29 @@ export function isInlinePreviewPngPathValue(absolutePath: string, inlinePreviewD
 	return !isAbsolute(delta);
 }
 
+function inlinePreviewDirectoryCandidates(): string[] {
+	const roots = new Set<string>([INLINE_PREVIEW_DIR]);
+
+	if (process.env.MCP_TMPDIR) {
+		roots.add(resolve(process.env.MCP_TMPDIR, "inline"));
+	}
+	if (process.env.XDG_RUNTIME_DIR) {
+		roots.add(resolve(process.env.XDG_RUNTIME_DIR, "show-latex", "inline"));
+	}
+
+	return [...roots];
+}
+
+function isInlinePreviewPngPathWithinDirectory(absolutePath: string, inlinePreviewDir: string): boolean {
+	let canonicalInlineDir: string;
+	try {
+		canonicalInlineDir = realpathSync(inlinePreviewDir);
+	} catch {
+		return false;
+	}
+	return isInlinePreviewPngPathValue(absolutePath, canonicalInlineDir);
+}
+
 export function safeInlinePreviewPngPath(rawPngPath: unknown): string {
 	if (typeof rawPngPath !== "string") return "";
 	if (!isAbsolute(rawPngPath)) return "";
@@ -43,9 +66,18 @@ export function safeInlinePreviewPngPath(rawPngPath: unknown): string {
 	if (extname(pngPath).toLowerCase() !== ".png") return "";
 
 	try {
-		const inlinePreviewDir = realpathSync(INLINE_PREVIEW_DIR);
 		const realPngPath = realpathSync(pngPath);
-		if (!isInlinePreviewPngPathValue(realPngPath, inlinePreviewDir)) return "";
+		let isSafeDirectory = false;
+		for (const inlinePreviewDir of inlinePreviewDirectoryCandidates()) {
+			if (!isInlinePreviewPngPathWithinDirectory(realPngPath, inlinePreviewDir)) {
+				continue;
+			}
+			isSafeDirectory = true;
+			break;
+		}
+		if (!isSafeDirectory) {
+			return "";
+		}
 		if (extname(realPngPath).toLowerCase() !== ".png") return "";
 		const status = statSync(realPngPath);
 		if (!status.isFile()) return "";

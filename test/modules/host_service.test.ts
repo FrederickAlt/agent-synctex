@@ -12,7 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -2209,6 +2209,91 @@ test("host service client validates rasterize response artifact paths", async ()
 		malformedServer.close(() => resolve());
 	});
 	rmSync(baseDir, { recursive: true, force: true });
+});
+
+test("host service client accepts rasterize response artifact paths from XDG_RUNTIME_DIR", async () => {
+	const baseDir = temporaryDir("host-service-rasterize-runtime-artifact-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalXdgRuntimeDir = process.env.XDG_RUNTIME_DIR;
+	const originalMcpTmpDir = process.env.MCP_TMPDIR;
+	const runtimeRoot = mkdtempSync(resolve(tmpdir(), "host-service-rasterize-runtime-dir-"));
+	const runtimeInlineDir = resolve(runtimeRoot, "show-latex", "inline");
+	const expectedRequestId = "rasterize-runtime-artifact-id";
+
+	try {
+		process.env.XDG_RUNTIME_DIR = runtimeRoot;
+		process.env.MCP_TMPDIR = undefined;
+		mkdirSync(runtimeInlineDir, { mode: 0o700, recursive: true });
+		const previewPng = join(runtimeInlineDir, "rasterize-artifact-runtime.png");
+		writeFileSync(previewPng, createMiniPng(16, 8));
+
+		const response = JSON.stringify({
+			protocol_version: 1,
+			request_id: expectedRequestId,
+			operation: "rasterize",
+			status: "ok",
+			generated_at_ns: Date.now() * 1_000_000,
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				workspace_context: { cwd: baseDir },
+				request_id: expectedRequestId,
+				operation: "rasterize",
+				pdf_path: join(baseDir, "sample.pdf"),
+				artifacts: [
+					{
+						pngPath: previewPng,
+						page: 1,
+						dpi: 150,
+						renderer: "mutool",
+						trimmed: false,
+						fullPageWidthPx: 16,
+						fullPageHeightPx: 8,
+						widthPx: 16,
+						heightPx: 8,
+					},
+				],
+				artifact_paths: [previewPng],
+			},
+		}) + "\n";
+
+		const server = createServer((socket) => {
+			socket.end(response, () => {
+				socket.destroy();
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, () => {
+				resolve();
+			});
+		});
+		const client = new HostServiceClient({
+			socketPath,
+			requestTimeoutMs: 1_000,
+			requestIdFactory: () => expectedRequestId,
+		});
+		const result = await client.requestRasterizePdf({ pdf_path: "sample.pdf" }, { cwd: baseDir });
+		assert.equal(result.artifacts[0].pngPath, previewPng);
+		assert.equal(result.artifact_paths[0], previewPng);
+		await new Promise<void>((resolve) => {
+			server.close(() => resolve());
+		});
+	} finally {
+		if (originalXdgRuntimeDir === undefined) {
+			delete process.env.XDG_RUNTIME_DIR;
+		} else {
+			process.env.XDG_RUNTIME_DIR = originalXdgRuntimeDir;
+		}
+		if (originalMcpTmpDir === undefined) {
+			delete process.env.MCP_TMPDIR;
+		} else {
+			process.env.MCP_TMPDIR = originalMcpTmpDir;
+		}
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtimeRoot, { recursive: true, force: true });
+	}
 });
 
 test("host service client surfaces malformed close requests as invalid_request", async () => {
