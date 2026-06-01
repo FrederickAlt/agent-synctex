@@ -712,7 +712,7 @@ test("show_latex external flow distinguishes service timeout", async () => {
 				assert.fail("expected show_latex timeout to throw");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				assert.equal(/Viewer service request timed out while opening preview/.test(message), true);
+				assert.equal(/Host service request timed out while opening preview/.test(message), true);
 				assert.equal(/code=timeout|code=service_timeout/.test(message), false);
 			}
 		});
@@ -740,7 +740,7 @@ test("show_latex external flow distinguishes backend open failure", async () => 
 				assert.fail("expected show_latex open failure");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				assert.equal(/Viewer backend unavailable while opening preview/.test(message), true);
+				assert.equal(/Host service backend unavailable while opening preview/.test(message), true);
 				assert.equal(/code=backend_unavailable/.test(message), true);
 			}
 		});
@@ -768,7 +768,7 @@ test("show_latex external flow distinguishes service unavailable", async () => {
 				assert.fail("expected show_latex open failure");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				assert.equal(/Viewer service unavailable while opening preview/.test(message), true);
+				assert.equal(/Host service unavailable while opening preview/.test(message), true);
 				assert.equal(/code=service_unavailable/.test(message), true);
 				assert.equal(backend.openRequests.length, 1);
 			}
@@ -798,7 +798,7 @@ test("show_latex external compile failure is reported distinctly", async () => {
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				assert.equal(/LaTeX preview compilation failed/.test(message), true);
-				assert.equal(/Viewer service/.test(message), false);
+				assert.equal(/Host service|viewer service/.test(message), false);
 				assert.equal(backend.openRequests.length, 0);
 			}
 		});

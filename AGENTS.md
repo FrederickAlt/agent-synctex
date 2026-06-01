@@ -17,8 +17,8 @@ Before changing any preview rendering, refresh policy, or Kitty placeholder logi
 
 After the Pi adapter/module refactors (#25-36), keep index.ts as a composition root:
 - `src/modules/pi_adapter/pi_adapter.ts` should remain the thin Pi dispatch adapter.
-- viewer protocol logic belongs in `src/modules/viewer_service.ts` and service adapter behavior in `scripts/show_latex_viewer.py`.
-- avoid reintroducing direct viewer-command spawning in production TypeScript; use `viewer_guardrails.test.ts` as the regression check.
+- viewer protocol orchestration for normal tool flows belongs in `src/modules/host_service.ts` with backend adapters in `src/modules/host_service_viewer_backends.ts`.
+- avoid reintroducing direct viewer-command spawning in production TypeScript; use `viewer_guardrails.test.ts` as the regression check (host-service adapters may intentionally spawn GUI processes).
 
 Use this guide when touching:
 - `src/modules/preview/inline_preview_renderer.ts`
@@ -31,7 +31,7 @@ Use this guide when touching:
 
 This project may expose a project-local host broker via `pdf-preview-servicectl` and
 `${HOME}/.cache/pdf-preview-servicectl/broker.sock` so agents in this repo can sync/restart/status/log
-`codex-show-latex-viewer.service` without raw access to the user session D-Bus. Treat this as a narrow,
-privileged escape hatch. Do not use it for anything except maintaining/testing the PDF preview viewer service
-that supports PDF open, close, and SyncTeX/forward-search operations. Do not repurpose the broker, broaden its
+the host-service helper artifacts without raw access to the user session D-Bus. Treat this as a narrow,
+privileged escape hatch. Do not use it for anything except maintaining/testing the PDF host service that
+supports PDF open, close, and SyncTeX/forward-search operations. Do not repurpose the broker, broaden its
 permissions, or use it for arbitrary host commands.

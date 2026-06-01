@@ -555,14 +555,13 @@ test("compile_latex_file opens through host service when open_pdf=true", async (
 				viewer_backend: string;
 				viewer_owned: boolean;
 				viewer_capabilities: { open: boolean; close: boolean; forward_search: boolean; inverse_search: boolean; reuse: boolean };
-				synctex_callback_command: string;
 			};
 			assert.equal(details.source, sourcePath);
 			assert.equal(details.pdf, resolve(root, "paper.pdf"));
 			assert.equal(Number.isInteger(details.pdf_id) && details.pdf_id > 0, true);
 			assert.equal(details.pid, 123456);
 			assert.equal(result.content[0].text.startsWith(`ok: pdf_id=${details.pdf_id} pid=123456 pdf=${details.pdf}`), true);
-			assert.equal(typeof details.synctex_callback_command, "string");
+			assert.equal("synctex_callback_command" in (details as Record<string, unknown>), false);
 			assert.equal(typeof details.viewer_handle, "string");
 			assert.equal(details.viewer_backend, "fake-viewer");
 			assert.equal(details.viewer_owned, true);
@@ -744,6 +743,7 @@ test("open_pdf exposes host-service PDF IDs and supports jump/close", async () =
 					source: string;
 				};
 				assert.equal(openDetails.pdf_id, 7777);
+				assert.equal("synctex_callback_command" in (openDetails as Record<string, unknown>), false);
 				assert.equal(openResult.content[0].text.includes(`pdf_id=${openDetails.pdf_id}`), true);
 				assert.equal(openDetails.pdf, sourcePdfPath);
 				assert.equal(openDetails.source, sourcePath);
