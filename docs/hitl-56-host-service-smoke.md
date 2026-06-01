@@ -41,3 +41,45 @@ Commit: `c78e511` plus HITL runtime checks after #55/docs freshness merge.
 ## Conclusion
 
 HITL acceptance criteria for #56 passed. No blocking follow-up issues were identified.
+
+## True host systemd service rerun after service/broker/runtime-dir fixes
+
+Additional validation was performed after replacing the legacy Python viewer service with the host-managed TypeScript `show-latex.service` and moving shared artifacts to `${XDG_RUNTIME_DIR}/show-latex`.
+
+- Host-side broker/service was updated externally so `pdf-preview-servicectl` manages `show-latex.service`, which runs:
+
+  ```text
+  /usr/bin/node /home/frederick/projects/AI/pi_extensions/pdf-preview/scripts/agent-synctex-host-service.ts start
+  ```
+
+- Firejail no longer exposes the stale Python viewer install path and now permits the narrow runtime dirs:
+  - `/run/user/1000/agent-synctex`
+  - `/run/user/1000/show-latex`
+
+- `npm run host-service:status` from inside the jail reported:
+  - `service_available: true`
+  - `service_name: agent-synctex-host-service`
+  - `viewer_backend_name: zathura`
+
+- With X11/Wayland removed from the sandbox, external `show_latex(inline=false)` opened through the host systemd service. Human confirmed the Zathura window opened.
+- Inline `show_latex(inline=true)` rendered correctly using runtime artifact paths under `/run/user/1000/show-latex/inline`. Human confirmed the inline preview was visible.
+- `compile_latex_file(open_pdf=true)` for `hitl-true-service.tex` returned Host-Service PDF ID `30489681`; human confirmed Zathura opened.
+- `jump_pdf(30489681, line=7)` forward-searched to the equation region; human confirmed Zathura jumped/marked the equations.
+- Inverse SyncTeX click inserted without auto-submit:
+
+  ```text
+  PDF click: hitl-true-service.tex:9
+  Click target line for inverse SyncTeX.
+  ```
+
+- `close_pdf(30489681)` closed the managed window and did not close unrelated/user-owned windows.
+
+### Follow-up fixes made during rerun
+
+- `systemd/show-latex.service` is now the normal TypeScript Host Service user unit.
+- `.pi.firejail` no longer grants the stale Python viewer path and uses Firejail-compatible `${RUNUSER}` grants for runtime dirs.
+- Preview artifacts moved from private `/tmp` to `${XDG_RUNTIME_DIR}/show-latex` / `MCP_TMPDIR` to avoid host/sandbox namespace mismatches.
+- Host Service snippet output now uses a dedicated child directory under caller `workspace_root` and no longer chmods arbitrary workspace roots.
+- Inline preview artifact validation now accepts safe runtime-dir artifacts.
+
+The true host service HITL rerun passed.
