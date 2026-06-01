@@ -1063,8 +1063,39 @@ export class HostServiceClient {
 			throw new Error(`Malformed host service jump_pdf response payload: ${JSON.stringify(response)}`);
 		}
 		if (response.status !== "ok") {
-			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
-			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+			const jumpResponseDetails = response.status_details;
+			const errorCode = typeof jumpResponseDetails.error_code === "string" ? jumpResponseDetails.error_code : undefined;
+			const suffix = errorCode ? ` (code=${errorCode})` : "";
+			const parts: string[] = [];
+			if (typeof jumpResponseDetails.backend === "string" && jumpResponseDetails.backend) {
+				parts.push(`backend=${jumpResponseDetails.backend}`);
+			}
+			if (typeof jumpResponseDetails.backend_path === "string" && jumpResponseDetails.backend_path) {
+				parts.push(`backend_path=${jumpResponseDetails.backend_path}`);
+			}
+			if (typeof jumpResponseDetails.pdf_id === "number" && Number.isInteger(jumpResponseDetails.pdf_id)) {
+				parts.push(`pdf_id=${jumpResponseDetails.pdf_id}`);
+			}
+			if (typeof jumpResponseDetails.pdf === "string") {
+				parts.push(`pdf=${jumpResponseDetails.pdf}`);
+			}
+			if (typeof jumpResponseDetails.source_file === "string") {
+				parts.push(`source_file=${jumpResponseDetails.source_file}`);
+			}
+			if (typeof jumpResponseDetails.line === "number") {
+				parts.push(`line=${jumpResponseDetails.line}`);
+			}
+			if (typeof jumpResponseDetails.source_line === "string") {
+				parts.push(`source_line=${JSON.stringify(jumpResponseDetails.source_line)}`);
+			}
+			if (typeof jumpResponseDetails.reason === "string") {
+				parts.push(`reason=${jumpResponseDetails.reason}`);
+			}
+			const context = parts.length > 0 ? ` ${parts.join(" ")}` : "";
+			const diagnostics = Array.isArray(jumpResponseDetails.diagnostics)
+				? ` diagnostics=${JSON.stringify(jumpResponseDetails.diagnostics)}`
+				: "";
+			throw new Error(`${response.error || jumpResponseDetails.reason || "host service returned error status"}${suffix}${context}${diagnostics}`);
 		}
 		return response.status_details;
 	}

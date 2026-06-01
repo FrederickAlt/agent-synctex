@@ -2355,6 +2355,43 @@ test("host service jump_pdf forwards to viewer backend with inferred default sou
 	}
 });
 
+test("host service jump_pdf fails without default source unless source_file is provided", async () => {
+	const baseDir = temporaryDir("host-service-jump-missing-default-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: new FakeForwardSearchTracker(),
+	});
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		const openResponse = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: "sample.pdf", callback, reuse_existing: true },
+		);
+		if (openResponse.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const pdfId = openResponse.pdf_id;
+		await assert.rejects(
+			() => client.requestJumpPdf({ cwd: baseDir }, { pdf_id: pdfId, line: 2 }),
+			/No default source_file is known for tracked pdf_id=.*Pass source_file explicitly\./,
+		);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("host service jump_pdf requires explicit source_file when default source is unavailable", async () => {
 	const baseDir = temporaryDir("host-service-jump-explicit-source-");
 	const socketPath = join(baseDir, "host-service.sock");
@@ -2392,6 +2429,66 @@ test("host service jump_pdf requires explicit source_file when default source is
 		assert.equal(jumpResponse.source_file, explicitSourcePath);
 		assert.equal(jumpResponse.line, 2);
 		assert.equal(jumpResponse.source_line, "second");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service requestJumpPdf includes backend diagnostics and source context", async () => {
+	const baseDir = temporaryDir("host-service-jump-diagnostics-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	const sourcePath = join(baseDir, "sample.tex");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	writeFileSync(sourcePath, "alpha\nbeta\n");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	const backend = new FakeForwardSearchTracker({ name: "jump-faulty-backend" });
+	backend.setForwardSearchResponses([
+		{
+			status: "error",
+			error: "forward search command failed",
+			handled: false,
+			error_code: "backend_unavailable",
+			reason: "forward search execution failed",
+			service_available: false,
+			backend_identity_ok: true,
+			diagnostics: [{ command: "viewer-forward-search", exit_code: 42, stderr: "not found" }],
+		},
+	]);
+	const server = new HostServiceServer({ socketPath, viewerBackend: backend });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		const openResponse = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: "sample.pdf", callback, reuse_existing: true },
+		);
+		if (openResponse.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const pdfId = openResponse.pdf_id;
+		await assert.rejects(
+			async () => {
+				await client.requestJumpPdf({ cwd: baseDir }, { pdf_id: pdfId, line: 2 });
+			},
+			(error) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /backend_unavailable/);
+				assert.match(error.message, /backend=jump-faulty-backend/);
+				assert.match(error.message, /source_line="beta"/);
+				assert.match(error.message, /source_file=/);
+				assert.match(error.message, /diagnostics=\[\{"command":"viewer-forward-search","exit_code":42,"stderr":"not found"\}\]/);
+				assert.match(error.message, /line=2/);
+				return true;
+			},
+		);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
