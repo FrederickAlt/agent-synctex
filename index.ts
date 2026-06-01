@@ -1098,7 +1098,7 @@ const CompileLatexFileParams = Type.Object(
 const OpenPdfParams = Type.Object(
 	{
 		pdf_file_path: Type.String({
-			description: "Path to an existing local PDF file to send to the viewer service for opening/tracking and later SyncTeX actions.",
+			description: "Path to an existing local PDF file to send to the host service for opening/tracking and later SyncTeX actions.",
 			minLength: 1,
 		}),
 	},
@@ -1108,7 +1108,7 @@ const OpenPdfParams = Type.Object(
 const ClosePdfParams = Type.Object(
 	{
 		pdf_id: Type.Number({
-			description: "Tracked numeric PDF ID returned by open_pdf or compile_latex_file(..., open_pdf=true).",
+			description: "Host-service PDF ID returned by open_pdf or compile_latex_file(..., open_pdf=true).",
 			minimum: 1,
 		}),
 	},
@@ -1118,7 +1118,7 @@ const ClosePdfParams = Type.Object(
 const JumpPdfParams = Type.Object(
 	{
 		pdf_id: Type.Number({
-			description: "Tracked numeric PDF ID returned by open_pdf or compile_latex_file(..., open_pdf=true). Arbitrary PDF paths are not accepted.",
+			description: "Host-service PDF ID returned by open_pdf or compile_latex_file(..., open_pdf=true). Arbitrary PDF paths are not accepted.",
 			minimum: 1,
 		}),
 		line: Type.Number({
@@ -1476,11 +1476,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "open_pdf",
 		label: "Open PDF",
-		description: "Open an existing local PDF through the viewer service and track it for later SyncTeX actions. Returns a short numeric pdf_id that is valid only for the current running Pi session. Opening the same PDF path again reuses the existing tracked or visible viewer where practical. The viewer is configured with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
+		description: "Open an existing local PDF through the host service and track it for later SyncTeX actions. Returns a host-service pdf_id for this Pi session. Opening the same PDF path again reuses the existing tracked or visible viewer where practical. The viewer is configured with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
 		promptSnippet: "Open and track a local PDF through the viewer service",
 		promptGuidelines: [
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
-			"Pass an existing local PDF path. The returned pdf_id is short-lived and valid only in the current Pi session.",
+			"Pass an existing local PDF path. The returned pdf_id is the host-service ID for this Pi session.",
 			"Opening the same normalized PDF path again should return the existing pdf_id instead of creating a duplicate viewer where practical.",
 			"PDFs opened through the viewer service are wired to paste inverse SyncTeX clicks into the current interactive editor without triggering an agent turn when the backend supports it.",
 		],
@@ -1498,16 +1498,56 @@ export default function (pi: ExtensionAPI) {
 				if (!ctx) {
 					throw new Error("open_pdf requires a Pi agent session context");
 				}
-				const server = await ensureSynctexCallbacks(ctx);
-				synctexCommand = server.command;
-				const trackedPdf = await openTrackedPdfForContext(
-					ctx,
-					requestedPath,
+				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
+				const callbackTargetId = await ensureHostServiceCallbackTarget(ctx);
+				const callbackServer = await ensureSynctexCallbacks(ctx);
+				synctexCommand = callbackServer.command;
+				const socketPath = hostServiceSocketPath();
+				const hostServiceClient = new HostServiceClient({
+					socketPath,
+					requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+				});
+				const openResponse = await hostServiceClient.requestOpenPdf(
+					workspaceContext,
+					{
+						pdf_path: requestedPath,
+						callback: callbackServer.callbackConfig,
+						reuse_existing: true,
+						require_persistent_viewer: true,
+					},
 					signal,
-					async (path, openSignal) => openPdfThroughViewerService(path, (await ensureSynctexCallbacks(ctx)).callbackConfig, openSignal),
-					undefined,
-					synctexCommand,
 				);
+				const trackedPdfPath = resolve(workspaceContext.cwd, openResponse.managed_record?.pdfPath ?? requestedPath);
+				let trackedPdf: Awaited<ReturnType<typeof openTrackedPdfForContext>>;
+				try {
+					trackedPdf = await openTrackedPdfForContext(
+						ctx,
+						trackedPdfPath,
+						signal,
+						() => Promise.resolve({
+							pid: openResponse.pid,
+							viewerHandle: openResponse.handle,
+							viewerBackend: openResponse.backend,
+							viewerOwned: openResponse.owned,
+							viewerCapabilities: openResponse.capabilities,
+							hostServicePdfId: openResponse.pdf_id,
+							hostServiceSocketPath: socketPath,
+							hostServiceCallbackTargetId: callbackTargetId,
+						}),
+						undefined,
+						synctexCommand,
+						{
+							reuseTrackedPdf: false,
+							pdfId: openResponse.pdf_id,
+						},
+					);
+				} catch (error) {
+					if (openResponse.pdf_id !== undefined) {
+						await hostServiceClient.requestClosePdf(workspaceContext, openResponse.pdf_id, signal)
+							.catch(() => undefined);
+					}
+					throw error;
+				}
 				pdfPath = trackedPdf.path;
 
 				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
@@ -1543,7 +1583,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "close_pdf",
 		label: "Close PDF",
-		description: "Request the viewer service to close an extension-tracked PDF by pdf_id. Service-managed windows are closed through private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The PDF is then removed from this session's tracking table when the close request succeeds.",
+		description: "Request the host-service or viewer service to close an extension-tracked PDF by pdf_id. Service-managed windows are closed through private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The PDF is then removed from this session's tracking table when the close request succeeds.",
 		promptSnippet: "Close a tracked PDF through the viewer service",
 		promptGuidelines: [
 			"Use close_pdf when the user asks to close a PDF previously opened or tracked by this extension.",
@@ -1810,14 +1850,17 @@ export default function (pi: ExtensionAPI) {
 							viewerBackend: managedRecord?.viewerBackend,
 							viewerOwned: managedRecord?.viewerOwned,
 							viewerCapabilities: managedRecord?.capabilities,
-							hostServicePdfId: managedRecord?.id,
+							hostServicePdfId: compileResponse.pdf_id,
 							hostServiceSocketPath: hostServiceSocketPath(),
 							hostServiceCallbackTargetId: targetId,
 						};
 					},
 					compileResponse.source,
 					synctexCommand,
-					{ reuseTrackedPdf: false },
+					{
+						reuseTrackedPdf: false,
+						pdfId: compileResponse.pdf_id,
+					},
 				);
 				openResult = {
 					pdf_id: trackedPdf.id,

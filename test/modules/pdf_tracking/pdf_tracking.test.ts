@@ -167,6 +167,52 @@ test("openAndTrackPdf normalizes, opens, infers default source, and tracks a PDF
 	assert.equal(tracker.getByPath(realPdfPath), trackedPdf);
 });
 
+test("openAndTrackPdf tracks explicit host-service IDs when provided", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	writeMinimalPdf(pdf);
+
+	const tracker = new PdfTracker();
+	let openCount = 0;
+	const opener = async () => {
+		openCount += 1;
+		return {
+			pid: 4321,
+			viewerHandle: "viewer-service-open",
+			viewerBackend: "zathura",
+			viewerOwned: true,
+			viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+		};
+	};
+
+	const first = await openAndTrackPdf(pdf, tracker, undefined, opener, undefined, undefined, { pdfId: 1234 });
+	const second = await openAndTrackPdf(
+		pdf,
+		tracker,
+		undefined,
+		opener,
+		undefined,
+		undefined,
+		{ pdfId: 1234, reuseTrackedPdf: false },
+	);
+	const third = await openAndTrackPdf(
+		pdf,
+		tracker,
+		undefined,
+		opener,
+		undefined,
+		undefined,
+		{ pdfId: 9999, reuseTrackedPdf: false },
+	);
+
+	assert.equal(first.id, 1234);
+	assert.equal(second.id, 1234);
+	assert.equal(third.id, 9999);
+	assert.equal(openCount, 2);
+	assert.equal(tracker.getById(1234), undefined);
+	assert.equal(tracker.getById(9999), third);
+});
+
 test("openAndTrackPdf stores an exact default source from the caller", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");

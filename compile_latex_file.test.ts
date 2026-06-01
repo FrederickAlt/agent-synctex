@@ -6,7 +6,12 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
 import { closeTrackedPdfForContext, jumpTrackedPdfForContext } from "./src/modules/pdf_session/pdf_session.ts";
-import { FakeViewerBackend, HostServicePdfIdRegistry, HostServiceServer } from "./src/modules/host_service.ts";
+import {
+	FakeViewerBackend,
+	HostServiceClient,
+	HostServicePdfIdRegistry,
+	HostServiceServer,
+} from "./src/modules/host_service.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 
@@ -289,6 +294,27 @@ class FakeJumpableViewerBackend extends FakeViewerBackend {
 				backend: "fake-viewer",
 				handled: true,
 				backend_identity_ok: true,
+			},
+		};
+	}
+}
+
+class FakeUnvalidatedOpenViewerBackend extends FakeViewerBackend {
+	private nextHandle = 0;
+
+	async open(_requestId: string, _details: Record<string, unknown>): Promise<{ status: "ok"; status_details: Record<string, unknown> }> {
+		this.nextHandle += 1;
+		return {
+			status: "ok",
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				backend_path: "fake-viewer",
+				owned: false,
+				reused: false,
+				pid: 123456,
+				handle: `fake-viewer:${this.nextHandle}`,
 			},
 		};
 	}
@@ -693,6 +719,246 @@ test("compile_latex_file(open_pdf=true) can be followed by registered jump_pdf a
 	}
 });
 
+test("open_pdf exposes host-service PDF IDs and supports jump/close", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tools = await captureTools();
+	const context = createSessionContext(root);
+	const sourceLine = "\\begin{document}ok\\end{document}";
+	const sourcePdfPath = resolve(root, "paper.pdf");
+	writeFileSync(sourcePdfPath, "%PDF-1.7\n");
+	try {
+		await withHostService(
+			new FakeJumpableViewerBackend(),
+			async () => {
+				await runSessionStart(context);
+				const openResult = await tools.openPdfTool.execute(
+					"open-pdf-tool",
+					{ pdf_file_path: sourcePdfPath },
+					undefined,
+					undefined,
+					context,
+				);
+				const openDetails = openResult.details as {
+					pdf_id: number;
+					pdf: string;
+					source: string;
+				};
+				assert.equal(openDetails.pdf_id, 7777);
+				assert.equal(openResult.content[0].text.includes(`pdf_id=${openDetails.pdf_id}`), true);
+				assert.equal(openDetails.pdf, sourcePdfPath);
+				assert.equal(openDetails.source, sourcePath);
+
+				const jumpResult = await tools.jumpPdfTool.execute(
+					"jump-open-pdf-tool",
+					{ pdf_id: openDetails.pdf_id, line: 1, source_file: sourcePath },
+					undefined,
+					undefined,
+					context,
+				);
+				const jumpDetails = jumpResult.details as { source_line: string };
+				assert.equal(jumpResult.content[0].text, `line 1 contains:\n${sourceLine}`);
+				assert.equal(jumpDetails.source_line, sourceLine);
+
+				const closeResult = await tools.closePdfTool.execute(
+					"close-pdf-tool",
+					{ pdf_id: openDetails.pdf_id },
+					undefined,
+					undefined,
+					context,
+				);
+				const closeDetails = closeResult.details as { closed: boolean; pdf: string };
+				assert.equal(closeDetails.closed, true);
+				assert.equal(closeDetails.pdf, sourcePdfPath);
+			},
+			{ managedViewerRecords: makeFixedHostServicePdfIdRegistry(7777) },
+		);
+	} finally {
+		await runSessionShutdown(context);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("open_pdf resolves relative pdf_file_path using session cwd", async () => {
+	const { root } = withTemporaryProject();
+	const tools = await captureTools();
+	const context = createSessionContext(root);
+	const sourcePdfPath = resolve(root, "relative.pdf");
+	writeFileSync(sourcePdfPath, "%PDF-1.7\\n");
+
+	const originalCwd = process.cwd();
+	const externalCwd = mkdtempSync(resolve(tmpdir(), "pdf-preview-open-test-"));
+	const fixedPdfId = 9001;
+	const records = makeFixedHostServicePdfIdRegistry(fixedPdfId);
+	try {
+		process.chdir(externalCwd);
+		await withHostService(
+			new FakeJumpableViewerBackend(),
+			async () => {
+				await runSessionStart(context);
+				const openResult = await tools.openPdfTool.execute(
+					"open-pdf-relative-cwd",
+					{ pdf_file_path: "relative.pdf" },
+					undefined,
+					undefined,
+					context,
+				);
+				const openDetails = openResult.details as { pdf_id: number; pdf: string };
+				assert.equal(openDetails.pdf_id, fixedPdfId);
+				assert.equal(openDetails.pdf, sourcePdfPath);
+				assert.equal(records.activeCount, 1);
+				const closeResult = await tools.closePdfTool.execute(
+					"close-pdf-relative-cwd",
+					{ pdf_id: openDetails.pdf_id },
+					undefined,
+					undefined,
+					context,
+				);
+				assert.equal(closeResult.details.closed, true);
+				assert.equal(records.activeCount, 0);
+			},
+			{ managedViewerRecords: records },
+		);
+	} finally {
+		process.chdir(originalCwd);
+		rmSync(externalCwd, { recursive: true, force: true });
+		await runSessionShutdown(context);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("open_pdf closes host-viewer when tracking fails after host open", async () => {
+	const { root } = withTemporaryProject();
+	const tools = await captureTools();
+	const context = createSessionContext(root);
+	const fixedPdfId = 9002;
+	const records = makeFixedHostServicePdfIdRegistry(fixedPdfId);
+	let openError: unknown;
+	try {
+		await withHostService(
+			new FakeUnvalidatedOpenViewerBackend(),
+			async () => {
+				await runSessionStart(context);
+				try {
+					await tools.openPdfTool.execute(
+						"open-pdf-tracking-failure",
+						{ pdf_file_path: "relative-missing.pdf" },
+						undefined,
+						undefined,
+						context,
+					);
+					assert.fail("open_pdf should reject when opened PDF cannot be tracked");
+				} catch (error) {
+					openError = error;
+				}
+				assert.equal(records.activeCount, 0);
+			},
+			{ managedViewerRecords: records },
+		);
+	} finally {
+		await runSessionShutdown(context);
+		rmSync(root, { recursive: true, force: true });
+	}
+	assert.equal(openError !== undefined, true);
+	const openMessage = openError instanceof Error ? openError.message : String(openError);
+	assert.equal(/Cannot stat PDF file/.test(openMessage), true);
+});
+
+test("jump_pdf and close_pdf surface errors for unknown or closed host-service IDs", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tools = await captureTools();
+	const context = createSessionContext(root);
+	writeFileSync(resolve(root, "paper.pdf"), "%PDF-1.7\n");
+	writeFileSync(sourcePath, "\\begin{document}ok\\end{document}\n");
+	const fixedPdfId = 8888;
+	try {
+		await withHostService(
+			new FakeJumpableViewerBackend(),
+			async () => {
+				await runSessionStart(context);
+				const openResult = await tools.openPdfTool.execute(
+					"open-pdf-tool-stale",
+					{ pdf_file_path: resolve(root, "paper.pdf") },
+					undefined,
+					undefined,
+					context,
+				);
+				const openDetails = openResult.details as { pdf_id: number; pdf: string };
+				assert.equal(openDetails.pdf_id, fixedPdfId);
+				const hostServiceClient = new HostServiceClient({ socketPath: process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH });
+				await hostServiceClient.requestClosePdf({ cwd: root }, openDetails.pdf_id);
+
+				let staleJumpError: unknown;
+				try {
+					await tools.jumpPdfTool.execute(
+						"jump-pdf-tool-stale",
+						{ pdf_id: openDetails.pdf_id, line: 1, source_file: sourcePath },
+						undefined,
+						undefined,
+						context,
+					);
+					assert.fail("jump_pdf should reject for closed tracked id");
+				} catch (error) {
+					staleJumpError = error;
+				}
+				const staleJumpText = staleJumpError instanceof Error ? staleJumpError.message : String(staleJumpError);
+				assert.equal(/Closed pdf_id=/.test(staleJumpText), true);
+
+				let staleCloseError: unknown;
+				try {
+					await tools.closePdfTool.execute(
+						"close-pdf-tool-stale",
+						{ pdf_id: openDetails.pdf_id },
+						undefined,
+						undefined,
+						context,
+					);
+					assert.fail("close_pdf should reject for stale closed pdf_id");
+				} catch (error) {
+					staleCloseError = error;
+				}
+				const staleCloseText = staleCloseError instanceof Error ? staleCloseError.message : String(staleCloseError);
+				assert.equal(/Closed pdf_id=/.test(staleCloseText), true);
+			},
+			{ managedViewerRecords: makeFixedHostServicePdfIdRegistry(fixedPdfId) },
+		);
+
+		let unknownCloseError: unknown;
+		try {
+			await tools.closePdfTool.execute(
+				"close-pdf-unknown",
+				{ pdf_id: 424242 },
+				undefined,
+				undefined,
+				context,
+			);
+			assert.fail("close_pdf should reject for unknown id");
+		} catch (error) {
+			unknownCloseError = error;
+		}
+		const unknownCloseText = unknownCloseError instanceof Error ? unknownCloseError.message : String(unknownCloseError);
+		assert.equal(/Unknown tracked pdf_id/.test(unknownCloseText), true);
+
+		let unknownJumpError: unknown;
+		try {
+			await tools.jumpPdfTool.execute(
+				"jump-pdf-unknown",
+				{ pdf_id: 424242, line: 1, source_file: sourcePath },
+				undefined,
+				undefined,
+				context,
+			);
+			assert.fail("jump_pdf should reject for unknown id");
+		} catch (error) {
+			unknownJumpError = error;
+		}
+		const unknownJumpText = unknownJumpError instanceof Error ? unknownJumpError.message : String(unknownJumpError);
+		assert.equal(/Unknown tracked pdf_id/.test(unknownJumpText), true);
+	} finally {
+		await runSessionShutdown(context);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("compile_latex_file(open_pdf=true) refreshes host-service metadata after service restart", async () => {
 	const { root, sourcePath } = withTemporaryProject();
 	const tools = await captureTools();
@@ -704,7 +970,6 @@ test("compile_latex_file(open_pdf=true) refreshes host-service metadata after se
 
 	const context = createSessionContext(root);
 	const sourceLine = "\\begin{document}ok\\end{document}";
-	let trackedPdfId = 0;
 	try {
 		await runSessionStart(context);
 
@@ -719,7 +984,7 @@ test("compile_latex_file(open_pdf=true) refreshes host-service metadata after se
 					context,
 				);
 				const firstDetails = firstCompile.details as { pdf_id: number; pdf: string; source: string };
-				trackedPdfId = firstDetails.pdf_id;
+				assert.equal(firstDetails.pdf_id, 1001);
 				assert.equal(firstDetails.pdf, resolve(root, "paper.pdf"));
 				assert.equal(firstDetails.source, sourcePath);
 			},
@@ -736,15 +1001,15 @@ test("compile_latex_file(open_pdf=true) refreshes host-service metadata after se
 					undefined,
 					context,
 				);
-				const secondDetails = secondCompile.details as { pdf_id: number; pdf: string; source: string };
-				assert.equal(secondDetails.pdf_id, trackedPdfId);
+				const secondDetails = secondCompile.details as { pdf_id: number; pdf: string; source: string; };
+				assert.equal(secondDetails.pdf_id, 2222);
 				assert.equal(secondDetails.pdf, resolve(root, "paper.pdf"));
 				assert.equal(secondDetails.source, sourcePath);
 
 				const jumpResult = await tools.jumpPdfTool.execute(
 					"jump-latex-file-open-restart",
 					{
-						pdf_id: trackedPdfId,
+						pdf_id: secondDetails.pdf_id,
 						line: 1,
 						source_file: sourcePath,
 					},
@@ -762,14 +1027,14 @@ test("compile_latex_file(open_pdf=true) refreshes host-service metadata after se
 
 				const closeResult = await tools.closePdfTool.execute(
 					"close-latex-file-open-restart",
-					{ pdf_id: trackedPdfId },
+					{ pdf_id: secondDetails.pdf_id },
 					undefined,
 					undefined,
 					context,
 				);
 				const closeDetails = closeResult.details as { pdf: string; closed: boolean };
 
-				assert.equal(jumpDetails.pdf_id, trackedPdfId);
+				assert.equal(jumpDetails.pdf_id, secondDetails.pdf_id);
 				assert.equal(jumpDetails.pdf, resolve(root, "paper.pdf"));
 				assert.equal(jumpDetails.source, sourcePath);
 				assert.equal(jumpDetails.source_line, sourceLine);
