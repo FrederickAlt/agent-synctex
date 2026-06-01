@@ -2,13 +2,15 @@ import {
 	accessSync,
 	chmodSync,
 	constants,
+	existsSync,
 	lstatSync,
 	mkdirSync,
 	rmSync,
 	statSync,
 } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { createLatexFileCompileToolSupport, type LatexFileCompileRequest, LoggedToolError } from "./latex/latex_file_compiler.ts";
 
 export interface HostServiceWorkspaceContext {
 	cwd: string;
@@ -32,6 +34,19 @@ export interface HostServiceViewerBackendCapabilities {
 	reuse: boolean;
 }
 
+export interface HostServiceCompileRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "compile_latex_file";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+	details: {
+		latex_file_path: string;
+		compiler?: unknown;
+		clean?: boolean;
+	};
+}
+
 export interface HostServiceStatusResponseDetails {
 	protocol_version: number;
 	supported: boolean;
@@ -51,10 +66,26 @@ export interface HostServiceStatusResponseDetails {
 	viewer_backend_capabilities?: HostServiceViewerBackendCapabilities;
 }
 
-export interface HostServiceResponseEnvelope {
+export interface HostServiceCompileResponseDetails {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	workspace_context: HostServiceWorkspaceContext;
+	request_id: string;
+	operation: "compile_latex_file";
+	source: string;
+	pdf: string;
+	log: string;
+	artifact_paths: string[];
+	clean: boolean;
+	cleaned_artifacts: string[];
+	error_code?: string;
+}
+
+export interface HostServiceStatusResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
-	operation: string;
+	operation: "status";
 	status: "ok" | "error";
 	generated_at_ns: number;
 	error?: string;
@@ -85,6 +116,18 @@ export interface HostServicePdfIdRegistryOptions {
 	makePdfId?: () => number;
 	maxAllocationAttempts?: number;
 }
+
+export interface HostServiceCompileResponseEnvelope {
+	protocol_version: number;
+	request_id: string;
+	operation: "compile_latex_file";
+	status: "ok" | "error";
+	generated_at_ns: number;
+	error?: string;
+	status_details: HostServiceCompileResponseDetails;
+}
+
+export type HostServiceResponseEnvelope = HostServiceStatusResponseEnvelope | HostServiceCompileResponseEnvelope;
 
 export interface HostServiceClientOptions {
 	socketPath?: string;
@@ -168,6 +211,13 @@ export class FakeViewerBackend implements ViewerBackendAdapter {
 		this.available = available;
 	}
 }
+
+const hostServiceLatexFileCompiler = createLatexFileCompileToolSupport();
+type HostServiceOperation = HostServiceStatusRequest["operation"] | HostServiceCompileRequest["operation"];
+type HostServiceResponseForOperation<TOperation extends HostServiceOperation> =
+	TOperation extends HostServiceStatusRequest["operation"] ? HostServiceStatusResponseEnvelope
+	: HostServiceCompileResponseEnvelope;
+type HostServiceRequest = HostServiceStatusRequest | HostServiceCompileRequest;
 
 export function defaultHostServiceSocketPath(): string {
 	return DEFAULT_HOST_SERVICE_SOCKET_PATH;
@@ -320,7 +370,7 @@ export class HostServiceClient {
 	): Promise<HostServiceStatusResponseDetails> {
 		const context = normalizeWorkspaceContext(workspaceContext);
 		const requestId = this.makeRequestId();
-		const response = await this.request(
+		const response = await this.request("status",
 			{
 				protocol_version: PROTOCOL_VERSION,
 				request_id: requestId,
@@ -331,23 +381,55 @@ export class HostServiceClient {
 			signal,
 			requestTimeoutMs ?? this.requestTimeoutMs,
 		);
-		if (!isValidStatusResponse(response, requestId)) {
-			throw new Error(`Malformed host service status response payload: ${JSON.stringify(response)}`);
-		}
-		if (response.status !== "ok") {
+		if (response.status === "error") {
 			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
 			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
 		}
 		return response.status_details;
 	}
 
-	private async request(
-		request: HostServiceStatusRequest,
+	async requestCompileLatexFile(
+		request: HostServiceCompileRequest["details"],
+		workspaceContext: HostServiceWorkspaceContext,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceCompileResponseDetails> {
+		const context = normalizeWorkspaceContextForCompile(workspaceContext);
+		const requestId = this.makeRequestId();
+		const response = await this.request("compile_latex_file",
+			{
+				protocol_version: PROTOCOL_VERSION,
+				request_id: requestId,
+				operation: "compile_latex_file",
+				created_at_ns: Date.now() * 1_000_000,
+				workspace_context: context,
+				details: {
+					latex_file_path: request.latex_file_path,
+					...(request.compiler === undefined ? {} : { compiler: request.compiler }),
+					...(request.clean === undefined ? {} : { clean: request.clean }),
+				},
+			},
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (response.status === "error") {
+			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
+			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+		}
+		return response.status_details;
+	}
+
+	private async request<TOperation extends HostServiceOperation>(
+		operation: TOperation,
+		request: TOperation extends "status" ? HostServiceStatusRequest : HostServiceCompileRequest,
 		signal: AbortSignal | undefined,
 		requestTimeoutMs: number,
-	): Promise<HostServiceResponseEnvelope> {
+	): Promise<HostServiceResponseForOperation<TOperation>> {
 		if (!isValidWorkspaceContext(request.workspace_context)) {
 			throw new Error("host service request requires valid workspace_context.cwd");
+		}
+		if (operation === "compile_latex_file") {
+			normalizeWorkspaceContextForCompile(request.workspace_context);
 		}
 		if (signal?.aborted) {
 			throw new Error("host service request cancelled before submit");
@@ -360,10 +442,10 @@ export class HostServiceClient {
 		}
 
 		let abortUnsub: (() => void) | undefined;
-		const requestPromise = new Promise<HostServiceResponseEnvelope>((resolve, reject) => {
+		const requestPromise = new Promise<HostServiceResponseForOperation<TOperation>>((resolve, reject) => {
 			let settled = false;
 			let raw = "";
-			const finish = (value: HostServiceResponseEnvelope | Error) => {
+			const finish = (value: HostServiceResponseForOperation<TOperation> | Error) => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
@@ -408,7 +490,11 @@ export class HostServiceClient {
 				const lineBreak = raw.indexOf("\n");
 				if (lineBreak < 0) return;
 				try {
-					const response = parseResponse(raw.slice(0, lineBreak).trim(), request.request_id);
+					const response = parseResponse(
+						raw.slice(0, lineBreak).trim(),
+						request.request_id,
+						operation,
+					);
 					finish(response);
 				} catch (error) {
 					finish(error instanceof Error ? error : new Error(String(error)));
@@ -433,7 +519,11 @@ export class HostServiceClient {
 			const finishIfNotSettled = () => {
 				if (!settled && raw.trim()) {
 					try {
-						const response = parseResponse(raw.trim(), request.request_id);
+						const response = parseResponse(
+							raw.trim(),
+							request.request_id,
+							operation,
+						);
 						finish(response);
 					} catch (error) {
 						finish(error instanceof Error ? error : new Error(String(error)));
@@ -558,66 +648,176 @@ export class HostServiceServer {
 	}
 
 	private respondToRequest(raw: string, socket: Socket): void {
-		let requestPayload: unknown;
-		let request: HostServiceStatusRequest;
-		try {
-			requestPayload = parseRequest(raw);
-			request = validateStatusRequest(requestPayload);
-		} catch (error) {
-			const requestId = getRequestIdFromPayload(requestPayload);
-			socket.end(buildErrorResponse(
-				this.protocolVersion,
-				this.socketPath,
-				this.serviceName,
-				this.serviceInstanceId,
-				requestId,
-				error instanceof Error ? error.message : String(error),
-				"invalid_request",
-			));
-			return;
-		}
+		void (async () => {
+			let requestPayload: unknown;
+			let request: HostServiceRequest;
+			try {
+				requestPayload = parseRequest(raw);
+				request = validateHostServiceRequest(requestPayload);
+			} catch (error) {
+				const requestId = getRequestIdFromPayload(requestPayload);
+				const requestOperation = getRequestOperationFromPayload(requestPayload);
+				if (requestOperation === "compile_latex_file") {
+					const requestWorkspaceContext = getWorkspaceContextFromPayload(requestPayload);
+					const shouldResolveSource = canResolveCompileSourcePath(requestWorkspaceContext);
+					const requestedPath = getLatexPathFromPayload(requestPayload);
+					const source = requestedPath && shouldResolveSource
+						? normalizeLatexSourcePath(requestedPath, requestWorkspaceContext.cwd)
+						: requestedPath ?? "";
+					socket.end(buildCompileErrorResponse(
+						requestId,
+						requestWorkspaceContext ?? FALLBACK_WORKSPACE_CONTEXT,
+						source,
+						source ? inferLatexLogPath(source) : "",
+						false,
+						"invalid_request",
+						error instanceof Error ? error.message : String(error),
+					));
+					return;
+				}
+				socket.end(buildErrorResponse(
+					this.protocolVersion,
+					this.socketPath,
+					this.serviceName,
+					this.serviceInstanceId,
+					getRequestIdFromPayload(requestPayload),
+					error instanceof Error ? error.message : String(error),
+					"invalid_request",
+				));
+				return;
+			}
+			if (request.operation === "status") {
+				this.totalRequests += 1;
+				const nowNs = Date.now() * 1_000_000;
+				const viewerBackendAvailable = this.viewerBackend.isAvailable();
+				const response: HostServiceResponseEnvelope = {
+					protocol_version: this.protocolVersion,
+					request_id: request.request_id,
+					operation: request.operation,
+					status: "ok",
+					generated_at_ns: nowNs,
+					status_details: {
+						protocol_version: this.protocolVersion,
+						supported: true,
+						service_available: viewerBackendAvailable,
+						service_name: this.serviceName,
+						socket_path: this.socketPath,
+						service_instance_started_ns: this.startedAtNs,
+						service_instance_id: this.serviceInstanceId,
+						workspace_context: request.workspace_context,
+						request_id: request.request_id,
+						operation: request.operation,
+						uptime_ns: nowNs - this.startedAtNs,
+						total_requests: this.totalRequests,
+						viewer_backend_name: this.viewerBackend.name,
+						viewer_backend_available: viewerBackendAvailable,
+						viewer_backend_capabilities: this.viewerBackend.capabilities,
+					},
+				};
+				socket.end(`${JSON.stringify(response)}\n`);
+				return;
+			}
 
-		if (request.operation !== "status") {
+			if (request.operation === "compile_latex_file") {
+				this.totalRequests += 1;
+				const response = await this.compileLatexFileRequest(request);
+				socket.end(`${JSON.stringify(response)}\n`);
+				return;
+			}
+
 			socket.end(buildErrorResponse(
 				this.protocolVersion,
 				this.socketPath,
 				this.serviceName,
 				this.serviceInstanceId,
-				request.request_id,
-				`unsupported operation: ${request.operation}`,
+				getRequestIdFromPayload(requestPayload),
+				`unsupported operation: ${getRequestOperationFromPayload(requestPayload)}`,
 				"unsupported_operation",
 			));
-			return;
-		}
+		})().catch(() => {
+			socket.end(buildErrorResponse(
+				this.protocolVersion,
+				this.socketPath,
+				this.serviceName,
+				this.serviceInstanceId,
+				"",
+				"host service failed while handling request",
+				"internal_error",
+			));
+		});
+	}
 
-		this.totalRequests += 1;
-		const nowNs = Date.now() * 1_000_000;
-		const viewerBackendAvailable = this.viewerBackend.isAvailable();
-		const response: HostServiceResponseEnvelope = {
-			protocol_version: this.protocolVersion,
-			request_id: request.request_id,
-			operation: request.operation,
-			status: "ok",
-			generated_at_ns: nowNs,
-			status_details: {
+	private async compileLatexFileRequest(request: HostServiceCompileRequest): Promise<HostServiceResponseEnvelope> {
+		const requestedPath = request.details.latex_file_path;
+		const normalizedPath = normalizeLatexSourcePath(requestedPath, request.workspace_context.cwd);
+		const logPath = inferLatexLogPath(normalizedPath);
+		const shouldClean = request.details.clean === true;
+		const cleanArtifacts: string[] = [];
+
+		try {
+			const compileRequest: LatexFileCompileRequest = {
+				requestedPath,
+				compiler: request.details.compiler,
+				clean: shouldClean,
+				cwd: request.workspace_context.cwd,
+			};
+			const result = await hostServiceLatexFileCompiler.compileLatexFile(compileRequest);
+			const nowNs = Date.now() * 1_000_000;
+			for (const cleaned of result.cleanedArtifacts) {
+				cleanArtifacts.push(cleaned);
+			}
+			const artifactPaths = getExistingArtifacts(result.pdfPath, logPath);
+			return {
 				protocol_version: this.protocolVersion,
-				supported: true,
-				service_available: viewerBackendAvailable,
-				service_name: this.serviceName,
-				socket_path: this.socketPath,
-				service_instance_started_ns: this.startedAtNs,
-				service_instance_id: this.serviceInstanceId,
-				workspace_context: request.workspace_context,
 				request_id: request.request_id,
 				operation: request.operation,
-				uptime_ns: nowNs - this.startedAtNs,
-				total_requests: this.totalRequests,
-				viewer_backend_name: this.viewerBackend.name,
-				viewer_backend_available: viewerBackendAvailable,
-				viewer_backend_capabilities: this.viewerBackend.capabilities,
-			},
-		};
-		socket.end(`${JSON.stringify(response)}\n`);
+				status: "ok",
+				generated_at_ns: nowNs,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: true,
+					service_available: true,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: request.operation,
+					source: result.source,
+					pdf: result.pdfPath,
+					log: logPath,
+					clean: shouldClean,
+					cleaned_artifacts: cleanArtifacts,
+					artifact_paths: artifactPaths,
+				},
+			};
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			const log = error instanceof LoggedToolError ? error.logPath : logPath;
+			const nowNs = Date.now() * 1_000_000;
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: request.operation,
+				status: "error",
+				generated_at_ns: nowNs,
+				error: errorMessage,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: true,
+					service_available: true,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: request.operation,
+					source: normalizedPath,
+					pdf: "",
+					log: log,
+					clean: shouldClean,
+					cleaned_artifacts: cleanArtifacts,
+					artifact_paths: getExistingArtifacts(log),
+					error_code: extractCompileErrorCode(error),
+				},
+			};
+		}
+	}
+
 	}
 
 	private async prepareSocketPath(): Promise<void> {
@@ -690,6 +890,25 @@ function normalizeWorkspaceContext(context: HostServiceWorkspaceContext): HostSe
 	};
 }
 
+function normalizeWorkspaceContextForCompile(context: HostServiceWorkspaceContext): HostServiceWorkspaceContext {
+	const normalized = normalizeWorkspaceContext(context);
+	if (!isAbsolute(normalized.cwd)) {
+		throw new Error("workspace_context.cwd must be absolute for compile_latex_file");
+	}
+	if (normalized.workspace_root !== undefined && !isAbsolute(normalized.workspace_root)) {
+		throw new Error("workspace_context.workspace_root must be absolute for compile_latex_file");
+	}
+	return normalized;
+}
+
+function canResolveCompileSourcePath(workspaceContext: HostServiceWorkspaceContext | undefined): workspaceContext is HostServiceWorkspaceContext {
+	if (workspaceContext === undefined) {
+		return false;
+	}
+	return isAbsolute(workspaceContext.cwd)
+		&& (workspaceContext.workspace_root === undefined || isAbsolute(workspaceContext.workspace_root));
+}
+
 function isStringRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
@@ -709,20 +928,24 @@ function getRequestIdFromPayload(payload: unknown): string {
 	return "";
 }
 
-function parseResponse(raw: string, expectedRequestId: string): HostServiceResponseEnvelope {
+function parseResponse<TOperation extends HostServiceOperation>(
+	raw: string,
+	expectedRequestId: string,
+	expectedOperation: TOperation,
+): HostServiceResponseForOperation<TOperation> {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
-	if (!isValidStatusResponse(parsed, expectedRequestId)) {
+	if (!isValidHostServiceResponse(parsed, expectedRequestId, expectedOperation)) {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
-	return parsed;
+	return parsed as HostServiceResponseForOperation<TOperation>;
 }
 
-function validateStatusRequest(value: unknown): HostServiceStatusRequest {
+function validateHostServiceRequest(value: unknown): HostServiceRequest {
 	if (!isStringRecord(value)) {
 		throw new Error("invalid request payload");
 	}
@@ -732,50 +955,95 @@ function validateStatusRequest(value: unknown): HostServiceStatusRequest {
 	if (typeof value.request_id !== "string" || !value.request_id.trim()) {
 		throw new Error("missing request_id");
 	}
-	if (value.operation !== "status") {
-		throw new Error(`unsupported operation: ${String(value.operation)}`);
-	}
 	if (typeof value.created_at_ns !== "number") {
 		throw new Error("missing created_at_ns");
 	}
 	if (!isValidWorkspaceContext(value.workspace_context)) {
 		throw new Error("invalid workspace_context");
 	}
-	return {
-		protocol_version: PROTOCOL_VERSION,
-		request_id: value.request_id,
-		operation: "status",
-		created_at_ns: value.created_at_ns,
-		workspace_context: value.workspace_context,
-	};
+	if (value.operation === "status") {
+		return {
+			protocol_version: PROTOCOL_VERSION,
+			request_id: value.request_id,
+			operation: "status",
+			created_at_ns: value.created_at_ns,
+			workspace_context: value.workspace_context,
+		};
+	}
+	if (value.operation === "compile_latex_file") {
+		if (!isStringRecord(value.details)) {
+			throw new Error("missing compile details");
+		}
+		const rawDetails = value.details;
+		if (typeof rawDetails.latex_file_path !== "string" || !rawDetails.latex_file_path.trim()) {
+			throw new Error("missing latex_file_path");
+		}
+		if (rawDetails.compiler !== undefined && typeof rawDetails.compiler !== "string") {
+			throw new Error("compiler must be a string");
+		}
+		if (rawDetails.clean !== undefined && typeof rawDetails.clean !== "boolean") {
+			throw new Error("clean must be a boolean");
+		}
+		const workspaceContext = normalizeWorkspaceContextForCompile(value.workspace_context);
+		return {
+			protocol_version: PROTOCOL_VERSION,
+			request_id: value.request_id,
+			operation: "compile_latex_file",
+			created_at_ns: value.created_at_ns,
+			workspace_context: workspaceContext,
+			details: {
+				latex_file_path: rawDetails.latex_file_path,
+				compiler: rawDetails.compiler,
+				clean: rawDetails.clean === true,
+			},
+		};
+	}
+	throw new Error(`unsupported operation: ${String(value.operation)}`);
 }
 
-function isValidStatusResponse(response: unknown, expectedRequestId: string): response is HostServiceResponseEnvelope {
-	if (!isStringRecord(response)) {
+function isValidHostServiceResponse(
+	value: unknown,
+	expectedRequestId: string,
+	expectedOperation: HostServiceOperation,
+): value is HostServiceResponseEnvelope {
+	if (!isStringRecord(value)) {
 		return false;
 	}
-	if (typeof response.protocol_version !== "number" || response.protocol_version !== PROTOCOL_VERSION) {
+	if (typeof value.protocol_version !== "number" || value.protocol_version !== PROTOCOL_VERSION) {
 		return false;
 	}
-	if (typeof response.request_id !== "string" || response.request_id !== expectedRequestId) {
+	if (typeof value.request_id !== "string" || value.request_id !== expectedRequestId) {
 		return false;
 	}
-	if (response.status !== "ok" && response.status !== "error") {
+	if (value.status !== "ok" && value.status !== "error") {
 		return false;
 	}
-	if (response.operation !== "status") {
+	if (value.operation !== expectedOperation) {
 		return false;
 	}
-	if (typeof response.generated_at_ns !== "number") {
+	if (typeof value.generated_at_ns !== "number") {
 		return false;
 	}
-	if (response.error !== undefined && typeof response.error !== "string") {
+	if (value.error !== undefined && typeof value.error !== "string") {
 		return false;
 	}
-	const details = response.status_details;
+	if (value.status === "error" && value.error === undefined) {
+		return false;
+	}
+	const details = value.status_details;
 	if (!isStringRecord(details)) {
 		return false;
 	}
+	if (value.operation === "status") {
+		return isValidStatusResponseDetails(details, expectedRequestId);
+	}
+	if (value.operation === "compile_latex_file") {
+		return isValidCompileResponseDetails(details, expectedRequestId);
+	}
+	return false;
+}
+
+function isValidStatusResponseDetails(details: Record<string, unknown>, expectedRequestId: string): boolean {
 	if (typeof details.protocol_version !== "number" || details.protocol_version !== PROTOCOL_VERSION) {
 		return false;
 	}
@@ -824,7 +1092,47 @@ function isValidStatusResponse(response: unknown, expectedRequestId: string): re
 	if (details.viewer_backend_capabilities !== undefined && !isValidViewerBackendCapabilities(details.viewer_backend_capabilities)) {
 		return false;
 	}
-	if (response.status === "error" && response.error === undefined) {
+	return true;
+}
+
+function isValidCompileResponseDetails(details: Record<string, unknown>, expectedRequestId: string): boolean {
+	if (typeof details.protocol_version !== "number" || details.protocol_version !== PROTOCOL_VERSION) {
+		return false;
+	}
+	if (typeof details.supported !== "boolean") {
+		return false;
+	}
+	if (typeof details.service_available !== "boolean") {
+		return false;
+	}
+	if (!isValidWorkspaceContext(details.workspace_context)) {
+		return false;
+	}
+	if (typeof details.request_id !== "string" || details.request_id !== expectedRequestId) {
+		return false;
+	}
+	if (details.operation !== "compile_latex_file") {
+		return false;
+	}
+	if (typeof details.source !== "string") {
+		return false;
+	}
+	if (typeof details.pdf !== "string") {
+		return false;
+	}
+	if (typeof details.log !== "string") {
+		return false;
+	}
+	if (!Array.isArray(details.cleaned_artifacts) || !details.cleaned_artifacts.every((entry) => typeof entry === "string")) {
+		return false;
+	}
+	if (!Array.isArray(details.artifact_paths) || !details.artifact_paths.every((entry) => typeof entry === "string")) {
+		return false;
+	}
+	if (typeof details.clean !== "boolean") {
+		return false;
+	}
+	if (details.error_code !== undefined && typeof details.error_code !== "string") {
 		return false;
 	}
 	return true;
@@ -842,6 +1150,112 @@ function isValidViewerBackendCapabilities(value: unknown): value is HostServiceV
 		&& typeof value.reuse === "boolean"
 	);
 }
+
+function isValidStatusResponse(response: unknown, expectedRequestId: string): response is HostServiceStatusResponseEnvelope {
+	return isValidHostServiceResponse(response, expectedRequestId, "status");
+}
+
+function isValidCompileResponse(response: unknown, expectedRequestId: string): response is HostServiceCompileResponseEnvelope {
+	return isValidHostServiceResponse(response, expectedRequestId, "compile_latex_file");
+}
+
+function getRequestOperationFromPayload(payload: unknown): string | undefined {
+	if (!isStringRecord(payload)) {
+		return undefined;
+	}
+	return typeof payload.operation === "string" ? payload.operation : undefined;
+}
+
+function getWorkspaceContextFromPayload(payload: unknown): HostServiceWorkspaceContext | undefined {
+	if (!isStringRecord(payload)) {
+		return undefined;
+	}
+	return isValidWorkspaceContext(payload.workspace_context) ? payload.workspace_context : undefined;
+}
+
+function getLatexPathFromPayload(payload: unknown): string | undefined {
+	if (!isStringRecord(payload) || !isStringRecord(payload.details)) {
+		return undefined;
+	}
+	const details = payload.details;
+	if (typeof details.latex_file_path !== "string") {
+		return undefined;
+	}
+	return details.latex_file_path;
+}
+
+function normalizeLatexSourcePath(requestedPath: string, cwd: string): string {
+	return hostServiceLatexFileCompiler.resolveLatexFilePath(requestedPath, cwd);
+}
+
+function inferLatexLogPath(source: string): string {
+	if (!source) {
+		return "";
+	}
+	const directory = dirname(source);
+	const base = basename(source, extname(source));
+	if (!base) {
+		return "";
+	}
+	return join(directory, `${base}.log`);
+}
+
+function getExistingArtifacts(...paths: string[]): string[] {
+	const seen = new Set<string>();
+	for (const path of paths) {
+		if (!path || seen.has(path) || !existsSync(path)) {
+			continue;
+		}
+		seen.add(path);
+	}
+	return Array.from(seen);
+}
+
+function extractCompileErrorCode(error: unknown): string {
+	if (error instanceof LoggedToolError) {
+		return "compile_failed";
+	}
+	if (error instanceof Error && /compiler/.test(error.message)) {
+		return "compile_failed";
+	}
+	return "compile_failed";
+}
+
+function buildCompileErrorResponse(
+	requestId: string,
+	workspaceContext: HostServiceWorkspaceContext,
+	source: string,
+	logPath: string,
+	clean: boolean,
+	errorCode: string,
+	errorText: string,
+): string {
+	const nowNs = Date.now() * 1_000_000;
+	const response: HostServiceResponseEnvelope = {
+		protocol_version: PROTOCOL_VERSION,
+		request_id: requestId,
+		operation: "compile_latex_file",
+		status: "error",
+		generated_at_ns: nowNs,
+		error: errorText,
+		status_details: {
+			protocol_version: PROTOCOL_VERSION,
+			supported: false,
+			service_available: false,
+			workspace_context: workspaceContext,
+			request_id: requestId,
+			operation: "compile_latex_file",
+			source: source,
+			pdf: "",
+			log: logPath,
+			clean: clean,
+			artifact_paths: getExistingArtifacts(logPath),
+			cleaned_artifacts: [],
+			error_code: errorCode,
+		},
+	};
+	return `${JSON.stringify(response)}\n`;
+	}
 
 function buildErrorResponse(
 	protocolVersion: number,
