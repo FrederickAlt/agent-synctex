@@ -19,6 +19,7 @@ import { test } from "node:test";
 import {
 	FakeViewerBackend,
 	HostServiceClient,
+	HostServicePdfIdRegistry,
 	HostServiceServer,
 } from "../../src/modules/host_service.ts";
 import { INLINE_PREVIEW_DIR } from "../../src/modules/preview/inline_preview.ts";
@@ -256,6 +257,127 @@ class ValidatingFakeViewerBackend extends FakeViewerBackend {
 			}
 		}
 		return super.open(requestId, details);
+	}
+}
+
+class CloseControlledFakeViewerBackend extends FakeViewerBackend {
+	readonly closeMode: "closed" | "not_service_owned" | "not_running" | "backend_unavailable" | "identity_mismatch";
+
+	constructor(
+		closeMode: "closed" | "not_service_owned" | "not_running" | "backend_unavailable" | "identity_mismatch",
+		options?: ConstructorParameters<typeof FakeViewerBackend>[0],
+	) {
+		super(options);
+		this.closeMode = closeMode;
+	}
+
+	async close(
+		_requestId: string,
+		details: Record<string, unknown>,
+	): ReturnType<FakeViewerBackend["close"]> {
+		const handle = typeof details.handle === "string" ? details.handle : undefined;
+		if (this.closeMode === "closed") {
+			return {
+				status: "ok",
+				status_details: {
+					protocol_version: 1,
+					supported: true,
+					service_available: true,
+					backend: this.name,
+					backend_identity_ok: true,
+					backend_path: this.name,
+					handle,
+					closed: true,
+				},
+			};
+		}
+		if (this.closeMode === "not_service_owned") {
+			return {
+				status: "ok",
+				status_details: {
+					protocol_version: 1,
+					supported: true,
+					service_available: true,
+					backend: this.name,
+					backend_identity_ok: true,
+					backend_path: this.name,
+					handle,
+					closed: false,
+					reason: "not_service_owned",
+				},
+			};
+		}
+		if (this.closeMode === "not_running") {
+			return {
+				status: "ok",
+				status_details: {
+					protocol_version: 1,
+					supported: true,
+					service_available: true,
+					backend: this.name,
+					backend_identity_ok: true,
+					backend_path: this.name,
+					handle,
+					closed: false,
+					reason: "not_running",
+				},
+			};
+		}
+		if (this.closeMode === "identity_mismatch") {
+			return {
+				status: "error",
+				error: "backend identity mismatch",
+				status_details: {
+					protocol_version: 1,
+					supported: true,
+					service_available: true,
+					backend: "different-backend",
+					backend_identity_ok: false,
+					backend_path: this.name,
+					handle,
+					closed: false,
+					error_code: "identity_mismatch",
+					reason: "backend identity mismatch",
+				},
+			};
+		}
+		return {
+			status: "error",
+			error: "backend unavailable",
+			status_details: {
+				protocol_version: 1,
+				supported: false,
+				service_available: false,
+				backend: this.name,
+				backend_identity_ok: true,
+				backend_path: this.name,
+				handle,
+				closed: false,
+				error_code: "backend_unavailable",
+				reason: "backend unavailable",
+			},
+		};
+	}
+}
+
+class OwnedAwareFakeViewerBackend extends FakeViewerBackend {
+	readonly openOwned: boolean;
+
+	constructor(openOwned: boolean, options?: ConstructorParameters<typeof FakeViewerBackend>[0]) {
+		super(options);
+		this.openOwned = openOwned;
+	}
+
+	async open(
+		requestId: string,
+		details: Record<string, unknown>,
+	): ReturnType<FakeViewerBackend["open"]> {
+		const result = await super.open(requestId, details);
+		if (result.status === "ok") {
+			const statusDetails = result.status_details as Record<string, unknown>;
+			statusDetails.owned = this.openOwned;
+		}
+		return result;
 	}
 }
 
@@ -1337,6 +1459,48 @@ test("host service client validates rasterize response artifact paths", async ()
 	rmSync(baseDir, { recursive: true, force: true });
 });
 
+test("host service client surfaces malformed close requests as invalid_request", async () => {
+	const baseDir = temporaryDir("host-service-close-malformed-request-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-close-malformed-client" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+	});
+	const requestId = "close-malformed-request-id";
+	const requester = client as unknown as {
+		request: (request: unknown, signal: AbortSignal | undefined, requestTimeoutMs: number) => Promise<unknown>;
+	};
+	const response = await requester.request(
+		{
+			protocol_version: 1,
+			request_id: requestId,
+			operation: "close_pdf",
+			created_at_ns: Date.now() * 1_000_000,
+			workspace_context: { cwd: baseDir },
+		} as Record<string, unknown>,
+		undefined,
+		1_000,
+	) as {
+		operation: string;
+		status: "ok" | "error";
+		error?: string;
+		status_details: {
+			request_id?: string;
+			error_code?: string;
+		};
+	};
+
+	assert.equal(response.operation, "close_pdf");
+	assert.equal(response.status, "error");
+	assert.equal(response.status_details.error_code, "invalid_request");
+	assert.equal(response.status_details.request_id, requestId);
+	assert.match(response.error ?? "", /invalid pdf_id/);
+	await server.stop();
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
 test("host service client rejects malformed response with mismatched status_details protocol version", async () => {
 	const baseDir = temporaryDir("host-service-bad-details-version-");
 	const socketPath = join(baseDir, "host-service.sock");
@@ -1731,6 +1895,313 @@ test("host service open_pdf allocates active pdf ids from random range", async (
 		assert.equal(pdfIds.size, 5);
 	} finally {
 		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service close_pdf closes active ids and invalidates registry records", async () => {
+	const baseDir = temporaryDir("host-service-close-pdf-success-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\\n");
+	const registry = new HostServicePdfIdRegistry();
+	const backend = new CloseControlledFakeViewerBackend("closed");
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: backend,
+		managedViewerRecords: registry,
+	});
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+
+	try {
+		const openResponse = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{
+				pdf_path: "sample.pdf",
+				callback,
+				reuse_existing: true,
+			},
+		);
+		if (openResponse.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const pdfId = openResponse.pdf_id;
+		assert.equal(registry.activeCount, 1);
+		const closeResponse = await client.requestClosePdf({ cwd: baseDir }, pdfId);
+		assert.equal(closeResponse.pdf_id, pdfId);
+		assert.equal(closeResponse.closed, true);
+		assert.equal(registry.activeCount, 0);
+		await assert.rejects(
+			() => client.requestClosePdf({ cwd: baseDir }, pdfId),
+			/Closed pdf_id=/,
+		);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service close_pdf handles unowned-style no-op responses", async () => {
+	const baseDir = temporaryDir("host-service-close-pdf-noop-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\\n");
+	const registry = new HostServicePdfIdRegistry();
+	const backend = new CloseControlledFakeViewerBackend("not_service_owned");
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: backend,
+		managedViewerRecords: registry,
+	});
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+
+	try {
+		const openResponse = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{
+				pdf_path: "sample.pdf",
+				callback,
+				reuse_existing: true,
+			},
+		);
+		if (openResponse.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const pdfId = openResponse.pdf_id;
+		const closeResponse = await client.requestClosePdf({ cwd: baseDir }, pdfId);
+		assert.equal(closeResponse.closed, false);
+		assert.equal(closeResponse.reason, "not_service_owned");
+		assert.equal(registry.activeCount, 0);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service close_pdf no-ops close for unowned managed records", async () => {
+	const baseDir = temporaryDir("host-service-close-pdf-unowned-record-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\\n");
+	const registry = new HostServicePdfIdRegistry();
+	const backend = new OwnedAwareFakeViewerBackend(false, {
+		name: "host-service-zathura-unowned",
+	});
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: backend,
+		managedViewerRecords: registry,
+	});
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+
+	try {
+		const openResponse = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{
+				pdf_path: "sample.pdf",
+				callback,
+				reuse_existing: true,
+			},
+		);
+		if (openResponse.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const pdfId = openResponse.pdf_id;
+		assert.equal(openResponse.owned, false);
+		assert.equal(registry.activeCount, 1);
+		const closeResponse = await client.requestClosePdf({ cwd: baseDir }, pdfId);
+		assert.equal(closeResponse.closed, false);
+		assert.equal(closeResponse.reason, "not_service_owned");
+		assert.equal(registry.activeCount, 0);
+		await assert.rejects(
+			() => client.requestClosePdf({ cwd: baseDir }, pdfId),
+			/Closed pdf_id=/,
+		);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service close_pdf returns clear errors for unknown, stale, and closed ids", async () => {
+	const baseDir = temporaryDir("host-service-close-pdf-id-classification-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\\n");
+	const registry = new HostServicePdfIdRegistry();
+	const backend = new CloseControlledFakeViewerBackend("closed");
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: backend,
+		managedViewerRecords: registry,
+	});
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+
+	try {
+		await assert.rejects(
+			() => client.requestClosePdf({ cwd: baseDir }, 999_999_999),
+			/Unknown pdf_id=999999999:/,
+		);
+
+		const openResponse = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{
+				pdf_path: "sample.pdf",
+				callback,
+				reuse_existing: true,
+			},
+		);
+		if (openResponse.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const staleId = openResponse.pdf_id;
+		registry.markRecordStale(staleId);
+		await assert.rejects(
+			() => client.requestClosePdf({ cwd: baseDir }, staleId),
+			/Stale pdf_id=/,
+		);
+
+		const secondOpen = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{
+				pdf_path: "sample.pdf",
+				callback,
+				reuse_existing: true,
+			},
+		);
+		if (secondOpen.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const closedId = secondOpen.pdf_id;
+		await client.requestClosePdf({ cwd: baseDir }, closedId);
+		await assert.rejects(
+			() => client.requestClosePdf({ cwd: baseDir }, closedId),
+			/Closed pdf_id=/,
+		);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service close_pdf surfaces backend close failures", async () => {
+	const baseDir = temporaryDir("host-service-close-pdf-failures-");
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\\n");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	const unsupportedSocket = join(baseDir, "unsupported.sock");
+	const unavailableSocket = join(baseDir, "unavailable.sock");
+	const mismatchSocket = join(baseDir, "mismatch.sock");
+
+	const unsupportedBackend = new FakeViewerBackend({
+		name: "host-service-unsupported-close-backend",
+		capabilities: {
+			open: true,
+			close: false,
+			forward_search: false,
+			inverse_search: false,
+			reuse: false,
+		},
+	});
+	const unsupportedService = new HostServiceServer({
+		socketPath: unsupportedSocket,
+		viewerBackend: unsupportedBackend,
+	});
+	const unavailableService = new HostServiceServer({
+		socketPath: unavailableSocket,
+		viewerBackend: new CloseControlledFakeViewerBackend("backend_unavailable"),
+	});
+	const mismatchService = new HostServiceServer({
+		socketPath: mismatchSocket,
+		viewerBackend: new CloseControlledFakeViewerBackend("identity_mismatch"),
+	});
+	await Promise.all([
+		unsupportedService.start(),
+		unavailableService.start(),
+		mismatchService.start(),
+	]);
+	const unsupportedClient = new HostServiceClient({ socketPath: unsupportedSocket, requestTimeoutMs: 1_000 });
+	const unavailableClient = new HostServiceClient({ socketPath: unavailableSocket, requestTimeoutMs: 1_000 });
+	const mismatchClient = new HostServiceClient({ socketPath: mismatchSocket, requestTimeoutMs: 1_000 });
+
+	try {
+		const unsupportedOpen = await unsupportedClient.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: "sample.pdf", callback, reuse_existing: true },
+		);
+		if (unsupportedOpen.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const unsupportedPdfId = unsupportedOpen.pdf_id;
+		await assert.rejects(
+			() => unsupportedClient.requestClosePdf({ cwd: baseDir }, unsupportedPdfId),
+			/unsupported_operation/,
+		);
+
+		const unavailableOpen = await unavailableClient.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: "sample.pdf", callback, reuse_existing: true },
+		);
+		if (unavailableOpen.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const unavailablePdfId = unavailableOpen.pdf_id;
+		await assert.rejects(
+			() => unavailableClient.requestClosePdf({ cwd: baseDir }, unavailablePdfId),
+			/backend_unavailable/,
+		);
+
+		const mismatchOpen = await mismatchClient.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: "sample.pdf", callback, reuse_existing: true },
+		);
+		if (mismatchOpen.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const mismatchPdfId = mismatchOpen.pdf_id;
+		await assert.rejects(
+			() => mismatchClient.requestClosePdf({ cwd: baseDir }, mismatchPdfId),
+			/identity_mismatch/,
+		);
+	} finally {
+		await Promise.all([
+			unsupportedService.stop(),
+			unavailableService.stop(),
+			mismatchService.stop(),
+		]);
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });

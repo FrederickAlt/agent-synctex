@@ -165,12 +165,22 @@ export interface HostServiceOpenRequest {
 	};
 }
 
+export interface HostServiceCloseRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "close_pdf";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+	pdf_id: number;
+}
+
 export type HostServiceRequest =
 	| HostServiceStatusRequest
 	| HostServiceCompileRequest
 	| HostServiceCompileSnippetRequest
 	| HostServiceRasterizeRequest
 	| HostServiceOpenRequest
+	| HostServiceCloseRequest
 	| HostServiceRegisterCallbackTargetRequest
 	| HostServiceUnregisterCallbackTargetRequest
 	| HostServiceResolveCallbackTargetRequest;
@@ -181,6 +191,7 @@ export type HostServiceOperation =
 	| "compile_latex_snippet"
 	| "rasterize"
 	| "open_pdf"
+	| "close_pdf"
 	| "register_callback_target"
 	| "unregister_callback_target"
 	| "resolve_callback_target";
@@ -312,6 +323,24 @@ export interface HostServiceOpenResponseDetails {
 	error_code?: string;
 	reason?: string;
 }
+
+export interface HostServiceCloseResponseDetails {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	workspace_context: HostServiceWorkspaceContext;
+	request_id: string;
+	operation: "close_pdf";
+	backend: string;
+	backend_path: string;
+	backend_identity_ok?: boolean;
+	closed: boolean;
+	reason?: string;
+	handle?: string;
+	pdf_id: number;
+	error_code?: string;
+}
+
 export interface HostServiceStatusResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
@@ -361,6 +390,17 @@ export interface HostServiceOpenResponseEnvelope {
 	error?: string;
 	status_details: HostServiceOpenResponseDetails;
 }
+
+export interface HostServiceCloseResponseEnvelope {
+	protocol_version: number;
+	request_id: string;
+	operation: "close_pdf";
+	status: "ok" | "error";
+	generated_at_ns: number;
+	error?: string;
+	status_details: HostServiceCloseResponseDetails;
+}
+
 export interface HostServiceRegisterCallbackTargetResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
@@ -397,6 +437,7 @@ export type HostServiceResponseEnvelope =
 	| HostServiceCompileSnippetResponseEnvelope
 	| HostServiceRasterizeResponseEnvelope
 	| HostServiceOpenResponseEnvelope
+	| HostServiceCloseResponseEnvelope
 	| HostServiceRegisterCallbackTargetResponseEnvelope
 	| HostServiceUnregisterCallbackTargetResponseEnvelope
 	| HostServiceResolveCallbackTargetResponseEnvelope;
@@ -905,6 +946,40 @@ export class HostServiceClient {
 		return response.status_details;
 	}
 
+	async requestClosePdf(
+		workspaceContext: HostServiceWorkspaceContext,
+		pdfId: number,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceCloseResponseDetails> {
+		if (!Number.isInteger(pdfId) || pdfId <= 0) {
+			throw new Error("invalid pdf_id");
+		}
+		const context = normalizeWorkspaceContext(workspaceContext);
+		const requestId = this.makeRequestId();
+		const requestPayload: HostServiceCloseRequest = {
+			protocol_version: PROTOCOL_VERSION,
+			request_id: requestId,
+			operation: "close_pdf",
+			created_at_ns: Date.now() * 1_000_000,
+			workspace_context: context,
+			pdf_id: pdfId,
+		};
+		const response = await this.request(
+			requestPayload,
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (!isValidCloseResponse(response, requestId)) {
+			throw new Error(`Malformed host service close_pdf response payload: ${JSON.stringify(response)}`);
+		}
+		if (response.status !== "ok") {
+			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
+			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+		}
+		return response.status_details;
+	}
+
 	async requestOpen(
 		workspaceContext: HostServiceWorkspaceContext,
 		details: HostServiceOpenRequest["details"],
@@ -1191,11 +1266,11 @@ export class HostServiceServer {
 					));
 					return;
 				}
-				if (requestOperation === "open_pdf") {
+				if (requestOperation === "open_pdf" || requestOperation === "close_pdf") {
 					socket.end(buildViewerOperationErrorResponse(
 						requestId,
 						getWorkspaceContextFromPayload(requestPayload) ?? FALLBACK_WORKSPACE_CONTEXT,
-						"open_pdf",
+						requestOperation,
 						"invalid_request",
 						error instanceof Error ? error.message : String(error),
 					));
@@ -1266,6 +1341,12 @@ export class HostServiceServer {
 				case "open_pdf": {
 					this.totalRequests += 1;
 					const response = await this.openViewerRequest(request);
+					socket.end(`${JSON.stringify(response)}\n`);
+					return;
+				}
+				case "close_pdf": {
+					this.totalRequests += 1;
+					const response = await this.closeViewerRequest(request);
 					socket.end(`${JSON.stringify(response)}\n`);
 					return;
 				}
@@ -1778,6 +1859,136 @@ export class HostServiceServer {
 		};
 	}
 
+	private async closeViewerRequest(request: HostServiceCloseRequest): Promise<HostServiceCloseResponseEnvelope> {
+		let managedRecord: HostServiceManagedViewerRecord;
+		try {
+			managedRecord = this.managedViewerRecords.getActiveRecord(request.pdf_id);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const nowNs = Date.now() * 1_000_000;
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "close_pdf",
+				status: "error",
+				generated_at_ns: nowNs,
+				error: message,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "close_pdf",
+					backend: this.viewerBackend.name,
+					backend_path: this.viewerBackend.name,
+					closed: false,
+					pdf_id: request.pdf_id,
+					error_code: "invalid_request",
+					reason: message,
+				},
+			};
+		}
+		const nowNs = Date.now() * 1_000_000;
+		if (!managedRecord.viewerOwned) {
+			this.managedViewerRecords.closeRecord(request.pdf_id);
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "close_pdf",
+				status: "ok",
+				generated_at_ns: nowNs,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: true,
+					service_available: true,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "close_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path: typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+						? managedRecord.backendPath
+						: this.viewerBackend.name,
+					backend_identity_ok: true,
+					closed: false,
+					handle: managedRecord.viewerHandle,
+					reason: "not_service_owned",
+					pdf_id: request.pdf_id,
+				},
+			};
+		}
+		const backendResult = await this.viewerBackend.close(request.request_id, {
+			handle: managedRecord.viewerHandle,
+			backend: managedRecord.viewerBackend,
+		});
+		const backendDetails = backendResult.status_details as Record<string, unknown>;
+		const backendPath =
+			typeof backendDetails.backend_path === "string" && backendDetails.backend_path.trim()
+				? backendDetails.backend_path
+				: typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+					? managedRecord.backendPath
+					: this.viewerBackend.name;
+		const backendAvailable = typeof backendDetails.service_available === "boolean"
+			? backendDetails.service_available
+			: true;
+		const backendIdentityOk = typeof backendDetails.backend_identity_ok === "boolean" ? backendDetails.backend_identity_ok : true;
+		const closed = typeof backendDetails.closed === "boolean" ? backendDetails.closed : false;
+		const reason = typeof backendDetails.reason === "string" && backendDetails.reason.trim() ? backendDetails.reason : undefined;
+
+		if (backendResult.status === "ok") {
+			this.managedViewerRecords.closeRecord(request.pdf_id);
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "close_pdf",
+				status: "ok",
+				generated_at_ns: nowNs,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: true,
+					service_available: backendAvailable,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "close_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path: backendPath,
+					backend_identity_ok: backendIdentityOk,
+					closed,
+					handle: managedRecord.viewerHandle,
+					reason,
+					pdf_id: request.pdf_id,
+					error_code: typeof backendDetails.error_code === "string" ? backendDetails.error_code : undefined,
+				},
+			};
+		}
+		return {
+			protocol_version: this.protocolVersion,
+			request_id: request.request_id,
+			operation: "close_pdf",
+			status: "error",
+			generated_at_ns: nowNs,
+			error: backendResult.error ?? "close failed",
+			status_details: {
+				protocol_version: this.protocolVersion,
+				supported: false,
+				service_available: false,
+				workspace_context: request.workspace_context,
+				request_id: request.request_id,
+				operation: "close_pdf",
+				backend: managedRecord.viewerBackend,
+				backend_path: backendPath,
+				backend_identity_ok: backendIdentityOk,
+				closed,
+				handle: managedRecord.viewerHandle,
+				reason,
+				pdf_id: request.pdf_id,
+				error_code: typeof backendDetails.error_code === "string"
+					? backendDetails.error_code
+					: "backend_unavailable",
+			},
+		};
+	}
+
 	private async prepareSocketPath(): Promise<void> {
 		const baseDir = dirname(this.socketPath);
 		ensureDirectory(baseDir);
@@ -1991,6 +2202,7 @@ function getOperationFromPayload(payload: unknown): HostServiceOperation {
 			|| operation === "compile_latex_snippet"
 			|| operation === "rasterize"
 			|| operation === "open_pdf"
+			|| operation === "close_pdf"
 			|| operation === "register_callback_target"
 			|| operation === "unregister_callback_target"
 			|| operation === "resolve_callback_target"
@@ -2172,6 +2384,20 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				},
 			};
 		}
+		case "close_pdf": {
+			const rawPdfId = (value as Record<string, unknown>).pdf_id;
+			if (typeof rawPdfId !== "number" || !Number.isInteger(rawPdfId) || rawPdfId <= 0) {
+				throw new Error("invalid pdf_id");
+			}
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "close_pdf",
+				created_at_ns: value.created_at_ns,
+				workspace_context: value.workspace_context,
+				pdf_id: rawPdfId,
+			};
+		}
 		case "register_callback_target": {
 			if (typeof value.target_id !== "string" || !value.target_id.trim()) {
 				throw new Error("invalid target_id");
@@ -2278,6 +2504,9 @@ function isValidHostServiceResponse(
 	}
 	if (value.operation === "open_pdf") {
 		return isValidOpenResponse(value, expectedRequestId);
+	}
+	if (value.operation === "close_pdf") {
+		return isValidCloseResponse(value, expectedRequestId);
 	}
 	return false;
 }
@@ -2673,6 +2902,40 @@ function isValidOpenResponse(response: unknown, expectedRequestId: string): resp
 	if (response.status === "ok" && details.handle === undefined) return false;
 	return true;
 }
+
+function isValidCloseResponse(response: unknown, expectedRequestId: string): response is HostServiceCloseResponseEnvelope {
+	if (!isStringRecord(response)) return false;
+	if (response.status !== "ok" && response.status !== "error") return false;
+	if (typeof response.protocol_version !== "number" || response.protocol_version !== PROTOCOL_VERSION) return false;
+	if (typeof response.request_id !== "string" || response.request_id !== expectedRequestId) return false;
+	if (response.operation !== "close_pdf") return false;
+	if (typeof response.generated_at_ns !== "number") return false;
+	if (response.error !== undefined && typeof response.error !== "string") return false;
+	if (response.status === "error" && response.error === undefined) return false;
+	if (!isStringRecord(response.status_details)) return false;
+	const details = response.status_details;
+	if (typeof details.protocol_version !== "number" || details.protocol_version !== PROTOCOL_VERSION) return false;
+	if (typeof details.supported !== "boolean") return false;
+	if (typeof details.service_available !== "boolean") return false;
+	if (!isValidWorkspaceContext(details.workspace_context)) return false;
+	if (typeof details.request_id !== "string" || details.request_id !== expectedRequestId) return false;
+	if (details.operation !== "close_pdf") return false;
+	if (typeof details.backend !== "string" || !details.backend) return false;
+	if (typeof details.backend_path !== "string" || !details.backend_path) return false;
+	if (details.backend_identity_ok !== undefined && typeof details.backend_identity_ok !== "boolean") return false;
+	if (typeof details.closed !== "boolean") return false;
+	if (details.handle !== undefined && typeof details.handle !== "string") return false;
+	const closeRequestError = response.status === "error" && typeof details.error_code === "string" && details.error_code === "invalid_request";
+	if (!closeRequestError && (typeof details.pdf_id !== "number" || !Number.isInteger(details.pdf_id) || details.pdf_id <= 0)) {
+		return false;
+	}
+	if (details.error_code !== undefined && typeof details.error_code !== "string") return false;
+	if (details.reason !== undefined && typeof details.reason !== "string") return false;
+	if (response.status === "error" && typeof details.error_code !== "string") return false;
+	if (response.status === "ok" && details.error_code !== undefined) return false;
+	return true;
+}
+
 function isValidCommonHostServiceResponse(
 	response: unknown,
 	expectedRequestId: string,
@@ -2989,7 +3252,7 @@ function buildRasterizeErrorResponse(
 function buildViewerOperationErrorResponse(
 	requestId: string,
 	workspaceContext: HostServiceWorkspaceContext,
-	operation: "open_pdf",
+	operation: "open_pdf" | "close_pdf",
 	errorCode: string,
 	errorText: string,
 ): string {
@@ -3023,6 +3286,12 @@ function buildViewerOperationErrorResponse(
 		};
 		(base.status_details as Record<string, unknown>).owned = false;
 		(base.status_details as Record<string, unknown>).reused = false;
+	}
+	if (operation === "close_pdf") {
+		(base.status_details as Record<string, unknown>).backend = "unknown";
+		(base.status_details as Record<string, unknown>).backend_path = "unknown";
+		(base.status_details as Record<string, unknown>).closed = false;
+		(base.status_details as Record<string, unknown>).reason = "unavailable during validation";
 	}
 	return `${JSON.stringify(base)}\n`;
 }
