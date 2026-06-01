@@ -15,7 +15,11 @@ import { join } from "node:path";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { HostServiceClient, HostServiceServer } from "../../src/modules/host_service.ts";
+import {
+	FakeViewerBackend,
+	HostServiceClient,
+	HostServiceServer,
+} from "../../src/modules/host_service.ts";
 
 function temporaryDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));
@@ -92,6 +96,23 @@ function readFromSocket(path: string, timeoutMs = 300): Promise<string> {
 			resolve(raw);
 		});
 	});
+}
+
+function buildHostServiceBackendHarness(baseDir: string, backend?: FakeViewerBackend): {
+	server: HostServiceServer;
+	client: HostServiceClient;
+} {
+	const socketPath = join(baseDir, "host-service.sock");
+	const testBackend = backend ?? new FakeViewerBackend();
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: testBackend,
+	});
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+	});
+	return { server, client };
 }
 
 function startOrphanSocketServer(path: string): Promise<import("node:child_process").ChildProcess> {
@@ -459,4 +480,45 @@ test("host service replaces stale socket on startup", async () => {
 	await hostServer.stop();
 
 	rmSync(baseDir, { recursive: true, force: true });
+});
+test("host service status reports configured fake viewer backend name and capabilities", async () => {
+	const baseDir = temporaryDir("host-service-backend-harness-status-");
+	const fakeBackend = new FakeViewerBackend({
+		name: "agent-synctex-fake-viewer",
+		capabilities: {
+			close: false,
+			forward_search: false,
+		},
+	});
+	const { server, client } = buildHostServiceBackendHarness(baseDir, fakeBackend);
+
+	await server.start();
+	try {
+		const status = await client.requestStatus({ cwd: baseDir });
+		assert.equal(status.viewer_backend_name, "agent-synctex-fake-viewer");
+		assert.equal(status.viewer_backend_available, true);
+		assert.equal(status.viewer_backend_capabilities?.open, true);
+		assert.equal(status.viewer_backend_capabilities?.close, false);
+		assert.equal(status.viewer_backend_capabilities?.forward_search, false);
+		assert.equal(status.service_available, true);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service status reflects backend availability for health checks", async () => {
+	const baseDir = temporaryDir("host-service-backend-harness-unavailable-");
+	const fakeBackend = new FakeViewerBackend({ available: false });
+	const { server, client } = buildHostServiceBackendHarness(baseDir, fakeBackend);
+
+	await server.start();
+	try {
+		const status = await client.requestStatus({ cwd: baseDir });
+		assert.equal(status.viewer_backend_available, false);
+		assert.equal(status.service_available, false);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
 });
