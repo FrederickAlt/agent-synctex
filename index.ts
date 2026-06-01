@@ -1660,9 +1660,10 @@ export default function (pi: ExtensionAPI) {
 						throw new Error("closeTrackedPdf requires host-service metadata in normal operation mode");
 					},
 					signal,
-					async (hostPdfId, hostServiceSocketPath, closeSignal) => {
+					async (hostPdfId, trackedHostServiceSocketPath, closeSignal) => {
+						const socketPath = trackedHostServiceSocketPath || hostServiceSocketPath();
 						const workspaceHostServiceClient = new HostServiceClient({
-							socketPath: hostServiceSocketPath,
+							socketPath,
 							requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
 						});
 						const closeResponse = await workspaceHostServiceClient.requestClosePdf(workspaceContext, hostPdfId, closeSignal);
@@ -1738,13 +1739,14 @@ export default function (pi: ExtensionAPI) {
 						},
 						requestJumpFromHostService: async (
 						hostPdfId,
-						hostServiceSocketPath,
+						trackedHostServiceSocketPath,
 						hostSourceFile,
 						jumpLine,
 						jumpSignal,
 					) => {
+						const socketPath = trackedHostServiceSocketPath || hostServiceSocketPath();
 						const workspaceHostServiceClient = new HostServiceClient({
-							socketPath: hostServiceSocketPath,
+							socketPath,
 							requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
 						});
 						const hostResponse = await workspaceHostServiceClient.requestJumpPdf(
@@ -1754,6 +1756,7 @@ export default function (pi: ExtensionAPI) {
 						);
 						return {
 							handled: hostResponse.handled,
+							pdf: hostResponse.pdf,
 							source_file: hostResponse.source_file,
 							source_line: hostResponse.source_line,
 							reopened: hostResponse.reopened,

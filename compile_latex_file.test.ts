@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
-import { closeTrackedPdfForContext, jumpTrackedPdfForContext } from "./src/modules/pdf_session/pdf_session.ts";
+import { clearPdfTrackerForContext, closeTrackedPdfForContext, jumpTrackedPdfForContext } from "./src/modules/pdf_session/pdf_session.ts";
 import {
 	FakeViewerBackend,
 	HostServiceClient,
@@ -867,8 +867,9 @@ test("jump_pdf and close_pdf surface errors for unknown or closed host-service I
 	const { root, sourcePath } = withTemporaryProject();
 	const tools = await captureTools();
 	const context = createSessionContext(root);
+	const sourceLine = "\\begin{document}ok\\end{document}";
 	writeFileSync(resolve(root, "paper.pdf"), "%PDF-1.7\n");
-	writeFileSync(sourcePath, "\\begin{document}ok\\end{document}\n");
+	writeFileSync(sourcePath, `${sourceLine}\n`);
 	const fixedPdfId = 8888;
 	try {
 		await withHostService(
@@ -918,41 +919,90 @@ test("jump_pdf and close_pdf surface errors for unknown or closed host-service I
 				}
 				const staleCloseText = staleCloseError instanceof Error ? staleCloseError.message : String(staleCloseError);
 				assert.equal(/Closed pdf_id=/.test(staleCloseText), true);
+
+				let unknownCloseError: unknown;
+				try {
+					await tools.closePdfTool.execute(
+						"close-pdf-unknown",
+						{ pdf_id: 424242 },
+						undefined,
+						undefined,
+						context,
+					);
+					assert.fail("close_pdf should reject for unknown id");
+				} catch (error) {
+					unknownCloseError = error;
+				}
+				const unknownCloseText = unknownCloseError instanceof Error ? unknownCloseError.message : String(unknownCloseError);
+				assert.equal(/Unknown pdf_id=/.test(unknownCloseText), true);
+
+				let unknownJumpError: unknown;
+				try {
+					await tools.jumpPdfTool.execute(
+						"jump-pdf-unknown",
+						{ pdf_id: 424242, line: 1, source_file: sourcePath },
+						undefined,
+						undefined,
+						context,
+					);
+					assert.fail("jump_pdf should reject for unknown id");
+				} catch (error) {
+					unknownJumpError = error;
+				}
+				const unknownJumpText = unknownJumpError instanceof Error ? unknownJumpError.message : String(unknownJumpError);
+				assert.equal(/Unknown pdf_id=/.test(unknownJumpText), true);
 			},
 			{ managedViewerRecords: makeFixedHostServicePdfIdRegistry(fixedPdfId) },
 		);
+	} finally {
+		await runSessionShutdown(context);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
-		let unknownCloseError: unknown;
-		try {
-			await tools.closePdfTool.execute(
-				"close-pdf-unknown",
-				{ pdf_id: 424242 },
-				undefined,
-				undefined,
-				context,
-			);
-			assert.fail("close_pdf should reject for unknown id");
-		} catch (error) {
-			unknownCloseError = error;
-		}
-		const unknownCloseText = unknownCloseError instanceof Error ? unknownCloseError.message : String(unknownCloseError);
-		assert.equal(/Unknown tracked pdf_id/.test(unknownCloseText), true);
-
-		let unknownJumpError: unknown;
-		try {
-			await tools.jumpPdfTool.execute(
-				"jump-pdf-unknown",
-				{ pdf_id: 424242, line: 1, source_file: sourcePath },
-				undefined,
-				undefined,
-				context,
-			);
-			assert.fail("jump_pdf should reject for unknown id");
-		} catch (error) {
-			unknownJumpError = error;
-		}
-		const unknownJumpText = unknownJumpError instanceof Error ? unknownJumpError.message : String(unknownJumpError);
-		assert.equal(/Unknown tracked pdf_id/.test(unknownJumpText), true);
+test("close_pdf and jump_pdf work when the host-service ID is active but not locally tracked", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tools = await captureTools();
+	const context = createSessionContext(root);
+	const sourceLine = "\\begin{document}ok\\end{document}";
+	writeFileSync(resolve(root, "paper.pdf"), "%PDF-1.7\n");
+	writeFileSync(sourcePath, `${sourceLine}\n`);
+	const fixedPdfId = 9004;
+	try {
+		await withHostService(
+			new FakeJumpableViewerBackend(),
+			async () => {
+				await runSessionStart(context);
+				const openResult = await tools.openPdfTool.execute(
+					"open-pdf-tool-untracked",
+					{ pdf_file_path: resolve(root, "paper.pdf") },
+					undefined,
+					undefined,
+					context,
+				);
+				const openDetails = openResult.details as { pdf_id: number; pdf: string };
+				assert.equal(openDetails.pdf_id, fixedPdfId);
+				clearPdfTrackerForContext(context);
+				const jumpResult = await tools.jumpPdfTool.execute(
+					"jump-pdf-tool-untracked",
+					{ pdf_id: openDetails.pdf_id, line: 1, source_file: sourcePath },
+					undefined,
+					undefined,
+					context,
+				);
+				assert.equal(jumpResult.content[0].text, `line 1 contains:\n${sourceLine}`);
+				assert.equal(jumpResult.details.pdf, openDetails.pdf);
+				const closeResult = await tools.closePdfTool.execute(
+					"close-pdf-tool-untracked",
+					{ pdf_id: openDetails.pdf_id },
+					undefined,
+					undefined,
+					context,
+				);
+				assert.equal(closeResult.details.closed, true);
+			},
+			{ managedViewerRecords: makeFixedHostServicePdfIdRegistry(fixedPdfId) },
+		);
 	} finally {
 		await runSessionShutdown(context);
 		rmSync(root, { recursive: true, force: true });

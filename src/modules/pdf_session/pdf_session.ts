@@ -66,7 +66,7 @@ export type PdfSessionClose = (
 	signal?: AbortSignal,
 ) => Promise<{ closed: boolean; reason?: string }>;
 
-export type PdfSessionCloseFromHostService = (hostServicePdfId: number, hostServiceSocketPath: string, signal?: AbortSignal) => Promise<{ closed: boolean; reason?: string }>;
+export type PdfSessionCloseFromHostService = (hostServicePdfId: number, hostServiceSocketPath?: string, signal?: AbortSignal) => Promise<{ closed: boolean; reason?: string }>;
 
 function toPdfOpenResult(openResult: PdfSessionOpenResult | void): PdfOpenResult | void {
 	if (!openResult) return undefined;
@@ -204,12 +204,13 @@ export interface PdfSessionJumpOptions {
 	sourceLineReader?: PdfSessionJumpSourceReader;
 	requestJumpFromHostService?: (
 		hostServicePdfId: number,
-		hostServiceSocketPath: string,
-		sourceFile: string,
+		hostServiceSocketPath: string | undefined,
+		sourceFile: string | undefined,
 		line: number,
 		signal?: AbortSignal,
 	) => Promise<{
 		handled?: boolean;
+		pdf?: string;
 		source_file?: string;
 		source_line?: string;
 		reopened?: boolean;
@@ -264,10 +265,11 @@ export async function jumpTrackedPdfForContext(
 					);
 					return {
 						handled: response.handled,
+						pdf: response.pdf,
 						source_file: response.source_file,
 						source_line: response.source_line,
 						reopened: response.reopened,
-				};
+					};
 				}
 				: undefined,
 		},
