@@ -1,6 +1,6 @@
 import { createInterface, type Interface } from "node:readline";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -26,6 +26,7 @@ import {
 	type ShowLatexCallOptions,
 	type ShowLatexCompiledPreview,
 	type ShowLatexPreviewResult,
+	type ShowLatexWorkspaceContext,
 } from "./src/modules/preview/show_latex_pipeline.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "./src/modules/preview/kitty_placeholder_image.ts";
 import {
@@ -42,6 +43,8 @@ import { ViewerServiceClient, type ViewerServiceOpenResult } from "./src/modules
 import {
 	HostServiceClient,
 	type HostServiceCompileResponseDetails,
+	type HostServiceCompileSnippetResponseDetails,
+	type HostServiceOpenResponseDetails,
 	defaultHostServiceSocketPath,
 } from "./src/modules/host_service.ts";
 import {
@@ -160,20 +163,6 @@ function findPreambleFile(directory: string): string | null {
 	}
 
 	return null;
-}
-
-function readLatexPreambleFromTmpdir(): string {
-	ensurePreviewTmpdirAccessible();
-
-	const preambleFile = findPreambleFile(MCP_TMPDIR);
-	if (!preambleFile) return "";
-
-	try {
-		return readFileSync(preambleFile, "utf8").trim();
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`Failed to read temp preamble ${preambleFile}: ${message}`);
-	}
 }
 
 function writeLatexPreambleToTmpdir(latexPreamble: string): number {
@@ -943,6 +932,14 @@ function hostServiceWorkspaceContextForRequest(ctx?: ExtensionContext): { cwd: s
 	return { cwd: process.cwd() };
 }
 
+function hostServiceWorkspaceContextForShowLatex(ctx?: ExtensionContext): { cwd: string; workspace_root?: string; session_id?: string } {
+	const context = hostServiceWorkspaceContextForRequest(ctx);
+	return {
+		...context,
+		workspace_root: MCP_TMPDIR,
+	};
+}
+
 async function ensureHostServiceCallbackTarget(ctx: ExtensionContext): Promise<string> {
 	const contextKey = callbackKeyForContext(ctx);
 	const targetId = hostServiceTargetId(ctx);
@@ -1146,21 +1143,37 @@ const SynctexCallbackCommandParams = Type.Object({}, { additionalProperties: fal
 
 const showLatexPreviewPipeline = createShowLatexPreviewPipeline({
 	resolveLatexCompiler,
-	callShowLatex: (latexSource, compiler, synctexEditorCommand, signal, options) => {
-		if (!existsSync(MCP_SCRIPT_PATH)) {
-			throw new Error(`MCP script not found at ${MCP_SCRIPT_PATH}`);
-		}
-		return mcpClient.callShowLatex(
-			latexSource,
-			compiler,
-			synctexEditorCommand,
+	callShowLatex: async (latexSource, compiler, _synctexEditorCommand, signal, options) => {
+		const workspaceContext = options?.workspaceContext ?? hostServiceWorkspaceContextForRequest(undefined);
+		const client = new HostServiceClient({
+			socketPath: hostServiceSocketPath(),
+			requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+		});
+		const compileResult = await client.requestCompileLatexSnippet(
+			{
+				latex_source: latexSource,
+				compiler: compiler,
+				...(options?.suppressPageNumbers === true ? { suppress_page_numbers: true } : {}),
+				...(options?.cropToContent === true ? { crop_to_content: true } : {}),
+			},
+			workspaceContext,
 			signal,
-			options,
 		);
+		return { text: "ok", pdfPath: compileResult.pdf, sourcePath: compileResult.source };
 	},
-	readLatexPreamble: () => readLatexPreambleFromTmpdir(),
 	rememberInlinePreviewRenderState,
-	rasterizePdfPages,
+	rasterizePdfPages: async (pdfPath, options) => {
+		const client = new HostServiceClient({
+			socketPath: hostServiceSocketPath(),
+			requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+		});
+		const rasterResult = await client.requestRasterizePdf(
+			{ pdf_path: pdfPath },
+			options?.workspaceContext ?? hostServiceWorkspaceContextForRequest(undefined),
+			options?.signal,
+		);
+		return rasterResult.artifacts;
+	},
 	mergeInlinePreviewArtifacts,
 	buildInlinePreviewToolPayload,
 });
@@ -1183,6 +1196,7 @@ async function executeShowLatexPreviewTool(
 	let previewPdfPath = "";
 	let preview: ShowLatexCompiledPreview;
 	let inline = true;
+	const workspaceContext = hostServiceWorkspaceContextForShowLatex(ctx);
 
 	try {
 		latexSource = latexSourceInput;
@@ -1201,6 +1215,7 @@ async function executeShowLatexPreviewTool(
 			compiler,
 			inline,
 			signal,
+			workspaceContext,
 			synctexEditorCommand: inline ? undefined : synctexCommand,
 		});
 		previewPdfPath = preview.previewPdfPath;
@@ -1222,14 +1237,51 @@ async function executeShowLatexPreviewTool(
 	}
 
 	try {
+		const callbackTargetId = await ensureHostServiceCallbackTarget(ctx!);
 		const callbackConfig = (await ensureSynctexCallbacks(ctx!)).callbackConfig;
-		const trackedPdf = await openTrackedPdfForContextFromViewerService(
-			ctx,
-			MCP_FIXED_PREVIEW_PDF_PATH,
-			signal,
-			(path, openSignal) => openPdfThroughViewerService(path, callbackConfig, openSignal),
-			synctexCommand || undefined,
-		);
+		if (previewPdfPath !== MCP_FIXED_PREVIEW_PDF_PATH) {
+			ensurePreviewTmpdirAccessible();
+			copyFileSync(previewPdfPath, MCP_FIXED_PREVIEW_PDF_PATH);
+			copySynctexArtifactsForFixedPdfPath(previewPdfPath, MCP_FIXED_PREVIEW_PDF_PATH);
+		}
+		const openResponse = await openPdfThroughHostService(MCP_FIXED_PREVIEW_PDF_PATH, workspaceContext, callbackConfig, signal);
+		if (openResponse.pdf_id === undefined) {
+			throw new Error("Host service open response missing pdf_id");
+		}
+		let trackedPdf: Awaited<ReturnType<typeof openTrackedPdfForContext>>;
+		const defaultSourceForPdf = preview.sourcePath ?? previewPdfPath;
+		const trackedOpenResult = {
+			pid: openResponse.pid,
+			viewerHandle: openResponse.handle,
+			viewerBackend: openResponse.backend,
+			viewerOwned: openResponse.owned,
+			viewerCapabilities: openResponse.capabilities,
+			hostServicePdfId: openResponse.pdf_id,
+			hostServiceSocketPath: hostServiceSocketPath(),
+			hostServiceCallbackTargetId: callbackTargetId,
+		};
+		try {
+			trackedPdf = await openTrackedPdfForContext(
+				ctx,
+				MCP_FIXED_PREVIEW_PDF_PATH,
+				signal,
+				async () => trackedOpenResult,
+				defaultSourceForPdf,
+				synctexCommand || undefined,
+				{
+					reuseTrackedPdf: false,
+					pdfId: openResponse.pdf_id,
+				},
+			);
+		} catch (error) {
+			if (openResponse.pdf_id !== undefined) {
+				await new HostServiceClient({
+					socketPath: hostServiceSocketPath(),
+					requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+				}).requestClosePdf(workspaceContext, openResponse.pdf_id, signal).catch(() => undefined);
+			}
+			throw error;
+		}
 
 		return {
 			content: [{ type: "text", text: preview.text }],
@@ -1260,7 +1312,7 @@ function describeShowLatexViewerOpenFailure(error: unknown): string {
 	const message = errorMessage(error).toLowerCase();
 	const errorCode = extractViewerServiceErrorCode(error);
 
-	if (message.includes("viewer service request timed out")) {
+	if (message.includes("viewer service request timed out") || message.includes("host service request timed out")) {
 		return "Viewer service request timed out while opening preview";
 	}
 	if (errorCode === "backend_unavailable") {
@@ -1269,7 +1321,7 @@ function describeShowLatexViewerOpenFailure(error: unknown): string {
 	if (errorCode) {
 		return `Viewer service unavailable while opening preview (code=${errorCode})`;
 	}
-	if (message.includes("viewer service unavailable")) {
+	if (message.includes("viewer service unavailable") || message.includes("host service unavailable")) {
 		return "Viewer service unavailable while opening preview";
 	}
 	return "Viewer service unavailable while opening preview";
@@ -1284,7 +1336,9 @@ function isStringRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hostServiceCompileErrorDetails(error: unknown): HostServiceCompileResponseDetails | undefined {
+function hostServiceCompileErrorDetails(
+	error: unknown,
+): (HostServiceCompileResponseDetails | { operation?: string; source?: string; pdf?: string; clean?: boolean; cleaned_artifacts?: unknown; error_code?: string } ) | undefined {
 	if (!error || typeof error !== "object") {
 		return;
 	}
@@ -1292,13 +1346,13 @@ function hostServiceCompileErrorDetails(error: unknown): HostServiceCompileRespo
 	if (!isStringRecord(statusDetails)) {
 		return;
 	}
-	if (statusDetails.operation !== "compile_latex_file") {
+	if (typeof statusDetails.operation === "string" && !["compile_latex_file", "compile_latex_snippet"].includes(statusDetails.operation)) {
 		return;
 	}
 	if (typeof statusDetails.source !== "string" || typeof statusDetails.pdf !== "string") {
 		return;
 	}
-	return statusDetails as unknown as HostServiceCompileResponseDetails;
+	return statusDetails as HostServiceCompileResponseDetails | HostServiceCompileSnippetResponseDetails | { operation?: string };
 }
 
 function stringsOrEmpty(value: unknown): string[] {
@@ -1316,8 +1370,8 @@ function describeCompileFailureContext(
 	const details = hostServiceCompileErrorDetails(error);
 	if (details) {
 		return {
-			source: details.source,
-			pdf: details.pdf,
+			source: typeof details.source === "string" ? details.source : requestedPath,
+			pdf: typeof details.pdf === "string" ? details.pdf : "",
 			clean: typeof details.clean === "boolean" ? details.clean : false,
 			cleaned_artifacts: stringsOrEmpty(details.cleaned_artifacts),
 		};
@@ -1347,6 +1401,44 @@ async function openPdfThroughViewerService(
 		path,
 		callbackConfig,
 		{ reuseExisting: true, requirePersistentViewer: true },
+		signal,
+	);
+}
+
+function copySynctexArtifactsForFixedPdfPath(sourcePdfPath: string, fixedPdfPath: string): void {
+	const sourceBase = sourcePdfPath.toLowerCase().endsWith(".pdf") ? sourcePdfPath.slice(0, -4) : sourcePdfPath;
+	const fixedBase = fixedPdfPath.toLowerCase().endsWith(".pdf") ? fixedPdfPath.slice(0, -4) : fixedPdfPath;
+	for (const extension of [".synctex", ".synctex.gz"] as const) {
+		const sourceArtifactPath = `${sourceBase}${extension}`;
+		const fixedArtifactPath = `${fixedBase}${extension}`;
+		if (existsSync(sourceArtifactPath)) {
+			copyFileSync(sourceArtifactPath, fixedArtifactPath);
+			continue;
+		}
+		if (existsSync(fixedArtifactPath)) {
+			rmSync(fixedArtifactPath);
+		}
+	}
+}
+
+async function openPdfThroughHostService(
+	pdfPath: string,
+	workspaceContext: ShowLatexWorkspaceContext,
+	callbackConfig: SynctexCallbackConfig,
+	signal?: AbortSignal,
+): Promise<HostServiceOpenResponseDetails> {
+	const hostServiceClient = new HostServiceClient({
+		socketPath: hostServiceSocketPath(),
+		requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+	});
+	return hostServiceClient.requestOpenPdf(
+		workspaceContext,
+		{
+			pdf_path: pdfPath,
+			callback: callbackConfig,
+			reuse_existing: true,
+			require_persistent_viewer: true,
+		},
 		signal,
 	);
 }

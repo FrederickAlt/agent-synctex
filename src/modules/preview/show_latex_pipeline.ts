@@ -1,5 +1,4 @@
 import type { LatexCompiler } from "../latex/latex_file_compiler.ts";
-import { applyLatexPreamble } from "../latex/latex_preamble.ts";
 import { mergeInlinePreviewArtifacts, rasterizePdfPages, type InlinePreviewArtifact } from "./inline_preview.ts";
 import { buildInlinePreviewToolPayload, type InlinePreviewToolPayload } from "./inline_preview_payload.ts";
 import { type InlinePreviewRenderState } from "./inline_preview_metadata.ts";
@@ -13,6 +12,7 @@ export interface ParsedShowLatexInput {
 export interface ShowLatexPreviewResult {
 	text: string;
 	pdfPath: string;
+	sourcePath?: string;
 }
 
 export interface ShowLatexCallOptions {
@@ -22,6 +22,12 @@ export interface ShowLatexCallOptions {
 	suppressPageNumbers?: boolean;
 }
 
+export interface ShowLatexWorkspaceContext {
+	cwd: string;
+	workspace_root?: string;
+	session_id?: string;
+}
+
 export interface ShowLatexPipelineDependencies {
 	resolveLatexCompiler: (compiler: unknown) => LatexCompiler | undefined;
 	callShowLatex: (
@@ -29,11 +35,13 @@ export interface ShowLatexPipelineDependencies {
 		compiler: LatexCompiler | undefined,
 		synctexEditorCommand: string | undefined,
 		signal: AbortSignal | undefined,
-		options?: ShowLatexCallOptions,
+		options: ShowLatexCallOptions & { workspaceContext?: ShowLatexWorkspaceContext },
 	) => Promise<ShowLatexPreviewResult>;
-	readLatexPreamble: () => string;
 	rememberInlinePreviewRenderState: (state: InlinePreviewRenderState) => string;
-	rasterizePdfPages: (pdfPath: string, options: { dpi?: number; signal?: AbortSignal }) => Promise<InlinePreviewArtifact[]>;
+	rasterizePdfPages: (
+		pdfPath: string,
+		options: { dpi?: number; signal?: AbortSignal; workspaceContext?: ShowLatexWorkspaceContext },
+	) => Promise<InlinePreviewArtifact[]>;
 	mergeInlinePreviewArtifacts: (
 		artifacts: InlinePreviewArtifact[],
 		options: { signal?: AbortSignal },
@@ -51,12 +59,15 @@ export interface ShowLatexPipelineCompileRequest {
 	inline?: boolean;
 	synctexEditorCommand?: string;
 	signal?: AbortSignal;
+	workspaceContext?: ShowLatexWorkspaceContext;
 }
 
 export interface ShowLatexCompiledPreview {
 	text: string;
 	previewPdfPath: string;
 	inline: boolean;
+	sourcePath?: string;
+	workspaceContext?: ShowLatexWorkspaceContext;
 }
 
 export interface ShowLatexInlineResult {
@@ -163,11 +174,7 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 
 		const inline = request.inline !== false;
 		const preview = await dependencies.callShowLatex(
-			applyLatexPreamble(
-				request.latexSource,
-				dependencies.readLatexPreamble(),
-				{ cropToContent: false, suppressPageNumbers: inline },
-			),
+			request.latexSource,
 			request.compiler,
 			request.synctexEditorCommand,
 			request.signal,
@@ -176,13 +183,16 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 				writeFixed: !inline,
 				cropToContent: false,
 				suppressPageNumbers: inline,
+				workspaceContext: request.workspaceContext,
 			},
 		);
 
 		return {
 			text: preview.text,
 			previewPdfPath: preview.pdfPath,
+			sourcePath: preview.sourcePath,
 			inline,
+			workspaceContext: request.workspaceContext,
 		};
 	}
 
@@ -191,7 +201,11 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 			throw new Error("Cannot build inline preview result for external flow");
 		}
 
-		const pageArtifacts = await dependencies.rasterizePdfPages(compiledPreview.previewPdfPath, { dpi: 150, signal });
+		const pageArtifacts = await dependencies.rasterizePdfPages(compiledPreview.previewPdfPath, {
+			dpi: 150,
+			signal,
+			workspaceContext: compiledPreview.workspaceContext,
+		});
 		const artifacts = await dependencies.mergeInlinePreviewArtifacts(pageArtifacts, { signal });
 		const previewId = dependencies.rememberInlinePreviewRenderState({
 			pdf: compiledPreview.previewPdfPath,
