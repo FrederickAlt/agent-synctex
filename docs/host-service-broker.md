@@ -40,18 +40,32 @@ Expected to confirm the broker is managing the host daemon and not the legacy Py
 - "TypeScript Host Service" (or equivalent wording)
 - `agent-synctex-host-service`
 
-### 2) `systemctl --user status show-latex.service`
+### 2) `systemctl` host unit checks
+
+Use `status` for active/loaded state:
+
+```bash
+systemctl --user status show-latex.service
+```
 
 Expected host daemon status shape:
 
 - `Loaded: loaded` for `show-latex.service`
 - `Active: active (running)`
-- `ExecStart=.../agent-synctex-host-service.ts start`
 - no stale/legacy Python viewer-command process ownership in the host-service path
+
+Use `show` or `cat` for the exact `ExecStart` assertion, because `status` output is not guaranteed to include it:
+
+```bash
+systemctl --user show -p ExecStart show-latex.service
+systemctl --user cat show-latex.service
+```
+
+Expected unit definition includes `ExecStart=.../agent-synctex-host-service.ts start`.
 
 ### 3) `journalctl --user -u show-latex.service`
 
-Expected logs should include daemon startup and viewer lifecycle lines from the TypeScript host service (for example service start/stop/open/close/jump events) and should not be tied to the old Python viewer service.
+Expected logs should include currently emitted TypeScript host-service startup/status/error signals, such as `agent-synctex-host-service: started at ...` or `agent-synctex host service running on ...`, and should not be tied to the old Python viewer service. Do not require open/close/jump lifecycle lines unless host-service code is updated to emit them.
 
 ### 4) `npm run host-service:status` (executed in Firejail context)
 
@@ -71,6 +85,8 @@ Expected JSON payload includes at least:
 
 > Issue #55 is ready for closure from a docs/audit standpoint: I have added explicit host-service broker verification notes for the externalized migration (`docs/host-service-broker.md`), including expected service names, expected external files, runtime directories, and concrete verification commands.
 >
-> The repo side now documents and validates the TypeScript Host Service flow via `show-latex.service` + `systemctl --user status show-latex.service` + `journalctl --user -u show-latex.service` + `npm run host-service:status` (in Firejail, expecting `service_available: true`, `service_name: agent-synctex-host-service`, `viewer_backend_name: zathura`).
+> Closure evidence is captured in `docs/hitl-56-host-service-smoke.md`: the external broker now targets `show-latex.service`; Firejail `npm run host-service:status` reaches the TypeScript Host Service and reports `service_available: true`, `service_name: agent-synctex-host-service`, and `viewer_backend_name: zathura`; external open, jump, inverse SyncTeX, and close HITL flows passed; and the old Python viewer service is no longer the normal runtime path.
+>
+> Verification status: `<fill in npm run verify / relevant check result before posting>`.
 >
 > No code changes were made here, as host-path and migration files are external by design; only repository-side documentation and auditability were updated.
