@@ -105,6 +105,53 @@ while true; do
 	chmodSync(path, 0o700);
 }
 
+function shellSingleQuoted(value: string): string {
+	return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+function writeFakeForkingZathuraViewerBinary(path: string, options: { childPidFile?: string } = {}): void {
+	const childPidFile = options.childPidFile ?? "";
+	const quotedChildPidFile = shellSingleQuoted(childPidFile);
+	const script = `#!/usr/bin/env bash
+set -eu
+if [ "$1" = "--zathura-existing" ]; then
+	shift
+	while true; do
+		sleep 1
+	done
+fi
+if [ "$1" = "--zathura-fork-child" ]; then
+	shift
+	childPidFile=${quotedChildPidFile}
+	if [ -n "$childPidFile" ]; then
+		printf '%s' "$$" > "$childPidFile"
+	fi
+	while true; do
+		sleep 1
+	done
+fi
+"$0" --zathura-fork-child "$@" &
+exit 0
+`;
+	writeFileSync(path, script, { encoding: "utf8", mode: 0o700 });
+	chmodSync(path, 0o700);
+}
+
+function writeFakeShortLivedZathuraViewerBinary(path: string): void {
+	const script = `#!/usr/bin/env bash
+set -eu
+if [ "$1" = "--zathura-existing" ]; then
+	shift
+	while true; do
+		sleep 1
+	done
+fi
+exit 0
+`;
+	writeFileSync(path, script, { encoding: "utf8", mode: 0o700 });
+	chmodSync(path, 0o700);
+}
+
 function createMiniPng(width: number, height: number): Buffer {
 	const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 	const ihdrLength = Buffer.alloc(4);
@@ -2680,6 +2727,181 @@ test("zathura backend closes previous owned session on replacement and replaceme
 		await waitForProcessExit(secondPid);
 	} finally {
 		await backend.closeAll();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("zathura backend ignores pre-existing matching viewer process", async () => {
+	const baseDir = temporaryDir("host-service-zathura-preexisting-");
+	const binDir = join(baseDir, "bin");
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const zathuraPath = join(binDir, "zathura");
+	writeFakeShortLivedZathuraViewerBinary(zathuraPath);
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	const preexisting = spawn(zathuraPath, ["--zathura-existing", pdfPath], { stdio: "ignore" });
+	const preexistingPid = preexisting.pid;
+	if (preexistingPid === undefined) {
+		throw new Error("failed to spawn pre-existing fake viewer process");
+	}
+	const backend = new ZathuraViewerBackend({ executablePath: zathuraPath, nodePath: process.execPath });
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+
+	try {
+		const openResult = await backend.open("open", { pdf_path: pdfPath, callback, reuse_existing: true });
+		assert.equal(openResult.status, "ok");
+		const openDetails = openResult.status_details as {
+			handle?: string;
+			owned?: boolean;
+			pid?: number;
+		};
+		assert.equal(openDetails.owned, false);
+		assert.equal(openDetails.pid, undefined);
+		if (typeof openDetails.handle !== "string") {
+			throw new Error("open response did not include a handle");
+		}
+		const closeResult = await backend.close("close", { handle: openDetails.handle, backend: backend.name });
+		assert.equal(closeResult.status, "error");
+		assert.equal(closeResult.error, "viewer handle not recognized");
+		await sleep(50);
+		assert.ok(isProcessAlive(preexistingPid), "pre-existing viewer process should remain alive");
+	} finally {
+		if (isProcessAlive(preexistingPid)) {
+			try {
+				process.kill(preexistingPid, "SIGTERM");
+			} catch {
+				/* ignore */
+			}
+			try {
+				process.kill(preexistingPid, "SIGKILL");
+			} catch {
+				/* ignore */
+			}
+		}
+		await backend.closeAll();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("zathura backend closes forked persistent session on close", async () => {
+	const baseDir = temporaryDir("host-service-zathura-fork-close-");
+	const binDir = join(baseDir, "bin");
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const zathuraPath = join(binDir, "bash");
+	const childPidPath = join(baseDir, "fork-child.pid");
+	writeFakeForkingZathuraViewerBinary(zathuraPath, { childPidFile: childPidPath });
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	const backend = new ZathuraViewerBackend({ executablePath: zathuraPath, nodePath: process.execPath });
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	let discoveredPid: number | undefined;
+
+	try {
+		const openResult = await backend.open("open", { pdf_path: pdfPath, callback, reuse_existing: true });
+		const openDetails = openResult.status_details as {
+			handle?: string;
+			owned?: boolean;
+			pid?: number;
+		};
+		if (openDetails.owned !== true) {
+			throw new Error(`open did not report owned session: ${JSON.stringify(openDetails)}`);
+		}
+		if (typeof openDetails.handle !== "string") {
+			throw new Error("open response did not include a handle");
+		}
+		if (typeof openDetails.pid !== "number") {
+			throw new Error("open response did not include a process id");
+		}
+		const persistentPid = openResult.status_details.pid as number;
+		assert.ok(isProcessAlive(persistentPid), "open session pid should be alive");
+		const deadline = Date.now() + 1000;
+		while (Date.now() < deadline) {
+			try {
+				discoveredPid = Number(readFileSync(childPidPath, "utf8").trim());
+				if (Number.isInteger(discoveredPid) && discoveredPid > 0) {
+					break;
+				}
+				discoveredPid = undefined;
+			} catch {
+				discoveredPid = undefined;
+			}
+			await sleep(25);
+		}
+		if (discoveredPid === undefined) {
+			throw new Error("forked fake viewer child did not write PID");
+		}
+		assert.equal(openDetails.pid, discoveredPid);
+
+		const closeResult = await backend.close("close", { handle: openDetails.handle, backend: backend.name });
+		assert.equal(closeResult.status, "ok");
+		const closeClosed = (closeResult.status_details as { closed?: boolean }).closed;
+		if (closeClosed !== true) {
+			assert.equal((closeResult.status_details as { reason?: string }).reason, "not_running");
+		}
+		await waitForProcessExit(persistentPid);
+	} finally {
+		if (discoveredPid !== undefined && isProcessAlive(discoveredPid)) {
+			try {
+				process.kill(discoveredPid, "SIGKILL");
+			} catch {
+				/* ignore */
+			}
+		}
+		await backend.closeAll();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("zathura backend closeAll closes forked persistent sessions", async () => {
+	const baseDir = temporaryDir("host-service-zathura-fork-closeall-");
+	const binDir = join(baseDir, "bin");
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const zathuraPath = join(binDir, "bash");
+	writeFakeForkingZathuraViewerBinary(zathuraPath);
+	const pdfPathA = join(baseDir, "sample-a.pdf");
+	const pdfPathB = join(baseDir, "sample-b.pdf");
+	writeFileSync(pdfPathA, "%PDF-1.4\n");
+	writeFileSync(pdfPathB, "%PDF-1.4\n");
+	const backend = new ZathuraViewerBackend({ executablePath: zathuraPath, nodePath: process.execPath });
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+
+	try {
+		const firstOpen = await backend.open("first", { pdf_path: pdfPathA, callback, reuse_existing: true });
+		assert.equal(firstOpen.status, "ok");
+		const firstDetails = firstOpen.status_details as { handle?: string; owned?: boolean; pid?: number };
+		if (firstDetails.owned !== true || typeof firstDetails.handle !== "string" || typeof firstDetails.pid !== "number") {
+			throw new Error("first open response missing expected session data");
+		}
+		const firstPid = firstDetails.pid;
+
+		const secondOpen = await backend.open("second", { pdf_path: pdfPathB, callback, reuse_existing: true });
+		assert.equal(secondOpen.status, "ok");
+		const secondDetails = secondOpen.status_details as { handle?: string; owned?: boolean; pid?: number };
+		if (secondDetails.owned !== true || typeof secondDetails.handle !== "string" || typeof secondDetails.pid !== "number") {
+			throw new Error("second open response missing expected session data");
+		}
+		const secondPid = secondDetails.pid;
+		assert.notEqual(firstPid, secondPid);
+
+		await backend.closeAll();
+		await waitForProcessExit(firstPid);
+		await waitForProcessExit(secondPid);
+	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });
