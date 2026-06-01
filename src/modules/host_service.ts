@@ -159,6 +159,7 @@ const REQUIRED_SOCKET_MODE = 0o600;
 const MAX_PAYLOAD_BYTES = 16_384;
 const STARTUP_SOCKET_CHECK_TIMEOUT_MS = 250;
 const ACTIVE_CONNECTION_TIMEOUT_MS = 10_000;
+const CALLBACK_SOCKET_PROBE_TIMEOUT_MS = 75;
 const FALLBACK_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
 
 interface HostServiceStoredCallbackTarget {
@@ -507,7 +508,7 @@ export class HostServiceServer {
 			}
 			socket.off("data", handleData);
 			socket.removeAllListeners("timeout");
-			this.respondToRequest(raw.slice(0, lineBreak).trim(), socket);
+			void this.respondToRequest(raw.slice(0, lineBreak).trim(), socket);
 		};
 		socket.on("data", handleData);
 		socket.once("close", () => {
@@ -518,7 +519,7 @@ export class HostServiceServer {
 		});
 	}
 
-	private respondToRequest(raw: string, socket: Socket): void {
+	private async respondToRequest(raw: string, socket: Socket): Promise<void> {
 		let requestPayload: unknown;
 		let request: HostServiceRequest;
 		try {
@@ -570,13 +571,14 @@ export class HostServiceServer {
 				break;
 			}
 			case "register_callback_target": {
-				this.pruneCallbackTargets();
+				await this.pruneCallbackTargets();
+				const targetId = callbackTargetRegistryKey(request.workspace_context, request.target_id);
 				const targetRecord = {
 					target: request.target,
 					staleAfterNs: resolveStaleAfterNs(request.stale_after_ms),
 				};
-				const replaced = this.callbackTargets.has(request.target_id);
-				this.callbackTargets.set(request.target_id, targetRecord);
+				const replaced = this.callbackTargets.has(targetId);
+				this.callbackTargets.set(targetId, targetRecord);
 				response = {
 					protocol_version: this.protocolVersion,
 					request_id: request.request_id,
@@ -605,8 +607,9 @@ export class HostServiceServer {
 				break;
 			}
 			case "unregister_callback_target": {
-				this.pruneCallbackTargets();
-				const removed = this.callbackTargets.delete(request.target_id);
+				await this.pruneCallbackTargets();
+				const targetId = callbackTargetRegistryKey(request.workspace_context, request.target_id);
+				const removed = this.callbackTargets.delete(targetId);
 				response = {
 					protocol_version: this.protocolVersion,
 					request_id: request.request_id,
@@ -633,8 +636,9 @@ export class HostServiceServer {
 				break;
 			}
 			case "resolve_callback_target": {
-				this.pruneCallbackTargets();
-				const target = this.resolveCallbackTarget(request.target_id);
+				await this.pruneCallbackTargets();
+				const targetId = callbackTargetRegistryKey(request.workspace_context, request.target_id);
+				const target = await this.resolveCallbackTarget(targetId);
 				const targetAvailable = target !== undefined;
 				response = {
 					protocol_version: this.protocolVersion,
@@ -666,26 +670,26 @@ export class HostServiceServer {
 		socket.end(`${JSON.stringify(response)}\n`);
 	}
 
-	private resolveCallbackTarget(targetId: string): HostServiceCallbackTarget | undefined {
+	private async resolveCallbackTarget(targetId: string): Promise<HostServiceCallbackTarget | undefined> {
 		const stored = this.callbackTargets.get(targetId);
 		if (!stored) {
 			return undefined;
 		}
-		if (!isSocketUsable(stored.target.socket_path)) {
+		if (!(await isSocketUsable(stored.target.socket_path))) {
 			this.callbackTargets.delete(targetId);
 			return undefined;
 		}
 		return stored.target;
 	}
 
-	private pruneCallbackTargets(): void {
+	private async pruneCallbackTargets(): Promise<void> {
 		const nowNs = Date.now() * 1_000_000;
 		for (const [targetId, stored] of this.callbackTargets) {
 			if (stored.staleAfterNs !== undefined && stored.staleAfterNs > 0 && nowNs > stored.staleAfterNs) {
 				this.callbackTargets.delete(targetId);
 				continue;
 			}
-			if (!isSocketUsable(stored.target.socket_path)) {
+			if (!(await isSocketUsable(stored.target.socket_path))) {
 				this.callbackTargets.delete(targetId);
 			}
 		}
@@ -748,6 +752,12 @@ function isValidWorkspaceContext(value: unknown): value is HostServiceWorkspaceC
 	if (value.workspace_root !== undefined && typeof value.workspace_root !== "string") return false;
 	if (value.session_id !== undefined && typeof value.session_id !== "string") return false;
 	return true;
+}
+
+function callbackTargetRegistryKey(context: HostServiceWorkspaceContext, targetId: string): string {
+	const workspaceRoot = context.workspace_root ?? context.cwd;
+	const sessionId = context.session_id ?? "";
+	return JSON.stringify([workspaceRoot, sessionId, targetId]);
 }
 
 function normalizeWorkspaceContext(context: HostServiceWorkspaceContext): HostServiceWorkspaceContext {
@@ -1172,14 +1182,40 @@ function resolveStaleAfterNs(staleAfterMs: number | undefined): number | undefin
 	return Date.now() * 1_000_000 + staleAfterMs * 1_000_000;
 }
 
-function isSocketUsable(socketPath: string): boolean {
+function isSocketUsable(socketPath: string): Promise<boolean> {
 	try {
 		const st = lstatSync(socketPath);
-		return st.isSocket();
+		if (!st.isSocket()) {
+			return Promise.resolve(false);
+		}
 	} catch {
-		return false;
+		return Promise.resolve(false);
 	}
+	return new Promise<boolean>((resolve) => {
+		let settled = false;
+		const finalize = (value: boolean) => {
+			if (settled) return;
+			settled = true;
+			resolve(value);
+		};
+		const socket = createConnection({ path: socketPath });
+		const timer = setTimeout(() => {
+			finalize(false);
+			socket.destroy();
+		}, CALLBACK_SOCKET_PROBE_TIMEOUT_MS);
+		timer.unref?.();
+
+		socket.once("connect", () => {
+			finalize(true);
+			socket.destroy();
+		});
+		socket.once("error", () => {
+			finalize(false);
+			socket.destroy();
+		});
+	});
 }
+
 
 function ensureDirectory(path: string): void {
 	try {
