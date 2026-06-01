@@ -1,5 +1,10 @@
 #!/usr/bin/env node
-import { HostServiceClient, HostServiceServer, defaultHostServiceSocketPath } from "../src/modules/host_service.ts";
+import {
+	HostServiceClient,
+	HostServiceServer,
+	ZathuraViewerBackend,
+	defaultHostServiceSocketPath,
+} from "../src/modules/host_service.ts";
 
 interface ParsedArgs {
 	socketPath: string;
@@ -37,7 +42,11 @@ function usage(): void {
 }
 
 async function runStart(socketPath: string): Promise<void> {
-	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-host-service" });
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-host-service",
+		viewerBackend: new ZathuraViewerBackend(),
+	});
 	await server.start();
 	console.log(`agent-synctex-host-service: started at ${socketPath}`);
 	process.stdout.write(`agent-synctex host service running on ${socketPath}\n`);

@@ -22,7 +22,15 @@ import {
 	type InlinePreviewArtifact,
 } from "./preview/inline_preview.ts";
 import { safeInlinePreviewPngPath } from "./preview/inline_preview_metadata.ts";
+import {
+	FakeViewerBackend,
+	type FakeViewerBackendOptions,
+	type ViewerBackendAdapter,
+	ZathuraViewerBackend,
+} from "./host_service_viewer_backends.ts";
 
+export { FakeViewerBackend, ZathuraViewerBackend };
+export type { FakeViewerBackendOptions, ViewerBackendAdapter };
 export interface HostServiceWorkspaceContext {
 	cwd: string;
 	workspace_root?: string;
@@ -143,11 +151,26 @@ export interface HostServiceCallbackTargetRegistration {
 	stale_after_ms?: number;
 }
 
+export interface HostServiceOpenRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "open";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+	details: {
+		pdf_path: string;
+		callback: HostServiceCallbackTarget;
+		reuse_existing?: boolean;
+		require_persistent_viewer?: boolean;
+	};
+}
+
 export type HostServiceRequest =
 	| HostServiceStatusRequest
 	| HostServiceCompileRequest
 	| HostServiceCompileSnippetRequest
 	| HostServiceRasterizeRequest
+	| HostServiceOpenRequest
 	| HostServiceRegisterCallbackTargetRequest
 	| HostServiceUnregisterCallbackTargetRequest
 	| HostServiceResolveCallbackTargetRequest;
@@ -157,10 +180,10 @@ export type HostServiceOperation =
 	| "compile_latex_file"
 	| "compile_latex_snippet"
 	| "rasterize"
+	| "open"
 	| "register_callback_target"
 	| "unregister_callback_target"
 	| "resolve_callback_target";
-
 export interface HostServiceStatusResponseDetails {
 	protocol_version: number;
 	supported: boolean;
@@ -269,6 +292,24 @@ export interface HostServiceResolveCallbackTargetResponseDetails {
 	error_code?: string;
 }
 
+export interface HostServiceOpenResponseDetails {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	workspace_context: HostServiceWorkspaceContext;
+	request_id: string;
+	operation: "open";
+	backend: string;
+	backend_path: string;
+	capabilities: HostServiceViewerBackendCapabilities;
+	handle?: string;
+	owned: boolean;
+	reused: boolean;
+	pid?: number;
+	pid_diagnostic?: string;
+	error_code?: string;
+	reason?: string;
+}
 export interface HostServiceStatusResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
@@ -309,6 +350,15 @@ export interface HostServiceRasterizeResponseEnvelope {
 	status_details: HostServiceRasterizeResponseDetails;
 }
 
+export interface HostServiceOpenResponseEnvelope {
+	protocol_version: number;
+	request_id: string;
+	operation: "open";
+	status: "ok" | "error";
+	generated_at_ns: number;
+	error?: string;
+	status_details: HostServiceOpenResponseDetails;
+}
 export interface HostServiceRegisterCallbackTargetResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
@@ -344,6 +394,7 @@ export type HostServiceResponseEnvelope =
 	| HostServiceCompileResponseEnvelope
 	| HostServiceCompileSnippetResponseEnvelope
 	| HostServiceRasterizeResponseEnvelope
+	| HostServiceOpenResponseEnvelope
 	| HostServiceRegisterCallbackTargetResponseEnvelope
 	| HostServiceUnregisterCallbackTargetResponseEnvelope
 	| HostServiceResolveCallbackTargetResponseEnvelope;
@@ -381,18 +432,6 @@ export interface HostServiceClientOptions {
 	requestIdFactory?: () => string;
 }
 
-export interface ViewerBackendAdapter {
-	readonly name: string;
-	readonly capabilities: HostServiceViewerBackendCapabilities;
-	isAvailable(): boolean;
-}
-
-export interface FakeViewerBackendOptions {
-	name?: string;
-	available?: boolean;
-	capabilities?: Partial<HostServiceViewerBackendCapabilities>;
-}
-
 export interface HostServiceServerOptions {
 	socketPath?: string;
 	serviceName?: string;
@@ -423,45 +462,6 @@ export const MAX_ACTIVE_PDF_ID = 99_999_999;
 const DEFAULT_MIN_ACTIVE_PDF_ID = MIN_ACTIVE_PDF_ID;
 const DEFAULT_MAX_ACTIVE_PDF_ID = MAX_ACTIVE_PDF_ID;
 const DEFAULT_ACTIVE_PDF_ID_ALLOCATION_ATTEMPTS = 64;
-
-const DEFAULT_FAKE_VIEWER_BACKEND_NAME = "fake-viewer";
-const DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES: HostServiceViewerBackendCapabilities = {
-	open: true,
-	close: true,
-	forward_search: true,
-	inverse_search: false,
-	reuse: true,
-};
-
-function cloneCapabilities(overrides?: Partial<HostServiceViewerBackendCapabilities>): HostServiceViewerBackendCapabilities {
-	return {
-		open: overrides?.open ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.open,
-		close: overrides?.close ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.close,
-		forward_search: overrides?.forward_search ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.forward_search,
-		inverse_search: overrides?.inverse_search ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.inverse_search,
-		reuse: overrides?.reuse ?? DEFAULT_FAKE_VIEWER_BACKEND_CAPABILITIES.reuse,
-	};
-}
-
-export class FakeViewerBackend implements ViewerBackendAdapter {
-	readonly name: string;
-	readonly capabilities: HostServiceViewerBackendCapabilities;
-	private available: boolean;
-
-	constructor(options: FakeViewerBackendOptions = {}) {
-		this.name = options.name ?? DEFAULT_FAKE_VIEWER_BACKEND_NAME;
-		this.available = options.available ?? true;
-		this.capabilities = cloneCapabilities(options.capabilities);
-	}
-
-	isAvailable(): boolean {
-		return this.available;
-	}
-
-	setAvailable(available: boolean): void {
-		this.available = available;
-	}
-}
 
 const hostServiceLatexFileCompiler = createLatexFileCompileToolSupport();
 const CALLBACK_SOCKET_PROBE_TIMEOUT_MS = 75;
@@ -837,6 +837,41 @@ export class HostServiceClient {
 		return response.status_details;
 	}
 
+	async requestOpen(
+		workspaceContext: HostServiceWorkspaceContext,
+		details: HostServiceOpenRequest["details"],
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceOpenResponseDetails> {
+		const context = normalizeWorkspaceContextForViewer(workspaceContext);
+		const requestId = this.makeRequestId();
+		const response = await this.request(
+			{
+				protocol_version: PROTOCOL_VERSION,
+				request_id: requestId,
+				operation: "open",
+				created_at_ns: Date.now() * 1_000_000,
+				workspace_context: context,
+				details: {
+					pdf_path: details.pdf_path,
+					callback: details.callback,
+					reuse_existing: details.reuse_existing,
+					require_persistent_viewer: details.require_persistent_viewer,
+				},
+			},
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (!isValidOpenResponse(response, requestId)) {
+			throw new Error(`Malformed host service open response payload: ${JSON.stringify(response)}`);
+		}
+		if (response.status !== "ok") {
+			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
+			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+		}
+		return response.status_details;
+	}
+
 	private async request(
 		request: HostServiceRequest,
 		signal: AbortSignal | undefined,
@@ -858,6 +893,9 @@ export class HostServiceClient {
 		}
 		if (request.operation === "rasterize") {
 			normalizeWorkspaceContextForRasterize(request.workspace_context);
+		}
+		if (request.operation === "open") {
+			normalizeWorkspaceContextForViewer(request.workspace_context);
 		}
 
 		const payload = `${JSON.stringify(request)}\n`;
@@ -974,7 +1012,7 @@ export class HostServiceServer {
 		this.socketPath = resolve(options.socketPath ?? DEFAULT_HOST_SERVICE_SOCKET_PATH);
 		this.serviceName = options.serviceName ?? "agent-synctex-host-service";
 		this.serviceInstanceId = options.serviceInstanceId ?? `host-service-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
-		this.viewerBackend = options.viewerBackend ?? new FakeViewerBackend();
+		this.viewerBackend = options.viewerBackend ?? new ZathuraViewerBackend();
 	}
 
 	async start(): Promise<void> {
@@ -1107,6 +1145,16 @@ export class HostServiceServer {
 					));
 					return;
 				}
+				if (requestOperation === "open") {
+					socket.end(buildViewerOperationErrorResponse(
+						requestId,
+						getWorkspaceContextFromPayload(requestPayload) ?? FALLBACK_WORKSPACE_CONTEXT,
+						"open",
+						"invalid_request",
+						error instanceof Error ? error.message : String(error),
+					));
+					return;
+				}
 				socket.end(buildErrorResponse(
 					this.protocolVersion,
 					this.socketPath,
@@ -1166,6 +1214,12 @@ export class HostServiceServer {
 				case "rasterize": {
 					this.totalRequests += 1;
 					const response = await this.rasterizePdfRequest(request);
+					socket.end(`${JSON.stringify(response)}\n`);
+					return;
+				}
+				case "open": {
+					this.totalRequests += 1;
+					const response = await this.openViewerRequest(request);
 					socket.end(`${JSON.stringify(response)}\n`);
 					return;
 				}
@@ -1462,7 +1516,7 @@ export class HostServiceServer {
 		}
 	}
 
-	private async rasterizePdfRequest(request: HostServiceRasterizeRequest): Promise<HostServiceResponseEnvelope> {
+	private async rasterizePdfRequest(request: HostServiceRasterizeRequest): Promise<HostServiceRasterizeResponseEnvelope> {
 		const shouldMerge = request.details.merge_pages !== false;
 		const pdfPath = isAbsolute(request.details.pdf_path)
 			? request.details.pdf_path
@@ -1526,6 +1580,65 @@ export class HostServiceServer {
 				},
 			};
 		}
+	}
+
+	private async openViewerRequest(request: HostServiceOpenRequest): Promise<HostServiceOpenResponseEnvelope> {
+		const backendResult = await this.viewerBackend.open(request.request_id, request.details as Record<string, unknown>);
+		const nowNs = Date.now() * 1_000_000;
+		const backendDetails = backendResult.status_details as Record<string, unknown>;
+		if (backendResult.status === "ok") {
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "open",
+				status: "ok",
+				generated_at_ns: nowNs,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: true,
+					service_available: true,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "open",
+					backend: this.viewerBackend.name,
+					backend_path: String(backendDetails.backend_path ?? this.viewerBackend.name),
+					capabilities: this.viewerBackend.capabilities,
+					handle: backendDetails.handle as string | undefined,
+					owned: Boolean(backendDetails.owned ?? false),
+					reused: Boolean(backendDetails.reused ?? false),
+					pid: typeof backendDetails.pid === "number" ? backendDetails.pid : undefined,
+					pid_diagnostic: typeof backendDetails.pid_diagnostic === "string" ? backendDetails.pid_diagnostic : undefined,
+					error_code: backendDetails.error_code as string | undefined,
+					reason: typeof backendDetails.reason === "string" ? backendDetails.reason : undefined,
+				},
+			};
+		}
+		return {
+			protocol_version: this.protocolVersion,
+			request_id: request.request_id,
+			operation: "open",
+			status: "error",
+			generated_at_ns: nowNs,
+			error: backendResult.error ?? "open failed",
+			status_details: {
+				protocol_version: this.protocolVersion,
+				supported: false,
+				service_available: false,
+				workspace_context: request.workspace_context,
+				request_id: request.request_id,
+				operation: "open",
+				backend: this.viewerBackend.name,
+				backend_path: String(backendDetails.backend_path ?? this.viewerBackend.name),
+				capabilities: this.viewerBackend.capabilities,
+				handle: backendDetails.handle as string | undefined,
+				owned: Boolean(backendDetails.owned ?? false),
+				reused: Boolean(backendDetails.reused ?? false),
+				pid: typeof backendDetails.pid === "number" ? backendDetails.pid : undefined,
+				pid_diagnostic: typeof backendDetails.pid_diagnostic === "string" ? backendDetails.pid_diagnostic : undefined,
+				error_code: (backendDetails.error_code as string | undefined) ?? "backend_unavailable",
+				reason: backendResult.error,
+			},
+		};
 	}
 
 	private async prepareSocketPath(): Promise<void> {
@@ -1631,6 +1744,17 @@ function normalizeWorkspaceContextForRasterize(context: HostServiceWorkspaceCont
 	return normalized;
 }
 
+function normalizeWorkspaceContextForViewer(context: HostServiceWorkspaceContext): HostServiceWorkspaceContext {
+	const normalized = normalizeWorkspaceContext(context);
+	if (!isAbsolute(normalized.cwd)) {
+		throw new Error("workspace_context.cwd must be absolute for open");
+	}
+	if (normalized.workspace_root !== undefined && !isAbsolute(normalized.workspace_root)) {
+		throw new Error("workspace_context.workspace_root must be absolute for open");
+	}
+	return normalized;
+}
+
 function canResolveCompileSourcePath(workspaceContext: HostServiceWorkspaceContext | undefined): workspaceContext is HostServiceWorkspaceContext {
 	if (workspaceContext === undefined) {
 		return false;
@@ -1719,6 +1843,7 @@ function getOperationFromPayload(payload: unknown): HostServiceOperation {
 			|| operation === "compile_latex_file"
 			|| operation === "compile_latex_snippet"
 			|| operation === "rasterize"
+			|| operation === "open"
 			|| operation === "register_callback_target"
 			|| operation === "unregister_callback_target"
 			|| operation === "resolve_callback_target"
@@ -1868,6 +1993,38 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				},
 			};
 		}
+		case "open": {
+			if (!isStringRecord(value.details)) {
+				throw new Error("missing open details");
+			}
+			const rawDetails = value.details;
+			if (typeof rawDetails.pdf_path !== "string" || !rawDetails.pdf_path.trim()) {
+				throw new Error("missing pdf_path");
+			}
+			if (!isValidCallbackTarget(rawDetails.callback)) {
+				throw new Error("invalid callback");
+			}
+			if (rawDetails.reuse_existing !== undefined && typeof rawDetails.reuse_existing !== "boolean") {
+				throw new Error("reuse_existing must be a boolean");
+			}
+			if (rawDetails.require_persistent_viewer !== undefined && typeof rawDetails.require_persistent_viewer !== "boolean") {
+				throw new Error("require_persistent_viewer must be a boolean");
+			}
+			const workspaceContext = normalizeWorkspaceContextForViewer(value.workspace_context);
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "open",
+				created_at_ns: value.created_at_ns,
+				workspace_context: workspaceContext,
+				details: {
+					pdf_path: resolve(workspaceContext.cwd, rawDetails.pdf_path),
+					callback: rawDetails.callback,
+					reuse_existing: rawDetails.reuse_existing,
+					require_persistent_viewer: rawDetails.require_persistent_viewer,
+				},
+			};
+		}
 		case "register_callback_target": {
 			if (typeof value.target_id !== "string" || !value.target_id.trim()) {
 				throw new Error("invalid target_id");
@@ -1971,6 +2128,9 @@ function isValidHostServiceResponse(
 	}
 	if (value.operation === "resolve_callback_target") {
 		return isValidResolveCallbackTargetResponse(value, expectedRequestId);
+	}
+	if (value.operation === "open") {
+		return isValidOpenResponse(value, expectedRequestId);
 	}
 	return false;
 }
@@ -2330,6 +2490,39 @@ function isValidResolveCallbackTargetResponse(response: unknown, expectedRequest
 	return true;
 }
 
+function isValidOpenResponse(response: unknown, expectedRequestId: string): response is HostServiceOpenResponseEnvelope {
+	if (!isStringRecord(response)) return false;
+	if (response.status !== "ok" && response.status !== "error") return false;
+	if (typeof response.protocol_version !== "number" || response.protocol_version !== PROTOCOL_VERSION) return false;
+	if (typeof response.request_id !== "string" || response.request_id !== expectedRequestId) return false;
+	if (response.operation !== "open") return false;
+	if (typeof response.generated_at_ns !== "number") return false;
+	if (response.error !== undefined && typeof response.error !== "string") return false;
+	if (response.status === "error" && response.error === undefined) return false;
+	if (!isStringRecord(response.status_details)) return false;
+	const details = response.status_details;
+	if (typeof details.protocol_version !== "number" || details.protocol_version !== PROTOCOL_VERSION) return false;
+	if (typeof details.supported !== "boolean") return false;
+	if (typeof details.service_available !== "boolean") return false;
+	if (!isValidWorkspaceContext(details.workspace_context)) return false;
+	if (typeof details.request_id !== "string" || details.request_id !== expectedRequestId) return false;
+	if (details.operation !== "open") return false;
+	if (typeof details.backend !== "string" || !details.backend) return false;
+	if (typeof details.backend_path !== "string" || !details.backend_path) return false;
+	if (typeof details.owned !== "boolean") return false;
+	if (typeof details.reused !== "boolean") return false;
+	if (!isValidViewerBackendCapabilities(details.capabilities)) return false;
+	if (details.handle !== undefined && typeof details.handle !== "string") return false;
+	if (details.pid !== undefined) {
+		if (typeof details.pid !== "number" || !Number.isInteger(details.pid) || details.pid <= 0) return false;
+	}
+	if (details.pid_diagnostic !== undefined && typeof details.pid_diagnostic !== "string") return false;
+	if (details.error_code !== undefined && typeof details.error_code !== "string") return false;
+	if (response.status === "error" && typeof details.error_code !== "string") return false;
+	if (response.status === "ok" && details.error_code !== undefined) return false;
+	if (response.status === "ok" && details.handle === undefined) return false;
+	return true;
+}
 function isValidCommonHostServiceResponse(
 	response: unknown,
 	expectedRequestId: string,
@@ -2592,6 +2785,47 @@ function buildRasterizeErrorResponse(
 		},
 	};
 	return `${JSON.stringify(response)}\n`;
+}
+
+function buildViewerOperationErrorResponse(
+	requestId: string,
+	workspaceContext: HostServiceWorkspaceContext,
+	operation: "open",
+	errorCode: string,
+	errorText: string,
+): string {
+	const nowNs = Date.now() * 1_000_000;
+	const base: Record<string, unknown> = {
+		protocol_version: PROTOCOL_VERSION,
+		request_id: requestId,
+		operation,
+		status: "error",
+		generated_at_ns: nowNs,
+		error: errorText,
+		status_details: {
+			protocol_version: PROTOCOL_VERSION,
+			supported: false,
+			service_available: false,
+			workspace_context: workspaceContext,
+			request_id: requestId,
+			operation,
+			error_code: errorCode,
+		},
+	};
+	if (operation === "open") {
+		(base.status_details as Record<string, unknown>).backend = "unknown";
+		(base.status_details as Record<string, unknown>).backend_path = "";
+		(base.status_details as Record<string, unknown>).capabilities = {
+			open: false,
+			close: false,
+			forward_search: false,
+			inverse_search: false,
+			reuse: false,
+		};
+		(base.status_details as Record<string, unknown>).owned = false;
+		(base.status_details as Record<string, unknown>).reused = false;
+	}
+	return `${JSON.stringify(base)}\n`;
 }
 
 type HostServiceNonCompileOperation = Exclude<

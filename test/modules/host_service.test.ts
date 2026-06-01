@@ -202,6 +202,15 @@ function buildHostServiceBackendHarness(baseDir: string, backend?: FakeViewerBac
 	return { server, client };
 }
 
+class RecordingFakeViewerBackend extends FakeViewerBackend {
+	readonly openedDetails: Array<Record<string, unknown>> = [];
+
+	async open(requestId: string, details: Record<string, unknown>) {
+		this.openedDetails.push({ ...details });
+		return super.open(requestId, details);
+	}
+}
+
 async function writeHostServiceRequest(
 	path: string,
 	request: Record<string, unknown>,
@@ -268,7 +277,11 @@ function startOrphanSocketServer(path: string): Promise<import("node:child_proce
 test("host service status request returns service health details over unix socket", async () => {
 	const baseDir = temporaryDir("host-service-status-");
 	const socketPath = join(baseDir, "host-service.sock");
-	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-test" });
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-test",
+		viewerBackend: new FakeViewerBackend(),
+	});
 	await server.start();
 
 	const client = new HostServiceClient({
@@ -1446,6 +1459,71 @@ test("host service status reflects backend availability for health checks", asyn
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 
+});
+
+test("host service open resolves relative PDF paths and reuses sessions for matching callback", async () => {
+	const baseDir = temporaryDir("host-service-open-reuse-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	const backend = new RecordingFakeViewerBackend();
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		const firstOpen = await client.requestOpen(
+			{ cwd: baseDir },
+			{
+				pdf_path: "sample.pdf",
+				callback,
+				reuse_existing: true,
+			},
+		);
+		assert.equal(firstOpen.reused, false);
+		assert.equal(firstOpen.owned, true);
+		assert.equal(typeof firstOpen.handle, "string");
+		assert.equal(backend.openedDetails.length, 1);
+		assert.equal(backend.openedDetails[0]!.pdf_path, pdfPath);
+		const secondOpen = await client.requestOpen(
+			{ cwd: baseDir },
+			{
+				pdf_path: "sample.pdf",
+				callback,
+				reuse_existing: true,
+			},
+		);
+		assert.equal(secondOpen.reused, true);
+		assert.equal(secondOpen.handle, firstOpen.handle);
+		const thirdOpen = await client.requestOpen(
+			{ cwd: baseDir },
+			{
+				pdf_path: "sample.pdf",
+				callback: {
+					...callback,
+					token: "beta-token",
+				},
+				reuse_existing: true,
+			},
+		);
+		assert.equal(thirdOpen.reused, false);
+		assert.notEqual(thirdOpen.handle, firstOpen.handle);
+		assert.equal(backend.openedDetails.length, 3);
+		assert.equal(backend.openedDetails[1]!.pdf_path, pdfPath);
+		assert.equal(backend.openedDetails[2]!.pdf_path, pdfPath);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
 });
 
 	test("host service supports callback target register, replace, and unregister", async () => {
