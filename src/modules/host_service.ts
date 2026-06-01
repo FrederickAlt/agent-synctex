@@ -22,13 +22,14 @@ import {
 	type InlinePreviewArtifact,
 } from "./preview/inline_preview.ts";
 import { safeInlinePreviewPngPath } from "./preview/inline_preview_metadata.ts";
+import { assertReadableSourceFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
+import { readSourceLine } from "./synctex/synctex.ts";
 import {
 	FakeViewerBackend,
 	type FakeViewerBackendOptions,
 	type ViewerBackendAdapter,
 	ZathuraViewerBackend,
 } from "./host_service_viewer_backends.ts";
-
 export { FakeViewerBackend, ZathuraViewerBackend };
 export type { FakeViewerBackendOptions, ViewerBackendAdapter };
 export interface HostServiceWorkspaceContext {
@@ -174,6 +175,17 @@ export interface HostServiceCloseRequest {
 	pdf_id: number;
 }
 
+export interface HostServiceJumpRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "jump_pdf";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+	pdf_id: number;
+	line: number;
+	source_file?: string;
+}
+
 export type HostServiceRequest =
 	| HostServiceStatusRequest
 	| HostServiceCompileRequest
@@ -181,6 +193,7 @@ export type HostServiceRequest =
 	| HostServiceRasterizeRequest
 	| HostServiceOpenRequest
 	| HostServiceCloseRequest
+	| HostServiceJumpRequest
 	| HostServiceRegisterCallbackTargetRequest
 	| HostServiceUnregisterCallbackTargetRequest
 	| HostServiceResolveCallbackTargetRequest;
@@ -192,6 +205,7 @@ export type HostServiceOperation =
 	| "rasterize"
 	| "open_pdf"
 	| "close_pdf"
+	| "jump_pdf"
 	| "register_callback_target"
 	| "unregister_callback_target"
 	| "resolve_callback_target";
@@ -341,6 +355,31 @@ export interface HostServiceCloseResponseDetails {
 	error_code?: string;
 }
 
+export interface HostServiceJumpResponseDetails {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	workspace_context: HostServiceWorkspaceContext;
+	request_id: string;
+	operation: "jump_pdf";
+	backend: string;
+	backend_path: string;
+	backend_identity_ok?: boolean;
+	handled: boolean;
+	closed?: boolean;
+	reopened: boolean;
+	pdf?: string;
+	pdf_id?: number;
+	source_file?: string;
+	line?: number;
+	source_line?: string;
+	reason?: string;
+	handle?: string;
+	error_code?: string;
+	diagnostics?: Array<Record<string, unknown>>;
+	managed_record?: HostServiceManagedViewerRecord;
+}
+
 export interface HostServiceStatusResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
@@ -401,6 +440,16 @@ export interface HostServiceCloseResponseEnvelope {
 	status_details: HostServiceCloseResponseDetails;
 }
 
+export interface HostServiceJumpResponseEnvelope {
+	protocol_version: number;
+	request_id: string;
+	operation: "jump_pdf";
+	status: "ok" | "error";
+	generated_at_ns: number;
+	error?: string;
+	status_details: HostServiceJumpResponseDetails;
+}
+
 export interface HostServiceRegisterCallbackTargetResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
@@ -438,6 +487,7 @@ export type HostServiceResponseEnvelope =
 	| HostServiceRasterizeResponseEnvelope
 	| HostServiceOpenResponseEnvelope
 	| HostServiceCloseResponseEnvelope
+	| HostServiceJumpResponseEnvelope
 	| HostServiceRegisterCallbackTargetResponseEnvelope
 	| HostServiceUnregisterCallbackTargetResponseEnvelope
 	| HostServiceResolveCallbackTargetResponseEnvelope;
@@ -980,6 +1030,76 @@ export class HostServiceClient {
 		return response.status_details;
 	}
 
+	async requestJumpPdf(
+		workspaceContext: HostServiceWorkspaceContext,
+		details: { pdf_id: number; line: number; source_file?: string },
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceJumpResponseDetails> {
+		if (!Number.isInteger(details.pdf_id) || details.pdf_id <= 0) {
+			throw new Error("invalid pdf_id");
+		}
+		if (!Number.isInteger(details.line) || details.line <= 0) {
+			throw new Error("line must be a positive integer");
+		}
+		const context = normalizeWorkspaceContextForViewer(workspaceContext);
+		const requestId = this.makeRequestId();
+		const requestPayload: HostServiceJumpRequest = {
+			protocol_version: PROTOCOL_VERSION,
+			request_id: requestId,
+			operation: "jump_pdf",
+			created_at_ns: Date.now() * 1_000_000,
+			workspace_context: context,
+			pdf_id: details.pdf_id,
+			line: details.line,
+			...(details.source_file === undefined ? {} : { source_file: details.source_file }),
+		};
+		const response = await this.request(
+			requestPayload,
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (!isValidJumpResponse(response, requestId)) {
+			throw new Error(`Malformed host service jump_pdf response payload: ${JSON.stringify(response)}`);
+		}
+		if (response.status !== "ok") {
+			const jumpResponseDetails = response.status_details;
+			const errorCode = typeof jumpResponseDetails.error_code === "string" ? jumpResponseDetails.error_code : undefined;
+			const suffix = errorCode ? ` (code=${errorCode})` : "";
+			const parts: string[] = [];
+			if (typeof jumpResponseDetails.backend === "string" && jumpResponseDetails.backend) {
+				parts.push(`backend=${jumpResponseDetails.backend}`);
+			}
+			if (typeof jumpResponseDetails.backend_path === "string" && jumpResponseDetails.backend_path) {
+				parts.push(`backend_path=${jumpResponseDetails.backend_path}`);
+			}
+			if (typeof jumpResponseDetails.pdf_id === "number" && Number.isInteger(jumpResponseDetails.pdf_id)) {
+				parts.push(`pdf_id=${jumpResponseDetails.pdf_id}`);
+			}
+			if (typeof jumpResponseDetails.pdf === "string") {
+				parts.push(`pdf=${jumpResponseDetails.pdf}`);
+			}
+			if (typeof jumpResponseDetails.source_file === "string") {
+				parts.push(`source_file=${jumpResponseDetails.source_file}`);
+			}
+			if (typeof jumpResponseDetails.line === "number") {
+				parts.push(`line=${jumpResponseDetails.line}`);
+			}
+			if (typeof jumpResponseDetails.source_line === "string") {
+				parts.push(`source_line=${JSON.stringify(jumpResponseDetails.source_line)}`);
+			}
+			if (typeof jumpResponseDetails.reason === "string") {
+				parts.push(`reason=${jumpResponseDetails.reason}`);
+			}
+			const context = parts.length > 0 ? ` ${parts.join(" ")}` : "";
+			const diagnostics = Array.isArray(jumpResponseDetails.diagnostics)
+				? ` diagnostics=${JSON.stringify(jumpResponseDetails.diagnostics)}`
+				: "";
+			throw new Error(`${response.error || jumpResponseDetails.reason || "host service returned error status"}${suffix}${context}${diagnostics}`);
+		}
+		return response.status_details;
+	}
+
 	async requestOpen(
 		workspaceContext: HostServiceWorkspaceContext,
 		details: HostServiceOpenRequest["details"],
@@ -1011,7 +1131,7 @@ export class HostServiceClient {
 		if (request.operation === "rasterize") {
 			normalizeWorkspaceContextForRasterize(request.workspace_context);
 		}
-		if (request.operation === "open_pdf") {
+		if (request.operation === "open_pdf" || request.operation === "jump_pdf") {
 			normalizeWorkspaceContextForViewer(request.workspace_context);
 		}
 
@@ -1266,7 +1386,7 @@ export class HostServiceServer {
 					));
 					return;
 				}
-				if (requestOperation === "open_pdf" || requestOperation === "close_pdf") {
+				if (requestOperation === "open_pdf" || requestOperation === "close_pdf" || requestOperation === "jump_pdf") {
 					socket.end(buildViewerOperationErrorResponse(
 						requestId,
 						getWorkspaceContextFromPayload(requestPayload) ?? FALLBACK_WORKSPACE_CONTEXT,
@@ -1347,6 +1467,12 @@ export class HostServiceServer {
 				case "close_pdf": {
 					this.totalRequests += 1;
 					const response = await this.closeViewerRequest(request);
+					socket.end(`${JSON.stringify(response)}\n`);
+					return;
+				}
+				case "jump_pdf": {
+					this.totalRequests += 1;
+					const response = await this.jumpViewerRequest(request);
 					socket.end(`${JSON.stringify(response)}\n`);
 					return;
 				}
@@ -1761,6 +1887,7 @@ export class HostServiceServer {
 				};
 			}
 
+			const defaultSourcePath = inferDefaultSourceFileForPdf(request.details.pdf_path);
 			const existingRecord = reused
 				? this.managedViewerRecords.findActiveRecord((record) =>
 					record.viewerHandle === handle
@@ -1776,6 +1903,7 @@ export class HostServiceServer {
 					existingRecord.pidDiagnostic = pidDiagnostic;
 					existingRecord.capabilities = capabilities;
 					existingRecord.backendPath = backendPath;
+					existingRecord.defaultSourcePath = existingRecord.defaultSourcePath ?? defaultSourcePath;
 					existingRecord.callback = request.details.callback;
 					existingRecord.metadata = {
 						...(existingRecord.metadata ?? {}),
@@ -1794,6 +1922,7 @@ export class HostServiceServer {
 					reused,
 					capabilities,
 					backendPath,
+					defaultSourcePath,
 					callback: request.details.callback,
 					metadata: {
 						backend_path: backendPath,
@@ -1985,6 +2114,402 @@ export class HostServiceServer {
 				error_code: typeof backendDetails.error_code === "string"
 					? backendDetails.error_code
 					: "backend_unavailable",
+			},
+		};
+	}
+
+	private async jumpViewerRequest(request: HostServiceJumpRequest): Promise<HostServiceJumpResponseEnvelope> {
+		let managedRecord: HostServiceManagedViewerRecord;
+		try {
+			managedRecord = this.managedViewerRecords.getActiveRecord(request.pdf_id);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const nowNs = Date.now() * 1_000_000;
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "error",
+				generated_at_ns: nowNs,
+				error: message,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: this.viewerBackend.name,
+					backend_path: this.viewerBackend.name,
+					handled: false,
+					reopened: false,
+					pdf_id: request.pdf_id,
+					error_code: "invalid_request",
+					reason: message,
+				},
+			};
+		}
+		if (managedRecord.capabilities?.forward_search === false) {
+			const nowNs = Date.now() * 1_000_000;
+			const errorText = `Tracked PDF ${request.pdf_id} is managed by a viewer backend without forward-search support: ${managedRecord.viewerBackend}`;
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "error",
+				generated_at_ns: nowNs,
+				error: errorText,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path:
+						typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+							? managedRecord.backendPath
+							: this.viewerBackend.name,
+					handled: false,
+					reopened: false,
+					pdf_id: request.pdf_id,
+					error_code: "unsupported_operation",
+					reason: errorText,
+					source_file: request.source_file,
+					line: request.line,
+				},
+			};
+		}
+
+		const resolvedSourceFile = request.source_file ?? managedRecord.defaultSourcePath;
+		if (!resolvedSourceFile) {
+			const nowNs = Date.now() * 1_000_000;
+			const reason = `No default source_file is known for tracked pdf_id=${request.pdf_id}. Pass source_file explicitly.`;
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "error",
+				generated_at_ns: nowNs,
+				error: reason,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path:
+						typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+							? managedRecord.backendPath
+							: this.viewerBackend.name,
+					handled: false,
+					reopened: false,
+					error_code: "invalid_request",
+					pdf_id: request.pdf_id,
+					pdf: managedRecord.pdfPath,
+					reason: reason,
+				},
+			};
+		}
+
+		try {
+			assertReadableSourceFile(resolvedSourceFile);
+		} catch (error) {
+			const nowNs = Date.now() * 1_000_000;
+			const reason = error instanceof Error ? error.message : String(error);
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "error",
+				generated_at_ns: nowNs,
+				error: reason,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path:
+						typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+							? managedRecord.backendPath
+							: this.viewerBackend.name,
+					handled: false,
+					reopened: false,
+					error_code: "invalid_request",
+					pdf_id: request.pdf_id,
+					pdf: managedRecord.pdfPath,
+					source_file: resolvedSourceFile,
+					line: request.line,
+					source_line: readSourceLine(resolvedSourceFile, request.line, request.workspace_context.cwd),
+					reason: reason,
+				},
+			};
+		}
+
+		const managedBackendPath =
+			typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+				? managedRecord.backendPath
+				: this.viewerBackend.name;
+		const sourceLine = readSourceLine(resolvedSourceFile, request.line, request.workspace_context.cwd) ?? "";
+
+		const jumpBackend = async (
+			syctexPid: number | undefined,
+			forwardSourceFile: string,
+		): Promise<ReturnType<ViewerBackendAdapter["forwardSearch"]>> => {
+			const backendDetails: Record<string, unknown> = {
+				handle: managedRecord.viewerHandle,
+				backend: managedRecord.viewerBackend,
+				source_file: forwardSourceFile,
+				line: request.line,
+			};
+			if (syctexPid !== undefined) {
+				backendDetails.synctex_pid = syctexPid;
+			}
+			return this.viewerBackend.forwardSearch(request.request_id, backendDetails);
+		};
+
+		const makeSuccessResponse = (
+			handled: boolean,
+			reopened: boolean,
+			errorCode: string | undefined,
+			reason: string | undefined,
+			backendIdentityOk: boolean,
+			serviceAvailable: boolean,
+			diagnostics: Array<Record<string, unknown>> | undefined,
+		): HostServiceJumpResponseEnvelope => ({
+			protocol_version: this.protocolVersion,
+			request_id: request.request_id,
+			operation: "jump_pdf",
+			status: handled ? "ok" : "error",
+			generated_at_ns: Date.now() * 1_000_000,
+			error: handled ? undefined : reason,
+			status_details: {
+				protocol_version: this.protocolVersion,
+				supported: handled,
+				service_available: serviceAvailable,
+				workspace_context: request.workspace_context,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				backend: managedRecord.viewerBackend,
+				backend_path: managedBackendPath,
+				backend_identity_ok: backendIdentityOk,
+				handled: handled,
+				reopened,
+				pdf_id: request.pdf_id,
+				pdf: managedRecord.pdfPath,
+				source_file: resolvedSourceFile,
+				line: request.line,
+				source_line: sourceLine,
+				handle: managedRecord.viewerHandle,
+				reason,
+				error_code: handled ? undefined : errorCode,
+				diagnostics: diagnostics,
+				managed_record: managedRecord,
+			},
+		});
+
+		const initialAttempt = await jumpBackend(managedRecord.pid, resolvedSourceFile);
+		const initialDetails = initialAttempt.status_details as Record<string, unknown>;
+		const initialDiagnostics = Array.isArray(initialDetails.diagnostics) ? initialDetails.diagnostics : undefined;
+		const initialHandled = typeof initialDetails.handled === "boolean" ? initialDetails.handled : false;
+		const backendIdentityOk =
+			typeof initialDetails.backend_identity_ok === "boolean" ? initialDetails.backend_identity_ok : false;
+		const backendAvailable = typeof initialDetails.service_available === "boolean" ? initialDetails.service_available : true;
+		const initialErrorCode = typeof initialDetails.error_code === "string" ? initialDetails.error_code : "backend_unavailable";
+		const initialReason = typeof initialDetails.reason === "string" && initialDetails.reason.trim()
+			? initialDetails.reason
+			: initialAttempt.error;
+
+		if (initialAttempt.status === "ok") {
+			return makeSuccessResponse(
+				initialHandled,
+				false,
+				undefined,
+				initialReason,
+				backendIdentityOk,
+				backendAvailable,
+				initialDiagnostics,
+			);
+		}
+		if (initialErrorCode !== "handle_not_found") {
+			return makeSuccessResponse(false, false, initialErrorCode, initialReason, backendIdentityOk, backendAvailable, initialDiagnostics);
+		}
+
+		if (!managedRecord.callback) {
+			const nowNs = Date.now() * 1_000_000;
+			const reason = `Tracked pdf_id=${request.pdf_id} is not managed by a callback target; cannot reopen for stale forward-search.`;
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "error",
+				generated_at_ns: nowNs,
+				error: reason,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path: managedBackendPath,
+					handled: false,
+					reopened: false,
+					pdf_id: request.pdf_id,
+					pdf: managedRecord.pdfPath,
+					source_file: resolvedSourceFile,
+					line: request.line,
+					source_line: sourceLine,
+					error_code: "invalid_request",
+					reason,
+					diagnostics: initialDiagnostics,
+				},
+			};
+		}
+
+		const reopenAttempt = await this.viewerBackend.open(request.request_id, {
+			pdf_path: managedRecord.pdfPath,
+			callback: managedRecord.callback,
+			reuse_existing: true,
+			require_persistent_viewer: true,
+		});
+		const reopenDetails = reopenAttempt.status_details as Record<string, unknown>;
+		const reopenBackendPath =
+			typeof reopenDetails.backend_path === "string" && reopenDetails.backend_path.trim()
+				? reopenDetails.backend_path
+				: managedBackendPath;
+		const reopenHandle = typeof reopenDetails.handle === "string" && reopenDetails.handle.trim() ? reopenDetails.handle : managedRecord.viewerHandle;
+		const reopenPid = typeof reopenDetails.pid === "number" && Number.isInteger(reopenDetails.pid) && reopenDetails.pid > 0
+			? reopenDetails.pid
+			: undefined;
+		const reopenPidDiagnostic =
+			typeof reopenDetails.pid_diagnostic === "string" && reopenDetails.pid_diagnostic.trim()
+				? reopenDetails.pid_diagnostic
+				: undefined;
+		const reopenOwned = typeof reopenDetails.owned === "boolean" ? reopenDetails.owned : managedRecord.viewerOwned;
+		const reopenReused = typeof reopenDetails.reused === "boolean" ? reopenDetails.reused : managedRecord.reused;
+		const reopenCapabilities = isValidViewerBackendCapabilities(reopenDetails.capabilities)
+			? reopenDetails.capabilities
+			: managedRecord.capabilities ?? this.viewerBackend.capabilities;
+		const reopenServiceAvailable =
+			typeof reopenAttempt.status === "string" && reopenAttempt.status === "ok"
+				? typeof reopenDetails.service_available === "boolean"
+					? reopenDetails.service_available
+					: true
+				: false;
+
+		if (reopenAttempt.status === "ok") {
+			managedRecord.viewerHandle = reopenHandle;
+			managedRecord.pid = reopenPid;
+			managedRecord.pidDiagnostic = reopenPidDiagnostic;
+			managedRecord.reused = reopenReused;
+			managedRecord.viewerOwned = reopenOwned;
+			managedRecord.capabilities = reopenCapabilities;
+			managedRecord.backendPath = reopenBackendPath;
+			managedRecord.defaultSourcePath = managedRecord.defaultSourcePath ?? inferDefaultSourceFileForPdf(managedRecord.pdfPath);
+			const retryAttempt = await jumpBackend(reopenPid, resolvedSourceFile);
+			const retryDetails = retryAttempt.status_details as Record<string, unknown>;
+			const retryHandled = typeof retryDetails.handled === "boolean" ? retryDetails.handled : false;
+			const retryDiagnostics = Array.isArray(retryDetails.diagnostics) ? retryDetails.diagnostics : [];
+			const retryBackendIdentityOk =
+				typeof retryDetails.backend_identity_ok === "boolean" ? retryDetails.backend_identity_ok : false;
+			const retryServiceAvailable =
+				typeof retryDetails.service_available === "boolean" ? retryDetails.service_available : true;
+			const retryReason = typeof retryDetails.reason === "string" && retryDetails.reason.trim()
+				? retryDetails.reason
+				: retryAttempt.error;
+			if (retryAttempt.status === "ok") {
+				return makeSuccessResponse(
+					retryHandled,
+					true,
+					undefined,
+					retryReason,
+					retryBackendIdentityOk,
+					retryServiceAvailable,
+					retryDiagnostics,
+				);
+			}
+			const staleRetryReason = retryAttempt.error
+				? `${initialReason ?? ""} ${retryAttempt.error}`.trim()
+				: "recovered handle jump failed";
+			const nowNs = Date.now() * 1_000_000;
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "error",
+				generated_at_ns: nowNs,
+				error: `Tracked PDF pdf_id=${request.pdf_id} appears closed or unavailable, stale handle retry failed for ${managedRecord.pdfPath}: ${staleRetryReason}`,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path: reopenBackendPath,
+					backend_identity_ok: retryBackendIdentityOk,
+					handled: false,
+					reopened: true,
+					pdf_id: request.pdf_id,
+					pdf: managedRecord.pdfPath,
+					source_file: resolvedSourceFile,
+					line: request.line,
+					source_line: sourceLine,
+					error_code: typeof retryDetails.error_code === "string"
+						? retryDetails.error_code
+						: "backend_unavailable",
+					reason: staleRetryReason,
+					handle: managedRecord.viewerHandle,
+					diagnostics: initialDiagnostics
+						? [...initialDiagnostics, ...retryDiagnostics]
+						: retryDiagnostics,
+					managed_record: managedRecord,
+				},
+			};
+		}
+
+		const firstReason = initialReason ? `${initialReason}` : "closed or unavailable";
+		const secondReason = typeof reopenDetails.error === "string" ? reopenDetails.error : "reopen failed";
+		const nowNs = Date.now() * 1_000_000;
+		return {
+			protocol_version: this.protocolVersion,
+			request_id: request.request_id,
+			operation: "jump_pdf",
+			status: "error",
+			generated_at_ns: nowNs,
+			error: `Tracked PDF pdf_id=${request.pdf_id} is not available, and had a stale forward_search handle ${managedRecord.viewerHandle} at ${managedRecord.pdfPath}: ${firstReason} ${secondReason}`,
+			status_details: {
+				protocol_version: this.protocolVersion,
+				supported: false,
+				service_available: false,
+				workspace_context: request.workspace_context,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				backend: managedRecord.viewerBackend,
+				backend_path: managedBackendPath,
+				handled: false,
+				reopened: false,
+				pdf_id: request.pdf_id,
+				pdf: managedRecord.pdfPath,
+				source_file: resolvedSourceFile,
+				line: request.line,
+				source_line: sourceLine,
+				error_code: typeof reopenAttempt.status === "string"
+					? (typeof reopenDetails.error_code === "string" ? reopenDetails.error_code : "backend_unavailable")
+					: "backend_unavailable",
+				reason: firstReason,
+				handle: managedRecord.viewerHandle,
+				diagnostics: initialDiagnostics,
+				managed_record: managedRecord,
 			},
 		};
 	}
@@ -2203,6 +2728,7 @@ function getOperationFromPayload(payload: unknown): HostServiceOperation {
 			|| operation === "rasterize"
 			|| operation === "open_pdf"
 			|| operation === "close_pdf"
+			|| operation === "jump_pdf"
 			|| operation === "register_callback_target"
 			|| operation === "unregister_callback_target"
 			|| operation === "resolve_callback_target"
@@ -2398,6 +2924,33 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				pdf_id: rawPdfId,
 			};
 		}
+		case "jump_pdf": {
+			const rawPdfId = (value as Record<string, unknown>).pdf_id;
+			if (typeof rawPdfId !== "number" || !Number.isInteger(rawPdfId) || rawPdfId <= 0) {
+				throw new Error("invalid pdf_id");
+			}
+			const rawLine = (value as Record<string, unknown>).line;
+			if (typeof rawLine !== "number" || !Number.isInteger(rawLine) || rawLine <= 0) {
+				throw new Error("line must be a positive integer");
+			}
+			const rawSourceFile = (value as Record<string, unknown>).source_file;
+			if (rawSourceFile !== undefined) {
+				if (typeof rawSourceFile !== "string" || !rawSourceFile.trim()) {
+					throw new Error("source_file must be a non-empty string");
+				}
+			}
+			const workspaceContext = normalizeWorkspaceContextForViewer(value.workspace_context);
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "jump_pdf",
+				created_at_ns: value.created_at_ns,
+				workspace_context: workspaceContext,
+				pdf_id: rawPdfId,
+				line: rawLine,
+				...(rawSourceFile === undefined ? {} : { source_file: resolve(workspaceContext.cwd, rawSourceFile) }),
+			};
+		}
 		case "register_callback_target": {
 			if (typeof value.target_id !== "string" || !value.target_id.trim()) {
 				throw new Error("invalid target_id");
@@ -2507,6 +3060,9 @@ function isValidHostServiceResponse(
 	}
 	if (value.operation === "close_pdf") {
 		return isValidCloseResponse(value, expectedRequestId);
+	}
+	if (value.operation === "jump_pdf") {
+		return isValidJumpResponse(value, expectedRequestId);
 	}
 	return false;
 }
@@ -2936,6 +3492,44 @@ function isValidCloseResponse(response: unknown, expectedRequestId: string): res
 	return true;
 }
 
+function isValidJumpResponse(response: unknown, expectedRequestId: string): response is HostServiceJumpResponseEnvelope {
+	if (!isStringRecord(response)) return false;
+	if (response.status !== "ok" && response.status !== "error") return false;
+	if (typeof response.protocol_version !== "number" || response.protocol_version !== PROTOCOL_VERSION) return false;
+	if (typeof response.request_id !== "string" || response.request_id !== expectedRequestId) return false;
+	if (response.operation !== "jump_pdf") return false;
+	if (typeof response.generated_at_ns !== "number") return false;
+	if (response.error !== undefined && typeof response.error !== "string") return false;
+	if (response.status === "error" && response.error === undefined) return false;
+	if (!isStringRecord(response.status_details)) return false;
+	const details = response.status_details;
+	if (typeof details.protocol_version !== "number" || details.protocol_version !== PROTOCOL_VERSION) return false;
+	if (typeof details.supported !== "boolean") return false;
+	if (typeof details.service_available !== "boolean") return false;
+	if (!isValidWorkspaceContext(details.workspace_context)) return false;
+	if (typeof details.request_id !== "string" || details.request_id !== expectedRequestId) return false;
+	if (details.operation !== "jump_pdf") return false;
+	if (typeof details.backend !== "string" || !details.backend) return false;
+	if (typeof details.backend_path !== "string" || !details.backend_path) return false;
+	if (details.backend_identity_ok !== undefined && typeof details.backend_identity_ok !== "boolean") return false;
+	if (typeof details.handled !== "boolean") return false;
+	if (typeof details.reopened !== "boolean") return false;
+	if (details.closed !== undefined && typeof details.closed !== "boolean") return false;
+	if (details.pdf_id !== undefined && (typeof details.pdf_id !== "number" || !Number.isInteger(details.pdf_id) || details.pdf_id <= 0)) return false;
+	if (details.pdf !== undefined && typeof details.pdf !== "string") return false;
+	if (details.source_file !== undefined && typeof details.source_file !== "string") return false;
+	if (details.line !== undefined && (typeof details.line !== "number" || !Number.isInteger(details.line) || details.line <= 0)) return false;
+	if (details.source_line !== undefined && typeof details.source_line !== "string") return false;
+	if (details.reason !== undefined && typeof details.reason !== "string") return false;
+	if (details.handle !== undefined && typeof details.handle !== "string") return false;
+	if (details.error_code !== undefined && typeof details.error_code !== "string") return false;
+	if (response.status === "error" && typeof details.error_code !== "string") return false;
+	if (response.status === "ok" && details.error_code !== undefined) return false;
+	if (details.diagnostics !== undefined && !Array.isArray(details.diagnostics)) return false;
+	if (details.managed_record !== undefined && !isValidManagedViewerRecord(details.managed_record)) return false;
+	return true;
+}
+
 function isValidCommonHostServiceResponse(
 	response: unknown,
 	expectedRequestId: string,
@@ -3252,7 +3846,7 @@ function buildRasterizeErrorResponse(
 function buildViewerOperationErrorResponse(
 	requestId: string,
 	workspaceContext: HostServiceWorkspaceContext,
-	operation: "open_pdf" | "close_pdf",
+	operation: "open_pdf" | "close_pdf" | "jump_pdf",
 	errorCode: string,
 	errorText: string,
 ): string {
@@ -3291,6 +3885,13 @@ function buildViewerOperationErrorResponse(
 		(base.status_details as Record<string, unknown>).backend = "unknown";
 		(base.status_details as Record<string, unknown>).backend_path = "unknown";
 		(base.status_details as Record<string, unknown>).closed = false;
+		(base.status_details as Record<string, unknown>).reason = "unavailable during validation";
+	}
+	if (operation === "jump_pdf") {
+		(base.status_details as Record<string, unknown>).backend = "unknown";
+		(base.status_details as Record<string, unknown>).backend_path = "unknown";
+		(base.status_details as Record<string, unknown>).handled = false;
+		(base.status_details as Record<string, unknown>).reopened = false;
 		(base.status_details as Record<string, unknown>).reason = "unavailable during validation";
 	}
 	return `${JSON.stringify(base)}\n`;
