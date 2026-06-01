@@ -4,15 +4,15 @@ import {
 	rasterizePdfPage,
 	rasterizePdfPages,
 	mergeInlinePreviewArtifacts,
-	type InlinePreviewArtifact,
 } from "./preview/inline_preview.ts";
 import type {
+	HostServiceRasterizeArtifact,
 	HostServiceRasterizeRequest,
 	HostServiceRasterizeResponseEnvelope,
 	HostServiceWorkspaceContext,
-} from "./host_service.ts";
+} from "./host_service_protocol.ts";
 
-export type HostServiceRasterizeArtifact = InlinePreviewArtifact;
+export type { HostServiceRasterizeArtifact };
 
 export function normalizeWorkspaceContextForRasterize(context: HostServiceWorkspaceContext): HostServiceWorkspaceContext {
 	const normalized = {

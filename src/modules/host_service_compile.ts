@@ -19,7 +19,7 @@ import type {
 	HostServiceOpenRequest,
 	HostServiceOpenResponseEnvelope,
 	HostServiceWorkspaceContext,
-} from "./host_service.ts";
+} from "./host_service_protocol.ts";
 
 const REQUIRED_DIRECTORY_MODE = 0o700;
 const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "show-latex");
