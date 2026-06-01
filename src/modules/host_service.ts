@@ -589,6 +589,7 @@ const MAX_PAYLOAD_BYTES = 16_384;
 const STARTUP_SOCKET_CHECK_TIMEOUT_MS = 250;
 const ACTIVE_CONNECTION_TIMEOUT_MS = 10_000;
 const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "show-latex");
+const HOST_SERVICE_SNIPPET_WORKDIR_NAME = "host-service-snippets";
 const HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES = [
 	"preamble.tex",
 	"praeamble.tex",
@@ -2894,8 +2895,18 @@ function canResolveCompileSourcePath(workspaceContext: HostServiceWorkspaceConte
 
 function buildSnippetLatexSourcePath(workspaceContext: HostServiceWorkspaceContext): string {
 	const workspaceRoot = workspaceContext.workspace_root ?? DEFAULT_HOST_SERVICE_TMPDIR;
-	ensureDirectory(workspaceRoot);
-	const runDir = mkdtempSync(`${join(workspaceRoot, "snippet-")}xxxxxx`);
+	const snippetRoot = workspaceContext.workspace_root
+		? join(workspaceRoot, HOST_SERVICE_SNIPPET_WORKDIR_NAME)
+		: workspaceRoot;
+
+	if (workspaceContext.workspace_root === undefined) {
+		ensureDirectory(snippetRoot);
+	} else {
+		assertDirectorySafe(workspaceRoot, { enforceMode: false });
+		ensureDirectory(snippetRoot);
+	}
+
+	const runDir = mkdtempSync(`${join(snippetRoot, "snippet-")}xxxxxx`);
 	chmodSync(runDir, REQUIRED_DIRECTORY_MODE);
 	return join(runDir, "snippet.tex");
 }
@@ -4246,7 +4257,8 @@ function ensureDirectory(path: string): void {
 	}
 }
 
-function assertDirectorySafe(path: string): void {
+function assertDirectorySafe(path: string, options: { enforceMode?: boolean } = {}): void {
+	const { enforceMode = true } = options;
 	const st = lstatSync(path);
 	if (st.isSymbolicLink()) {
 		throw new Error(`host service path is a symlink: ${path}`);
@@ -4257,11 +4269,11 @@ function assertDirectorySafe(path: string): void {
 	if (process.getuid?.() !== undefined && st.uid !== process.getuid()) {
 		throw new Error(`host service path is not owned by current user: ${path}`);
 	}
-	if ((st.mode & 0o777) !== REQUIRED_DIRECTORY_MODE) {
+	if (enforceMode && (st.mode & 0o777) !== REQUIRED_DIRECTORY_MODE) {
 		chmodSync(path, REQUIRED_DIRECTORY_MODE);
-	}
-	if ((statSync(path).mode & 0o777) !== REQUIRED_DIRECTORY_MODE) {
-		throw new Error(`host service path mode check failed after correction: ${path}`);
+		if ((statSync(path).mode & 0o777) !== REQUIRED_DIRECTORY_MODE) {
+			throw new Error(`host service path mode check failed after correction: ${path}`);
+		}
 	}
 }
 

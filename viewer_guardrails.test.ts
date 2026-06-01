@@ -291,3 +291,16 @@ test("Systemd host service unit is named and configured for show-latex", () => {
 	assert.match(unitSource, /PartOf=graphical-session\.target/);
 	assert.match(unitSource, /WantedBy=graphical-session\.target/);
 });
+
+test("Firejail profile keeps host service runtime paths macro-compatible", () => {
+	const firejailPath = join(REPO_ROOT, ".pi.firejail");
+	const firejailSource = readFileSync(firejailPath, "utf8");
+
+	assert.match(firejailSource, /mkdir\s+\$\{RUNUSER\}\/show-latex/);
+	assert.match(firejailSource, /whitelist\s+\$\{RUNUSER\}\/show-latex/);
+	assert.match(firejailSource, /read-write\s+\$\{RUNUSER\}\/show-latex/);
+	assert.match(firejailSource, /mkdir\s+\$\{RUNUSER\}\/agent-synctex/);
+	assert.match(firejailSource, /whitelist\s+\$\{RUNUSER\}\/agent-synctex/);
+	assert.match(firejailSource, /read-write\s+\$\{RUNUSER\}\/agent-synctex/);
+	assert.equal(firejailSource.includes("${XDG_RUNTIME_DIR}"), false, ".pi.firejail should avoid unsupported XDG_RUNTIME_DIR variable");
+});
