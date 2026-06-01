@@ -502,6 +502,25 @@ export type HostServiceResponseEnvelope =
 	| HostServiceUnregisterCallbackTargetResponseEnvelope
 	| HostServiceResolveCallbackTargetResponseEnvelope;
 
+export type HostServiceAnyResponseDetails =
+	| HostServiceStatusResponseDetails
+	| HostServiceCompileResponseDetails
+	| HostServiceCompileSnippetResponseDetails
+	| HostServiceRasterizeResponseDetails
+	| HostServiceOpenResponseDetails
+	| HostServiceCloseResponseDetails
+	| HostServiceJumpResponseDetails
+	| HostServiceRegisterCallbackTargetResponseDetails
+	| HostServiceUnregisterCallbackTargetResponseDetails
+	| HostServiceResolveCallbackTargetResponseDetails;
+
+export interface HostServiceResponseError extends Error {
+	statusDetails?: HostServiceAnyResponseDetails;
+	errorCode?: string;
+	requestId?: string;
+	requestOperation?: HostServiceOperation;
+}
+
 
 export interface HostServiceManagedViewerRecord {
 	id: number;
@@ -807,7 +826,12 @@ export class HostServiceClient {
 		}
 		if (response.status === "error") {
 			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
-			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+			const error = new Error(`${response.error || "host service returned error status"}${suffix}`) as HostServiceResponseError;
+			error.statusDetails = response.status_details;
+			error.errorCode = response.status_details.error_code;
+			error.requestId = response.request_id;
+			error.requestOperation = "compile_latex_file";
+			throw error;
 		}
 		return response.status_details;
 	}
