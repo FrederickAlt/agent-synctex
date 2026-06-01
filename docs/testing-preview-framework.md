@@ -160,33 +160,35 @@ For extension-triggered scroll, resize, or render bugs that need the real Pi TUI
 
 These Pi-internal imports are best for throwaway/debug repros unless this repo gains an explicit test dependency on Pi internals. Keep committed tests at the extension seams above when possible.
 
-## Viewer-service testing
+## Host-service testing
 
-The default test suite is intentionally headless. It uses fake viewer backends and protocol files to test service open/reuse/close/forward-search behavior without launching a real GUI. Use this layer for committed regressions around:
+The default test suite is intentionally headless. It uses fake host-service backends and protocol files to test service
+open/reuse/close/forward-search behavior without launching a real GUI. Use this layer for committed regressions around:
 
 - ambient `MCP_TMPDIR` isolation;
-- service request/result protocol shape;
-- PDF/source validation and request hardening;
-- owned viewer PID tracking, stale/exited process handling, and close cleanup;
+- protocol shape and request/result hardening;
+- PDF/source validation and lifecycle behavior;
+- backend PID tracking, stale/exited process handling, and close cleanup;
 - forward-search command construction and diagnostic propagation.
 
-Real Zathura behavior still needs an opt-in smoke test because D-Bus and SyncTeX behavior cannot be fully represented by fake processes. After installing the current checkout's service files and restarting `codex-show-latex-viewer.service`, run from Pi (remaining manual HITL check for human validation):
+Real Zathura behavior still needs an opt-in smoke test because D-Bus and SyncTeX behavior cannot be fully represented by fake processes.
+From Pi, run the standard host-service flow after start:
 
 1. `show_latex` (default inline flow) and confirm an inline artifact is rendered in the Pi result.
-2. `show_latex` with `inline=false` and confirm a viewer opens through the service.
+2. `show_latex` with `inline=false` and confirm the host service opens a viewer.
 3. `compile_latex_file(<repo-local.tex>, {"open_pdf": true})` and confirm a `pdf_id` is returned and opens in the service-controlled viewer.
 4. `jump_pdf(pdf_id, line)` and confirm forward-search moves the viewer to the source line.
 5. Click a clickable PDF region in the opened viewer and confirm the session receives a pasted block `PDF click: path/to/file.tex:LINE`.
-6. `close_pdf(pdf_id)` and confirm the service-owned viewer closes, with unowned/reused handles acknowledged as not closed.
+6. `close_pdf(pdf_id)` and confirm service-owned windows close, with unowned/reused handles acknowledged as not closed.
 
-Do not treat direct `zathura ...` commands launched from an agent `bash` tool as equivalent to the real service path: those commands run in the agent sandbox, while the viewer service runs in the user's desktop session. Use `~/plugins/codex-show-latex-mcp/scripts/show_latex_viewer.py --status`, `viewer.log`, and the tool error logs under the preview temp directory for diagnostics.
+Do not treat direct `zathura ...` commands launched from an agent `bash` tool as equivalent to the host service path: those commands run in the agent sandbox, while the host service runs in the user's desktop session. Use `npm run host-service:status`, `show-latex`-relevant diagnostics under `/tmp/codex-show-latex/*.log`, and tool error logs under the preview temp directory for diagnostics.
 
 A dedicated runtime guardrail test (`viewer_guardrails.test.ts`) enforces that extension production code never directly controls GUI viewers (no direct `zathura`/`evince` spawns, no session discovery via `/proc`, no raw session-env probing). Keep it green whenever the viewer path changes.
 
 ### Brokered real-service iteration
 
 When the project-local Firejail include is installed, agents in this repo may have access to a narrow host broker via
-`pdf-preview-servicectl` and `~/.cache/pdf-preview-servicectl/broker.sock`. Use it only for this viewer-service smoke
+`pdf-preview-servicectl` and `~/.cache/pdf-preview-servicectl/broker.sock`. Use it only for this host-service smoke
 loop:
 
 ```bash
@@ -196,10 +198,10 @@ pdf-preview-servicectl status
 pdf-preview-servicectl logs
 ```
 
-This broker exists solely to sync/restart/status/log the PDF preview viewer service so real open/close/SyncTeX behavior
+This broker exists solely to sync/restart/status/log host-service support files so real open/close/SyncTeX behavior
 can be tested outside the sandbox. It is not a general host-control channel. Do not use it for unrelated commands,
-unrelated services, or any purpose other than maintaining/testing the PDF viewer service used by `open_pdf`, `close_pdf`,
-`jump_pdf`, `show_latex(inline=false)`, and `compile_latex_file(open_pdf=true)`.
+unrelated services, or any purpose other than maintaining/testing the PDF host service used by `open_pdf`, `close_pdf`,
+`jump_pdf`, `show_latex(inline=false)`, and `compile_latex_file(open_pdf=true)`. 
 
 ## Verification commands
 

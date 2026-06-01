@@ -36,10 +36,8 @@ import {
 	describePdfJumpFailureContextForContext,
 	jumpTrackedPdfForContext,
 	openTrackedPdfForContext,
-	openTrackedPdfForContextFromViewerService,
 } from "./src/modules/pdf_session/pdf_session.ts";
 import { SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./src/modules/synctex/synctex.ts";
-import { ViewerServiceClient, type ViewerServiceOpenResult } from "./src/modules/viewer_service.ts";
 import {
 	HostServiceClient,
 	type HostServiceCompileResponseDetails,
@@ -91,7 +89,6 @@ interface PipelineStatusSnapshot {
 
 const MCP_TMPDIR = process.env.MCP_TMPDIR ?? "/tmp/codex-show-latex";
 const MCP_FIXED_PREVIEW_PDF_PATH = resolve(MCP_TMPDIR, "show-latex.pdf");
-const VIEWER_SERVICE_REQUEST_TIMEOUT_MS = 5_000;
 const LATEX_PREAMBLE_FILE_NAMES = ["preamble.tex", "praeamble.tex"] as const;
 const LATEX_PREAMBLE_PATH = resolve(MCP_TMPDIR, "preamble.tex");
 const REQUEST_TIMEOUT_DEFAULT_MS = 60_000;
@@ -860,7 +857,6 @@ class ShowLatexMcpClient {
 const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
-const viewerServiceClient = new ViewerServiceClient(MCP_TMPDIR, { requestTimeoutMs: VIEWER_SERVICE_REQUEST_TIMEOUT_MS });
 function hostServiceClientConfig() {
 	return {
 		socketPath: process.env[HOST_SERVICE_SESSION_ENV_VAR] ?? defaultHostServiceSocketPath(),
@@ -1066,7 +1062,7 @@ const ShowLatexParams = Type.Object(
 		}),
 		compiler: LatexCompilerParam,
 		inline: Type.Optional(Type.Boolean({
-			description: "When true, rasterize the compiled PDF and show it inline in the Pi TUI instead of requesting an external viewer-service preview. Defaults to true.",
+			description: "When true, rasterize the compiled PDF and show it inline in the Pi TUI instead of requesting a host-service external preview. Defaults to true.",
 			default: true,
 		})),
 	},
@@ -1081,7 +1077,7 @@ const CompileLatexFileParams = Type.Object(
 		}),
 		compiler: LatexCompilerParam,
 		open_pdf: Type.Optional(Type.Boolean({
-			description: "When true, request the viewer service to open and track the compiled PDF after successful compilation. Defaults to false.",
+			description: "When true, request the host service to open and track the compiled PDF after successful compilation. Defaults to false.",
 			default: false,
 		})),
 		clean: Type.Optional(Type.Boolean({
@@ -1138,8 +1134,6 @@ const SetLatexPreambleParams = Type.Object(
 	},
 	{ additionalProperties: false },
 );
-
-const SynctexCallbackCommandParams = Type.Object({}, { additionalProperties: false });
 
 const showLatexPreviewPipeline = createShowLatexPreviewPipeline({
 	resolveLatexCompiler,
@@ -1227,7 +1221,6 @@ async function executeShowLatexPreviewTool(
 			latex_source_tail: tailText(latexSource, 30000),
 			pdf: previewPdfPath,
 			fixed_preview_pdf: MCP_FIXED_PREVIEW_PDF_PATH,
-			synctex_callback_command: synctexCommand,
 		}, error);
 	}
 
@@ -1290,44 +1283,42 @@ async function executeShowLatexPreviewTool(
 				pdf_id: trackedPdf.id,
 				operation_pdf: previewPdfPath,
 				inline: false,
-				synctex_callback_command: synctexCommand,
 			},
 		};
 	} catch (error) {
-		throw latexToolFailure(toolName, describeShowLatexViewerOpenFailure(error), {
+		throw latexToolFailure(toolName, describeShowLatexHostServiceOpenFailure(error), {
 			compiler: compiler ?? compilerParam ?? DEFAULT_LATEX_COMPILER,
 			inline,
 			latex_source_length: latexSource.length,
 			latex_source_tail: tailText(latexSource, 30000),
 			preview_pdf: previewPdfPath,
 			fixed_preview_pdf: MCP_FIXED_PREVIEW_PDF_PATH,
-			synctex_callback_command: synctexCommand,
 			open_error: errorMessage(error),
-			open_error_code: extractViewerServiceErrorCode(error),
+			open_error_code: extractHostServiceErrorCode(error),
 		}, error);
 	}
 }
 
-function describeShowLatexViewerOpenFailure(error: unknown): string {
+function describeShowLatexHostServiceOpenFailure(error: unknown): string {
 	const message = errorMessage(error).toLowerCase();
-	const errorCode = extractViewerServiceErrorCode(error);
+	const errorCode = extractHostServiceErrorCode(error);
 
 	if (message.includes("viewer service request timed out") || message.includes("host service request timed out")) {
-		return "Viewer service request timed out while opening preview";
+		return "Host service request timed out while opening preview";
 	}
 	if (errorCode === "backend_unavailable") {
-		return "Viewer backend unavailable while opening preview";
+		return "Host service backend unavailable while opening preview";
 	}
 	if (errorCode) {
-		return `Viewer service unavailable while opening preview (code=${errorCode})`;
+		return `Host service unavailable while opening preview (code=${errorCode})`;
 	}
 	if (message.includes("viewer service unavailable") || message.includes("host service unavailable")) {
-		return "Viewer service unavailable while opening preview";
+		return "Host service unavailable while opening preview";
 	}
-	return "Viewer service unavailable while opening preview";
+	return "Host service unavailable while opening preview";
 }
 
-function extractViewerServiceErrorCode(error: unknown): string | undefined {
+function extractHostServiceErrorCode(error: unknown): string | undefined {
 	const message = error instanceof Error ? error.message : String(error);
 	return /\(code=([^)]+)\)/.exec(message)?.[1];
 }
@@ -1390,19 +1381,6 @@ function describeCompileFailureContext(
 function isOpenFailureFromCompileError(error: unknown): boolean {
 	const details = hostServiceCompileErrorDetails(error);
 	return typeof details?.pdf === "string" && details.pdf.length > 0 && details.error_code !== "compile_failed";
-}
-
-async function openPdfThroughViewerService(
-	path: string,
-	callbackConfig: SynctexCallbackConfig,
-	signal?: AbortSignal,
-): Promise<ViewerServiceOpenResult> {
-	return viewerServiceClient.requestOpenPdf(
-		path,
-		callbackConfig,
-		{ reuseExisting: true, requirePersistentViewer: true },
-		signal,
-	);
 }
 
 function copySynctexArtifactsForFixedPdfPath(sourcePdfPath: string, fixedPdfPath: string): void {
@@ -1534,18 +1512,10 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.registerCommand("synctex_callback_command", {
-		description: "Paste the exact session-specific Zathura SyncTeX callback command into the editor for manual configuration.",
-		async handler(_args, ctx) {
-			const server = await ensureSynctexCallbacks(ctx);
-			if (ctx.hasUI) ctx.ui.pasteToEditor(`${server.command}\n`);
-		},
-	});
-
 	pi.registerTool({
 		name: "show_latex",
 		label: "Show LaTeX",
-		description: "FREEFORM/raw LaTeX preview. Pass LaTeX code directly; optional YAML-like front matter may set compiler and inline. Example: ---\ncompiler: lualatex\ninline: true\n---\n\\begin{equation}\nx\n\\end{equation}\nThe \\begin{document}...\\end{document} wrapper is accepted but not required. Defaults to inline preview with lualatex; set inline=false to refresh fixed artifacts and request a viewer-service open instead.",
+		description: "FREEFORM/raw LaTeX preview. Pass LaTeX code directly; optional YAML-like front matter may set compiler and inline. Example: ---\ncompiler: lualatex\ninline: true\n---\n\\begin{equation}\nx\n\\end{equation}\nThe \\begin{document}...\\end{document} wrapper is accepted but not required. Defaults to inline preview with lualatex; set inline=false to request host-service external open instead.",
 		promptSnippet: "FREEFORM LaTeX preview; optional front matter can set compiler and inline",
 		promptGuidelines: [
 			"Use show_latex when the user asks for a LaTeX PDF preview. Prefer passing only the LaTeX body, for example \\[x\\]; \\begin{document}...\\end{document} is accepted but usually unnecessary.",
@@ -1569,12 +1539,12 @@ export default function (pi: ExtensionAPI) {
 		name: "open_pdf",
 		label: "Open PDF",
 		description: "Open an existing local PDF through the host service and track it for later SyncTeX actions. Returns a host-service pdf_id for this Pi session. Opening the same PDF path again reuses the existing tracked or visible viewer where practical. The viewer is configured with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
-		promptSnippet: "Open and track a local PDF through the viewer service",
+		promptSnippet: "Open and track a local PDF through the host service",
 		promptGuidelines: [
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
 			"Pass an existing local PDF path. The returned pdf_id is the host-service ID for this Pi session.",
 			"Opening the same normalized PDF path again should return the existing pdf_id instead of creating a duplicate viewer where practical.",
-			"PDFs opened through the viewer service are wired to paste inverse SyncTeX clicks into the current interactive editor without triggering an agent turn when the backend supports it.",
+			"PDFs opened through the host service are wired to paste inverse SyncTeX clicks into the current interactive editor without triggering an agent turn when the backend supports it.",
 		],
 		parameters: OpenPdfParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -1643,9 +1613,7 @@ export default function (pi: ExtensionAPI) {
 				pdfPath = trackedPdf.path;
 
 				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
-				const text = synctexCommand
-					? `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
-					: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
+				const text = `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
 				return {
 					content: [{ type: "text", text }],
 					details: {
@@ -1657,16 +1625,14 @@ export default function (pi: ExtensionAPI) {
 						viewer_backend: trackedPdf.viewerBackend,
 						viewer_owned: trackedPdf.viewerOwned,
 						viewer_capabilities: trackedPdf.viewerCapabilities,
-						synctex_callback_command: synctexCommand,
 					},
 				};
 			} catch (error) {
 				throw latexToolFailure("open-pdf", "Open PDF failed", {
 					requested_path: requestedPath,
 					pdf: pdfPath,
-					synctex_callback_command: synctexCommand,
 					open_error: error instanceof Error ? error.message : String(error),
-					open_error_code: extractViewerServiceErrorCode(error),
+					open_error_code: extractHostServiceErrorCode(error),
 				}, error);
 			}
 		},
@@ -1675,8 +1641,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "close_pdf",
 		label: "Close PDF",
-		description: "Request the host-service or viewer service to close an extension-tracked PDF by pdf_id. Service-managed windows are closed through private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The PDF is then removed from this session's tracking table when the close request succeeds.",
-		promptSnippet: "Close a tracked PDF through the viewer service",
+		description: "Request the host service to close an extension-tracked PDF by pdf_id. Service-managed windows are closed through private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The PDF is then removed from this session's tracking table when the close request succeeds.",
+		promptSnippet: "Close a tracked PDF via host service",
 		promptGuidelines: [
 			"Use close_pdf when the user asks to close a PDF previously opened or tracked by this extension.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true).",
@@ -1691,7 +1657,7 @@ export default function (pi: ExtensionAPI) {
 					ctx,
 					pdfId,
 					async (viewerHandle, viewerBackend, closeSignal) => {
-						return viewerServiceClient.requestClosePdf(viewerHandle, viewerBackend, closeSignal);
+						throw new Error("closeTrackedPdf requires host-service metadata in normal operation mode");
 					},
 					signal,
 					async (hostPdfId, hostServiceSocketPath, closeSignal) => {
@@ -1725,10 +1691,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "jump_pdf",
 		label: "Jump PDF",
-		description: "Perform a line-based viewer-service forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. The PDF must have SyncTeX data, and the source file must be readable. Uses the tracked default source file when known, or pass source_file when no default source was inferred or when jumping to an included .tex file. On success, the text result names the jumped line and then shows the verbatim LaTeX source line.",
+		description: "Perform a line-based host-service forward SyncTeX jump in an already tracked PDF. Requires the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); arbitrary PDF paths are not accepted. The PDF must have SyncTeX data, and the source file must be readable. Uses the tracked default source file when known, or pass source_file when no default source was inferred or when jumping to an included .tex file. On success, the text result names the jumped line and then shows the verbatim LaTeX source line.",
 		promptSnippet: "Jump to a source line in a tracked PDF",
 		promptGuidelines: [
-			"Use jump_pdf to move an already tracked viewer-service PDF to a source line via forward SyncTeX.",
+			"Use jump_pdf to move an already tracked host-service PDF to a source line via forward SyncTeX.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true); do not pass arbitrary PDF paths.",
 			"Reuse the same pdf_id for repeated jumps within one tracked PDF.",
 			"source_file is optional only when the target line is in the tracked default source file; provide it whenever the target is in another source file or needs disambiguation.",
@@ -1764,34 +1730,11 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					{
 						synctexEditorCommand: synctexCommand || undefined,
-						opener: async (path: string, openSignal: AbortSignal | undefined) => {
-							const callbackConfig = (await ensureSynctexCallbacks(ctx)).callbackConfig;
-							const response = await openPdfThroughViewerService(path, callbackConfig, openSignal);
-							return {
-								pid: response.pid,
-								viewerHandle: response.handle,
-								viewerBackend: response.backend,
-								viewerOwned: response.owned,
-								viewerCapabilities: response.capabilities,
-							};
+						opener: async () => {
+							throw new Error("jumpTrackedPdf requires host-service metadata in normal operation mode");
 						},
-						requestForwardSearch: async (
-							viewerHandle,
-							viewerBackend,
-							sourceFilePath,
-							jumpLine,
-							synctexPid,
-							jumpSignal,
-						) => {
-							const response = await viewerServiceClient.requestForwardSearch(
-								viewerHandle,
-								viewerBackend,
-								sourceFilePath,
-								jumpLine,
-								synctexPid,
-								jumpSignal,
-							);
-							return { handled: response.handled, reason: response.reason };
+						requestForwardSearch: async () => {
+							throw new Error("jumpTrackedPdf requires host-service metadata in normal operation mode");
 						},
 						requestJumpFromHostService: async (
 						hostPdfId,
@@ -1828,39 +1771,12 @@ export default function (pi: ExtensionAPI) {
 					pdf_id: pdfId || params.pdf_id,
 					line: line || params.line,
 					source_file: sourceFile ?? params.source_file,
-					synctex_callback_command: synctexCommand,
 				};
 				if (ctx && pdfId > 0) {
 					failureContext.jump_failure_context = describePdfJumpFailureContextForContext(ctx, pdfId, synctexCommand || undefined);
 				}
 				throw latexToolFailure("jump-pdf", "PDF jump failed", failureContext, error);
 			}
-		},
-	});
-
-	pi.registerTool({
-		name: "get_synctex_callback_command",
-		label: "Get SyncTeX Callback Command",
-		description: "Return the exact session-specific Zathura inverse SyncTeX callback command for manual configuration. The command forwards Zathura %{input}/%{line} clicks to this Pi session and only pastes text into the interactive editor; it never submits a message.",
-		promptSnippet: "Get the current session's Zathura inverse SyncTeX callback command",
-		promptGuidelines: [
-			"Use get_synctex_callback_command when the user wants to configure Zathura manually for inverse SyncTeX clicks.",
-			"The returned command is specific to the current running Pi session and should be used as Zathura's synctex-editor-command.",
-		],
-		parameters: SynctexCallbackCommandParams,
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			if (!ctx) throw new Error("SyncTeX callback command is only available inside a Pi session");
-			const server = await ensureSynctexCallbacks(ctx);
-			const text = [
-				"Zathura SyncTeX callback command:",
-				server.command,
-				"",
-				"Manual use: configure this as zathura's synctex-editor-command for the current Pi session.",
-			].join("\n");
-			return {
-				content: [{ type: "text", text }],
-				details: { command: server.command },
-			};
 		},
 	});
 
@@ -1960,9 +1876,7 @@ export default function (pi: ExtensionAPI) {
 					source: trackedPdf.sourceFile ?? compileResponse.source,
 				};
 				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
-				const text = synctexCommand
-					? `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
-					: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
+				const text = `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
 				return {
 					content: [{ type: "text", text }],
 					details: {
@@ -1976,7 +1890,6 @@ export default function (pi: ExtensionAPI) {
 						viewer_capabilities: trackedPdf.viewerCapabilities,
 						clean: compileResponse.clean,
 						cleaned_artifacts: compileResponse.cleaned_artifacts,
-						synctex_callback_command: synctexCommand,
 					},
 				};
 			} catch (error) {
@@ -1991,9 +1904,8 @@ export default function (pi: ExtensionAPI) {
 						cleaned_artifacts: failureContext.cleaned_artifacts,
 						pdf: failureContext.pdf,
 						target_id: targetId,
-						synctex_callback_command: synctexCommand,
 						open_error: error instanceof Error ? error.message : String(error),
-						open_error_code: extractViewerServiceErrorCode(error),
+						open_error_code: extractHostServiceErrorCode(error),
 					}, error);
 				}
 
@@ -2005,7 +1917,6 @@ export default function (pi: ExtensionAPI) {
 					clean: failureContext.clean,
 					cleaned_artifacts: failureContext.cleaned_artifacts,
 					pdf: failureContext.pdf,
-					synctex_callback_command: synctexCommand,
 					callback_target_id: shouldOpenPdf ? targetId : undefined,
 				}, error);
 			}
@@ -2015,14 +1926,14 @@ export default function (pi: ExtensionAPI) {
 	const compileLatexFileTool: TracerToolDefinition = {
 		name: "compile_latex_file",
 		label: "Compile LaTeX File",
-		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a viewer-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external viewer state. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles.",
+		description: "Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external service state. Relative \\input, \\include, graphics, bibliography, and other project files are resolved the same way they are when compiling the file directly from its directory. The fixed temp preamble is not injected for file compiles.",
 		promptSnippet: "Compile a local LaTeX file as PDF",
 		promptGuidelines: [
 			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
-			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without requesting external viewer state; set open_pdf=true only when the user wants the compiled PDF opened/tracked by the viewer service immediately.",
+			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without requesting external service state; set open_pdf=true only when the user wants the compiled PDF opened/tracked by the host service immediately.",
 			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling.",
 			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
-			"For multi-file LaTeX projects, compile the root file that produces the PDF, such as main.tex, and use open_pdf=true only when a viewer-service-tracked PDF is needed. The returned pdf_id identifies the resulting PDF/viewer and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
+			"For multi-file LaTeX projects, compile the root file that produces the PDF, such as main.tex, and use open_pdf=true only when a host-service-tracked PDF is needed. The returned pdf_id identifies the running service-tracked PDF and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
 			"On failure this tool returns only a short error message and writes details to a temporary log file.",
 		],
 		parameters: CompileLatexFileParams,
