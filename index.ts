@@ -39,6 +39,7 @@ import {
 } from "./src/modules/pdf_session/pdf_session.ts";
 import { SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./src/modules/synctex/synctex.ts";
 import { ViewerServiceClient, type ViewerServiceOpenResult } from "./src/modules/viewer_service.ts";
+import { HostServiceClient, defaultHostServiceSocketPath } from "./src/modules/host_service.ts";
 import {
 	createUniversalToolFacade,
 	registerTracerTools,
@@ -92,6 +93,9 @@ const STARTUP_TIMEOUT_MAX_MS = 120_000;
 const MCP_SHUTDOWN_TERM_TIMEOUT_MS = 1_000;
 const MCP_SHUTDOWN_KILL_TIMEOUT_MS = 1_000;
 const TMUX_COMMAND_TIMEOUT_MS = 1_000;
+const HOST_SERVICE_CALLBACK_TARGET_PREFIX = "pi";
+const HOST_SERVICE_SESSION_ENV_VAR = "PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH";
+const HOST_SERVICE_REQUEST_TIMEOUT_MS = 5_000;
 
 function debugLog(..._parts: unknown[]): void {
 	// Debug logging is intentionally disabled; this extension has no environment-driven configuration.
@@ -864,6 +868,13 @@ const MCP_SCRIPT_PATH = resolveMcpScriptPath();
 const SYNCTEX_CALLBACK_SCRIPT_PATH = resolveSynctexCallbackScriptPath();
 const mcpClient = new ShowLatexMcpClient("python3", MCP_SCRIPT_PATH);
 const viewerServiceClient = new ViewerServiceClient(MCP_TMPDIR, { requestTimeoutMs: VIEWER_SERVICE_REQUEST_TIMEOUT_MS });
+function hostServiceClientConfig() {
+	return {
+		socketPath: process.env[HOST_SERVICE_SESSION_ENV_VAR] ?? defaultHostServiceSocketPath(),
+		requestTimeoutMs: HOST_SERVICE_REQUEST_TIMEOUT_MS,
+	};
+}
+const hostServiceSessionTargets = new Map<string, { targetId: string; workspaceContext: { cwd: string; session_id?: string }; socketPath: string }>();
 const tmuxKittyPreviewInvalidationRegistry = new KittyPreviewInvalidationRegistry();
 const terminalRefreshPolicy = createTerminalRefreshPolicy({
 	adapter: {
@@ -900,6 +911,68 @@ function inlinePreviewRenderStateFromDetails(details: Record<string, unknown>): 
 }
 function callbackKeyForContext(ctx: ExtensionContext): string {
 	return contextSessionKey(ctx);
+}
+
+function hostServiceSocketPath(): string {
+	return hostServiceClientConfig().socketPath;
+}
+
+function hostServiceTargetId(ctx: ExtensionContext): string {
+	return `${HOST_SERVICE_CALLBACK_TARGET_PREFIX}:${callbackKeyForContext(ctx)}`;
+}
+
+function hostServiceWorkspaceContextForSession(ctx: ExtensionContext): { cwd: string; session_id?: string } {
+	const context: { cwd: string; session_id?: string } = {
+		cwd: ctx.cwd,
+	};
+	const rawSessionId = (ctx as { session_id?: unknown }).session_id;
+	if (typeof rawSessionId === "string" && rawSessionId.length > 0) {
+		context.session_id = rawSessionId;
+	}
+	return context;
+}
+
+function notifyHostServiceError(ctx: ExtensionContext, operation: string, error: unknown): void {
+	if (!ctx.hasUI) return;
+	ctx.ui.notify(`Host Service ${operation} failed: ${errorMessage(error)}. Expected socket ${hostServiceSocketPath()}`, "error");
+}
+
+async function registerHostServiceCallbackTarget(ctx: ExtensionContext): Promise<void> {
+	const contextKey = callbackKeyForContext(ctx);
+	const targetId = hostServiceTargetId(ctx);
+	const workspaceContext = hostServiceWorkspaceContextForSession(ctx);
+	const callbackServer = await ensureSynctexCallbacks(ctx);
+	const socketPath = hostServiceSocketPath();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+	});
+	await client.requestStatus(workspaceContext);
+	await client.requestRegisterCallbackTarget(workspaceContext, {
+		target_id: targetId,
+		target: callbackServer.callbackConfig,
+	});
+	hostServiceSessionTargets.set(contextKey, {
+		targetId,
+		workspaceContext,
+		socketPath,
+	});
+}
+
+async function unregisterHostServiceCallbackTarget(contextKey: string): Promise<void> {
+	const registration = hostServiceSessionTargets.get(contextKey);
+	if (!registration) return;
+	hostServiceSessionTargets.delete(contextKey);
+	const client = new HostServiceClient({
+		socketPath: registration.socketPath,
+		requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+	});
+	await client.requestUnregisterCallbackTarget(registration.workspaceContext, registration.targetId);
+}
+
+async function unregisterAllHostServiceCallbacks(): Promise<void> {
+	const contextKeys = [...hostServiceSessionTargets.keys()];
+	await Promise.allSettled(contextKeys.map((contextKey) => unregisterHostServiceCallbackTarget(contextKey)));
 }
 
 function createSynctexCallbackServer(): SynctexCallbackServer {
@@ -1263,16 +1336,19 @@ function renderShowLatexResult(result: { content?: Array<{ type?: string; text?:
 export default function (pi: ExtensionAPI) {
 	initializeLatexPreambleFile();
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		terminalRefreshPolicy.cleanup();
 		terminalRefreshPolicy.install({ hasUI: ctx.hasUI, ui: ctx.ui });
 
-		void rotateSynctexCallbacks(ctx).catch((error) => {
-			if (ctx.hasUI) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`Failed to start SyncTeX callback server: ${message}`, "error");
+		try {
+			await rotateSynctexCallbacks(ctx);
+			await registerHostServiceCallbackTarget(ctx);
+		} catch (error) {
+			notifyHostServiceError(ctx, "startup", error);
+			if (!ctx.hasUI) {
+				console.error(`Host Service startup failed: ${errorMessage(error)}`);
 			}
-		});
+		}
 	});
 
 	pi.registerCommand("synctex_callback_command", {
@@ -1682,6 +1758,14 @@ export default function (pi: ExtensionAPI) {
 		terminalRefreshPolicy.clearInvalidators();
 		if (ctx) {
 			clearPdfTrackerForContext(ctx);
+			const contextKey = callbackKeyForContext(ctx);
+			try {
+				await unregisterHostServiceCallbackTarget(contextKey);
+			} catch (error) {
+				notifyHostServiceError(ctx, "cleanup", error);
+			}
+		} else {
+			await unregisterAllHostServiceCallbacks();
 		}
 		await shutdownSynctexCallbacks();
 		await mcpClient.shutdown();
