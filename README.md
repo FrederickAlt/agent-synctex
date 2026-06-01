@@ -9,6 +9,8 @@ Pi extension that exposes six tools:
 - `compile_latex_file` — compile a local LaTeX source file in place, optionally sending a host service open request to track the resulting PDF.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
+The TypeScript Host Service now owns backend `show_latex` compilation/open/jump/close flows and viewer backend dispatch. Pi remains the frontend coordinator for tool registration, inline rendering, and editor paste behavior.
+
 When `inline=false`, previews are opened through the local host service using this extension's request context. Each successful preview writes an operation-scoped PDF and refreshes a fixed `/tmp/codex-show-latex/show-latex.pdf` compatibility copy only for external preview calls.
 For example:
 
@@ -86,7 +88,11 @@ npm run host-service:start
 npm run host-service:status
 ```
 
+`npm run host-service:start` starts the host service in the foreground and blocks until it receives SIGINT or SIGTERM. During HITL, run it in a separate terminal (or background with a tracked PID) so you can still run tool calls in another shell.
+If your project has `pdf-preview-servicectl`, you can also use `pdf-preview-servicectl restart`, `pdf-preview-servicectl status`, and `pdf-preview-servicectl logs`.
+
 The host service exposes sockets under `/tmp/codex-show-latex` and logs under `/tmp/codex-show-latex/*.log`; host-service status logs should be consulted when open/close/jump requests fail unexpectedly.
+Before first start, `npm run host-service:status` may return ENOENT when the service runtime directory has not been created yet; this is expected.
 
 Viewer backends are configured in-host by the service runtime; Zathura is the default local backend, with optional test backends for repository-level verification.
 
@@ -117,8 +123,7 @@ unrelated host commands, unrelated services, or non-viewer automation.
 - **Backend unavailable**: failures like `viewer backend is unavailable` or `(code=backend_unavailable)` usually mean
   the configured backend command is missing/unlaunchable. Run
   `npm run host-service:status` and check returned backend/daemon diagnostics before restarting the service.
-- The extension sends the service structured callback data (`kind`, `transport`, `socket_path`, `token`); raw callback commands are only
-  for legacy manual Zathura setup only, by reading the session callback settings directly from source as needed; it is not a public tool path.
+- The extension sends the service structured callback data (`kind`, `transport`, `socket_path`, `token`); raw callback commands are legacy-only and are not a public tool path.
 - For host-open failures, inspect `/tmp/codex-show-latex/*.log` for details.
 - If LaTeX compilation fails (for `show_latex` or `compile_latex_file`), check `/tmp/codex-show-latex/*.log`; compile and service failures are separate.
 
@@ -148,7 +153,7 @@ PDF click: relative/path/main.tex:123
 
 The path is relative to the Pi session cwd. The source line is included when the clicked source file is readable; otherwise the block still ends with the blank line.
 
-Manual callback command details are intentionally not exposed as a public tool. For advanced debugging only, derive the command format from the repository source (`src/modules/synctex/synctex.ts`) and use fresh session socket/token values; never reuse a callback command from another Pi session.
+Manual callback command details are intentionally not exposed as a public tool path. Use service logs and `npm run host-service:status` for troubleshooting; callback command reconstruction is not part of the stable user-facing flow.
 
 In headless/non-interactive sessions the callback never submits a message automatically. If a PDF click arrives while the agent is busy/streaming, it only pastes into the editor.
 

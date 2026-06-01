@@ -20,22 +20,22 @@ LaTeX PDF Production has two input modes: snippet input and file input. Snippet 
 ### Pi Extension
 The Pi-specific frontend integration for pdf-preview. It owns Pi tool registration, Pi UI rendering behavior, Pi terminal refresh behavior, and Pi editor paste integration.
 
-The Pi Extension should preserve its existing public tool API and user-facing language even if core logic moves into the MCP Service, except for `get_synctex_callback_command`, which is intentionally planned for removal. Manual inverse SyncTeX setup should move to documentation rather than remain a public tool.
+The Pi Extension should preserve its existing public tool API and user-facing language while keeping implementation internal. Manual inverse SyncTeX callback setup details remain internal implementation documentation and are not part of public API guidance.
 
 Pi may continue to expose `inline` because that describes Pi presentation behavior. Internally, Pi can translate inline preview requests into service-facing artifact/rasterization requests.
 
 ### Host Service
 The long-running local service intended to own pdf-preview core capabilities and expose them to MCP-capable agents.
 
-The Host Service is planned to become the primary owner of core logic, active PDF IDs, artifact/session state, callback routing, and viewer backend adapters. It should use service-facing concepts such as rasterization and artifacts rather than frontend presentation concepts such as inline rendering.
+The Host Service is the primary owner of core logic, active PDF IDs, artifact/session state, callback routing, and viewer backend adapters. It owns backend compilation (`show_latex`, `compile_latex_file`), open/jump/close operations, and uses service-facing concepts such as rasterization and artifacts rather than frontend presentation concepts such as inline rendering.
 
-The Host Service should communicate over a local Unix socket unless a future portability constraint requires another transport. Pi wraps the Host Service and may register a callback endpoint so the Host Service can actively deliver inverse SyncTeX events back to Pi for editor insertion.
+The Host Service communicates over a local Unix socket and exposes the main runtime surface as MCP for automation clients. Pi wraps the Host Service and registers a callback endpoint so inverse SyncTeX events can return to the editor for paste-injection.
 
 Because the Host Service is long-running and may serve multiple agents/projects, requests that depend on relative paths or project defaults must include explicit workspace context. The service should not rely on its own process working directory as the caller's project context.
 
-The stable integration surface is MCP, not a public CLI. Developer convenience commands may exist under a shared command namespace such as `agent-synctex show_latex ...`, but these are for debugging/smoke testing rather than the primary user workflow.
+The stable integration surface is MCP. Developer convenience scripts such as `agent-synctex ...` are for debugging/smoke testing rather than the primary user workflow.
 
-The previous separate viewer-service role should be absorbed into the Host Service unless a future security or deployment constraint requires splitting it again.
+The previous separate viewer-service role has been absorbed into the Host Service (with compatibility helpers retained only for legacy parity).
 
 ### Preview Artifact
 A generated output of preview or compile work, such as a PDF file, rasterized image file, or log file. Frontends decide how to present preview artifacts to users.
@@ -48,7 +48,7 @@ External snippet previews and compiled-file opens should both use managed viewer
 ### PDF ID
 A short, Host-Service-generated, random numeric identifier for an active PDF viewer record.
 
-PDF IDs are globally unique among currently active records. They are intended to prevent accidental cross-agent interference without requiring long UUID-style tokens. The current planned range is 1 through 99,999,999.
+PDF IDs are globally unique among currently active records. They are intended to prevent accidental cross-agent interference without requiring long UUID-style tokens. The active range is currently 1 through 99,999,999.
 
 PDF IDs are active runtime state and are kept in memory only. They do not survive Host Service restart. Artifacts may remain on disk, but active viewer records and PDF IDs must be re-established after restart.
 

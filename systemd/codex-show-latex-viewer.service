@@ -1,5 +1,7 @@
 [Unit]
-Description=Codex Show LaTeX desktop viewer helper
+# DEPRECATED: legacy Python viewer-service unit kept for compatibility only.
+# Production startup uses `npm run host-service:start` (scripts/agent-synctex-host-service.ts).
+Description=Codex Show LaTeX legacy Python viewer service (deprecated)
 After=graphical-session.target
 PartOf=graphical-session.target
 
