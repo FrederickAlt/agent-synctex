@@ -11,6 +11,7 @@ ExecStart=/usr/bin/env sh -c 'DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRE
 Restart=on-failure
 RestartSec=2
 Environment=NODE_NO_WARNINGS=1
+Environment=MCP_TMPDIR=%t/show-latex
 NoNewPrivileges=true
 
 [Install]

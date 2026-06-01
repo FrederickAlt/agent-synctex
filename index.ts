@@ -87,7 +87,7 @@ interface PipelineStatusSnapshot {
 	ready: PipelineArtifactStatus;
 }
 
-const MCP_TMPDIR = process.env.MCP_TMPDIR ?? "/tmp/codex-show-latex";
+const MCP_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "show-latex");
 const MCP_FIXED_PREVIEW_PDF_PATH = resolve(MCP_TMPDIR, "show-latex.pdf");
 const LATEX_PREAMBLE_FILE_NAMES = ["preamble.tex", "praeamble.tex"] as const;
 const LATEX_PREAMBLE_PATH = resolve(MCP_TMPDIR, "preamble.tex");
@@ -1129,7 +1129,7 @@ const JumpPdfParams = Type.Object(
 const SetLatexPreambleParams = Type.Object(
 	{
 		latex_preamble: Type.String({
-			description: "LaTeX preamble lines to write to /tmp/codex-show-latex/preamble.tex and include before \\begin{document} for show_latex snippet compiles. This overwrites the active temp preamble; if a project preamble was copied there at startup, this makes the active preview preamble diverge from the project's real ./preamble.tex. Use only for pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. Use an empty string to clear it only when intentionally clearing the active preview preamble.",
+			description: "LaTeX preamble lines to write to ${XDG_RUNTIME_DIR}/show-latex/preamble.tex and include before \\begin{document} for show_latex snippet compiles. This overwrites the active temp preamble; if a project preamble was copied there at startup, this makes the active preview preamble diverge from the project's real ./preamble.tex. Use only for pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. Use an empty string to clear it only when intentionally clearing the active preview preamble.",
 		}),
 	},
 	{ additionalProperties: false },
@@ -1522,8 +1522,8 @@ export default function (pi: ExtensionAPI) {
 			"Use optional front matter only when changing options, for example: ---\ncompiler: xelatex\ninline: false\n---",
 			"show_latex renders inline by default; set inline=false only when the user wants an external viewer.",
 			"Do not use verbatim-like LaTeX constructs (for example, \\begin{verbatim}, lstlisting, minted, or \\verb) to show the user LaTeX code; provide real LaTeX that compiles and renders the requested content.",
-			"In an existing LaTeX project, assume ./preamble.tex or ./praeamble.tex has already been copied into /tmp/codex-show-latex/preamble.tex. Do not add a standalone \\documentclass or repeat the project preamble unless the user explicitly asks.",
-			"If a project snippet preview fails, inspect the log and project preamble, or restore the project preamble in /tmp/codex-show-latex/preamble.tex. Do not call set_latex_preamble with a minimal preamble as a workaround unless the user explicitly asks to change the active preview preamble.",
+			"In an existing LaTeX project, assume ./preamble.tex or ./praeamble.tex has already been copied into ${XDG_RUNTIME_DIR}/show-latex/preamble.tex. Do not add a standalone \\documentclass or repeat the project preamble unless the user explicitly asks.",
+			"If a project snippet preview fails, inspect the log and project preamble, or restore the project preamble in ${XDG_RUNTIME_DIR}/show-latex/preamble.tex. Do not call set_latex_preamble with a minimal preamble as a workaround unless the user explicitly asks to change the active preview preamble.",
 		],
 		renderShell: "self",
 		parameters: ShowLatexParams,
@@ -1944,13 +1944,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "set_latex_preamble",
 		label: "Set LaTeX Preamble",
-		description: "Set LaTeX preamble lines inserted before \\begin{document} in subsequent show_latex snippet compiles. This overwrites the active temp preamble at /tmp/codex-show-latex/preamble.tex. If a project preamble was copied there at startup, this changes the active preview preamble for the rest of the session and can make it diverge from the project's real ./preamble.tex or ./praeamble.tex. It should contain pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. compile_latex_file compiles complete files directly and does not inject this preamble.",
+		description: "Set LaTeX preamble lines inserted before \\begin{document} in subsequent show_latex snippet compiles. This overwrites the active temp preamble at ${XDG_RUNTIME_DIR}/show-latex/preamble.tex. If a project preamble was copied there at startup, this changes the active preview preamble for the rest of the session and can make it diverge from the project's real ./preamble.tex or ./praeamble.tex. It should contain pre-document setup such as \\documentclass, \\usepackage, and macro definitions, not document body content. compile_latex_file compiles complete files directly and does not inject this preamble.",
 		promptSnippet: "Set a LaTeX preamble for future PDF previews",
 		promptGuidelines: [
 			"Use set_latex_preamble only when the user explicitly wants to change packages/macros/options for every subsequent snippet preview.",
 			"In an existing LaTeX project, remember that this overwrites the already-copied active temp preamble, not just an isolated one-off preview setting. Do not use it after a failed preview unless the user explicitly wants to replace the active session preamble.",
-			"Do not install a minimal standalone preamble inside an existing LaTeX project as a workaround for a failed show_latex compile. Inspect the log and project preamble first, and restore the project preamble into /tmp/codex-show-latex/preamble.tex if it diverged.",
-			"For reusable project defaults, write pre-\\begin{document} code to ./preamble.tex or ./praeamble.tex before starting the Pi session so it is copied into /tmp/codex-show-latex/preamble.tex.",
+			"Do not install a minimal standalone preamble inside an existing LaTeX project as a workaround for a failed show_latex compile. Inspect the log and project preamble first, and restore the project preamble into ${XDG_RUNTIME_DIR}/show-latex/preamble.tex if it diverged.",
+			"For reusable project defaults, write pre-\\begin{document} code to ./preamble.tex or ./praeamble.tex before starting the Pi session so it is copied into ${XDG_RUNTIME_DIR}/show-latex/preamble.tex.",
 		],
 		parameters: SetLatexPreambleParams,
 		async execute(_toolCallId, params) {

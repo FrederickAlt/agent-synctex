@@ -588,7 +588,7 @@ const REQUIRED_SOCKET_MODE = 0o600;
 const MAX_PAYLOAD_BYTES = 16_384;
 const STARTUP_SOCKET_CHECK_TIMEOUT_MS = 250;
 const ACTIVE_CONNECTION_TIMEOUT_MS = 10_000;
-const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? "/tmp/codex-show-latex";
+const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "show-latex");
 const HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES = [
 	"preamble.tex",
 	"praeamble.tex",
@@ -1885,7 +1885,7 @@ export class HostServiceServer {
 		let sourcePath = "";
 
 		try {
-			sourcePath = buildSnippetLatexSourcePath();
+			sourcePath = buildSnippetLatexSourcePath(request.workspace_context);
 			const source = request.details.latex_source;
 			const workspacePreamble = resolveWorkspacePreambleForCompile(request.workspace_context);
 			const preamble = workspacePreamble || DEFAULT_SNIPPET_PREAMBLE;
@@ -2892,9 +2892,10 @@ function canResolveCompileSourcePath(workspaceContext: HostServiceWorkspaceConte
 		&& (workspaceContext.workspace_root === undefined || isAbsolute(workspaceContext.workspace_root));
 }
 
-function buildSnippetLatexSourcePath(): string {
-	ensureDirectory(DEFAULT_HOST_SERVICE_TMPDIR);
-	const runDir = mkdtempSync(`${join(DEFAULT_HOST_SERVICE_TMPDIR, "snippet-")}xxxxxx`);
+function buildSnippetLatexSourcePath(workspaceContext: HostServiceWorkspaceContext): string {
+	const workspaceRoot = workspaceContext.workspace_root ?? DEFAULT_HOST_SERVICE_TMPDIR;
+	ensureDirectory(workspaceRoot);
+	const runDir = mkdtempSync(`${join(workspaceRoot, "snippet-")}xxxxxx`);
 	chmodSync(runDir, REQUIRED_DIRECTORY_MODE);
 	return join(runDir, "snippet.tex");
 }

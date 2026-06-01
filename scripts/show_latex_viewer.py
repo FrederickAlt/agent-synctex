@@ -5,9 +5,9 @@ This helper exposes a filesystem protocol consumed by the Pi extension so that
 file operations are validated, serialized, and sandbox-safe.
 
 Clients create per-request files under:
-  /tmp/codex-show-latex/viewer-requests/<id>.json
+  ${XDG_RUNTIME_DIR}/show-latex/viewer-requests/<id>.json
 and poll matching result files under:
-  /tmp/codex-show-latex/viewer-results/<id>.json
+  ${XDG_RUNTIME_DIR}/show-latex/viewer-results/<id>.json
 
 Supports status checks and viewer `open` requests.
 """
@@ -32,7 +32,7 @@ os.umask(0o077)
 
 OPEN_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-DEFAULT_TMPDIR = os.environ.get("MCP_TMPDIR", "/tmp/codex-show-latex")
+DEFAULT_TMPDIR = os.environ.get("MCP_TMPDIR", str(Path(os.environ.get("XDG_RUNTIME_DIR", os.environ.get("HOME") or os.getcwd()) ) / "show-latex"))
 REQUESTS_NAME = "viewer-requests"
 RESULTS_NAME = "viewer-results"
 STATE_NAME = "viewer-state.json"

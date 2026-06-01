@@ -1629,6 +1629,41 @@ test("host service compile_latex_snippet resolves workspace_root preamble", asyn
 });
 
 
+test("host service compile_latex_snippet places snippets under workspace_root", async () => {
+	const baseDir = temporaryDir("host-service-snippet-output-root-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	const workspaceRoot = join(baseDir, "shared-workspace");
+	const compileCwd = join(baseDir, "cwd");
+	mkdirSync(workspaceRoot, { recursive: true });
+	mkdirSync(compileCwd, { recursive: true });
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-output-root" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const result = await client.requestCompileLatexSnippet(
+			{ latex_source: "\\section{Output}" },
+			{ cwd: compileCwd, workspace_root: workspaceRoot },
+		);
+		assert.equal(result.source.startsWith(workspaceRoot), true);
+		assert.equal(result.source.includes("snippet.tex"), true);
+		assert.equal(result.pdf.startsWith(workspaceRoot), true);
+		assert.equal(existsSync(result.pdf), true);
+		assert.equal(result.artifact_paths.includes(result.pdf), true);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
 test("host service compile_latex_snippet preserves compile failures", async () => {
 	const baseDir = temporaryDir("host-service-compile-snippet-failure-");
 	const socketPath = join(baseDir, "host-service.sock");

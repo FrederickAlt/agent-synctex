@@ -110,7 +110,7 @@ const TYPEBOX_STUB_SOURCE = `export const Type = {
 const FAKE_VIEWER_SERVICE_SCRIPT = String.raw`const fs = require("node:fs");
 const path = require("node:path");
 
-const baseDir = process.env.MCP_TMPDIR || "/tmp/codex-show-latex";
+const baseDir = process.env.MCP_TMPDIR || resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "show-latex");
 const failOpen = process.env.FAKE_VIEWER_OPEN_FAIL === "1";
 const protocolDirectories = {
 	base: baseDir,

@@ -2,8 +2,11 @@
 whitelist ${HOME}/.local/bin/pdf-preview-servicectl
 read-only ${HOME}/.local/bin/pdf-preview-servicectl
 
-whitelist ${HOME}/.cache/show-latex
-read-write ${HOME}/.cache/show-latex
-
 whitelist ${HOME}/.cache/pdf-preview-servicectl
 read-write ${HOME}/.cache/pdf-preview-servicectl
+
+# Runtime scratch and socket directories used by host-service-backed preview flows.
+whitelist ${XDG_RUNTIME_DIR}/show-latex
+read-write ${XDG_RUNTIME_DIR}/show-latex
+whitelist ${XDG_RUNTIME_DIR}/agent-synctex
+read-write ${XDG_RUNTIME_DIR}/agent-synctex

@@ -11,7 +11,7 @@ Pi extension that exposes six tools:
 
 The TypeScript Host Service now owns backend `show_latex` compilation/open/jump/close flows and viewer backend dispatch. Pi remains the frontend coordinator for tool registration, inline rendering, and editor paste behavior.
 
-When `inline=false`, previews are opened through the local host service using this extension's request context. Each successful preview writes an operation-scoped PDF and refreshes a fixed `/tmp/codex-show-latex/show-latex.pdf` compatibility copy only for external preview calls.
+When `inline=false`, previews are opened through the local host service using this extension's request context. Each successful preview writes an operation-scoped PDF and refreshes a fixed `${XDG_RUNTIME_DIR}/show-latex/show-latex.pdf` compatibility copy only for external preview calls.
 For example:
 
 ```tex
@@ -34,7 +34,7 @@ page width, so small symbols stay small while wide formulas use more of the TUI.
 refreshes fixed compatibility files and submits an `open` request to the host service. The extension does not use a ready-marker watcher and never launches Zathura or any GUI viewer directly; it only sends host-service protocol requests.
 Inline preview details persist metadata locally in the tool result (`image_path`, `inline_previews`, and `pdf`), containing only
 safe artifact paths plus dimensions, so repeated renders in the same process can reuse an in-memory preview ID while a
-`/reload` can still recover images from the persisted metadata as long as `/tmp/codex-show-latex/inline` artifacts
+`/reload` can still recover images from the persisted metadata as long as `${XDG_RUNTIME_DIR}/show-latex/inline` artifacts
 remain on disk.
 LaTeX compile workflows (snippets and files), plus open/jump/close/external preview orchestration, go through the TypeScript Host Service. Pi remains the frontend coordinator and request sender; it does not spawn GUI viewers directly.
 
@@ -93,7 +93,7 @@ During HITL, run them in a separate terminal (or background with a tracked PID).
 If your project has `pdf-preview-servicectl`, it targets `show-latex.service` for host-service maintenance
 commands (`restart`, `status`, and `logs`).
 
-The host service exposes sockets under `/tmp/codex-show-latex` and logs under `/tmp/codex-show-latex/*.log`; host-service status logs should be consulted when open/close/jump requests fail unexpectedly.
+The host service socket lives under `${XDG_RUNTIME_DIR}/agent-synctex/host-service.sock`, and logs are written under `${XDG_RUNTIME_DIR}/show-latex/*.log`; host-service status logs should be consulted when open/close/jump requests fail unexpectedly.
 Before first start, `npm run host-service:status` may return ENOENT when the service runtime directory has not been created yet; this is expected.
 
 Viewer backends are configured in-host by the service runtime; Zathura is the default local backend, with optional test backends for repository-level verification.
@@ -126,8 +126,8 @@ unrelated host commands, unrelated services, or non-viewer automation.
   the configured backend command is missing/unlaunchable. Run
   `npm run host-service:status` and check returned backend/daemon diagnostics before restarting the service.
 - The extension sends the service structured callback data (`kind`, `transport`, `socket_path`, `token`); raw callback commands are legacy-only and are not a public tool path.
-- For host-open failures, inspect `/tmp/codex-show-latex/*.log` for details.
-- If LaTeX compilation fails (for `show_latex` or `compile_latex_file`), check `/tmp/codex-show-latex/*.log`; compile and service failures are separate.
+- For host-open failures, inspect `${XDG_RUNTIME_DIR}/show-latex/*.log` for details.
+- If LaTeX compilation fails (for `show_latex` or `compile_latex_file`), check `${XDG_RUNTIME_DIR}/show-latex/*.log`; compile and service failures are separate.
 
 ## PDF tracking and jumps
 
@@ -139,7 +139,7 @@ Tracked PDFs also remember a default source file when possible. `compile_latex_f
 
 `close_pdf(pdf_id)` forwards close via service metadata and removes that PDF from the in-memory tracking table.
 
-Open, close, and jump failures are reported as tool errors and logged under `/tmp/codex-show-latex` and `/tmp/codex-show-latex/*.log`. These include service timeout, timeout-like unavailability, stale/unknown handle, and backend availability failures.
+Open, close, and jump failures are reported as tool errors and logged under `${XDG_RUNTIME_DIR}/show-latex` and `${XDG_RUNTIME_DIR}/show-latex/*.log`. These include service timeout, timeout-like unavailability, stale/unknown handle, and backend availability failures.
 
 ## Inverse SyncTeX PDF clicks
 
@@ -196,7 +196,7 @@ the tool sends a host-service open request for the PDF after a successful compil
 details. If compile succeeds but open fails, re-check service status/logs for `open`/`jump`-style viewer failures.
 
 Both `show_latex` and `compile_latex_file` report only a short error on failure and write diagnostic
-details to `/tmp/codex-show-latex/*.log`.
+details to `${XDG_RUNTIME_DIR}/show-latex/*.log`.
 
 ## Preamble behavior
 
@@ -206,15 +206,15 @@ For production flows, extension behavior is fixed to service-driven viewer contr
 
 Runtime paths are hardcoded:
 
-- Preview temp directory: `/tmp/codex-show-latex`
-- Active preamble file: `/tmp/codex-show-latex/preamble.tex`
+- Preview temp directory: `${XDG_RUNTIME_DIR}/show-latex`
+- Active preamble file: `${XDG_RUNTIME_DIR}/show-latex/preamble.tex`
 
-At extension initialization, `./preamble.tex` or `./praeamble.tex` in the Pi agent's current working directory is searched in that order. If one exists, its contents are copied to `/tmp/codex-show-latex/preamble.tex` and become the default preamble. During `show_latex` snippet compilation, the extension loads the preamble from `/tmp/codex-show-latex/preamble.tex`; `/tmp/codex-show-latex/praeamble.tex` is also accepted as a fallback if no canonical preamble exists. This means the model should assume the preamble is already in effect and provide only the body unless it intentionally wants to override those definitions.
+At extension initialization, `./preamble.tex` or `./praeamble.tex` in the Pi agent's current working directory is searched in that order. If one exists, its contents are copied to `${XDG_RUNTIME_DIR}/show-latex/preamble.tex` and become the default preamble. During `show_latex` snippet compilation, the extension loads the preamble from `${XDG_RUNTIME_DIR}/show-latex/preamble.tex`; `${XDG_RUNTIME_DIR}/show-latex/praeamble.tex` is also accepted as a fallback if no canonical preamble exists. This means the model should assume the preamble is already in effect and provide only the body unless it intentionally wants to override those definitions.
 
-The preamble can also be changed at runtime with `set_latex_preamble`, which writes `/tmp/codex-show-latex/preamble.tex`. Preamble files should contain only pre-`\begin{document}` code such as `\documentclass`, `\usepackage`, and macro definitions. `show_latex` inputs should then contain only the document body, or the `\begin{document}`...`\end{document}` block. `compile_latex_file` compiles complete files directly and does not inject this temp preamble.
+The preamble can also be changed at runtime with `set_latex_preamble`, which writes `${XDG_RUNTIME_DIR}/show-latex/preamble.tex`. Preamble files should contain only pre-`\begin{document}` code such as `\documentclass`, `\usepackage`, and macro definitions. `show_latex` inputs should then contain only the document body, or the `\begin{document}`...`\end{document}` block. `compile_latex_file` compiles complete files directly and does not inject this temp preamble.
 
 ## Firejail note
 
-Your Pi runtime is firejail sandboxed. Keep `/tmp/codex-show-latex` accessible to the sandbox
+Your Pi runtime is firejail sandboxed. Keep `${XDG_RUNTIME_DIR}/show-latex` accessible to the sandbox
 so the extension and host service can communicate via request/result files and preview artifacts.
 # agent-synctex
