@@ -5,12 +5,16 @@ import {
 	existsSync,
 	lstatSync,
 	mkdirSync,
+	mkdtempSync,
+	readFileSync,
 	rmSync,
 	statSync,
+	writeFileSync,
 } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { createLatexFileCompileToolSupport, type LatexFileCompileRequest, LoggedToolError } from "./latex/latex_file_compiler.ts";
+import { applyLatexPreamble, DEFAULT_SNIPPET_PREAMBLE } from "./latex/latex_preamble.ts";
 
 export interface HostServiceWorkspaceContext {
 	cwd: string;
@@ -44,6 +48,20 @@ export interface HostServiceCompileRequest {
 		latex_file_path: string;
 		compiler?: unknown;
 		clean?: boolean;
+	};
+}
+
+export interface HostServiceCompileSnippetRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "compile_latex_snippet";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+	details: {
+		latex_source: string;
+		compiler?: unknown;
+		suppress_page_numbers?: boolean;
+		crop_to_content?: boolean;
 	};
 }
 
@@ -92,6 +110,7 @@ export interface HostServiceCallbackTargetRegistration {
 export type HostServiceRequest =
 	| HostServiceStatusRequest
 	| HostServiceCompileRequest
+	| HostServiceCompileSnippetRequest
 	| HostServiceRegisterCallbackTargetRequest
 	| HostServiceUnregisterCallbackTargetRequest
 	| HostServiceResolveCallbackTargetRequest;
@@ -99,6 +118,7 @@ export type HostServiceRequest =
 export type HostServiceOperation =
 	| "status"
 	| "compile_latex_file"
+	| "compile_latex_snippet"
 	| "register_callback_target"
 	| "unregister_callback_target"
 	| "resolve_callback_target";
@@ -129,6 +149,22 @@ export interface HostServiceCompileResponseDetails {
 	workspace_context: HostServiceWorkspaceContext;
 	request_id: string;
 	operation: "compile_latex_file";
+	source: string;
+	pdf: string;
+	log: string;
+	artifact_paths: string[];
+	clean: boolean;
+	cleaned_artifacts: string[];
+	error_code?: string;
+}
+
+export interface HostServiceCompileSnippetResponseDetails {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	workspace_context: HostServiceWorkspaceContext;
+	request_id: string;
+	operation: "compile_latex_snippet";
 	source: string;
 	pdf: string;
 	log: string;
@@ -215,6 +251,16 @@ export interface HostServiceCompileResponseEnvelope {
 	status_details: HostServiceCompileResponseDetails;
 }
 
+export interface HostServiceCompileSnippetResponseEnvelope {
+	protocol_version: number;
+	request_id: string;
+	operation: "compile_latex_snippet";
+	status: "ok" | "error";
+	generated_at_ns: number;
+	error?: string;
+	status_details: HostServiceCompileSnippetResponseDetails;
+}
+
 export interface HostServiceRegisterCallbackTargetResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
@@ -248,6 +294,7 @@ export interface HostServiceResolveCallbackTargetResponseEnvelope {
 export type HostServiceResponseEnvelope =
 	| HostServiceStatusResponseEnvelope
 	| HostServiceCompileResponseEnvelope
+	| HostServiceCompileSnippetResponseEnvelope
 	| HostServiceRegisterCallbackTargetResponseEnvelope
 	| HostServiceUnregisterCallbackTargetResponseEnvelope
 	| HostServiceResolveCallbackTargetResponseEnvelope;
@@ -316,6 +363,11 @@ const REQUIRED_SOCKET_MODE = 0o600;
 const MAX_PAYLOAD_BYTES = 16_384;
 const STARTUP_SOCKET_CHECK_TIMEOUT_MS = 250;
 const ACTIVE_CONNECTION_TIMEOUT_MS = 10_000;
+const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? "/tmp/codex-show-latex";
+const HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES = [
+	"preamble.tex",
+	"praeamble.tex",
+] as const;
 const FALLBACK_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
 export const MIN_ACTIVE_PDF_ID = 1;
 export const MAX_ACTIVE_PDF_ID = 99_999_999;
@@ -574,6 +626,42 @@ export class HostServiceClient {
 		return response.status_details;
 	}
 
+	async requestCompileLatexSnippet(
+		request: HostServiceCompileSnippetRequest["details"],
+		workspaceContext: HostServiceWorkspaceContext,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceCompileSnippetResponseDetails> {
+		const context = normalizeWorkspaceContextForSnippetCompile(workspaceContext);
+		const requestId = this.makeRequestId();
+		const response = await this.request({
+			protocol_version: PROTOCOL_VERSION,
+			request_id: requestId,
+			operation: "compile_latex_snippet",
+			created_at_ns: Date.now() * 1_000_000,
+			workspace_context: context,
+			details: {
+				latex_source: request.latex_source,
+				...(request.compiler === undefined ? {} : { compiler: request.compiler }),
+				...(request.suppress_page_numbers === undefined
+					? {}
+					: { suppress_page_numbers: request.suppress_page_numbers }),
+				...(request.crop_to_content === undefined ? {} : { crop_to_content: request.crop_to_content }),
+			},
+		},
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (!isValidCompileSnippetResponse(response, requestId)) {
+			throw new Error(`Malformed host service compile_latex_snippet response payload: ${JSON.stringify(response)}`);
+		}
+		if (response.status === "error") {
+			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
+			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+		}
+		return response.status_details;
+	}
+
 	async requestRegisterCallbackTarget(
 		workspaceContext: HostServiceWorkspaceContext,
 		registration: HostServiceCallbackTargetRegistration,
@@ -681,6 +769,9 @@ export class HostServiceClient {
 
 		if (request.operation === "compile_latex_file") {
 			normalizeWorkspaceContextForCompile(request.workspace_context);
+		}
+		if (request.operation === "compile_latex_snippet") {
+			normalizeWorkspaceContextForSnippetCompile(request.workspace_context);
 		}
 
 		const payload = `${JSON.stringify(request)}\n`;
@@ -899,21 +990,24 @@ export class HostServiceServer {
 			} catch (error) {
 				const requestId = getRequestIdFromPayload(requestPayload);
 				const requestOperation = getOperationFromPayload(requestPayload);
-				if (requestOperation === "compile_latex_file") {
+				if (requestOperation === "compile_latex_file" || requestOperation === "compile_latex_snippet") {
 					const requestWorkspaceContext = getWorkspaceContextFromPayload(requestPayload);
-					const shouldResolveSource = canResolveCompileSourcePath(requestWorkspaceContext);
-					const requestedPath = getLatexPathFromPayload(requestPayload);
-					const source = requestedPath && shouldResolveSource && requestWorkspaceContext
-						? normalizeLatexSourcePath(requestedPath, requestWorkspaceContext.cwd)
-						: requestedPath ?? "";
+					const requestedSource = requestOperation === "compile_latex_file"
+						? getLatexPathFromPayload(requestPayload)
+						: getLatexSnippetFromPayload(requestPayload);
+					const source = requestOperation === "compile_latex_file"
+						? requestedSource ?? ""
+						: "";
+					const logPath = requestOperation === "compile_latex_file" && source ? inferLatexLogPath(source) : "";
 					socket.end(buildCompileErrorResponse(
 						requestId,
 						requestWorkspaceContext ?? FALLBACK_WORKSPACE_CONTEXT,
 						source,
-						source ? inferLatexLogPath(source) : "",
+						logPath,
 						false,
 						"invalid_request",
 						error instanceof Error ? error.message : String(error),
+						requestOperation,
 					));
 					return;
 				}
@@ -964,6 +1058,12 @@ export class HostServiceServer {
 				case "compile_latex_file": {
 					this.totalRequests += 1;
 					const response = await this.compileLatexFileRequest(request);
+					socket.end(`${JSON.stringify(response)}\n`);
+					return;
+				}
+				case "compile_latex_snippet": {
+					this.totalRequests += 1;
+					const response = await this.compileLatexSnippetRequest(request);
 					socket.end(`${JSON.stringify(response)}\n`);
 					return;
 				}
@@ -1182,6 +1282,84 @@ export class HostServiceServer {
 		}
 	}
 
+	private async compileLatexSnippetRequest(request: HostServiceCompileSnippetRequest): Promise<HostServiceResponseEnvelope> {
+		const shouldClean = false;
+		const cleanArtifacts: string[] = [];
+		let sourcePath = "";
+
+		try {
+			sourcePath = buildSnippetLatexSourcePath();
+			const source = request.details.latex_source;
+			const workspacePreamble = resolveWorkspacePreambleForCompile(request.workspace_context);
+			const preamble = workspacePreamble || DEFAULT_SNIPPET_PREAMBLE;
+			const wrappedSource = applyLatexPreamble(source, preamble, {
+				cropToContent: request.details.crop_to_content === true,
+				suppressPageNumbers: request.details.suppress_page_numbers === true,
+			});
+			writeFileSync(sourcePath, wrappedSource, { mode: 0o600 });
+			const compileRequest: LatexFileCompileRequest = {
+				requestedPath: sourcePath,
+				compiler: request.details.compiler,
+				clean: shouldClean,
+				cwd: dirname(sourcePath),
+			};
+
+			const result = await hostServiceLatexFileCompiler.compileLatexFile(compileRequest);
+			const logPath = inferLatexLogPath(result.source);
+			const nowNs = Date.now() * 1_000_000;
+			const artifactPaths = getExistingArtifacts(result.pdfPath, logPath);
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: request.operation,
+				status: "ok",
+				generated_at_ns: nowNs,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: true,
+					service_available: true,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: request.operation,
+					source: result.source,
+					pdf: result.pdfPath,
+					log: logPath,
+					clean: shouldClean,
+					cleaned_artifacts: cleanArtifacts,
+					artifact_paths: artifactPaths,
+				},
+			};
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			const source = sourcePath;
+			const log = error instanceof LoggedToolError ? error.logPath : (source ? inferLatexLogPath(source) : "");
+			const nowNs = Date.now() * 1_000_000;
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: request.operation,
+				status: "error",
+				generated_at_ns: nowNs,
+				error: errorMessage,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: true,
+					service_available: true,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: request.operation,
+					source: source,
+					pdf: "",
+					log: log,
+					clean: shouldClean,
+					cleaned_artifacts: cleanArtifacts,
+					artifact_paths: getExistingArtifacts(log),
+					error_code: extractCompileErrorCode(error),
+				},
+			};
+		}
+	}
+
 	private async prepareSocketPath(): Promise<void> {
 		const baseDir = dirname(this.socketPath);
 		ensureDirectory(baseDir);
@@ -1263,12 +1441,54 @@ function normalizeWorkspaceContextForCompile(context: HostServiceWorkspaceContex
 	return normalized;
 }
 
+function normalizeWorkspaceContextForSnippetCompile(context: HostServiceWorkspaceContext): HostServiceWorkspaceContext {
+	const normalized = normalizeWorkspaceContext(context);
+	if (!isAbsolute(normalized.cwd)) {
+		throw new Error("workspace_context.cwd must be absolute for compile_latex_snippet");
+	}
+	if (normalized.workspace_root !== undefined && !isAbsolute(normalized.workspace_root)) {
+		throw new Error("workspace_context.workspace_root must be absolute for compile_latex_snippet");
+	}
+	return normalized;
+}
+
 function canResolveCompileSourcePath(workspaceContext: HostServiceWorkspaceContext | undefined): workspaceContext is HostServiceWorkspaceContext {
 	if (workspaceContext === undefined) {
 		return false;
 	}
 	return isAbsolute(workspaceContext.cwd)
 		&& (workspaceContext.workspace_root === undefined || isAbsolute(workspaceContext.workspace_root));
+}
+
+function buildSnippetLatexSourcePath(): string {
+	ensureDirectory(DEFAULT_HOST_SERVICE_TMPDIR);
+	const runDir = mkdtempSync(`${join(DEFAULT_HOST_SERVICE_TMPDIR, "snippet-")}xxxxxx`);
+	chmodSync(runDir, REQUIRED_DIRECTORY_MODE);
+	return join(runDir, "snippet.tex");
+}
+
+function resolveWorkspacePreambleForCompile(context: HostServiceWorkspaceContext): string {
+	const workspaceRoot = context.workspace_root ?? context.cwd;
+	const preambleFile = resolveWorkspacePreambleFile(workspaceRoot);
+	if (!preambleFile) {
+		return "";
+	}
+	try {
+		return readFileSync(preambleFile, "utf8").trim();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`failed to read workspace preamble ${preambleFile}: ${message}`);
+	}
+}
+
+function resolveWorkspacePreambleFile(workspaceRoot: string): string | null {
+	for (const fileName of HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES) {
+		const candidate = resolve(workspaceRoot, fileName);
+		if (existsSync(candidate)) {
+			return candidate;
+		}
+	}
+	return null;
 }
 
 function normalizeLatexSourcePath(rawSourcePath: string, workspaceCwd: string): string {
@@ -1318,6 +1538,7 @@ function getOperationFromPayload(payload: unknown): HostServiceOperation {
 		if (
 			operation === "status"
 			|| operation === "compile_latex_file"
+			|| operation === "compile_latex_snippet"
 			|| operation === "register_callback_target"
 			|| operation === "unregister_callback_target"
 			|| operation === "resolve_callback_target"
@@ -1396,6 +1617,38 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 					latex_file_path: rawDetails.latex_file_path,
 					compiler: rawDetails.compiler,
 					clean: rawDetails.clean === true,
+				},
+			};
+		}
+		case "compile_latex_snippet": {
+			if (!isStringRecord(value.details)) {
+				throw new Error("missing compile details");
+			}
+			const rawDetails = value.details;
+			if (typeof rawDetails.latex_source !== "string" || !rawDetails.latex_source.trim()) {
+				throw new Error("missing latex_source");
+			}
+			if (rawDetails.compiler !== undefined && typeof rawDetails.compiler !== "string") {
+				throw new Error("compiler must be a string");
+			}
+			if (rawDetails.suppress_page_numbers !== undefined && typeof rawDetails.suppress_page_numbers !== "boolean") {
+				throw new Error("suppress_page_numbers must be a boolean");
+			}
+			if (rawDetails.crop_to_content !== undefined && typeof rawDetails.crop_to_content !== "boolean") {
+				throw new Error("crop_to_content must be a boolean");
+			}
+			const workspaceContext = normalizeWorkspaceContextForSnippetCompile(value.workspace_context);
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "compile_latex_snippet",
+				created_at_ns: value.created_at_ns,
+				workspace_context: workspaceContext,
+				details: {
+					latex_source: rawDetails.latex_source,
+					compiler: rawDetails.compiler,
+					suppress_page_numbers: rawDetails.suppress_page_numbers,
+					crop_to_content: rawDetails.crop_to_content,
 				},
 			};
 		}
@@ -1488,6 +1741,9 @@ function isValidHostServiceResponse(
 	if (value.operation === "compile_latex_file") {
 		return isValidCompileResponse(value, expectedRequestId);
 	}
+	if (value.operation === "compile_latex_snippet") {
+		return isValidCompileResponseLike(value, expectedRequestId, "compile_latex_snippet");
+	}
 	if (value.operation === "register_callback_target") {
 		return isValidRegisterCallbackTargetResponse(value, expectedRequestId);
 	}
@@ -1535,6 +1791,18 @@ function isValidStatusResponse(value: unknown, expectedRequestId: string): value
 }
 
 function isValidCompileResponse(value: unknown, expectedRequestId: string): value is HostServiceCompileResponseEnvelope {
+	return isValidCompileResponseLike(value, expectedRequestId, "compile_latex_file");
+}
+
+function isValidCompileSnippetResponse(value: unknown, expectedRequestId: string): value is HostServiceCompileSnippetResponseEnvelope {
+	return isValidCompileResponseLike(value, expectedRequestId, "compile_latex_snippet");
+}
+
+function isValidCompileResponseLike(
+	value: unknown,
+	expectedRequestId: string,
+	operation: "compile_latex_file" | "compile_latex_snippet",
+): value is HostServiceCompileResponseEnvelope | HostServiceCompileSnippetResponseEnvelope {
 	if (!isStringRecord(value)) {
 		return false;
 	}
@@ -1547,7 +1815,7 @@ function isValidCompileResponse(value: unknown, expectedRequestId: string): valu
 	if (value.status !== "ok" && value.status !== "error") {
 		return false;
 	}
-	if (value.operation !== "compile_latex_file") {
+	if (value.operation !== operation) {
 		return false;
 	}
 	if (typeof value.generated_at_ns !== "number") {
@@ -1578,7 +1846,7 @@ function isValidCompileResponse(value: unknown, expectedRequestId: string): valu
 	if (typeof details.request_id !== "string" || details.request_id !== expectedRequestId) {
 		return false;
 	}
-	if (details.operation !== "compile_latex_file") {
+	if (details.operation !== operation) {
 		return false;
 	}
 	if (typeof details.source !== "string") {
@@ -1738,7 +2006,7 @@ function isValidCommonHostServiceResponse(
 	expectedRequestId: string,
 	operation: Extract<
 		HostServiceOperation,
-		"status" | "compile_latex_file" | "register_callback_target" | "unregister_callback_target" | "resolve_callback_target"
+		"status" | "compile_latex_file" | "compile_latex_snippet" | "register_callback_target" | "unregister_callback_target" | "resolve_callback_target"
 	>,
 ): response is HostServiceResponseEnvelope {
 	if (!isStringRecord(response)) {
@@ -1834,6 +2102,17 @@ function getLatexPathFromPayload(payload: unknown): string | undefined {
 	return details.latex_file_path;
 }
 
+function getLatexSnippetFromPayload(payload: unknown): string | undefined {
+	if (!isStringRecord(payload) || !isStringRecord(payload.details)) {
+		return undefined;
+	}
+	const details = payload.details;
+	if (typeof details.latex_source !== "string") {
+		return undefined;
+	}
+	return details.latex_source;
+}
+
 function getExistingArtifacts(...paths: string[]): string[] {
 	const seen = new Set<string>();
 	for (const path of paths) {
@@ -1908,12 +2187,13 @@ function buildCompileErrorResponse(
 	clean: boolean,
 	errorCode: string,
 	errorText: string,
+	operation: HostServiceOperation,
 ): string {
 	const nowNs = Date.now() * 1_000_000;
 	const response = {
 		protocol_version: PROTOCOL_VERSION,
 		request_id: requestId,
-		operation: "compile_latex_file",
+		operation,
 		status: "error",
 		generated_at_ns: nowNs,
 		error: errorText,
@@ -1923,7 +2203,7 @@ function buildCompileErrorResponse(
 			service_available: false,
 			workspace_context: workspaceContext,
 			request_id: requestId,
-			operation: "compile_latex_file",
+			operation,
 			source: source,
 			pdf: "",
 			log: logPath,
@@ -1938,7 +2218,7 @@ function buildCompileErrorResponse(
 
 type HostServiceNonCompileOperation = Exclude<
 	HostServiceOperation,
-	"compile_latex_file"
+	"compile_latex_file" | "compile_latex_snippet"
 >;
 
 function buildErrorResponse(

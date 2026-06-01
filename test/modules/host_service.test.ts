@@ -368,6 +368,34 @@ test("host service compile_latex_file includes raw source path for invalid compi
 });
 
 
+test("host service compile_latex_snippet malformed requests avoid raw snippet in error details", async () => {
+	const baseDir = temporaryDir("host-service-snippet-malformed-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-malformed" });
+	await server.start();
+
+	const requestPayload = {
+		protocol_version: 1,
+		request_id: "snippet-workspace-request-id",
+		operation: "compile_latex_snippet",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: { cwd: baseDir },
+	};
+	const raw = await writeHostServiceRequest(socketPath, requestPayload as Record<string, unknown>);
+	const response = JSON.parse(raw.trim());
+
+	await server.stop();
+	rmSync(baseDir, { recursive: true, force: true });
+
+	assert.equal(response.operation, "compile_latex_snippet");
+	assert.equal(response.status, "error");
+	assert.equal(response.status_details.source, "");
+	assert.equal(response.status_details.log, "");
+	assert.equal(response.status_details.error_code, "invalid_request");
+	assert.match(response.error, /missing compile details/);
+});
+
+
 test("host service compile_latex_file rejects invalid compiler values", async () => {
 	const baseDir = temporaryDir("host-service-compile-invalid-compiler-");
 	const socketPath = join(baseDir, "host-service.sock");
@@ -422,6 +450,197 @@ test("host service compile_latex_file rejects unsupported compiler strings", asy
 	assert.ok(observed instanceof Error);
 	assert.match(observed.message, /compiler must be one of:/);
 	assert.match(observed.message, /code=compile_failed/);
+});
+
+
+test("host service compile_latex_snippet wraps bare snippets when no workspace preamble exists", async () => {
+	const baseDir = temporaryDir("host-service-snippet-no-preamble-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-no-preamble" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const result = await client.requestCompileLatexSnippet(
+			{ latex_source: "\\section{Hello}" },
+			{ cwd: baseDir },
+		);
+		assert.equal(result.operation, "compile_latex_snippet");
+		assert.equal(result.clean, false);
+		assert.equal(result.artifact_paths.includes(result.pdf), true);
+		assert.equal(result.artifact_paths.includes(result.log), true);
+		assert.equal(existsSync(result.pdf), true);
+		assert.equal(existsSync(result.log), true);
+		const renderedSource = readFileSync(result.source, "utf8");
+		assert.match(renderedSource, /\\documentclass\{article\}/);
+		assert.match(renderedSource, /\\begin\{document\}/);
+		assert.match(renderedSource, /\\end\{document\}/);
+		assert.match(renderedSource, /\\section\{Hello\}/);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service compile_latex_snippet applies workspace preamble and document wrapper", async () => {
+	const baseDir = temporaryDir("host-service-snippet-success-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "preamble.tex"), "\\usepackage{paper}");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-success" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const result = await client.requestCompileLatexSnippet(
+			{ latex_source: "\\section{Hello}" },
+			{ cwd: baseDir },
+		);
+		assert.equal(result.operation, "compile_latex_snippet");
+		assert.equal(result.clean, false);
+		assert.equal(result.artifact_paths.includes(result.pdf), true);
+		assert.equal(result.artifact_paths.includes(result.log), true);
+		assert.equal(existsSync(result.pdf), true);
+		assert.equal(existsSync(result.log), true);
+		const renderedSource = readFileSync(result.source, "utf8");
+		assert.match(renderedSource, /\\usepackage\{paper\}/);
+		assert.match(renderedSource, /\\begin\{document\}/);
+		assert.match(renderedSource, /\\end\{document\}/);
+		assert.match(renderedSource, /\\section\{Hello\}/);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service compile_latex_snippet keeps explicit document wrappers when provided", async () => {
+	const baseDir = temporaryDir("host-service-snippet-explicit-wrapper-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-explicit-wrapper" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const result = await client.requestCompileLatexSnippet(
+			{ latex_source: "\\documentclass{article}\\n\\begin{document}\\n\\section{Body}\\n\\end{document}" },
+			{ cwd: baseDir },
+		);
+		const renderedSource = readFileSync(result.source, "utf8");
+		const beginCount = (renderedSource.match(/\\begin\{document\}/g) ?? []).length;
+		const endCount = (renderedSource.match(/\\end\{document\}/g) ?? []).length;
+		assert.equal(beginCount, 1);
+		assert.equal(endCount, 1);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service compile_latex_snippet resolves workspace_root preamble", async () => {
+	const baseDir = temporaryDir("host-service-snippet-workspace-root-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	const workspaceRoot = join(baseDir, "workspace");
+	const compileCwd = join(baseDir, "cwd");
+	mkdirSync(workspaceRoot, { recursive: true });
+	mkdirSync(compileCwd, { recursive: true });
+	writeFileSync(join(workspaceRoot, "preamble.tex"), "\\usepackage{hyperref}");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-workspace-root" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const result = await client.requestCompileLatexSnippet(
+			{ latex_source: "\\section{Root}" },
+			{ cwd: compileCwd, workspace_root: workspaceRoot },
+		);
+		const renderedSource = readFileSync(result.source, "utf8");
+		assert.match(renderedSource, /\\usepackage\{hyperref\}/);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service compile_latex_snippet preserves compile failures", async () => {
+	const baseDir = temporaryDir("host-service-compile-snippet-failure-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"), { exitCode: 9 });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-failure" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexSnippet({ latex_source: "x", compiler: "lualatex" }, { cwd: baseDir });
+	} catch (error) {
+		observed = error;
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /LaTeX compile failed/);
+	assert.match(observed.message, /code=compile_failed/);
+});
+
+
+test("host service compile_latex_snippet requires absolute workspace cwd", async () => {
+	const baseDir = temporaryDir("host-service-compile-snippet-absolute-cwd-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-absolute" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexSnippet({ latex_source: "x" }, { cwd: "relative/path" });
+	} catch (error) {
+		observed = error;
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /must be absolute for compile_latex_snippet/);
 });
 
 
