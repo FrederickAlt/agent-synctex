@@ -36,7 +36,7 @@ Because the Host Service is long-running and may serve multiple agents/projects,
 Normal runtime is the user-systemd unit `show-latex.service` (from `systemd/show-latex.service`); the `npm run host-service:start` path is a foreground debug flow for smoke and HITL.
 The stable integration surface is MCP. Developer convenience scripts such as `agent-synctex ...` are for debugging/smoke testing rather than the primary user workflow.
 
-The previous separate viewer-service role has been absorbed into the Host Service (with compatibility helpers retained only for legacy parity).
+The previous separate viewer-service role has been absorbed into the Host Service.
 
 ### Preview Artifact
 A generated output of preview or compile work, such as a PDF file, rasterized image file, or log file. Frontends decide how to present preview artifacts to users.

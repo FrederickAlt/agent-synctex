@@ -11,7 +11,7 @@ Pi extension that exposes six tools:
 
 The TypeScript Host Service now owns backend `show_latex` compilation/open/jump/close flows and viewer backend dispatch. Pi remains the frontend coordinator for tool registration, inline rendering, and editor paste behavior.
 
-When `inline=false`, previews are opened through the local host service using this extension's request context. Each successful preview writes an operation-scoped PDF and refreshes a fixed `${XDG_RUNTIME_DIR}/show-latex/show-latex.pdf` compatibility copy only for external preview calls.
+When `inline=false`, previews are opened through the local host service using this extension's request context. Each successful preview writes an operation-scoped PDF and refreshes a fixed `${XDG_RUNTIME_DIR}/show-latex/show-latex.pdf` external-preview copy only for external preview calls.
 For example:
 
 ```tex
@@ -31,7 +31,7 @@ and, for multi-page PDFs, merges the page PNGs into one vertical image when Imag
 the tool result; the text result includes an `image_path=<png>` field for the primary local preview image.
 Inline image width is proportional to the cropped content width relative to the full PDF
 page width, so small symbols stay small while wide formulas use more of the TUI. With `inline=false`, it
-refreshes fixed compatibility files and submits an `open` request to the host service. The extension does not use a ready-marker watcher and never launches Zathura or any GUI viewer directly; it only sends host-service protocol requests.
+refreshes fixed external-preview files and submits an `open` request to the host service. The extension does not use a ready-marker watcher and never launches Zathura or any GUI viewer directly; it only sends host-service protocol requests.
 Inline preview details persist metadata locally in the tool result (`image_path`, `inline_previews`, and `pdf`), containing only
 safe artifact paths plus dimensions, so repeated renders in the same process can reuse an in-memory preview ID while a
 `/reload` can still recover images from the persisted metadata as long as `${XDG_RUNTIME_DIR}/show-latex/inline` artifacts
@@ -44,7 +44,7 @@ LaTeX compile workflows (snippets and files), plus open/jump/close/external prev
 - `src/modules/pi_adapter/pi_adapter.ts` — **thin** Pi adapter facade (`createUniversalToolFacade`, `registerTracerTools`) used for universal tool dispatch.
 - `src/modules/latex/latex_file_compiler.ts` and `src/modules/latex/latex_preamble.ts` — universal LaTeX compiler + preamble application logic shared by preview+file compile flows.
 - `src/modules/preview/` — universal preview modules:
-  - `show_latex_pipeline.ts` parses front matter, executes MCP show-latex flow, and builds inline artifacts.
+  - `show_latex_pipeline.ts` parses front matter, delegates compile/open work to the Host Service flow, and builds inline artifacts.
   - `inline_preview*` modules rasterize PDFs, cache state, render preview output, and validate Kitty placeholder output.
   - `terminal_refresh_policy.ts` manages terminal/kitty refresh invalidation behavior for inline previews.
 - `src/modules/synctex/synctex.ts` — session-scoped inverse SyncTeX callback server and click parsing helpers.
@@ -127,7 +127,7 @@ unrelated host commands, unrelated services, or non-viewer automation.
 - **Backend unavailable**: failures like `viewer backend is unavailable` or `(code=backend_unavailable)` usually mean
   the configured backend command is missing/unlaunchable. Run
   `npm run host-service:status` and check returned backend/daemon diagnostics before restarting the service.
-- The extension sends the service structured callback data (`kind`, `transport`, `socket_path`, `token`); raw callback commands are legacy-only and are not a public tool path.
+- The extension sends the service structured callback data (`kind`, `transport`, `socket_path`, `token`); raw callback commands are internal and are not a public tool path.
 - For host-open failures, inspect `${XDG_RUNTIME_DIR}/show-latex/*.log` for details.
 - If LaTeX compilation fails (for `show_latex` or `compile_latex_file`), check `${XDG_RUNTIME_DIR}/show-latex/*.log`; compile and service failures are separate.
 

@@ -209,9 +209,8 @@ service used by `open_pdf`, `close_pdf`, `jump_pdf`, `show_latex(inline=false)`,
 
 - Full: `npm run verify`
 - Focused examples:
-  - `node --test preview_pipeline.test.ts`
-  - `node --test test/modules/viewer_service.test.ts`
   - `node --test show_latex.test.ts compile_latex_file.test.ts`
+  - `node --test test/modules/host_service.test.ts`
   - `node --test test/modules/preview/inline_preview_renderer.test.ts`
   - `node --test test/modules/preview/kitty_placeholder_image.test.ts`
   - `node --test test/modules/preview/kitty_placeholder_oracle.test.ts`
