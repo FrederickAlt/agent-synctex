@@ -956,7 +956,11 @@ from pathlib import Path
 
 log_path = os.environ.get("FAKE_BACKEND_ARGV_LOG")
 if log_path:
-    Path(log_path).open("a", encoding="utf-8").write(" ".join(sys.argv) + "\\n")
+    with Path(log_path).open("a", encoding="utf-8") as log_file:
+        log_file.write(" ".join(sys.argv) + "\\n")
+        log_file.flush()
+        import os as _os
+        _os.fsync(log_file.fileno())
 
 if "--fork" in sys.argv:
     pid = os.fork()
@@ -1034,7 +1038,18 @@ try:
     expected_identity = open_session.get("process_identity")
     expected_cmdline = expected_identity.get("cmdline") if isinstance(expected_identity, dict) else []
 
-    invocation_lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line] if backend_argv_log.exists() else []
+    def wait_for_invocations(min_count: int) -> list[str]:
+        for _ in range(20):
+            if not backend_argv_log.exists():
+                time.sleep(0.05)
+                continue
+            lines = [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line]
+            if len(lines) >= min_count:
+                return lines
+            time.sleep(0.05)
+        return [line for line in backend_argv_log.read_text(encoding="utf-8").splitlines() if line] if backend_argv_log.exists() else []
+    
+    invocation_lines = wait_for_invocations(1)
     alive_before_close = isinstance(pid, int) and pid_alive(pid)
 
     if not isinstance(handle, str) or not isinstance(pid, int):
