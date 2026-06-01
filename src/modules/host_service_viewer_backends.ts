@@ -22,24 +22,15 @@ import {
 import type {
 	HostServiceCallbackTarget,
 	HostServiceViewerBackendCapabilities,
-} from "./host_service.ts";
-
-export interface ViewerBackendOperationResult<T extends Record<string, unknown> = Record<string, unknown>> {
-	status: "ok" | "error";
-	error?: string;
-	status_details: T;
-}
-
-export interface ViewerBackendAdapter {
-	readonly name: string;
-	readonly capabilities: HostServiceViewerBackendCapabilities;
-	isAvailable(): boolean;
-	status(requestId: string, operation: string): Promise<ViewerBackendOperationResult<Record<string, unknown>>>;
-	open(requestId: string, details: Record<string, unknown>): Promise<ViewerBackendOperationResult<Record<string, unknown>>>;
-	close(requestId: string, details: Record<string, unknown>): Promise<ViewerBackendOperationResult<Record<string, unknown>>>;
-	forwardSearch(requestId: string, details: Record<string, unknown>): Promise<ViewerBackendOperationResult<Record<string, unknown>>>;
-	closeAll(requestId?: string): Promise<void>;
-}
+	ViewerBackendAdapter,
+	ViewerBackendOperationResult,
+} from "./host_service_viewer_protocol.ts";
+export type {
+	HostServiceCallbackTarget,
+	HostServiceViewerBackendCapabilities,
+	ViewerBackendAdapter,
+	ViewerBackendOperationResult,
+} from "./host_service_viewer_protocol.ts";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_FAKE_VIEWER_BACKEND_NAME = "fake-viewer";
