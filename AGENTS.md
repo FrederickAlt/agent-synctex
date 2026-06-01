@@ -27,7 +27,7 @@ Use this guide when touching:
 - `src/modules/preview/kitty_placeholder_image.ts`
 - preview-related tests in `test/modules/preview/index_rendering.test.ts`, `test/modules/preview/inline_preview_renderer.test.ts`, `test/modules/preview/kitty_placeholder_image.test.ts`, `test/modules/preview/kitty_placeholder_oracle.test.ts`
 
-## Viewer service broker guardrail
+## Host service broker guardrail
 
 This project may expose a project-local host broker via `pdf-preview-servicectl` and
 `${HOME}/.cache/pdf-preview-servicectl/broker.sock` so agents in this repo can sync/restart/status/log
