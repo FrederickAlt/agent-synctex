@@ -154,7 +154,7 @@ export interface HostServiceCallbackTargetRegistration {
 export interface HostServiceOpenRequest {
 	protocol_version: number;
 	request_id: string;
-	operation: "open";
+	operation: "open_pdf";
 	created_at_ns: number;
 	workspace_context: HostServiceWorkspaceContext;
 	details: {
@@ -180,7 +180,7 @@ export type HostServiceOperation =
 	| "compile_latex_file"
 	| "compile_latex_snippet"
 	| "rasterize"
-	| "open"
+	| "open_pdf"
 	| "register_callback_target"
 	| "unregister_callback_target"
 	| "resolve_callback_target";
@@ -298,7 +298,7 @@ export interface HostServiceOpenResponseDetails {
 	service_available: boolean;
 	workspace_context: HostServiceWorkspaceContext;
 	request_id: string;
-	operation: "open";
+	operation: "open_pdf";
 	backend: string;
 	backend_path: string;
 	capabilities: HostServiceViewerBackendCapabilities;
@@ -355,7 +355,7 @@ export interface HostServiceRasterizeResponseEnvelope {
 export interface HostServiceOpenResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
-	operation: "open";
+	operation: "open_pdf";
 	status: "ok" | "error";
 	generated_at_ns: number;
 	error?: string;
@@ -870,7 +870,7 @@ export class HostServiceClient {
 		return response.status_details;
 	}
 
-	async requestOpen(
+	async requestOpenPdf(
 		workspaceContext: HostServiceWorkspaceContext,
 		details: HostServiceOpenRequest["details"],
 		signal?: AbortSignal,
@@ -882,7 +882,7 @@ export class HostServiceClient {
 			{
 				protocol_version: PROTOCOL_VERSION,
 				request_id: requestId,
-				operation: "open",
+				operation: "open_pdf",
 				created_at_ns: Date.now() * 1_000_000,
 				workspace_context: context,
 				details: {
@@ -896,13 +896,22 @@ export class HostServiceClient {
 			requestTimeoutMs ?? this.requestTimeoutMs,
 		);
 		if (!isValidOpenResponse(response, requestId)) {
-			throw new Error(`Malformed host service open response payload: ${JSON.stringify(response)}`);
+			throw new Error(`Malformed host service open_pdf response payload: ${JSON.stringify(response)}`);
 		}
 		if (response.status !== "ok") {
 			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
 			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
 		}
 		return response.status_details;
+	}
+
+	async requestOpen(
+		workspaceContext: HostServiceWorkspaceContext,
+		details: HostServiceOpenRequest["details"],
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceOpenResponseDetails> {
+		return this.requestOpenPdf(workspaceContext, details, signal, requestTimeoutMs);
 	}
 
 	private async request(
@@ -927,7 +936,7 @@ export class HostServiceClient {
 		if (request.operation === "rasterize") {
 			normalizeWorkspaceContextForRasterize(request.workspace_context);
 		}
-		if (request.operation === "open") {
+		if (request.operation === "open_pdf") {
 			normalizeWorkspaceContextForViewer(request.workspace_context);
 		}
 
@@ -1182,11 +1191,11 @@ export class HostServiceServer {
 					));
 					return;
 				}
-				if (requestOperation === "open") {
+				if (requestOperation === "open_pdf") {
 					socket.end(buildViewerOperationErrorResponse(
 						requestId,
 						getWorkspaceContextFromPayload(requestPayload) ?? FALLBACK_WORKSPACE_CONTEXT,
-						"open",
+						"open_pdf",
 						"invalid_request",
 						error instanceof Error ? error.message : String(error),
 					));
@@ -1254,7 +1263,7 @@ export class HostServiceServer {
 					socket.end(`${JSON.stringify(response)}\n`);
 					return;
 				}
-				case "open": {
+				case "open_pdf": {
 					this.totalRequests += 1;
 					const response = await this.openViewerRequest(request);
 					socket.end(`${JSON.stringify(response)}\n`);
@@ -1646,7 +1655,7 @@ export class HostServiceServer {
 				return {
 					protocol_version: this.protocolVersion,
 					request_id: request.request_id,
-					operation: "open",
+					operation: "open_pdf",
 					status: "error",
 					generated_at_ns: nowNs,
 					error: "viewer backend response missing handle",
@@ -1656,7 +1665,7 @@ export class HostServiceServer {
 						service_available: false,
 						workspace_context: request.workspace_context,
 						request_id: request.request_id,
-						operation: "open",
+						operation: "open_pdf",
 						backend: this.viewerBackend.name,
 						backend_path: backendPath,
 						capabilities: this.viewerBackend.capabilities,
@@ -1716,7 +1725,7 @@ export class HostServiceServer {
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
-				operation: "open",
+				operation: "open_pdf",
 				status: "ok",
 				generated_at_ns: nowNs,
 				status_details: {
@@ -1725,7 +1734,7 @@ export class HostServiceServer {
 					service_available: true,
 					workspace_context: request.workspace_context,
 					request_id: request.request_id,
-					operation: "open",
+					operation: "open_pdf",
 					backend: this.viewerBackend.name,
 					backend_path: backendPath,
 					capabilities,
@@ -1742,7 +1751,7 @@ export class HostServiceServer {
 		return {
 			protocol_version: this.protocolVersion,
 			request_id: request.request_id,
-			operation: "open",
+			operation: "open_pdf",
 			status: "error",
 			generated_at_ns: nowNs,
 			error: backendResult.error ?? "open failed",
@@ -1752,7 +1761,7 @@ export class HostServiceServer {
 				service_available: false,
 				workspace_context: request.workspace_context,
 				request_id: request.request_id,
-				operation: "open",
+				operation: "open_pdf",
 				backend: this.viewerBackend.name,
 				backend_path: backendPath,
 				capabilities,
@@ -1981,7 +1990,7 @@ function getOperationFromPayload(payload: unknown): HostServiceOperation {
 			|| operation === "compile_latex_file"
 			|| operation === "compile_latex_snippet"
 			|| operation === "rasterize"
-			|| operation === "open"
+			|| operation === "open_pdf"
 			|| operation === "register_callback_target"
 			|| operation === "unregister_callback_target"
 			|| operation === "resolve_callback_target"
@@ -2131,7 +2140,7 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				},
 			};
 		}
-		case "open": {
+		case "open_pdf": {
 			if (!isStringRecord(value.details)) {
 				throw new Error("missing open details");
 			}
@@ -2152,7 +2161,7 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 			return {
 				protocol_version: PROTOCOL_VERSION,
 				request_id: value.request_id,
-				operation: "open",
+				operation: "open_pdf",
 				created_at_ns: value.created_at_ns,
 				workspace_context: workspaceContext,
 				details: {
@@ -2267,7 +2276,7 @@ function isValidHostServiceResponse(
 	if (value.operation === "resolve_callback_target") {
 		return isValidResolveCallbackTargetResponse(value, expectedRequestId);
 	}
-	if (value.operation === "open") {
+	if (value.operation === "open_pdf") {
 		return isValidOpenResponse(value, expectedRequestId);
 	}
 	return false;
@@ -2633,7 +2642,7 @@ function isValidOpenResponse(response: unknown, expectedRequestId: string): resp
 	if (response.status !== "ok" && response.status !== "error") return false;
 	if (typeof response.protocol_version !== "number" || response.protocol_version !== PROTOCOL_VERSION) return false;
 	if (typeof response.request_id !== "string" || response.request_id !== expectedRequestId) return false;
-	if (response.operation !== "open") return false;
+	if (response.operation !== "open_pdf") return false;
 	if (typeof response.generated_at_ns !== "number") return false;
 	if (response.error !== undefined && typeof response.error !== "string") return false;
 	if (response.status === "error" && response.error === undefined) return false;
@@ -2644,7 +2653,7 @@ function isValidOpenResponse(response: unknown, expectedRequestId: string): resp
 	if (typeof details.service_available !== "boolean") return false;
 	if (!isValidWorkspaceContext(details.workspace_context)) return false;
 	if (typeof details.request_id !== "string" || details.request_id !== expectedRequestId) return false;
-	if (details.operation !== "open") return false;
+	if (details.operation !== "open_pdf") return false;
 	if (typeof details.backend !== "string" || !details.backend) return false;
 	if (typeof details.backend_path !== "string" || !details.backend_path) return false;
 	if (typeof details.owned !== "boolean") return false;
@@ -2980,7 +2989,7 @@ function buildRasterizeErrorResponse(
 function buildViewerOperationErrorResponse(
 	requestId: string,
 	workspaceContext: HostServiceWorkspaceContext,
-	operation: "open",
+	operation: "open_pdf",
 	errorCode: string,
 	errorText: string,
 ): string {
@@ -3002,7 +3011,7 @@ function buildViewerOperationErrorResponse(
 			error_code: errorCode,
 		},
 	};
-	if (operation === "open") {
+	if (operation === "open_pdf") {
 		(base.status_details as Record<string, unknown>).backend = "unknown";
 		(base.status_details as Record<string, unknown>).backend_path = "";
 		(base.status_details as Record<string, unknown>).capabilities = {

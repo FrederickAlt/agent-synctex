@@ -1509,7 +1509,7 @@ test("host service status reflects backend availability for health checks", asyn
 
 });
 
-test("host service open resolves relative PDF paths and tracks managed records for reuse", async () => {
+test("host service open_pdf resolves relative PDF paths and tracks managed records for reuse", async () => {
 	const baseDir = temporaryDir("host-service-open-reuse-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const pdfPath = join(baseDir, "sample.pdf");
@@ -1529,7 +1529,7 @@ test("host service open resolves relative PDF paths and tracks managed records f
 	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
 
 	try {
-		const firstOpen = await client.requestOpen(
+		const firstOpen = await client.requestOpenPdf(
 			{ cwd: baseDir },
 			{
 				pdf_path: "sample.pdf",
@@ -1556,7 +1556,7 @@ test("host service open resolves relative PDF paths and tracks managed records f
 		assert.equal(firstOpen.managed_record?.capabilities?.open, true);
 		assert.equal(backend.openedDetails.length, 1);
 		assert.equal(backend.openedDetails[0]!.pdf_path, pdfPath);
-		const secondOpen = await client.requestOpen(
+		const secondOpen = await client.requestOpenPdf(
 			{ cwd: baseDir },
 			{
 				pdf_path: "sample.pdf",
@@ -1567,7 +1567,7 @@ test("host service open resolves relative PDF paths and tracks managed records f
 		assert.equal(secondOpen.reused, true);
 		assert.equal(secondOpen.pdf_id, firstOpenPdfId);
 		assert.equal(secondOpen.handle, firstOpen.handle);
-		const thirdOpen = await client.requestOpen(
+		const thirdOpen = await client.requestOpenPdf(
 			{ cwd: baseDir },
 			{
 				pdf_path: "sample.pdf",
@@ -1590,7 +1590,7 @@ test("host service open resolves relative PDF paths and tracks managed records f
 	}
 });
 
-test("host service open returns backend-provided invalid-PDF errors", async () => {
+test("host service open_pdf returns backend-provided invalid-PDF errors", async () => {
 	const baseDir = temporaryDir("host-service-open-invalid-pdf-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const pdfPath = join(baseDir, "not-pdf.txt");
@@ -1608,7 +1608,7 @@ test("host service open returns backend-provided invalid-PDF errors", async () =
 
 	try {
 		await assert.rejects(
-			() => client.requestOpen(
+			() => client.requestOpenPdf(
 				{ cwd: baseDir },
 				{
 					pdf_path: "not-pdf.txt",
@@ -1624,7 +1624,7 @@ test("host service open returns backend-provided invalid-PDF errors", async () =
 	}
 });
 
-test("host service open returns backend-unavailable errors", async () => {
+test("host service open_pdf returns backend-unavailable errors", async () => {
 	const baseDir = temporaryDir("host-service-open-backend-unavailable-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const pdfPath = join(baseDir, "sample.pdf");
@@ -1642,7 +1642,7 @@ test("host service open returns backend-unavailable errors", async () => {
 
 	try {
 		await assert.rejects(
-			() => client.requestOpen(
+			() => client.requestOpenPdf(
 				{ cwd: baseDir },
 				{
 					pdf_path: "sample.pdf",
@@ -1658,7 +1658,7 @@ test("host service open returns backend-unavailable errors", async () => {
 	}
 });
 
-test("host service open allocates active pdf ids from random range", async () => {
+test("host service open_pdf allocates active pdf ids from random range", async () => {
 	const baseDir = temporaryDir("host-service-open-id-range-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const backend = new RecordingFakeViewerBackend();
@@ -1677,7 +1677,7 @@ test("host service open allocates active pdf ids from random range", async () =>
 		for (let i = 0; i < 5; i += 1) {
 			const pdfPath = join(baseDir, `sample-${i}.pdf`);
 			writeFileSync(pdfPath, "%PDF-1.4\n");
-			const response = await client.requestOpen(
+			const response = await client.requestOpenPdf(
 				{ cwd: baseDir },
 				{
 					pdf_path: `sample-${i}.pdf`,
