@@ -167,6 +167,52 @@ test("openAndTrackPdf normalizes, opens, infers default source, and tracks a PDF
 	assert.equal(tracker.getByPath(realPdfPath), trackedPdf);
 });
 
+test("openAndTrackPdf tracks explicit host-service IDs when provided", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	writeMinimalPdf(pdf);
+
+	const tracker = new PdfTracker();
+	let openCount = 0;
+	const opener = async () => {
+		openCount += 1;
+		return {
+			pid: 4321,
+			viewerHandle: "viewer-service-open",
+			viewerBackend: "zathura",
+			viewerOwned: true,
+			viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+		};
+	};
+
+	const first = await openAndTrackPdf(pdf, tracker, undefined, opener, undefined, undefined, { pdfId: 1234 });
+	const second = await openAndTrackPdf(
+		pdf,
+		tracker,
+		undefined,
+		opener,
+		undefined,
+		undefined,
+		{ pdfId: 1234, reuseTrackedPdf: false },
+	);
+	const third = await openAndTrackPdf(
+		pdf,
+		tracker,
+		undefined,
+		opener,
+		undefined,
+		undefined,
+		{ pdfId: 9999, reuseTrackedPdf: false },
+	);
+
+	assert.equal(first.id, 1234);
+	assert.equal(second.id, 1234);
+	assert.equal(third.id, 9999);
+	assert.equal(openCount, 2);
+	assert.equal(tracker.getById(1234), undefined);
+	assert.equal(tracker.getById(9999), third);
+});
+
 test("openAndTrackPdf stores an exact default source from the caller", async () => {
 	const dir = tempDir();
 	const pdf = join(dir, "paper.pdf");
@@ -455,6 +501,64 @@ test("jumpToTrackedPdf errors when service metadata lacks a forward-search handl
 		() => jumpToTrackedPdf(trackedPdf.id, 9, undefined, tracker),
 		/no forward-search handler is configured/,
 	);
+});
+
+test("jumpToTrackedPdf prefers host-service jump in host-service mode even when a stale local entry matches the same id", async () => {
+	const dir = tempDir();
+	const pdf = join(dir, "paper.pdf");
+	const source = join(dir, "paper.tex");
+	writeMinimalPdf(pdf);
+	writeFileSync(source, "line one\n");
+
+	const tracker = new PdfTracker();
+	const staleLocal = tracker.trackOpenedPdf(pdf, source, 111, undefined, {
+		viewerHandle: "zathura:local-stale",
+		viewerBackend: "zathura",
+		viewerOwned: true,
+		hostServicePdfId: 111,
+		viewerCapabilities: {
+			open: true,
+			close: true,
+			forward_search: true,
+			inverse_search: true,
+			reuse: true,
+		},
+	}, 333);
+
+	let hostJumpPdfId: number | undefined;
+	let hostJumpLine: number | undefined;
+	let hostJumpSourceFile: string | undefined;
+	let requestForwardSearchCalled = false;
+	const result = await jumpToTrackedPdf(333, 3, source, tracker, undefined, {
+		requestJumpFromHostService: async (hostPdfId, _hostSocketPath, sourceFile, line) => {
+			hostJumpPdfId = hostPdfId;
+			hostJumpLine = line;
+			hostJumpSourceFile = sourceFile;
+			return {
+				handled: true,
+				pdf,
+				source_file: sourceFile,
+				source_line: "line one",
+			};
+		},
+		requestForwardSearch: async () => {
+			requestForwardSearchCalled = true;
+			return { handled: true };
+		},
+	});
+
+	assert.equal(hostJumpPdfId, 333);
+	assert.equal(hostJumpLine, 3);
+	assert.equal(hostJumpSourceFile, source);
+	assert.equal(requestForwardSearchCalled, false);
+	assert.deepEqual(result, {
+		pdf,
+		sourceFile: source,
+		line: 3,
+		reopened: false,
+		sourceLine: "line one",
+	});
+	assert.equal(tracker.getById(staleLocal.id), staleLocal);
 });
 
 test("jumpToTrackedPdf uses viewer service forward_search when service metadata is present", async () => {
@@ -801,6 +905,40 @@ test("closeTrackedPdf returns no-op when service reports an unowned handle", asy
 	});
 	assert.equal(tracker.getById(trackedPdf.id), undefined);
 	assert.equal(tracker.getByPath("/tmp/paper.pdf"), undefined);
+});
+
+test("closeTrackedPdf prefers host-service close in host-service mode even when a stale local entry matches the same id", async () => {
+	const tracker = new PdfTracker();
+	const staleLocal = tracker.trackOpenedPdf("/tmp/local-stale.pdf", "/tmp/local.tex", 555, undefined, {
+		viewerHandle: "zathura:local-stale",
+		viewerBackend: "zathura",
+		viewerOwned: true,
+		hostServicePdfId: 666,
+		viewerCapabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	}, 777);
+
+	let hostClosePdfId: number | undefined;
+	let localCloseCalled = 0;
+	const result = await closeTrackedPdf(
+		staleLocal.id,
+		tracker,
+		{
+			requestClose: async () => {
+				localCloseCalled += 1;
+				return { closed: true };
+			},
+			requestCloseFromHostService: async (hostServicePdfId) => {
+				hostClosePdfId = hostServicePdfId;
+				return { closed: true };
+			},
+		},
+	);
+
+	assert.equal(hostClosePdfId, staleLocal.id);
+	assert.equal(localCloseCalled, 0);
+	assert.equal(result.wasTracked, false);
+	assert.equal(result.closed, true);
+	assert.equal(tracker.getById(staleLocal.id), staleLocal);
 });
 
 test("closeTrackedPdf forwards abort signal to viewer close request", async () => {

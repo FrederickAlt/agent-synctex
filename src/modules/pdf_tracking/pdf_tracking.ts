@@ -19,6 +19,9 @@ export interface TrackedPdf {
 		inverse_search: boolean;
 		reuse: boolean;
 	};
+	hostServicePdfId?: number;
+	hostServiceSocketPath?: string;
+	hostServiceCallbackTargetId?: string;
 	openedAtMs: number;
 	lastOpenedAtMs: number;
 }
@@ -29,6 +32,9 @@ export interface PdfOpenResult {
 	viewerBackend?: string;
 	viewerOwned?: boolean;
 	viewerCapabilities?: TrackedPdf["viewerCapabilities"];
+	hostServicePdfId?: number;
+	hostServiceSocketPath?: string;
+	hostServiceCallbackTargetId?: string;
 }
 
 export interface PdfJumpResult {
@@ -36,6 +42,7 @@ export interface PdfJumpResult {
 	sourceFile: string;
 	line: number;
 	reopened: boolean;
+	sourceLine?: string;
 }
 
 export interface PdfCloseResult {
@@ -61,12 +68,30 @@ const PDF_HEADER = "%PDF-";
 
 interface PdfCloseOptions {
 	requestClose?: (viewerHandle: string, viewerBackend: string, signal?: AbortSignal) => Promise<PdfServiceCloseResult>;
+	requestCloseFromHostService?: (
+		hostServicePdfId: number,
+		hostServiceSocketPath: string | undefined,
+		signal?: AbortSignal,
+	) => Promise<PdfServiceCloseResult>;
 }
 
 interface PdfJumpOptions {
 	opener?: PdfOpener;
 	requestForwardSearch?: (viewerHandle: string, viewerBackend: string, sourceFile: string, line: number, synctexPid?: number, signal?: AbortSignal) => Promise<PdfServiceForwardSearchResult>;
 	synctexEditorCommand?: string;
+	requestJumpFromHostService?: (
+		hostServicePdfId: number,
+		hostServiceSocketPath: string | undefined,
+		sourceFile: string | undefined,
+		line: number,
+		signal?: AbortSignal,
+	) => Promise<{
+		handled?: boolean;
+		pdf?: string;
+		source_file?: string;
+		source_line?: string;
+		reopened?: boolean;
+	}>;
 }
 
 export function describePdfJumpFailureContext(pdfId: number, tracker: PdfTracker, currentSynctexEditorCommand?: string): string {
@@ -84,6 +109,7 @@ export function describePdfJumpFailureContext(pdfId: number, tracker: PdfTracker
 		`viewer_handle=${trackedPdf.viewerHandle ?? "<none>"}`,
 		`viewer_backend=${trackedPdf.viewerBackend ?? "<none>"}`,
 		`viewer_owned=${trackedPdf.viewerOwned ?? "<unknown>"}`,
+		...(trackedPdf.hostServicePdfId === undefined ? [] : [`host_service_pdf_id=${trackedPdf.hostServicePdfId}`, `host_service_socket_path=${trackedPdf.hostServiceSocketPath ?? "<none>"}`, `host_service_callback_target_id=${trackedPdf.hostServiceCallbackTargetId ?? "<none>"}`]),
 	].join("\n");
 }
 
@@ -257,6 +283,11 @@ export function inferDefaultSourceFileForPdf(pdfFilePath: string): string | unde
 
 export type PdfOpener = (pdfFilePath: string, signal?: AbortSignal) => Promise<PdfOpenResult | void>;
 
+export interface OpenAndTrackPdfOptions {
+	reuseTrackedPdf?: boolean;
+	pdfId?: number;
+}
+
 function normalizeOpenResult(rawResult: PdfOpenResult | void): PdfOpenResult {
 	if (!rawResult) return {};
 	return {
@@ -265,6 +296,9 @@ function normalizeOpenResult(rawResult: PdfOpenResult | void): PdfOpenResult {
 		viewerBackend: rawResult.viewerBackend,
 		viewerOwned: rawResult.viewerOwned,
 		viewerCapabilities: rawResult.viewerCapabilities,
+		hostServicePdfId: rawResult.hostServicePdfId,
+		hostServiceSocketPath: rawResult.hostServiceSocketPath,
+		hostServiceCallbackTargetId: rawResult.hostServiceCallbackTargetId,
 	};
 }
 
@@ -287,10 +321,15 @@ export class PdfTracker {
 		pid?: number,
 		synctexEditorCommand?: string,
 		viewerOpenResult: PdfOpenResult = {},
+		overridePdfId?: number,
 	): TrackedPdf {
 		const now = Date.now();
+		const pdfId = overridePdfId ?? this.nextPdfId;
+		if (overridePdfId !== undefined && this.trackedPdfsById.has(overridePdfId)) {
+			this.untrackById(overridePdfId);
+		}
 		const trackedPdf: TrackedPdf = {
-			id: this.nextPdfId,
+			id: pdfId,
 			path: normalizedPdfPath,
 			sourceFile: defaultSourceFile,
 			pid,
@@ -299,10 +338,15 @@ export class PdfTracker {
 			viewerBackend: viewerOpenResult.viewerBackend,
 			viewerOwned: viewerOpenResult.viewerOwned,
 			viewerCapabilities: viewerOpenResult.viewerCapabilities,
+			hostServicePdfId: viewerOpenResult.hostServicePdfId,
+			hostServiceSocketPath: viewerOpenResult.hostServiceSocketPath,
+			hostServiceCallbackTargetId: viewerOpenResult.hostServiceCallbackTargetId,
 			openedAtMs: now,
 			lastOpenedAtMs: now,
 		};
-		this.nextPdfId += 1;
+		if (overridePdfId === undefined) {
+			this.nextPdfId += 1;
+		}
 		const pathEntries = this.trackedPdfsByPath.get(normalizedPdfPath) ?? [];
 		pathEntries.push(trackedPdf);
 		this.trackedPdfsByPath.set(normalizedPdfPath, pathEntries);
@@ -325,6 +369,9 @@ export class PdfTracker {
 		if (viewerOpenResult?.viewerBackend !== undefined) trackedPdf.viewerBackend = viewerOpenResult.viewerBackend;
 		if (viewerOpenResult?.viewerOwned !== undefined) trackedPdf.viewerOwned = viewerOpenResult.viewerOwned;
 		if (viewerOpenResult?.viewerCapabilities !== undefined) trackedPdf.viewerCapabilities = viewerOpenResult.viewerCapabilities;
+		if (viewerOpenResult?.hostServicePdfId !== undefined) trackedPdf.hostServicePdfId = viewerOpenResult.hostServicePdfId;
+		if (viewerOpenResult?.hostServiceSocketPath !== undefined) trackedPdf.hostServiceSocketPath = viewerOpenResult.hostServiceSocketPath;
+		if (viewerOpenResult?.hostServiceCallbackTargetId !== undefined) trackedPdf.hostServiceCallbackTargetId = viewerOpenResult.hostServiceCallbackTargetId;
 		trackedPdf.pid = pid;
 		trackedPdf.lastOpenedAtMs = Date.now();
 		return trackedPdf;
@@ -332,6 +379,13 @@ export class PdfTracker {
 
 	getById(pdfId: number): TrackedPdf | undefined {
 		return this.trackedPdfsById.get(pdfId);
+	}
+
+	getByHostServicePdfId(hostServicePdfId: number): TrackedPdf | undefined {
+		for (const trackedPdf of this.trackedPdfsById.values()) {
+			if (trackedPdf.hostServicePdfId === hostServicePdfId) return trackedPdf;
+		}
+		return undefined;
 	}
 
 	getByPath(normalizedPdfPath: string): TrackedPdf | undefined {
@@ -381,9 +435,45 @@ export async function closeTrackedPdf(
 	options: PdfCloseOptions = {},
 	signal?: AbortSignal,
 ): Promise<PdfCloseResult> {
-	const trackedPdf = tracker.getById(pdfId);
+	const trackedPdfById = tracker.getById(pdfId);
+	const trackedPdfByHostServicePdfId = tracker.getByHostServicePdfId(pdfId);
+	const hasHostServiceClose = options.requestCloseFromHostService !== undefined;
+	const trackedPdf = hasHostServiceClose
+		? (trackedPdfByHostServicePdfId ?? (trackedPdfById?.hostServicePdfId === pdfId ? trackedPdfById : undefined))
+		: trackedPdfById;
 	if (!trackedPdf) {
-		throw new Error(`Unknown tracked pdf_id=${pdfId}. Open the PDF first with open_pdf or compile_latex_file(..., open_pdf=true).`);
+		if (!options.requestCloseFromHostService) {
+			throw new Error(`Unknown tracked pdf_id=${pdfId}. Open the PDF first with open_pdf or compile_latex_file(..., open_pdf=true).`);
+		}
+		const serviceResult = await options.requestCloseFromHostService(pdfId, undefined, signal);
+		return {
+			pdf: "",
+			pdfId,
+			closed: serviceResult.closed,
+			...(serviceResult.reason !== undefined ? { reason: serviceResult.reason } : {}),
+			closedPids: [],
+			wasTracked: false,
+		};
+	}
+
+	if (trackedPdf.hostServicePdfId !== undefined) {
+		if (!options.requestCloseFromHostService) {
+			throw new Error(`Tracked pdf_id=${pdfId} requires host service close but no host service close handler is configured.`);
+		}
+		const serviceResult = await options.requestCloseFromHostService(
+			trackedPdf.hostServicePdfId,
+			trackedPdf.hostServiceSocketPath,
+			signal,
+		);
+		tracker.untrackById(trackedPdf.id);
+		return {
+			pdf: trackedPdf.path,
+			pdfId,
+			closed: serviceResult.closed,
+			...(serviceResult.reason !== undefined ? { reason: serviceResult.reason } : {}),
+			closedPids: [],
+			wasTracked: true,
+		};
 	}
 
 	if (trackedPdf.viewerHandle !== undefined && trackedPdf.viewerBackend !== undefined) {
@@ -391,7 +481,7 @@ export async function closeTrackedPdf(
 			throw new Error(`Tracked pdf_id=${pdfId} requires viewer service close but no close handler is configured.`);
 		}
 		const serviceResult = await options.requestClose(trackedPdf.viewerHandle, trackedPdf.viewerBackend, signal);
-		tracker.untrackById(pdfId);
+		tracker.untrackById(trackedPdf.id);
 		return {
 			pdf: trackedPdf.path,
 			pdfId,
@@ -412,16 +502,40 @@ export async function openAndTrackPdf(
 	opener?: PdfOpener,
 	defaultSourceFile?: string,
 	synctexEditorCommand?: string,
+	options: OpenAndTrackPdfOptions = {},
 ): Promise<TrackedPdf> {
+	const { reuseTrackedPdf = true, pdfId: overridePdfId } = options;
 	const pdfPath = normalizePdfFilePath(pdfFilePath);
 	const sourceFile = defaultSourceFile ?? inferDefaultSourceFileForPdf(pdfPath);
 	const reusableTrackedPdf = tracker.getByPath(pdfPath);
-	if (reusableTrackedPdf?.viewerHandle !== undefined && reusableTrackedPdf.viewerBackend !== undefined) {
+	if (
+		reusableTrackedPdf?.id === overridePdfId
+		&& reusableTrackedPdf?.viewerHandle !== undefined
+		&& reusableTrackedPdf.viewerBackend !== undefined
+	) {
+		return tracker.markReopened(reusableTrackedPdf.id, reusableTrackedPdf.pid, sourceFile, synctexEditorCommand) ?? reusableTrackedPdf;
+	}
+	if (
+		overridePdfId === undefined
+		&& reuseTrackedPdf
+		&& reusableTrackedPdf?.viewerHandle !== undefined
+		&& reusableTrackedPdf.viewerBackend !== undefined
+	) {
 		return tracker.markReopened(reusableTrackedPdf.id, reusableTrackedPdf.pid, sourceFile, synctexEditorCommand) ?? reusableTrackedPdf;
 	}
 
 	if (!opener) {
 		throw new Error("openAndTrackPdf requires a viewer-service opener. Direct Zathura opening is not supported in this flow.");
+	}
+	const staleTrackedPdf = tracker.getByPath(pdfPath);
+	if (overridePdfId !== undefined && staleTrackedPdf && staleTrackedPdf.id !== overridePdfId) {
+		tracker.untrackById(staleTrackedPdf.id);
+	}
+	if (overridePdfId !== undefined && tracker.getById(overridePdfId) !== undefined) {
+		const staleById = tracker.getById(overridePdfId);
+		if (staleById?.path !== undefined && staleById.path !== pdfPath) {
+			tracker.untrackById(overridePdfId);
+		}
 	}
 
 	const pendingOpen = tracker.getPendingOpen(pdfPath);
@@ -433,14 +547,19 @@ export async function openAndTrackPdf(
 		return trackedPdf;
 	}
 
-	const staleTrackedPdf = tracker.getByPath(pdfPath);
 	const openPromise = (async () => {
 		const openerResult = await opener(pdfPath, signal);
 		const normalizedResult = requireViewerServiceMetadata(normalizeOpenResult(openerResult));
+		if (overridePdfId !== undefined) {
+			const existingById = tracker.getById(overridePdfId);
+			if (existingById) {
+				return tracker.markReopened(existingById.id, normalizedResult.pid, sourceFile, synctexEditorCommand, normalizedResult) ?? existingById;
+			}
+		}
 		if (staleTrackedPdf && tracker.getById(staleTrackedPdf.id)) {
 			return tracker.markReopened(staleTrackedPdf.id, normalizedResult.pid, sourceFile, synctexEditorCommand, normalizedResult) ?? staleTrackedPdf;
 		}
-		return tracker.trackOpenedPdf(pdfPath, sourceFile, normalizedResult.pid, synctexEditorCommand, normalizedResult);
+		return tracker.trackOpenedPdf(pdfPath, sourceFile, normalizedResult.pid, synctexEditorCommand, normalizedResult, overridePdfId);
 	})();
 	tracker.setPendingOpen(pdfPath, openPromise);
 	try {
@@ -458,12 +577,59 @@ export async function jumpToTrackedPdf(
 	signal?: AbortSignal,
 	options: PdfJumpOptions = {},
 ): Promise<PdfJumpResult> {
-	const trackedPdf = tracker.getById(pdfId);
-	if (!trackedPdf) {
-		throw new Error(`Unknown tracked pdf_id=${pdfId}. Open the PDF first with open_pdf or compile_latex_file(..., open_pdf=true).`);
-	}
 	if (!Number.isInteger(line) || line < 1) {
 		throw new Error("line must be a positive integer");
+	}
+
+	const trackedPdfById = tracker.getById(pdfId);
+	const trackedPdfByHostServicePdfId = tracker.getByHostServicePdfId(pdfId);
+	const hasHostServiceJump = options.requestJumpFromHostService !== undefined;
+	const trackedPdf = hasHostServiceJump
+		? (trackedPdfByHostServicePdfId ?? (trackedPdfById?.hostServicePdfId === pdfId ? trackedPdfById : undefined))
+		: trackedPdfById;
+	if (!trackedPdf && !options.requestJumpFromHostService) {
+		throw new Error(`Unknown tracked pdf_id=${pdfId}. Open the PDF first with open_pdf or compile_latex_file(..., open_pdf=true).`);
+	}
+	const trackedSynctexCommand = options.synctexEditorCommand ?? trackedPdf?.synctexEditorCommand;
+	if (trackedPdf === undefined) {
+		const requestedSourceFile = sourceFile ? resolveSourceFilePath(sourceFile) : undefined;
+		const hostServiceJump = await options.requestJumpFromHostService!(
+			pdfId,
+			undefined,
+			requestedSourceFile,
+			line,
+			signal,
+		);
+		return {
+			pdf: hostServiceJump.pdf ?? "",
+			sourceFile: hostServiceJump.source_file ?? requestedSourceFile ?? "",
+			line,
+			reopened: Boolean(hostServiceJump.reopened),
+			sourceLine: hostServiceJump.source_line,
+		};
+	}
+
+	if (trackedPdf.hostServicePdfId !== undefined) {
+		if (!options.requestJumpFromHostService) {
+			throw new Error(`Tracked pdf_id=${pdfId} requires host service jump but no jump handler is configured.`);
+		}
+		const resolvedSourceFile = sourceFile
+			? resolveSourceFilePath(sourceFile)
+			: trackedPdf.sourceFile;
+		const hostServiceJump = await options.requestJumpFromHostService(
+			trackedPdf.hostServicePdfId,
+			trackedPdf.hostServiceSocketPath,
+			resolvedSourceFile,
+			line,
+			signal,
+		);
+		return {
+			pdf: hostServiceJump.pdf ?? trackedPdf.path,
+			sourceFile: hostServiceJump.source_file ?? resolvedSourceFile ?? "",
+			line,
+			reopened: Boolean(hostServiceJump.reopened),
+			sourceLine: hostServiceJump.source_line,
+		};
 	}
 
 	const resolvedSourceFile = sourceFile
@@ -473,8 +639,6 @@ export async function jumpToTrackedPdf(
 		throw new Error(`No default source_file is known for tracked pdf_id=${pdfId}. Pass source_file explicitly.`);
 	}
 	assertReadableSourceFile(resolvedSourceFile);
-
-	const trackedSynctexCommand = options.synctexEditorCommand ?? trackedPdf.synctexEditorCommand;
 
 	const extractServiceErrorCode = (error: unknown): string | undefined => {
 		const message = error instanceof Error ? error.message : String(error);

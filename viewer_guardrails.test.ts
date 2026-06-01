@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import ts from "typescript";
 
@@ -276,4 +276,31 @@ test("Production extension TypeScript rejects direct viewer-control regressions"
 	}
 
 	assert.equal(violations.length, 0, `Forbidden production GUI-regression patterns were found:\n${formatViolations(violations)}`);
+});
+
+test("Systemd host service unit is named and configured for show-latex", () => {
+	const unitPath = join(REPO_ROOT, "systemd", "show-latex.service");
+	const legacyUnitPath = join(REPO_ROOT, "systemd", "codex-show-latex-viewer.service");
+	const unitSource = readFileSync(unitPath, "utf8");
+
+	assert.equal(existsSync(legacyUnitPath), false, "Legacy systemd unit filename should be removed");
+	assert.match(unitSource, /WorkingDirectory=.*%h\/projects\/AI\/pi_extensions\/pdf-preview/);
+	assert.match(unitSource, /ExecStart=.*agent-synctex-host-service\.ts start/);
+	assert.match(unitSource, /Restart=on-failure/);
+	assert.match(unitSource, /DBUS_SESSION_BUS_ADDRESS=/);
+	assert.match(unitSource, /PartOf=graphical-session\.target/);
+	assert.match(unitSource, /WantedBy=graphical-session\.target/);
+});
+
+test("Firejail profile keeps host service runtime paths macro-compatible", () => {
+	const firejailPath = join(REPO_ROOT, ".pi.firejail");
+	const firejailSource = readFileSync(firejailPath, "utf8");
+
+	assert.match(firejailSource, /mkdir\s+\$\{RUNUSER\}\/show-latex/);
+	assert.match(firejailSource, /whitelist\s+\$\{RUNUSER\}\/show-latex/);
+	assert.match(firejailSource, /read-write\s+\$\{RUNUSER\}\/show-latex/);
+	assert.match(firejailSource, /mkdir\s+\$\{RUNUSER\}\/agent-synctex/);
+	assert.match(firejailSource, /whitelist\s+\$\{RUNUSER\}\/agent-synctex/);
+	assert.match(firejailSource, /read-write\s+\$\{RUNUSER\}\/agent-synctex/);
+	assert.equal(firejailSource.includes("${XDG_RUNTIME_DIR}"), false, ".pi.firejail should avoid unsupported XDG_RUNTIME_DIR variable");
 });

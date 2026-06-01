@@ -5,9 +5,9 @@ This helper exposes a filesystem protocol consumed by the Pi extension so that
 file operations are validated, serialized, and sandbox-safe.
 
 Clients create per-request files under:
-  /tmp/codex-show-latex/viewer-requests/<id>.json
+  ${XDG_RUNTIME_DIR}/show-latex/viewer-requests/<id>.json
 and poll matching result files under:
-  /tmp/codex-show-latex/viewer-results/<id>.json
+  ${XDG_RUNTIME_DIR}/show-latex/viewer-results/<id>.json
 
 Supports status checks and viewer `open` requests.
 """
@@ -32,7 +32,7 @@ os.umask(0o077)
 
 OPEN_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-DEFAULT_TMPDIR = os.environ.get("MCP_TMPDIR", "/tmp/codex-show-latex")
+DEFAULT_TMPDIR = os.environ.get("MCP_TMPDIR", str(Path(os.environ.get("XDG_RUNTIME_DIR", os.environ.get("HOME") or os.getcwd()) ) / "show-latex"))
 REQUESTS_NAME = "viewer-requests"
 RESULTS_NAME = "viewer-results"
 STATE_NAME = "viewer-state.json"
@@ -527,6 +527,9 @@ class ViewerBackendAdapter:
 			"status_details": status_details,
 		}
 
+	def close_all_sessions(self, _request_id: str = "service-shutdown") -> None:
+		return
+
 
 class ZathuraViewerBackend(ViewerBackendAdapter):
 	def __init__(self, executable_path: Optional[str] = None) -> None:
@@ -590,12 +593,69 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 		pids = _iter_viewer_pids_for_pdf(viewer_path, [pdf_path], allow_wrapped=False)
 		return pids[0] if pids else None
 
+	def _close_owned_session(self, matched_path: str, session: Dict[str, Any], request_id: str, handle: str, backend: str) -> None:
+		if not isinstance(session, dict):
+			OPEN_SESSIONS.pop(matched_path, None)
+			return
+		if session.get("owned") is not True:
+			OPEN_SESSIONS.pop(matched_path, None)
+			return
+		current_pid = session.get("pid")
+		if not isinstance(current_pid, int):
+			OPEN_SESSIONS.pop(matched_path, None)
+			return
+		session_process = session.get("process")
+		if isinstance(session_process, subprocess.Popen):
+			if session_process.poll() is None:
+				_ = self._terminate_owned_process(
+					session_process,
+					current_pid,
+					matched_path,
+					request_id,
+					handle,
+					backend,
+				)
+			try:
+				if session_process is not None:
+					session_process.wait(timeout=0)
+			except Exception:
+				pass
+			finally:
+				OPEN_SESSIONS.pop(matched_path, None)
+			return
+		if not _pid_alive(current_pid):
+			OPEN_SESSIONS.pop(matched_path, None)
+			return
+		if not self._is_process_identity_match(current_pid, session):
+			OPEN_SESSIONS.pop(matched_path, None)
+			return
+		deadline = time.time() + 1.0
+		try:
+			os.kill(current_pid, signal.SIGTERM)
+			while time.time() < deadline and _pid_alive(current_pid):
+				time.sleep(0.05)
+			if _pid_alive(current_pid):
+				try:
+					os.kill(current_pid, signal.SIGKILL)
+				except Exception:
+					pass
+			while time.time() < deadline and _pid_alive(current_pid):
+				time.sleep(0.05)
+		except ProcessLookupError:
+			OPEN_SESSIONS.pop(matched_path, None)
+			return
+		except PermissionError:
+			pass
+		finally:
+			OPEN_SESSIONS.pop(matched_path, None)
+
 	def _is_reusable_session(self, normalized_pdf_path: str, callback: Dict[str, Any]) -> bool:
 		session = OPEN_SESSIONS.get(normalized_pdf_path)
 		if not isinstance(session, dict):
 			OPEN_SESSIONS.pop(normalized_pdf_path, None)
 			return False
 		if session.get("callback") != callback:
+			self._close_owned_session(normalized_pdf_path, session, "callback-replaced", str(session.get("handle") or "unknown"), self.name)
 			return False
 
 		current_pid = session.get("pid")
@@ -606,15 +666,23 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 
 		if isinstance(session_process, subprocess.Popen):
 			if session_process.poll() is not None:
-				try:
-					session_process.wait(timeout=0)
-				except Exception:
-					pass
-				OPEN_SESSIONS.pop(normalized_pdf_path, None)
+				self._close_owned_session(
+					normalized_pdf_path,
+					session,
+					"session-ended",
+					str(session.get("handle") or "unknown"),
+					self.name,
+				)
 				return False
 			if self._is_process_identity_match(current_pid, session):
 				return True
-			OPEN_SESSIONS.pop(normalized_pdf_path, None)
+			self._close_owned_session(
+				normalized_pdf_path,
+				session,
+				"identity-mismatch",
+				str(session.get("handle") or "unknown"),
+				self.name,
+			)
 			return False
 
 		if not _pid_alive(current_pid):
@@ -622,7 +690,13 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 			return False
 		if self._is_process_identity_match(current_pid, session):
 			return True
-		OPEN_SESSIONS.pop(normalized_pdf_path, None)
+		self._close_owned_session(
+			normalized_pdf_path,
+			session,
+			"identity-mismatch",
+			str(session.get("handle") or "unknown"),
+			self.name,
+		)
 		return False
 
 	def _start_viewer_process(self, args: list[str]) -> subprocess.Popen:
@@ -800,6 +874,16 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 				),
 			}
 
+		existing_session = OPEN_SESSIONS.get(normalized_pdf_path)
+		if existing_session is not None:
+			self._close_owned_session(
+				normalized_pdf_path,
+				existing_session,
+				"open-replace",
+				str(existing_session.get("handle") or "unknown"),
+				self.name,
+			)
+
 		handle = f"{self.name}:{request_id}:{int(time.time_ns())}"
 		callback_command = self._build_synctex_editor_command(callback)
 		# Launch Zathura with the canonical PDF path rather than /proc/self/fd/<fd>.
@@ -869,6 +953,19 @@ class ZathuraViewerBackend(ViewerBackendAdapter):
 			),
 		}
 
+
+	def close_all_sessions(self, request_id: str = "service-shutdown") -> None:
+		for pdf_path, session in list(OPEN_SESSIONS.items()):
+			if not isinstance(session, dict):
+				OPEN_SESSIONS.pop(pdf_path, None)
+				continue
+			self._close_owned_session(
+				pdf_path,
+				session,
+				request_id,
+				str(session.get("handle") or "unknown"),
+				self.name,
+			)
 
 	def _find_session_by_handle(self, handle: str) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
 		for pdf_path, session in list(OPEN_SESSIONS.items()):
@@ -2203,10 +2300,15 @@ def main() -> int:
 		return 1
 
 	stop = False
+	backend = viewer_backend()
 
 	def handle_stop(signum: int, _frame: object) -> None:
 		nonlocal stop
 		stop = True
+		try:
+			backend.close_all_sessions("service-stop")
+		except Exception:
+			pass
 		log(f"received signal {signum}; stopping")
 
 	signal.signal(signal.SIGTERM, handle_stop)
@@ -2222,6 +2324,7 @@ def main() -> int:
 		scan_requests(now_ns)
 		time.sleep(POLL_SECONDS)
 
+	backend.close_all_sessions("service-stop")
 	log("viewer service stopped")
 	return 0
 

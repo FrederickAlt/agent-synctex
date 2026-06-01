@@ -2,7 +2,7 @@
 """Dependency-free stdio MCP server for LaTeX previews.
 
 Security model:
-- This process compiles LaTeX into operation-scoped files under /tmp/codex-show-latex.
+- This process compiles LaTeX into operation-scoped files under ${XDG_RUNTIME_DIR}/show-latex.
 - It never launches a GUI application.
 - External viewer operations are handled by a separate desktop-session viewer service; show-latex.ready is only a compatibility artifact for older standalone callers.
 """
@@ -26,7 +26,7 @@ SERVER_NAME = "codex-show-latex-mcp"
 SERVER_VERSION = "2.1.0"
 PROTOCOL_VERSION = "2025-06-18"
 
-DEFAULT_TMPDIR = os.environ.get("MCP_TMPDIR", "/tmp/codex-show-latex")
+DEFAULT_TMPDIR = os.environ.get("MCP_TMPDIR", str(Path(os.environ.get("XDG_RUNTIME_DIR", os.environ.get("HOME") or os.getcwd()) ) / "show-latex"))
 TEX_NAME = "show-latex.tex"
 PDF_NAME = "show-latex.pdf"
 LOG_NAME = "show-latex.log"
@@ -372,8 +372,8 @@ def tool_schema() -> list[Json]:
         {
             "name": "show_latex",
             "description": (
-                "Compile LaTeX source to an operation-scoped PDF under /tmp/codex-show-latex. "
-                "It uses the active preamble from /tmp/codex-show-latex/preamble.tex, which is initialized from "
+                "Compile LaTeX source to an operation-scoped PDF under ${XDG_RUNTIME_DIR}/show-latex. "
+                "It uses the active preamble from ${XDG_RUNTIME_DIR}/show-latex/preamble.tex, which is initialized from "
                 "any existing ./preamble.tex or ./praeamble.tex in the working directory, so fragments should not "
                 "repeat those definitions. Returns only 'ok' on success. A separate desktop helper opens the ready "
                 "descriptor PDF."
@@ -381,7 +381,7 @@ def tool_schema() -> list[Json]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "latex_source": {"type": "string", "description": "LaTeX source. Full documents compile as-is; fragments are wrapped automatically. The active preamble from /tmp/codex-show-latex/preamble.tex is applied automatically."},
+                    "latex_source": {"type": "string", "description": "LaTeX source. Full documents compile as-is; fragments are wrapped automatically. The active preamble from ${XDG_RUNTIME_DIR}/show-latex/preamble.tex is applied automatically."},
                     "compiler": {"type": "string", "enum": list(SUPPORTED_COMPILERS), "default": DEFAULT_COMPILER, "description": "Optional LaTeX compiler to use. Defaults to lualatex."},
                     "synctex_editor_command": {"type": "string", "description": "Session-specific Zathura inverse SyncTeX callback command for this preview operation."},
                     "write_ready": {"type": "boolean", "default": True, "description": "Whether to write the ready descriptor consumed by external preview helpers."},

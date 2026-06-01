@@ -2,7 +2,6 @@ import { createServer, type Server, type Socket } from "node:net";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
-import { tmpdir } from "node:os";
 
 export interface SynctexPasteTarget {
 	cwd: string;
@@ -44,7 +43,7 @@ interface SynctexCallbackResponse {
 	error?: string;
 }
 
-const DEFAULT_SYNCTEX_TMPDIR = resolve(tmpdir(), "codex-show-latex");
+const DEFAULT_SYNCTEX_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "show-latex");
 const SOCKET_NAME_PREFIX = "pi-synctex-";
 const ZATHURA_INPUT_PLACEHOLDER = "%{input}";
 const ZATHURA_LINE_PLACEHOLDER = "%{line}";
