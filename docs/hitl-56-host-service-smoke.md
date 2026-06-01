@@ -83,3 +83,9 @@ Additional validation was performed after replacing the legacy Python viewer ser
 - Inline preview artifact validation now accepts safe runtime-dir artifacts.
 
 The true host service HITL rerun passed.
+
+## Broker migration audit notes
+
+Issue #55 depends on host-side broker/service files that are intentionally external to this repo. For a checklist of expected external paths, expected service names, runtime/socket expectations, and concrete verification commands, see:
+
+- [docs/host-service-broker.md](./host-service-broker.md)

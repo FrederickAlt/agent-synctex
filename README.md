@@ -114,6 +114,8 @@ The broker socket is project-specific at `~/.cache/pdf-preview-servicectl/broker
 placed under the shared show-latex cache. Its purpose is only to let this project sync the host-service helper files, restart/status the host service, and read its diagnostics without exposing the
 user session D-Bus to the agent sandbox.
 
+For the external broker migration boundary and expected file/service locations, see [docs/host-service-broker.md](docs/host-service-broker.md).
+
 Do **not** broaden or repurpose this broker. It is a narrow privileged escape hatch for maintaining/testing the PDF
 host service only: opening PDFs, closing PDFs, and SyncTeX/forward-search behavior. It must not be used for
 unrelated host commands, unrelated services, or non-viewer automation.
