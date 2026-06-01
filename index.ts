@@ -39,7 +39,11 @@ import {
 } from "./src/modules/pdf_session/pdf_session.ts";
 import { SynctexCallbackServer, type SynctexCallbackConfig, type SynctexPasteTarget } from "./src/modules/synctex/synctex.ts";
 import { ViewerServiceClient, type ViewerServiceOpenResult } from "./src/modules/viewer_service.ts";
-import { HostServiceClient, defaultHostServiceSocketPath } from "./src/modules/host_service.ts";
+import {
+	HostServiceClient,
+	type HostServiceCompileResponseDetails,
+	defaultHostServiceSocketPath,
+} from "./src/modules/host_service.ts";
 import {
 	createUniversalToolFacade,
 	registerTracerTools,
@@ -932,6 +936,35 @@ function hostServiceWorkspaceContextForSession(ctx: ExtensionContext): { cwd: st
 	return context;
 }
 
+function hostServiceWorkspaceContextForRequest(ctx?: ExtensionContext): { cwd: string; session_id?: string } {
+	if (ctx) {
+		return hostServiceWorkspaceContextForSession(ctx);
+	}
+	return { cwd: process.cwd() };
+}
+
+async function ensureHostServiceCallbackTarget(ctx: ExtensionContext): Promise<string> {
+	const contextKey = callbackKeyForContext(ctx);
+	const targetId = hostServiceTargetId(ctx);
+	const workspaceContext = hostServiceWorkspaceContextForSession(ctx);
+	if (hostServiceSessionTargets.has(contextKey)) {
+		const client = new HostServiceClient({
+			socketPath: hostServiceSocketPath(),
+			requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+		});
+		try {
+			const resolved = await client.requestResolveCallbackTarget(workspaceContext, targetId);
+			if (resolved.callback_available) {
+				return targetId;
+			}
+		} catch {
+			// Fall back to re-registering the callback target if possible.
+		}
+	}
+	await registerHostServiceCallbackTarget(ctx);
+	return targetId;
+}
+
 function notifyHostServiceError(ctx: ExtensionContext, operation: string, error: unknown): void {
 	if (!ctx.hasUI) return;
 	ctx.ui.notify(`Host Service ${operation} failed: ${errorMessage(error)}. Expected socket ${hostServiceSocketPath()}`, "error");
@@ -1247,6 +1280,64 @@ function extractViewerServiceErrorCode(error: unknown): string | undefined {
 	return /\(code=([^)]+)\)/.exec(message)?.[1];
 }
 
+function isStringRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hostServiceCompileErrorDetails(error: unknown): HostServiceCompileResponseDetails | undefined {
+	if (!error || typeof error !== "object") {
+		return;
+	}
+	const statusDetails = "statusDetails" in error ? (error as { statusDetails?: unknown }).statusDetails : undefined;
+	if (!isStringRecord(statusDetails)) {
+		return;
+	}
+	if (statusDetails.operation !== "compile_latex_file") {
+		return;
+	}
+	if (typeof statusDetails.source !== "string" || typeof statusDetails.pdf !== "string") {
+		return;
+	}
+	return statusDetails as unknown as HostServiceCompileResponseDetails;
+}
+
+function stringsOrEmpty(value: unknown): string[] {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+	return value.every((entry) => typeof entry === "string") ? value : [];
+}
+
+function describeCompileFailureContext(
+	requestedPath: string,
+	compileResult: { source: string; pdf: string; clean: boolean; cleaned_artifacts: string[] } | undefined,
+	error: unknown,
+): { source: string; pdf: string; clean: boolean; cleaned_artifacts: string[] } {
+	const details = hostServiceCompileErrorDetails(error);
+	if (details) {
+		return {
+			source: details.source,
+			pdf: details.pdf,
+			clean: typeof details.clean === "boolean" ? details.clean : false,
+			cleaned_artifacts: stringsOrEmpty(details.cleaned_artifacts),
+		};
+	}
+	if (compileResult !== undefined) {
+		return compileResult;
+	}
+	return {
+		source: requestedPath,
+		pdf: "",
+		clean: false,
+		cleaned_artifacts: [],
+	};
+}
+
+function isOpenFailureFromCompileError(error: unknown): boolean {
+	const details = hostServiceCompileErrorDetails(error);
+	return typeof details?.pdf === "string" && details.pdf.length > 0 && details.error_code !== "compile_failed";
+}
+
 async function openPdfThroughViewerService(
 	path: string,
 	callbackConfig: SynctexCallbackConfig,
@@ -1463,6 +1554,11 @@ export default function (pi: ExtensionAPI) {
 			let pdfId = 0;
 			try {
 				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
+				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
+				const workspaceHostServiceClient = new HostServiceClient({
+					socketPath: hostServiceSocketPath(),
+					requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+				});
 				const result = await closeTrackedPdfForContext(
 					ctx,
 					pdfId,
@@ -1470,6 +1566,13 @@ export default function (pi: ExtensionAPI) {
 						return viewerServiceClient.requestClosePdf(viewerHandle, viewerBackend, closeSignal);
 					},
 					signal,
+					async (hostPdfId, closeSignal) => {
+						const closeResponse = await workspaceHostServiceClient.requestClosePdf(workspaceContext, hostPdfId, closeSignal);
+						return {
+							closed: closeResponse.closed,
+							reason: closeResponse.reason,
+						};
+					},
 				);
 				const reasonText = result.reason ? ` reason=${result.reason}` : "";
 				const closedText = result.closed
@@ -1520,6 +1623,11 @@ export default function (pi: ExtensionAPI) {
 				}
 				const server = await ensureSynctexCallbacks(ctx);
 				synctexCommand = server.command;
+				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
+				const workspaceHostServiceClient = new HostServiceClient({
+					socketPath: hostServiceSocketPath(),
+					requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
+				});
 				const result = await jumpTrackedPdfForContext(
 					ctx,
 					pdfId,
@@ -1556,6 +1664,19 @@ export default function (pi: ExtensionAPI) {
 								jumpSignal,
 							);
 							return { handled: response.handled, reason: response.reason };
+						},
+						requestJumpFromHostService: async (hostPdfId, hostSourceFile, jumpLine, jumpSignal) => {
+							const hostResponse = await workspaceHostServiceClient.requestJumpPdf(
+								workspaceContext,
+								{ pdf_id: hostPdfId, line: jumpLine, source_file: hostSourceFile },
+								jumpSignal,
+							);
+							return {
+								handled: hostResponse.handled,
+								source_file: hostResponse.source_file,
+								source_line: hostResponse.source_line,
+								reopened: hostResponse.reopened,
+							};
 						},
 						cwd: ctx.cwd,
 					},
@@ -1608,106 +1729,144 @@ export default function (pi: ExtensionAPI) {
 	const compileLatexFileToolFacade = createUniversalToolFacade({
 		"compile_latex_file": async (_toolCallId, params, signal, _onUpdate, ctx) => {
 			let requestedPath = "";
-			let latexFilePath = "";
-			let compileResult:
-				| { source: string; pdfPath: string; clean: boolean; cleanedArtifacts: string[] }
-				| undefined;
+			let compileResult: { source: string; pdf: string; clean: boolean; cleaned_artifacts: string[] } | undefined;
+			let openResult: { pdf_id?: number; pdf: string; source: string } | undefined;
 			let synctexCommand = "";
 			let compiler: LatexCompiler | undefined;
 			let shouldOpenPdf = false;
 			let shouldClean = false;
+			let targetId = "";
 			try {
 				requestedPath = String(params.latex_file_path ?? "");
 				if (!requestedPath.trim()) {
 					throw new Error("latex_file_path must be a non-empty string");
 				}
 
-				latexFilePath = resolveLatexFilePath(requestedPath, ctx?.cwd);
 				compiler = resolveLatexCompiler(params.compiler);
 				shouldOpenPdf = params.open_pdf === true;
 				shouldClean = params.clean === true;
-				compileResult = await latexFileCompileToolSupport.compileLatexFile({
-					requestedPath: latexFilePath,
-					compiler: params.compiler,
-					clean: shouldClean,
-					signal,
+				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
+				const client = new HostServiceClient({
+					socketPath: hostServiceSocketPath(),
+					requestTimeoutMs: hostServiceClientConfig().requestTimeoutMs,
 				});
-				const toolResult = latexFileCompileToolSupport.buildToolResult(compileResult);
-				const resolvedSource = toolResult.source;
+				const compileRequest: {
+					latex_file_path: string;
+					compiler?: string;
+					clean?: boolean;
+					open_pdf?: boolean;
+					callback_target_id?: string;
+				} = {
+					latex_file_path: requestedPath,
+					...(shouldClean ? { clean: true } : {}),
+				};
+				if (compiler !== undefined) {
+					compileRequest.compiler = compiler;
+				}
+				if (shouldOpenPdf && ctx) {
+					targetId = await ensureHostServiceCallbackTarget(ctx);
+					compileRequest.open_pdf = true;
+					compileRequest.callback_target_id = targetId;
+				}
+				const compileResponse = await client.requestCompileLatexFile(compileRequest, workspaceContext, signal);
+				compileResult = {
+					source: compileResponse.source,
+					pdf: compileResponse.pdf,
+					clean: compileResponse.clean,
+					cleaned_artifacts: compileResponse.cleaned_artifacts,
+				};
+
 				if (!shouldOpenPdf) {
 					return {
-						content: [{ type: "text", text: `ok: ${toolResult.pdf}` }],
+						content: [{ type: "text", text: `ok: ${compileResult.pdf}` }],
 						details: {
-							source: toolResult.source,
-							pdf: toolResult.pdf,
-							clean: toolResult.clean,
-							cleaned_artifacts: toolResult.cleaned_artifacts,
+							source: compileResult.source,
+							pdf: compileResult.pdf,
+							clean: compileResult.clean,
+							cleaned_artifacts: compileResult.cleaned_artifacts,
 						},
 					};
 				}
 
-				try {
-					if (!ctx) {
-						throw new Error("compile_latex_file with open_pdf=true requires a Pi agent session context");
-					}
-					const server = await ensureSynctexCallbacks(ctx);
-					synctexCommand = server.command;
-					const trackedPdf = await openTrackedPdfForContext(
-						ctx,
-						compileResult.pdfPath,
-						signal,
-						async (path, openSignal) => openPdfThroughViewerService(path, (await ensureSynctexCallbacks(ctx)).callbackConfig, openSignal),
-						resolvedSource,
-						synctexCommand,
-					);
-					const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
-					const text = synctexCommand
-						? `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
-						: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
-					return {
-						content: [{ type: "text", text }],
-						details: {
-							source: resolvedSource,
-							pdf: trackedPdf.path,
-							pdf_id: trackedPdf.id,
-							pid: trackedPdf.pid,
-							viewer_handle: trackedPdf.viewerHandle,
-							viewer_backend: trackedPdf.viewerBackend,
-							viewer_owned: trackedPdf.viewerOwned,
-							viewer_capabilities: trackedPdf.viewerCapabilities,
-							clean: compileResult.clean,
-							cleaned_artifacts: compileResult.cleanedArtifacts,
-							synctex_callback_command: synctexCommand,
-						},
-					};
-				} catch (error) {
+				if (!ctx) {
+					throw new Error("compile_latex_file with open_pdf=true requires a Pi agent session context");
+				}
+				synctexCommand = (await ensureSynctexCallbacks(ctx)).command;
+				const trackedPdf = await openTrackedPdfForContext(
+					ctx,
+					compileResponse.pdf,
+					signal,
+					async () => {
+						const managedRecord = compileResponse.managed_record;
+						return {
+							pid: managedRecord?.pid,
+							viewerHandle: managedRecord?.viewerHandle,
+							viewerBackend: managedRecord?.viewerBackend,
+							viewerOwned: managedRecord?.viewerOwned,
+							viewerCapabilities: managedRecord?.capabilities,
+							hostServicePdfId: managedRecord?.id,
+							hostServiceSocketPath: hostServiceSocketPath(),
+							hostServiceCallbackTargetId: targetId,
+						};
+					},
+					compileResponse.source,
+					synctexCommand,
+				);
+				openResult = {
+					pdf_id: trackedPdf.id,
+					pdf: trackedPdf.path,
+					source: trackedPdf.sourceFile ?? compileResponse.source,
+				};
+				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
+				const text = synctexCommand
+					? `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}\nsynctex_callback_command=${synctexCommand}`
+					: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}`;
+				return {
+					content: [{ type: "text", text }],
+					details: {
+						source: trackedPdf.sourceFile ?? compileResponse.source,
+						pdf: trackedPdf.path,
+						pdf_id: trackedPdf.id,
+						pid: trackedPdf.pid,
+						viewer_handle: trackedPdf.viewerHandle,
+						viewer_backend: trackedPdf.viewerBackend,
+						viewer_owned: trackedPdf.viewerOwned,
+						viewer_capabilities: trackedPdf.viewerCapabilities,
+						clean: compileResponse.clean,
+						cleaned_artifacts: compileResponse.cleaned_artifacts,
+						synctex_callback_command: synctexCommand,
+					},
+				};
+			} catch (error) {
+				const failureContext = describeCompileFailureContext(requestedPath, compileResult, error);
+				if (openResult === undefined && shouldOpenPdf && isOpenFailureFromCompileError(error)) {
 					throw latexToolFailure("compile-latex-file", "LaTeX compile succeeded but opening failed", {
 						requested_path: requestedPath,
-						source: compileResult?.source ?? latexFilePath,
+						source: failureContext.source,
 						compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
-						clean: compileResult?.clean ?? shouldClean,
-						cleaned_artifacts: compileResult?.cleanedArtifacts ?? [],
-						pdf: compileResult?.pdfPath ?? "",
+						open_pdf: shouldOpenPdf,
+						clean: failureContext.clean,
+						cleaned_artifacts: failureContext.cleaned_artifacts,
+						pdf: failureContext.pdf,
+						target_id: targetId,
 						synctex_callback_command: synctexCommand,
 						open_error: error instanceof Error ? error.message : String(error),
 						open_error_code: extractViewerServiceErrorCode(error),
 					}, error);
 				}
-			} catch (error) {
-				const resultPdfPath = compileResult?.pdfPath ?? "";
-				const cleanArtifacts = compileResult?.cleanedArtifacts ?? [];
-				const cleanSetting = compileResult?.clean ?? shouldClean;
+
 				throw latexToolFailure("compile-latex-file", "LaTeX compile failed", {
 					requested_path: requestedPath,
-					source: compileResult?.source ?? latexFilePath,
+					source: failureContext.source,
 					compiler: compiler ?? params.compiler ?? DEFAULT_LATEX_COMPILER,
 					open_pdf: shouldOpenPdf,
-					clean: cleanSetting,
-					cleaned_artifacts: cleanArtifacts,
-					pdf: resultPdfPath,
+					clean: failureContext.clean,
+					cleaned_artifacts: failureContext.cleaned_artifacts,
+					pdf: failureContext.pdf,
 					synctex_callback_command: synctexCommand,
+					callback_target_id: shouldOpenPdf ? targetId : undefined,
 				}, error);
-				}
+			}
 		},
 	});
 

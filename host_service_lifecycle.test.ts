@@ -648,7 +648,7 @@ test("missing host service during shutdown is handled without throwing", async (
 	rmSync(root, { recursive: true, force: true });
 });
 
-test("compile_latex_file continues to use viewer service when host service is unavailable", async () => {
+test("compile_latex_file fails when host service is unavailable", async () => {
 	const suite = await captureExtensionHandlersAndTools();
 	const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-migration-"));
 	const sourcePath = resolve(root, "paper.tex");
@@ -661,26 +661,23 @@ test("compile_latex_file continues to use viewer service when host service is un
 	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = resolve(root, "missing-host-service.sock");
 	const notifications: string[] = [];
 	const context = createSessionContext(root, notifications);
+	let threw = false;
 
 	await runSessionStart(suite.start, context);
 
-	await withFakeViewerService("ok", async () => {
-		const result = await suite.compileTool.execute(
+	try {
+		await suite.compileTool.execute(
 			"compile-latex-uses-viewer",
 			{ latex_file_path: sourcePath, open_pdf: true },
 			undefined,
 			undefined,
 			context,
 		);
-		const details = result.details as { pdf_id: number; pdf: string; pid: number; viewer_handle: string };
-		assert.equal(typeof details.pdf_id, "number");
-		assert.equal(details.pdf.endsWith("paper.pdf"), true);
-		assert.equal(details.pid, 222222);
-		const openSummary = readOpenSummary();
-		assert.equal(openSummary.validation_error, null);
-		assert.equal(openSummary.callback?.kind, "pi-synctex-callback-v1");
-	});
-
+	} catch (error) {
+		threw = true;
+		assert.equal(/host service socket unavailable/.test(error instanceof Error ? error.message : String(error)), true);
+	}
+	assert.equal(threw, true);
 	assert.equal(notifications.length > 0, true);
 	await runSessionShutdown(suite.shutdown, context);
 	process.env.PATH = originalPath;

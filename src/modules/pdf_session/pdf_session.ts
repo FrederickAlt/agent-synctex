@@ -54,6 +54,9 @@ export type PdfSessionOpenResult = {
 		inverse_search: boolean;
 		reuse: boolean;
 	};
+	hostServicePdfId?: number;
+	hostServiceSocketPath?: string;
+	hostServiceCallbackTargetId?: string;
 };
 export type PdfSessionOpen = (pdfFilePath: string, signal?: AbortSignal) => Promise<PdfSessionOpenResult | void>;
 
@@ -63,6 +66,8 @@ export type PdfSessionClose = (
 	signal?: AbortSignal,
 ) => Promise<{ closed: boolean; reason?: string }>;
 
+export type PdfSessionCloseFromHostService = (hostServicePdfId: number, signal?: AbortSignal) => Promise<{ closed: boolean; reason?: string }>;
+
 function toPdfOpenResult(openResult: PdfSessionOpenResult | void): PdfOpenResult | void {
 	if (!openResult) return undefined;
 	return {
@@ -71,6 +76,9 @@ function toPdfOpenResult(openResult: PdfSessionOpenResult | void): PdfOpenResult
 		viewerBackend: openResult.viewerBackend ?? openResult.backend,
 		viewerOwned: openResult.viewerOwned ?? openResult.owned,
 		viewerCapabilities: openResult.viewerCapabilities ?? openResult.capabilities,
+		hostServicePdfId: openResult.hostServicePdfId,
+		hostServiceSocketPath: openResult.hostServiceSocketPath,
+		hostServiceCallbackTargetId: openResult.hostServiceCallbackTargetId,
 	};
 }
 
@@ -184,6 +192,12 @@ export interface PdfSessionJumpOptions {
 	requestForwardSearch: PdfSessionForwardSearch;
 	opener?: PdfSessionOpen;
 	sourceLineReader?: PdfSessionJumpSourceReader;
+	requestJumpFromHostService?: (hostServicePdfId: number, sourceFile: string, line: number, signal?: AbortSignal) => Promise<{
+		handled?: boolean;
+		source_file?: string;
+		source_line?: string;
+		reopened?: boolean;
+	}>;
 	cwd?: string;
 }
 
@@ -223,10 +237,23 @@ export async function jumpTrackedPdfForContext(
 				);
 				return { handled: response.handled, reason: response.reason };
 			},
+			requestJumpFromHostService: options.requestJumpFromHostService
+				? async (hostServicePdfId, sourceFile, jumpLine, jumpSignal) => {
+					const response = await options.requestJumpFromHostService!(hostServicePdfId, sourceFile, jumpLine, jumpSignal);
+					return {
+						handled: response.handled,
+						source_file: response.source_file,
+						source_line: response.source_line,
+						reopened: response.reopened,
+				};
+				}
+				: undefined,
 		},
 	);
 
-	const sourceLine = (options.sourceLineReader ?? readSourceLine)(result.sourceFile, result.line, options.cwd ?? process.cwd());
+	const sourceLine = result.sourceLine === undefined
+		? (options.sourceLineReader ?? readSourceLine)(result.sourceFile, result.line, options.cwd ?? process.cwd())
+		: result.sourceLine;
 	return {
 		...result,
 		sourceLine: sourceLine ?? "",
@@ -246,6 +273,7 @@ export async function closeTrackedPdfForContext(
 	pdfId: number,
 	requestClose: PdfSessionClose,
 	signal?: AbortSignal,
+	requestCloseFromHostService?: PdfSessionCloseFromHostService,
 ): Promise<PdfCloseResult> {
 	const tracker = getPdfTrackerForContext(ctx);
 	return closeTrackedPdf(
@@ -253,6 +281,7 @@ export async function closeTrackedPdfForContext(
 		tracker,
 		{
 			requestClose,
+			...(requestCloseFromHostService === undefined ? {} : { requestCloseFromHostService }),
 		},
 		signal,
 	);
