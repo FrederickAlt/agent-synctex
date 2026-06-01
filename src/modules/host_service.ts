@@ -1890,6 +1890,33 @@ export class HostServiceServer {
 			};
 		}
 		const nowNs = Date.now() * 1_000_000;
+		if (!managedRecord.viewerOwned) {
+			this.managedViewerRecords.closeRecord(request.pdf_id);
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "close_pdf",
+				status: "ok",
+				generated_at_ns: nowNs,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: true,
+					service_available: true,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "close_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path: typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+						? managedRecord.backendPath
+						: this.viewerBackend.name,
+					backend_identity_ok: true,
+					closed: false,
+					handle: managedRecord.viewerHandle,
+					reason: "not_service_owned",
+					pdf_id: request.pdf_id,
+				},
+			};
+		}
 		const backendResult = await this.viewerBackend.close(request.request_id, {
 			handle: managedRecord.viewerHandle,
 			backend: managedRecord.viewerBackend,
@@ -2898,7 +2925,10 @@ function isValidCloseResponse(response: unknown, expectedRequestId: string): res
 	if (details.backend_identity_ok !== undefined && typeof details.backend_identity_ok !== "boolean") return false;
 	if (typeof details.closed !== "boolean") return false;
 	if (details.handle !== undefined && typeof details.handle !== "string") return false;
-	if (typeof details.pdf_id !== "number" || !Number.isInteger(details.pdf_id) || details.pdf_id <= 0) return false;
+	const closeRequestError = response.status === "error" && typeof details.error_code === "string" && details.error_code === "invalid_request";
+	if (!closeRequestError && (typeof details.pdf_id !== "number" || !Number.isInteger(details.pdf_id) || details.pdf_id <= 0)) {
+		return false;
+	}
 	if (details.error_code !== undefined && typeof details.error_code !== "string") return false;
 	if (details.reason !== undefined && typeof details.reason !== "string") return false;
 	if (response.status === "error" && typeof details.error_code !== "string") return false;
