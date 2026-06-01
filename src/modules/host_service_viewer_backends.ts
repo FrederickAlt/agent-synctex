@@ -926,6 +926,21 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 		});
 	}
 
+	private async waitForSessionPidExit(
+		session: ZathuraSession,
+		timeoutMs: number,
+	): Promise<"gone" | "identity_changed" | "timeout"> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (!isPidAlive(session.pid)) return "gone";
+			if (!isProcessIdentityMatch(session.pid, session, ["comm", "start_time", "exe", "cmdline"])) {
+				return "identity_changed";
+			}
+			await sleep(25);
+		}
+		return "timeout";
+	}
+
 	private runForwardSearch(
 		viewerPath: string,
 		line: number,
@@ -1041,6 +1056,7 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 		}
 		const callbackCommand = this.buildCallbackCommand(callback);
 		const handle = this.makeHandle();
+		const observedPidsBeforeSpawn = new Set(iterPidsForPdf(backendPath, [pdfPath], false));
 		let child: ChildProcess;
 		try {
 			child = spawn(backendPath, [`--synctex-editor-command=${callbackCommand}`, pdfPath], {
@@ -1069,7 +1085,24 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 			owned = true;
 			ownedPid = child.pid;
 		} else {
-			ownedPid = iterPidsForPdf(backendPath, [pdfPath], false)[0];
+			const discoveredCandidatePids = iterPidsForPdf(backendPath, [pdfPath], false)
+				.filter((pid) => !observedPidsBeforeSpawn.has(pid))
+				.sort((a, b) => a - b);
+			const callbackArg = `--synctex-editor-command=${callbackCommand}`;
+			const matchingCallbackPids = discoveredCandidatePids.filter((pid) => {
+				try {
+					const commandlineText = readFileSync(join("/", "proc", String(pid), "cmdline")).toString("utf8");
+					const commandline = commandlineText.split("\u0000").filter(Boolean);
+					return commandline.includes(callbackArg);
+				} catch {
+					return false;
+				}
+			});
+			if (matchingCallbackPids.length > 0) {
+				ownedPid = matchingCallbackPids.at(-1);
+			} else {
+				ownedPid = discoveredCandidatePids.at(-1);
+			}
 			if (ownedPid !== undefined && isPidAlive(ownedPid)) {
 				owned = true;
 			} else {
@@ -1191,7 +1224,7 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 				},
 			};
 		}
-		if (session.process && !session.process.killed) {
+		if (session.process && !session.process.killed && session.process.pid === session.pid) {
 			try {
 				session.process.kill("SIGTERM");
 				await this.waitForProcessExit(session.process, 1000);
@@ -1199,7 +1232,32 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 					session.process.kill("SIGKILL");
 					await this.waitForProcessExit(session.process, 500);
 				}
+				if (session.process.exitCode !== null) {
+					this.removeSession(session.pdfPath);
+					return {
+						status: "ok",
+						status_details: {
+							...closeStatusDetails({ closed: true, handle, backendIdentityOk: true }),
+							backend: this.name,
+						},
+					};
+				}
 			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+					this.removeSession(session.pdfPath);
+					return {
+						status: "ok",
+						status_details: {
+							...closeStatusDetails({
+								closed: false,
+								reason: "not_running",
+								handle,
+								backendIdentityOk: true,
+							}),
+							backend: this.name,
+						},
+					};
+				}
 				return {
 					status: "error",
 					error: `could not stop viewer pid ${session.pid}`,
@@ -1215,32 +1273,74 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 					},
 				};
 			}
-			this.removeSession(session.pdfPath);
-			return {
-				status: "ok",
-				status_details: {
-					...closeStatusDetails({ closed: true, handle, backendIdentityOk: true }),
-					backend: this.name,
-				},
-			};
 		}
 		try {
 			process.kill(session.pid, "SIGTERM");
-			this.removeSession(session.pdfPath);
-			return {
-				status: "ok",
-				status_details: {
-					...closeStatusDetails({ closed: true, handle, backendIdentityOk: true }),
-					backend: this.name,
-				},
-			};
+			const afterTerm = await this.waitForSessionPidExit(session, 1000);
+			if (afterTerm === "gone") {
+				this.removeSession(session.pdfPath);
+				return {
+					status: "ok",
+					status_details: {
+						...closeStatusDetails({ closed: true, handle, backendIdentityOk: true }),
+						backend: this.name,
+					},
+				};
+			}
+			if (afterTerm === "identity_changed") {
+				this.removeSession(session.pdfPath);
+				return {
+					status: "ok",
+					status_details: {
+						...closeStatusDetails({
+							closed: false,
+							reason: "not_running",
+							handle,
+							backendIdentityOk: true,
+						}),
+						backend: this.name,
+					},
+				};
+			}
+			process.kill(session.pid, "SIGKILL");
+			const afterKill = await this.waitForSessionPidExit(session, 500);
+			if (afterKill === "gone") {
+				this.removeSession(session.pdfPath);
+				return {
+					status: "ok",
+					status_details: {
+						...closeStatusDetails({ closed: true, handle, backendIdentityOk: true }),
+						backend: this.name,
+					},
+				};
+			}
+			if (afterKill === "identity_changed") {
+				this.removeSession(session.pdfPath);
+				return {
+					status: "ok",
+					status_details: {
+						...closeStatusDetails({
+							closed: false,
+							reason: "not_running",
+							handle,
+							backendIdentityOk: true,
+						}),
+						backend: this.name,
+					},
+				};
+			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ESRCH") {
 				this.removeSession(session.pdfPath);
 				return {
 					status: "ok",
 					status_details: {
-						...closeStatusDetails({ closed: false, reason: "not_running", handle, backendIdentityOk: true }),
+						...closeStatusDetails({
+							closed: false,
+							reason: "not_running",
+							handle,
+							backendIdentityOk: true,
+						}),
 						backend: this.name,
 					},
 				};
@@ -1260,6 +1360,20 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 				},
 			};
 		}
+		return {
+			status: "error",
+			error: `could not stop viewer pid ${session.pid}`,
+			status_details: {
+				...closeStatusDetails({
+					closed: false,
+					reason: "backend_unavailable",
+					errorCode: "backend_unavailable",
+					handle,
+					backendIdentityOk: true,
+				}),
+				backend: this.name,
+			},
+		};
 	}
 
 	async forwardSearch(requestId: string, details: Record<string, unknown>): Promise<ViewerBackendOperationResult<Record<string, unknown>>> {
