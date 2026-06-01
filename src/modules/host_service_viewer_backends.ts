@@ -38,6 +38,7 @@ export interface ViewerBackendAdapter {
 	open(requestId: string, details: Record<string, unknown>): Promise<ViewerBackendOperationResult<Record<string, unknown>>>;
 	close(requestId: string, details: Record<string, unknown>): Promise<ViewerBackendOperationResult<Record<string, unknown>>>;
 	forwardSearch(requestId: string, details: Record<string, unknown>): Promise<ViewerBackendOperationResult<Record<string, unknown>>>;
+	closeAll(requestId?: string): Promise<void>;
 }
 
 const PROTOCOL_VERSION = 1;
@@ -523,6 +524,10 @@ export class FakeViewerBackend implements ViewerBackendAdapter {
 		return this.available;
 	}
 
+	async closeAll(_requestId = "service-shutdown"): Promise<void> {
+		this.sessions.clear();
+	}
+
 	setAvailable(available: boolean): void {
 		this.available = available;
 	}
@@ -834,28 +839,51 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 		return this.sessions.get(pdfPath);
 	}
 
-	private isReusableSession(pdfPath: string, callback: HostServiceCallbackTarget): ZathuraSession | undefined {
+	private async retireSession(session: ZathuraSession, requestId: string): Promise<void> {
+		try {
+			await this.close(requestId, {
+				handle: session.handle,
+				backend: this.name,
+			});
+		} catch {
+			this.removeSession(session.pdfPath);
+		}
+	}
+
+	private async isReusableSession(
+		pdfPath: string,
+		callback: HostServiceCallbackTarget,
+	): Promise<ZathuraSession | undefined> {
 		const session = this.sessions.get(pdfPath);
 		if (!session) return;
 		if (!this.callbackMatch(session, callback)) {
-			this.removeSession(pdfPath);
+			await this.retireSession(session, "backend-session-callback-mismatch");
 			return;
 		}
 		if (!isPidAlive(session.pid)) {
-			this.removeSession(pdfPath);
+			await this.retireSession(session, "backend-session-stale-pid");
 			return;
 		}
 		if (session.process !== undefined) {
 			if (session.process.killed || !isPidAlive(session.pid)) {
-				this.removeSession(pdfPath);
+				await this.retireSession(session, "backend-session-stale-process");
 				return;
 			}
 		}
 		if (isProcessIdentityMatch(session.pid, session, ["comm", "start_time", "exe", "cmdline"])) {
 			return session;
 		}
-		this.removeSession(pdfPath);
+		await this.retireSession(session, "backend-session-identity-mismatch");
 		return;
+	}
+
+	async closeAll(requestId = "service-shutdown"): Promise<void> {
+		for (const session of [...this.sessions.values()]) {
+			await this.close(requestId, {
+				handle: session.handle,
+				backend: this.name,
+			});
+		}
 	}
 
 	private buildOpenSession(
@@ -991,7 +1019,7 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 		const reuseExisting = details.reuse_existing !== false;
 		const requirePersistent = details.require_persistent_viewer === true;
 		if (reuseExisting) {
-			const reusable = this.isReusableSession(pdfPath, callback);
+			const reusable = await this.isReusableSession(pdfPath, callback);
 			if (reusable) {
 				return {
 					status: "ok",
@@ -1006,6 +1034,10 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 					}),
 				};
 			}
+		}
+		const currentSession = this.sessions.get(pdfPath);
+		if (currentSession) {
+			await this.retireSession(currentSession, "backend-session-replaced");
 		}
 		const callbackCommand = this.buildCallbackCommand(callback);
 		const handle = this.makeHandle();
