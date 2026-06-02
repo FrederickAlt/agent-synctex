@@ -16,7 +16,7 @@ export type McpRequestId = string | number | null;
 
 export interface McpSuccessResponse {
 	jsonrpc: typeof MCP_JSONRPC_VERSION;
-	id: McpRequestId;
+	id: ParsedMcpRequestId;
 	result: Record<string, unknown>;
 }
 
@@ -28,7 +28,7 @@ export interface McpErrorBody {
 
 export interface McpErrorResponse {
 	jsonrpc: typeof MCP_JSONRPC_VERSION;
-	id: McpRequestId;
+	id: ParsedMcpRequestId;
 	error: McpErrorBody;
 }
 
@@ -54,15 +54,16 @@ interface McpParsedRequest {
 }
 
 export interface McpToolResult {
+	[key: string]: unknown;
 	content: Array<{ type: "text"; text: string }>;
 	isError?: boolean;
 }
 
 class McpRequestError extends Error {
 	readonly code: number;
-	readonly requestId: McpRequestId;
+	readonly requestId: ParsedMcpRequestId;
 	readonly data?: unknown;
-	constructor(code: number, requestId: McpRequestId, message: string, data?: unknown) {
+	constructor(code: number, requestId: ParsedMcpRequestId, message: string, data?: unknown) {
 		super(message);
 		this.code = code;
 		this.requestId = requestId;
@@ -117,10 +118,10 @@ function parseRequest(rawPayload: string): McpParsedRequest {
 		throw new McpRequestError(MCP_ERROR_INVALID_REQUEST, requestId, "Invalid request id");
 	}
 	if (parsed.jsonrpc !== MCP_JSONRPC_VERSION) {
-		throw new McpRequestError(MCP_ERROR_INVALID_REQUEST, requestId, "Invalid JSON-RPC version");
+		throw new McpRequestError(MCP_ERROR_INVALID_REQUEST, requestId ?? null, "Invalid JSON-RPC version");
 	}
 	if (typeof parsed.method !== "string" || !parsed.method.trim()) {
-		throw new McpRequestError(MCP_ERROR_INVALID_REQUEST, requestId, "Missing method");
+		throw new McpRequestError(MCP_ERROR_INVALID_REQUEST, requestId ?? null, "Missing method");
 	}
 	return {
 		id: requestId,
@@ -129,7 +130,7 @@ function parseRequest(rawPayload: string): McpParsedRequest {
 	};
 }
 
-export function buildMcpErrorResponse(id: McpRequestId, code: number, message: string, data?: unknown): McpErrorResponse {
+export function buildMcpErrorResponse(id: ParsedMcpRequestId, code: number, message: string, data?: unknown): McpErrorResponse {
 	return {
 		jsonrpc: MCP_JSONRPC_VERSION,
 		id,
@@ -141,7 +142,7 @@ export function buildMcpErrorResponse(id: McpRequestId, code: number, message: s
 	};
 }
 
-function buildSuccess(id: McpRequestId, result: Record<string, unknown>): McpSuccessResponse {
+function buildSuccess(id: ParsedMcpRequestId, result: Record<string, unknown>): McpSuccessResponse {
 	return {
 		jsonrpc: MCP_JSONRPC_VERSION,
 		id,
