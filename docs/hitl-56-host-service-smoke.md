@@ -4,11 +4,13 @@ Date: 2026-06-01
 Branch: `mcp_centered_impl`
 Commit: `c78e511` plus HITL runtime checks after #55/docs freshness merge.
 
-## Preflight
+This document is a historical run from Issue #56. Current post-#66 docs and runtime identity are now defined as `tex-actions`, with service name `tex-actions-host-service` and socket `${XDG_RUNTIME_DIR}/tex-actions/host-service.sock`.
+
+## Historical preflight (Issue #56)
 
 - `npm run verify` passed: 299/299 tests.
 - TypeScript Host Service started as foreground npm command in the background for HITL:
-  - socket: `/run/user/1000/agent-synctex/host-service.sock`
+  - socket: `/run/user/1000/agent-synctex/host-service.sock` *(historical snapshot / legacy path)*
   - backend: `zathura`
   - capabilities: open/close/forward_search/inverse_search/reuse all true
 
@@ -44,7 +46,7 @@ HITL acceptance criteria for #56 passed. No blocking follow-up issues were ident
 
 ## True host systemd service rerun after service/broker/runtime-dir fixes
 
-Additional validation was performed after replacing the legacy Python viewer service with the host-managed TypeScript `show-latex.service` and moving shared artifacts to `${XDG_RUNTIME_DIR}/show-latex`.
+Additional validation was performed after replacing the legacy Python viewer service with the host-managed TypeScript `show-latex.service` and moving shared artifacts to `${XDG_RUNTIME_DIR}/show-latex` (historical note; this run predates the final #66 naming cleanup).
 
 - Host-side broker/service was updated externally so `pdf-preview-servicectl` manages `show-latex.service`, which runs:
 
@@ -52,17 +54,19 @@ Additional validation was performed after replacing the legacy Python viewer ser
   /usr/bin/node /home/frederick/projects/AI/pi_extensions/pdf-preview/scripts/agent-synctex-host-service.ts start
   ```
 
+  *(legacy executable path retained for historical trace; current runtime uses `scripts/tex-actionsctl.ts daemon` as canonical)*
+
 - Firejail no longer exposes the stale Python viewer install path and now permits the narrow runtime dirs:
-  - `/run/user/1000/agent-synctex`
-  - `/run/user/1000/show-latex`
+  - `/run/user/1000/agent-synctex` *(historical path observed in this run)*
+  - `/run/user/1000/show-latex` *(historical path observed in this run; current runtime uses `/run/user/<uid>/tex-actions`)*
 
 - `npm run host-service:status` from inside the jail reported:
   - `service_available: true`
-  - `service_name: agent-synctex-host-service`
+  - `service_name: agent-synctex-host-service` *(historical; current status returns `tex-actions-host-service`)*
   - `viewer_backend_name: zathura`
 
 - With X11/Wayland removed from the sandbox, external `show_latex(inline=false)` opened through the host systemd service. Human confirmed the Zathura window opened.
-- Inline `show_latex(inline=true)` rendered correctly using runtime artifact paths under `/run/user/1000/show-latex/inline`. Human confirmed the inline preview was visible.
+- Inline `show_latex(inline=true)` rendered correctly using runtime artifact paths under `/run/user/1000/show-latex/inline` *(historical; current runtime uses `/run/user/<uid>/tex-actions/inline`)*. Human confirmed the inline preview was visible.
 - `compile_latex_file(open_pdf=true)` for `hitl-true-service.tex` returned Host-Service PDF ID `30489681`; human confirmed Zathura opened.
 - `jump_pdf(30489681, line=7)` forward-searched to the equation region; human confirmed Zathura jumped/marked the equations.
 - Inverse SyncTeX click inserted without auto-submit:

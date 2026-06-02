@@ -181,7 +181,7 @@ From Pi, start the normal host unit with `systemctl --user restart show-latex.se
 5. Click a clickable PDF region in the opened viewer and confirm the session receives a pasted block `PDF click: path/to/file.tex:LINE`.
 6. `close_pdf(pdf_id)` and confirm service-owned windows close, with unowned/reused handles acknowledged as not closed.
 
-Do not treat direct `zathura ...` commands launched from an agent `bash` tool as equivalent to the host service path: those commands run in the agent sandbox, while the host service runs in the user's desktop session. Use `npm run host-service:status`, `show-latex`-relevant diagnostics under `${XDG_RUNTIME_DIR}/show-latex/*.log`, and tool error logs under the preview temp directory for diagnostics.
+Do not treat direct `zathura ...` commands launched from an agent `bash` tool as equivalent to the host service path: those commands run in the agent sandbox, while the host service runs in the user's desktop session. Use `npm run host-service:status`, `journalctl --user -u show-latex.service -n 100 --no-pager`, viewer diagnostics under `${XDG_RUNTIME_DIR}/tex-actions/*.log`, and tool error logs under the preview temp directory for diagnostics.
 
 A dedicated runtime guardrail test (`viewer_guardrails.test.ts`) enforces that extension production code never directly controls GUI viewers (no direct `zathura`/`evince` spawns, no session discovery via `/proc`, no raw session-env probing). Keep it green whenever the viewer path changes.
 
