@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { contextSessionKey } from "../pdf_session/pdf_session.ts";
 import { SynctexCallbackServer, type SynctexPasteTarget } from "../synctex/synctex.ts";
-import { MCP_TMPDIR } from "./runtime_paths.ts";
+import { getMcpTmpDir } from "./runtime_paths.ts";
 import { createHostServiceClient, hostServiceSocketPath, type HostServiceCallbackTargetWorkspace } from "./host_service_client.ts";
 
 const HOST_SERVICE_CALLBACK_TARGET_PREFIX = "pi";
@@ -69,7 +69,7 @@ export class SynctexCallbackManager {
 	}
 
 	private createSynctexCallbackServer(): SynctexCallbackServer {
-		return new SynctexCallbackServer({ callbackScriptPath: this.callbackScriptPath, tmpDir: MCP_TMPDIR });
+		return new SynctexCallbackServer({ callbackScriptPath: this.callbackScriptPath, tmpDir: getMcpTmpDir() });
 	}
 
 	async rotateSynctexCallbacks(ctx: ExtensionContext): Promise<SynctexCallbackServer> {

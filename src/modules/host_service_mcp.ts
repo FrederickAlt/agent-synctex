@@ -1,5 +1,8 @@
+import { isAbsolute } from "node:path";
 import { getLatexPreambleFilePath } from "./runtime_preamble.ts";
 import { writeLatexPreambleToTmpdir } from "./runtime_preamble.ts";
+import { HostServiceCompileService } from "./host_service_compile.ts";
+import type { HostServiceCompileRequest, HostServiceCompileResponseEnvelope, HostServiceCompileSnippetRequest, HostServiceCompileSnippetResponseEnvelope, HostServiceWorkspaceContext } from "./host_service_protocol.ts";
 
 const MCP_JSONRPC_VERSION = "2.0" as const;
 export const MCP_TOOL_NAME = "tex-actions" as const;
@@ -11,6 +14,20 @@ export const MCP_ERROR_INVALID_REQUEST = -32600;
 export const MCP_ERROR_METHOD_NOT_FOUND = -32601;
 export const MCP_ERROR_INVALID_PARAMS = -32602;
 export const MCP_ERROR_INTERNAL = -32603;
+const MCP_HOST_SERVICE_PROTOCOL_VERSION = 1;
+const MCP_HOST_SERVICE_DAEMON_REQUEST_PREFIX = "mcp-host-service";
+const MCP_DEFAULT_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
+let mcpHostServiceRequestCounter = 0;
+
+const mcpCompileService = new HostServiceCompileService({
+	protocolVersion: MCP_HOST_SERVICE_PROTOCOL_VERSION,
+	managedViewerService: {
+		async openViewer() {
+			throw new Error("open_pdf is not supported by daemon MCP tools");
+		},
+	},
+	resolveManagedOpenCallback: async () => undefined,
+});
 
 export type McpRequestId = string | number | null;
 
@@ -73,6 +90,155 @@ class McpRequestError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
+}
+
+function nextHostServiceRequestId(): string {
+	mcpHostServiceRequestCounter += 1;
+	return `${MCP_HOST_SERVICE_DAEMON_REQUEST_PREFIX}-${mcpHostServiceRequestCounter}`;
+}
+
+function normalizeWorkspaceContext(rawWorkspaceContext: unknown): HostServiceWorkspaceContext {
+	if (rawWorkspaceContext === undefined) {
+		return MCP_DEFAULT_WORKSPACE_CONTEXT;
+	}
+	if (!isRecord(rawWorkspaceContext)) {
+		throw new Error("workspace_context must be an object");
+	}
+	const rawCwd = rawWorkspaceContext.cwd;
+	if (typeof rawCwd !== "string" || !rawCwd.trim()) {
+		throw new Error("workspace_context.cwd must be a non-empty string");
+	}
+	const workspaceContext: HostServiceWorkspaceContext = {
+		cwd: rawCwd,
+	};
+	if (rawWorkspaceContext.workspace_root !== undefined) {
+		if (typeof rawWorkspaceContext.workspace_root !== "string" || !rawWorkspaceContext.workspace_root.trim()) {
+			throw new Error("workspace_context.workspace_root must be a non-empty string");
+		}
+		if (!isAbsolute(rawWorkspaceContext.workspace_root)) {
+			throw new Error("workspace_context.workspace_root must be absolute");
+		}
+		workspaceContext.workspace_root = rawWorkspaceContext.workspace_root;
+	}
+	if (rawWorkspaceContext.session_id !== undefined) {
+		if (typeof rawWorkspaceContext.session_id !== "string" || !rawWorkspaceContext.session_id.trim()) {
+			throw new Error("workspace_context.session_id must be a non-empty string");
+		}
+		workspaceContext.session_id = rawWorkspaceContext.session_id;
+	}
+	return workspaceContext;
+}
+
+function parseBooleanArg(args: Record<string, unknown>, key: string): boolean | undefined {
+	if (!(key in args)) {
+		return undefined;
+	}
+	const value = args[key];
+	if (typeof value !== "boolean") {
+		throw new Error(`${key} must be a boolean`);
+	}
+	return value;
+}
+
+function parseOptionalStringArg(args: Record<string, unknown>, key: string): string | undefined {
+	if (!(key in args)) {
+		return undefined;
+	}
+	const value = args[key];
+	if (value === undefined) {
+		return undefined;
+	}
+	if (typeof value !== "string" || !value.trim()) {
+		throw new Error(`${key} must be a non-empty string`);
+	}
+	return value;
+}
+
+function parseStringArg(args: Record<string, unknown>, key: string): string {
+	const value = args[key];
+	if (typeof value !== "string" || !value.trim()) {
+		throw new Error(`${key} must be a non-empty string`);
+	}
+	return value;
+}
+
+function parseCompileWorkspaceContext(sourcePath: string, rawWorkspaceContext: unknown): HostServiceWorkspaceContext {
+	if (rawWorkspaceContext === undefined) {
+		if (!isAbsolute(sourcePath)) {
+			throw new Error("relative latex_file_path requires workspace_context.cwd");
+		}
+		return MCP_DEFAULT_WORKSPACE_CONTEXT;
+	}
+
+	const workspaceContext = normalizeWorkspaceContext(rawWorkspaceContext);
+	if (!isAbsolute(workspaceContext.cwd)) {
+		throw new Error("workspace_context.cwd must be absolute for compile_latex_file");
+	}
+	return workspaceContext;
+}
+function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompileSnippetRequest {
+	const source = parseStringArg(args, "source");
+	const compiler = parseOptionalStringArg(args, "compiler");
+	const rawWorkspaceContext = args.workspace_context;
+	const workspaceContext = rawWorkspaceContext === undefined
+		? { cwd: MCP_DEFAULT_WORKSPACE_CONTEXT.cwd }
+		: normalizeWorkspaceContext(rawWorkspaceContext);
+	if (rawWorkspaceContext !== undefined && !isAbsolute(workspaceContext.cwd)) {
+		throw new Error("workspace_context.cwd must be absolute for show_latex");
+	}
+	return {
+		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
+		request_id: nextHostServiceRequestId(),
+		operation: "compile_latex_snippet",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: workspaceContext,
+		details: {
+			latex_source: source,
+			...(compiler === undefined ? {} : { compiler }),
+		},
+	};
+}
+
+function parseCompileLatexFileRequest(args: Record<string, unknown>): HostServiceCompileRequest {
+	const latexFilePath = parseStringArg(args, "latex_file_path");
+	const compiler = parseOptionalStringArg(args, "compiler");
+	const clean = parseBooleanArg(args, "clean");
+	const openPdf = parseBooleanArg(args, "open_pdf");
+	if (openPdf === true) {
+		throw new Error("open_pdf is not supported by daemon MCP compile_latex_file");
+	}
+	const workspaceContext = parseCompileWorkspaceContext(latexFilePath, args.workspace_context);
+	return {
+		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
+		request_id: nextHostServiceRequestId(),
+		operation: "compile_latex_file",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: workspaceContext,
+		details: {
+			latex_file_path: latexFilePath,
+			...(compiler === undefined ? {} : { compiler }),
+			...(clean === undefined ? {} : { clean }),
+		},
+	};
+}
+
+function parseToolResult(
+	response: HostServiceCompileResponseEnvelope | HostServiceCompileSnippetResponseEnvelope,
+	successText: string,
+): McpToolResult {
+	const details = response.status_details;
+	if (response.status === "ok") {
+		return {
+			content: [{ type: "text", text: `${successText}${details.pdf ? ` ${details.pdf}` : ""}`.trim() }],
+			details,
+		};
+	}
+	const errorCode = typeof details.error_code === "string" ? ` (code=${details.error_code})` : "";
+	return {
+		isError: true,
+		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}` }],
+		details,
+	};
 }
 
 function validMcpRequestId(raw: unknown): raw is McpRequestId {
@@ -159,17 +325,51 @@ function mcpPreamblePath(): string {
 	return getLatexPreambleFilePath();
 }
 
+function workspaceContextSchema(): { type: "object"; properties: Record<string, unknown>; required: string[]; additionalProperties: boolean } {
+	return {
+		type: "object",
+		properties: {
+			cwd: { type: "string", minLength: 1 },
+			workspace_root: { type: "string", minLength: 1 },
+			session_id: { type: "string", minLength: 1 },
+		},
+		required: ["cwd"],
+		additionalProperties: false,
+	};
+}
+
 function mcpToolDescriptions(): readonly McpToolDefinition[] {
 	return [
 		{
 			name: "show_latex",
 			description: "Render a LaTeX snippet and optionally open a tracked PDF preview.",
-			inputSchema: { type: "object", additionalProperties: true },
+			inputSchema: {
+				type: "object",
+				properties: {
+					source: { type: "string", minLength: 1 },
+					compiler: { type: "string" },
+					inline: { type: "boolean" },
+					workspace_context: workspaceContextSchema(),
+				},
+				required: ["source"],
+				additionalProperties: false,
+			},
 		},
 		{
 			name: "compile_latex_file",
 			description: "Compile a LaTeX source file and optionally register a host-service PDF.",
-			inputSchema: { type: "object", additionalProperties: true },
+			inputSchema: {
+				type: "object",
+				properties: {
+					latex_file_path: { type: "string", minLength: 1 },
+					compiler: { type: "string" },
+					clean: { type: "boolean" },
+					open_pdf: { type: "boolean" },
+					workspace_context: workspaceContextSchema(),
+				},
+				required: ["latex_file_path"],
+				additionalProperties: false,
+			},
 		},
 		{
 			name: "open_pdf",
@@ -214,7 +414,7 @@ export function mcpFramedResponse(payload: McpResponsePayload): string {
 	return encodeResponse(payload);
 }
 
-export function handleMcpRequest(rawPayload: string): McpResponsePayload | null {
+export async function handleMcpRequest(rawPayload: string): Promise<McpResponsePayload | null> {
 	let request: McpParsedRequest;
 	try {
 		request = parseRequest(rawPayload);
@@ -233,7 +433,7 @@ export function handleMcpRequest(rawPayload: string): McpResponsePayload | null 
 	}
 
 	switch (request.method) {
-		case "initialize": {
+		case "initialize":
 			return buildSuccess(request.id, {
 				protocolVersion: MCP_PROTOCOL_VERSION,
 				capabilities: {
@@ -247,7 +447,6 @@ export function handleMcpRequest(rawPayload: string): McpResponsePayload | null 
 					displayName: MCP_TOOL_DISPLAY_NAME,
 				},
 			});
-		}
 		case "ping":
 			return buildSuccess(request.id, {});
 		case "tools/list":
@@ -266,39 +465,89 @@ export function handleMcpRequest(rawPayload: string): McpResponsePayload | null 
 			}
 
 			if (!HOST_SERVICE_TOOL_NAMES.includes(call.name as typeof HOST_SERVICE_TOOL_NAMES[number])) {
-				const toolResult: McpToolResult = {
-					isError: true,
-					content: [{ type: "text", text: `Tool not implemented by daemon: ${call.name}` }],
-				};
-				return buildSuccess(request.id, { ...toolResult });
-			}
-			if (call.name !== "set_latex_preamble") {
-				const toolResult: McpToolResult = {
-					isError: true,
-					content: [{ type: "text", text: `${call.name} is not yet implemented by the daemon` }],
-				};
-				return buildSuccess(request.id, { ...toolResult });
-			}
-			try {
-				const preamble = call.args.latex_preamble;
-				if (typeof preamble !== "string") {
-					return buildMcpErrorResponse(request.id, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble requires latex_preamble to be a string");
-				}
-				const preambleLength = writeLatexPreambleToTmpdir(preamble);
-				const preamblePath = mcpPreamblePath();
-				const resultText = preambleLength
-					? `LaTeX preamble set (${preambleLength} characters) at ${preamblePath}`
-					: `LaTeX preamble cleared at ${preamblePath}`;
-				const toolResult: McpToolResult = {
-					content: [{ type: "text", text: resultText }],
-				};
-				return buildSuccess(request.id, toolResult);
-			} catch (error) {
-				const details = error instanceof Error ? error.message : String(error);
 				return buildSuccess(request.id, {
 					isError: true,
-					content: [{ type: "text", text: `set_latex_preamble failed: ${details}` }],
+					content: [{ type: "text", text: `Tool not implemented by daemon: ${call.name}` }],
 				});
+			}
+
+			switch (call.name) {
+				case "show_latex": {
+					let compileRequest: HostServiceCompileSnippetRequest;
+					try {
+						const inlineValue = call.args.inline;
+						if (inlineValue !== undefined && typeof inlineValue !== "boolean") {
+							throw new Error("inline must be a boolean");
+						}
+						compileRequest = parseShowLatexRequest(call.args);
+					} catch (error) {
+						return buildMcpErrorResponse(
+							request.id,
+							MCP_ERROR_INVALID_PARAMS,
+							error instanceof Error ? error.message : String(error),
+						);
+					}
+					try {
+						const compileResponse = await mcpCompileService.compileLatexSnippetRequest(compileRequest);
+						return buildSuccess(request.id, parseToolResult(compileResponse, "ok"));
+					} catch (error) {
+						const details = error instanceof Error ? error.message : String(error);
+						return buildSuccess(request.id, {
+							isError: true,
+							content: [{ type: "text", text: `show_latex failed: ${details}` }],
+						});
+					}
+				}
+				case "compile_latex_file": {
+					let compileRequest: HostServiceCompileRequest;
+					try {
+						compileRequest = parseCompileLatexFileRequest(call.args);
+					} catch (error) {
+						return buildMcpErrorResponse(
+							request.id,
+							MCP_ERROR_INVALID_PARAMS,
+							error instanceof Error ? error.message : String(error),
+						);
+					}
+					try {
+						const compileResponse = await mcpCompileService.compileLatexFileRequest(compileRequest);
+						return buildSuccess(request.id, parseToolResult(compileResponse, "ok:"));
+					} catch (error) {
+						const details = error instanceof Error ? error.message : String(error);
+						return buildSuccess(request.id, {
+							isError: true,
+							content: [{ type: "text", text: `compile_latex_file failed: ${details}` }],
+						});
+					}
+				}
+				case "set_latex_preamble": {
+					try {
+						const preamble = call.args.latex_preamble;
+						if (typeof preamble !== "string") {
+							return buildMcpErrorResponse(request.id, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble requires latex_preamble to be a string");
+						}
+						const preambleLength = writeLatexPreambleToTmpdir(preamble);
+						const preamblePath = mcpPreamblePath();
+						const resultText = preambleLength
+							? `LaTeX preamble set (${preambleLength} characters) at ${preamblePath}`
+							: `LaTeX preamble cleared at ${preamblePath}`;
+						const toolResult: McpToolResult = {
+							content: [{ type: "text", text: resultText }],
+						};
+						return buildSuccess(request.id, toolResult);
+					} catch (error) {
+						const details = error instanceof Error ? error.message : String(error);
+						return buildSuccess(request.id, {
+							isError: true,
+							content: [{ type: "text", text: `set_latex_preamble failed: ${details}` }],
+						});
+					}
+				}
+				default:
+					return buildSuccess(request.id, {
+						isError: true,
+						content: [{ type: "text", text: `${call.name} is not yet implemented by the daemon` }],
+					});
 			}
 		}
 		default:
@@ -306,8 +555,8 @@ export function handleMcpRequest(rawPayload: string): McpResponsePayload | null 
 	}
 }
 
-export function handleFramedMcpRequest(rawPayload: string): string | null {
-	const response = handleMcpRequest(rawPayload);
+export async function handleFramedMcpRequest(rawPayload: string): Promise<string | null> {
+	const response = await handleMcpRequest(rawPayload);
 	if (response === null) {
 		return null;
 	}

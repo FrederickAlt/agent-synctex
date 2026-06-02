@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { writeLatexPreambleToTmpdir, LATEX_PREAMBLE_PATH } from "./latex_preamble_manager.ts";
+import { getLatexPreamblePath } from "./runtime_paths.ts";
+import { writeLatexPreambleToTmpdir as writeLatexPreambleToTmpdirShared } from "./latex_preamble_manager.ts";
 
 const SetLatexPreambleParams = Type.Object(
 	{
@@ -26,13 +27,14 @@ export function registerSetLatexPreambleTool(pi: ExtensionAPI): void {
 		],
 		parameters: SetLatexPreambleParams,
 		async execute(_toolCallId, params) {
-			const preambleLength = writeLatexPreambleToTmpdir(String(params.latex_preamble ?? ""));
+			const preambleLength = writeLatexPreambleToTmpdirShared(String(params.latex_preamble ?? ""));
+			const preamblePath = getLatexPreamblePath();
 			const text = preambleLength
-				? `LaTeX preamble set (${preambleLength} characters) at ${LATEX_PREAMBLE_PATH}. It will be included in subsequent show_latex snippet calls; compile_latex_file compiles complete files directly without preamble injection.`
-				: `LaTeX preamble cleared at ${LATEX_PREAMBLE_PATH}.`;
+				? `LaTeX preamble set (${preambleLength} characters) at ${preamblePath}. It will be included in subsequent show_latex snippet calls; compile_latex_file compiles complete files directly without preamble injection.`
+				: `LaTeX preamble cleared at ${preamblePath}.`;
 			return {
 				content: [{ type: "text", text }],
-				details: { preambleLength, preamblePath: LATEX_PREAMBLE_PATH },
+				details: { preambleLength, preamblePath },
 			};
 		},
 	});

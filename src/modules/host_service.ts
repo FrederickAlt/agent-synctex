@@ -1032,11 +1032,15 @@ export class HostServiceServer {
 	}
 
 	private respondToMcpRequest(raw: string, socket: Socket): void {
-		const response = handleFramedMcpRequest(raw);
-		if (response === null) {
-			return;
-		}
-		socket.write(response);
+		void (async () => {
+			const response = await handleFramedMcpRequest(raw);
+			if (response === null) {
+				return;
+			}
+			socket.write(response);
+		})().catch(() => {
+			socket.destroy();
+		});
 	}
 
 	private respondToRequest(raw: string, socket: Socket): void {

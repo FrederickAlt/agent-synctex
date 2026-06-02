@@ -1,11 +1,11 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { MCP_TMPDIR } from "./runtime_paths.ts";
+import { getMcpTmpDir } from "./runtime_paths.ts";
 import { LoggedToolError } from "../latex/latex_file_compiler.ts";
 
 function latexErrorLogPath(prefix: string): string {
 	const safePrefix = prefix.replace(/[^a-z0-9_.-]+/gi, "-").replace(/^-+|-+$/g, "") || "latex";
-	mkdirSync(MCP_TMPDIR, { recursive: true, mode: 0o700 });
-	return `${MCP_TMPDIR}/${safePrefix}.${Date.now()}.${process.pid}.log`;
+	mkdirSync(getMcpTmpDir(), { recursive: true, mode: 0o700 });
+	return `${getMcpTmpDir()}/${safePrefix}.${Date.now()}.${process.pid}.log`;
 }
 
 export function errorMessage(error: unknown): string {

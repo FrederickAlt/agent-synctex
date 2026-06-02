@@ -24,7 +24,7 @@ import {
 	hostServiceWorkspaceContextForRequest,
 } from "./host_service_client.ts";
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
-import { MCP_FIXED_PREVIEW_PDF_PATH, MCP_TMPDIR } from "./runtime_paths.ts";
+import { getMcpFixedPreviewPdfPath, getMcpTmpDir } from "./runtime_paths.ts";
 import { renderShowLatexResult, rememberInlinePreviewRenderState } from "./inline_renderer.ts";
 import { errorMessage, latexToolFailure, tailText } from "./error_utils.ts";
 
@@ -89,8 +89,12 @@ const showLatexPreviewPipeline = createShowLatexPreviewPipeline({
 function hostServiceWorkspaceContextForShowLatex(ctx?: ExtensionContext): ShowLatexWorkspaceContext {
 	return {
 		...hostServiceWorkspaceContextForRequest(ctx),
-		workspace_root: MCP_TMPDIR,
+		workspace_root: getMcpTmpDir(),
 	};
+}
+
+function fixedPreviewPdfPath(): string {
+	return getMcpFixedPreviewPdfPath();
 }
 
 function copySynctexArtifactsForFixedPdfPath(sourcePdfPath: string, fixedPdfPath: string): void {
@@ -202,7 +206,7 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 					latex_source_length: latexSource.length,
 					latex_source_tail: tailText(latexSource, 30_000),
 					pdf: previewPdfPath,
-					fixed_preview_pdf: MCP_FIXED_PREVIEW_PDF_PATH,
+					fixed_preview_pdf: fixedPreviewPdfPath(),
 				},
 				error,
 			);
@@ -216,12 +220,12 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 			try {
 				const callbackTargetId = await callbackManager.ensureHostServiceCallbackTarget(ctx!);
 				const callbackConfig = (await callbackManager.ensureSynctexCallbacks(ctx!)).callbackConfig;
-				if (previewPdfPath !== MCP_FIXED_PREVIEW_PDF_PATH) {
-					copyFileSync(previewPdfPath, MCP_FIXED_PREVIEW_PDF_PATH);
-					copySynctexArtifactsForFixedPdfPath(previewPdfPath, MCP_FIXED_PREVIEW_PDF_PATH);
+				if (previewPdfPath !== fixedPreviewPdfPath()) {
+					copyFileSync(previewPdfPath, fixedPreviewPdfPath());
+					copySynctexArtifactsForFixedPdfPath(previewPdfPath, fixedPreviewPdfPath());
 				}
 				const openResponse = await openPdfThroughHostService(
-					MCP_FIXED_PREVIEW_PDF_PATH,
+					fixedPreviewPdfPath(),
 					workspaceContext,
 					callbackConfig,
 					signal,
@@ -244,7 +248,7 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 				try {
 					trackedPdf = await openTrackedPdfForContext(
 						ctx,
-						MCP_FIXED_PREVIEW_PDF_PATH,
+						fixedPreviewPdfPath(),
 						signal,
 						async () => trackedOpenResult,
 						defaultSourceForPdf,
@@ -276,7 +280,7 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 					latex_source_length: latexSource.length,
 					latex_source_tail: tailText(latexSource, 30_000),
 					preview_pdf: previewPdfPath,
-					fixed_preview_pdf: MCP_FIXED_PREVIEW_PDF_PATH,
+					fixed_preview_pdf: fixedPreviewPdfPath(),
 					open_error: errorMessage(error),
 					open_error_code: extractHostServiceErrorCode(error),
 				},

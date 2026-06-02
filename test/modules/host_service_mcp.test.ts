@@ -1,7 +1,7 @@
 import { createConnection } from "node:net";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { getLatexPreamblePath } from "../../src/modules/runtime_paths.ts";
@@ -24,8 +24,34 @@ function allocateMcpTmpDir(prefix = "host-service-mcp-runtime-") {
 	};
 }
 
+function writeFakeLatexCompiler(binDir: string): void {
+	const compilerPath = join(binDir, "lualatex");
+	mkdirSync(binDir, { mode: 0o700, recursive: true });
+	writeFileSync(
+		compilerPath,
+		"#!/bin/sh\nset -eu\ntex_file=\"\"\nfor arg in \"$@\"; do\n  tex_file=\"$arg\"\ndone\nbase=\"${tex_file##*/}\"\nname=\"${base%.*}\"\nout_dir=\"$(dirname \"$tex_file\")\"\nif [ -z \"$tex_file\" ]; then\n  exit 1\nfi\nprintf \"fake compiler output\\n\" > \"$out_dir/$name.log\"\ntouch \"$out_dir/$name.pdf\"\ntouch \"$out_dir/$name.aux\"\nexit 0\n",
+		{ mode: 0o700 },
+	);
+	chmodSync(compilerPath, 0o700);
+}
+
 function encodeMcpFrame(jsonText: string): string {
 	return `Content-Length: ${Buffer.byteLength(jsonText, "utf8")}\r\n\r\n${jsonText}`;
+}
+
+async function withPathOverride(value: string | undefined, run: () => Promise<unknown>): Promise<unknown> {
+	const previous = process.env.PATH;
+	const nextValue = value ?? process.execPath;
+	process.env.PATH = nextValue;
+	try {
+		return await run();
+	} finally {
+		if (previous === undefined) {
+			delete process.env.PATH;
+		} else {
+			process.env.PATH = previous;
+		}
+	}
 }
 
 function parseMcpFrame(raw: string): unknown {
@@ -209,10 +235,17 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.deepEqual(pingResponse.result, {});
 
 		const toolsListPayload = JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" });
-		const toolsListResponse = (await sendFramedRequest(socketPath, toolsListPayload)) as { jsonrpc: "2.0"; id: 3; result: { tools: Array<{ name: string }> } };
+		const toolsListResponse = (await sendFramedRequest(socketPath, toolsListPayload)) as { jsonrpc: "2.0"; id: 3; result: { tools: Array<{ name: string; inputSchema: { properties: Record<string, { type?: string }> } }> } };
 		const names = toolsListResponse.result.tools.map((tool) => tool.name);
 		assert.deepEqual(names, HOST_TOOL_NAMES);
 
+		const byName = new Map(toolsListResponse.result.tools.map((tool) => [tool.name, tool]));
+		const showLatexTool = byName.get("show_latex");
+		const compileFileTool = byName.get("compile_latex_file");
+		assert.ok(showLatexTool);
+		assert.ok(compileFileTool);
+		assert.equal(typeof showLatexTool.inputSchema.properties.workspace_context, "object");
+		assert.equal(typeof compileFileTool.inputSchema.properties.workspace_context, "object");
 		const setPreamblePayload = JSON.stringify({
 			jsonrpc: "2.0",
 			id: 4,
@@ -283,8 +316,9 @@ test("daemon rejects invalid set_latex_preamble arguments", async () => {
 				arguments: {},
 			},
 		});
-		const response = (await sendFramedRequest(socketPath, payload)) as { error: { code: number } };
+		const response = (await sendFramedRequest(socketPath, payload)) as { error: { code: number; message: string } };
 		assert.equal(response.error.code, -32602);
+		assert.equal(response.error.message, "set_latex_preamble requires latex_preamble to be a string");
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -305,11 +339,254 @@ test("daemon returns MCP-style tool errors for unimplemented tools", async () =>
 			id: 8,
 			method: "tools/call",
 			params: {
-				name: "show_latex",
+				name: "open_pdf",
 			},
 		});
 		const response = await sendFramedRequest(socketPath, payload);
 		assert.equal((response as { result: { isError?: boolean } }).result.isError, true);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon rejects compile_latex_file relative path without workspace_context", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-compile-rel-reject-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-compile-rel-reject-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	const fakeCompilerDir = join(baseDir, "fake-bin");
+	writeFakeLatexCompiler(fakeCompilerDir);
+	await server.start();
+	const requestPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 8,
+		method: "tools/call",
+		params: {
+			name: "compile_latex_file",
+			arguments: {
+				latex_file_path: "main.tex",
+			},
+		},
+	});
+	try {
+		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
+			const request = await sendFramedRequest(socketPath, requestPayload);
+			return request;
+		})) as { error: { code: number; message: string } };
+		assert.equal(response.error.code, -32602);
+		assert.equal(response.error.message, "relative latex_file_path requires workspace_context.cwd");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon compiles LaTeX file with relative path and workspace_context", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-compile-rel-success-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-compile-rel-success-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const latexPath = join(workspaceDir, "main.tex");
+	writeFileSync(latexPath, "\\documentclass{article}\\begin{document}Hello\\end{document}\n");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	const fakeCompilerDir = join(baseDir, "fake-bin");
+	writeFakeLatexCompiler(fakeCompilerDir);
+	await server.start();
+	const requestPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 9,
+		method: "tools/call",
+		params: {
+			name: "compile_latex_file",
+			arguments: {
+				latex_file_path: "main.tex",
+				workspace_context: {
+					cwd: workspaceDir,
+				},
+			},
+		},
+	});
+	try {
+		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
+			return await sendFramedRequest(socketPath, requestPayload);
+		})) as { result: { isError?: boolean; content: Array<{ text: string }> } };
+		assert.equal(response.result.isError, undefined);
+		const resultText = response.result.content[0].text;
+		const pdfPath = resultText.split(" ").at(-1);
+		assert.ok(pdfPath && existsSync(pdfPath));
+		assert.equal(dirname(pdfPath), workspaceDir);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon compiles LaTeX file with absolute path without workspace_context", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-compile-abs-success-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-compile-abs-success-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const latexPath = join(workspaceDir, "main.tex");
+	writeFileSync(latexPath, "\\documentclass{article}\\begin{document}Hello\\end{document}\n");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	const fakeCompilerDir = join(baseDir, "fake-bin");
+	writeFakeLatexCompiler(fakeCompilerDir);
+	await server.start();
+	const requestPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 10,
+		method: "tools/call",
+		params: {
+			name: "compile_latex_file",
+			arguments: {
+				latex_file_path: latexPath,
+			},
+		},
+	});
+	try {
+		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
+			return await sendFramedRequest(socketPath, requestPayload);
+		})) as { result: { isError?: boolean; content: Array<{ text: string }> } };
+		assert.equal(response.result.isError, undefined);
+		const resultText = response.result.content[0].text;
+		const pdfPath = resultText.split(" ").at(-1);
+		assert.ok(pdfPath && existsSync(pdfPath));
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon rejects compile_latex_file absolute path with non-absolute workspace_context.cwd", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-compile-abs-rel-cwd-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-compile-abs-rel-cwd-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const latexPath = join(workspaceDir, "main.tex");
+	writeFileSync(latexPath, "\\documentclass{article}\\begin{document}Hello\\end{document}\n");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	await server.start();
+	const requestPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 11,
+		method: "tools/call",
+		params: {
+			name: "compile_latex_file",
+			arguments: {
+				latex_file_path: latexPath,
+				workspace_context: {
+					cwd: "relative/workspace",
+				},
+			},
+		},
+	});
+	try {
+		const response = (await sendFramedRequest(socketPath, requestPayload)) as { error: { code: number; message: string } };
+		assert.equal(response.error.code, -32602);
+		assert.equal(response.error.message, "workspace_context.cwd must be absolute for compile_latex_file");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon rejects compile_latex_file open_pdf support", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-compile-open-pdf-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-compile-open-pdf-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const latexPath = join(workspaceDir, "main.tex");
+	writeFileSync(latexPath, "\\documentclass{article}\\begin{document}Hello\\end{document}\n");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	await server.start();
+	const requestPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 11,
+		method: "tools/call",
+		params: {
+			name: "compile_latex_file",
+			arguments: {
+				latex_file_path: latexPath,
+				open_pdf: true,
+			},
+		},
+	});
+	try {
+		const response = (await sendFramedRequest(socketPath, requestPayload)) as { error: { code: number; message: string } };
+		assert.equal(response.error.code, -32602);
+		assert.equal(response.error.message, "open_pdf is not supported by daemon MCP compile_latex_file");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon renders show_latex through compile flow", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-show-success-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-show-success-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	const fakeCompilerDir = join(baseDir, "fake-bin");
+	writeFakeLatexCompiler(fakeCompilerDir);
+	await server.start();
+	const workspaceContext = {
+		cwd: baseDir,
+		workspace_root: baseDir,
+	};
+	const requestPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 11,
+		method: "tools/call",
+		params: {
+			name: "show_latex",
+			arguments: {
+				source: "x",
+				workspace_context: workspaceContext,
+			},
+		},
+	});
+	try {
+		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
+			return await sendFramedRequest(socketPath, requestPayload);
+		})) as { result: { isError?: boolean; content: Array<{ text: string }> } };
+		assert.equal(response.result.isError, undefined);
+		const resultText = response.result.content[0].text;
+		assert.match(resultText, /\.pdf$/);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon returns MCP method-not-found for unknown methods", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-method-not-found-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-method-not-found-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	await server.start();
+	try {
+		const payload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 12,
+			method: "foobar",
+		});
+		const response = (await sendFramedRequest(socketPath, payload)) as { error: { code: number } };
+		assert.equal(response.error.code, -32601);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
