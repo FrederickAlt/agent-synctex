@@ -17,9 +17,12 @@ import type {
 	ViewerBackendAdapter,
 } from "./host_service_viewer_protocol.ts";
 
-function sameCallbackTarget(left: HostServiceCallbackTarget | undefined, right: HostServiceCallbackTarget): boolean {
-	if (!left) {
-		return false;
+function sameCallbackTarget(
+	left: HostServiceCallbackTarget | undefined,
+	right: HostServiceCallbackTarget | undefined,
+): boolean {
+	if (left === undefined || right === undefined) {
+		return left === right;
 	}
 	return (
 		left.kind === right.kind
@@ -135,6 +138,9 @@ export class HostServiceManagedViewerService {
 						...(existingRecord.metadata ?? {}),
 						backend_path: backendPath,
 						handle,
+						...(request.details.callback
+							? { callback_target_id: request.details.callback.socket_path }
+							: {}),
 					};
 					return existingRecord;
 				})()
@@ -154,7 +160,9 @@ export class HostServiceManagedViewerService {
 						backend_path: backendPath,
 						handle,
 						backend_name: this.viewerBackend.name,
-						callback_target_id: request.details.callback.socket_path,
+						...(request.details.callback
+							? { callback_target_id: request.details.callback.socket_path }
+							: {}),
 					},
 				});
 

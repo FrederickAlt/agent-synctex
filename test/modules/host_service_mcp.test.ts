@@ -54,6 +54,121 @@ async function withPathOverride(value: string | undefined, run: () => Promise<un
 	}
 }
 
+class TestManagedViewerBackend extends FakeViewerBackend {
+	openHandles = new Set<string>();
+	openRequests: Array<{ requestId: string; details: Record<string, unknown> }> = [];
+	closeRequests: Array<{ requestId: string; details: Record<string, unknown> }> = [];
+	forwardSearchRequests: Array<{ requestId: string; details: Record<string, unknown> }> = [];
+
+	async open(requestId: string, details: Record<string, unknown>) {
+		this.openRequests.push({ requestId, details: { ...details } });
+		const result = await super.open(requestId, details);
+		if (result.status === "ok") {
+			const handle = (result.status_details as Record<string, unknown>).handle;
+			if (typeof handle === "string") {
+				this.openHandles.add(handle);
+			}
+		}
+		return result;
+	}
+	async close(requestId: string, details: Record<string, unknown>) {
+		this.closeRequests.push({ requestId, details: { ...details } });
+		const handle = details.handle;
+		if (typeof handle === "string") {
+			this.openHandles.delete(handle);
+		}
+		return super.close(requestId, details);
+	}
+	async forwardSearch(requestId: string, details: Record<string, unknown>) {
+		this.forwardSearchRequests.push({ requestId, details: { ...details } });
+		const handle = details.handle;
+		if (typeof handle === "string" && this.openHandles.has(handle)) {
+			return {
+				status: "ok" as const,
+				status_details: {
+					protocol_version: 1,
+					supported: true,
+					service_available: true,
+					backend: this.name,
+					backend_identity_ok: true,
+					handle,
+					handled: true,
+				},
+			};
+		}
+		return super.forwardSearch(requestId, details);
+	}
+}
+
+class FailingManagedViewerBackend extends TestManagedViewerBackend {
+	readonly behavior: { open?: boolean; forwardSearch?: boolean; close?: boolean };
+	constructor(behavior: { open?: boolean; forwardSearch?: boolean; close?: boolean } = {}) {
+		super();
+		this.behavior = behavior;
+	}
+
+	async open(requestId: string, details: Record<string, unknown>) {
+		if (this.behavior.open) {
+			return {
+				status: "error" as const,
+				error: "backend unavailable",
+				status_details: {
+					protocol_version: 1,
+					supported: false,
+					service_available: false,
+					backend: this.name,
+					backend_identity_ok: false,
+					error_code: "backend_unavailable",
+					handled: false,
+				},
+			};
+		}
+		return super.open(requestId, details);
+	}
+
+	async forwardSearch(requestId: string, details: Record<string, unknown>) {
+		if (this.behavior.forwardSearch) {
+			return {
+				status: "error" as const,
+				error: "forward search unavailable",
+				status_details: {
+					protocol_version: 1,
+					supported: false,
+					service_available: false,
+					backend: this.name,
+					backend_identity_ok: false,
+					handled: false,
+					reason: "backend unavailable",
+					error_code: "backend_unavailable",
+					handle: details.handle,
+				},
+			};
+		}
+		return super.forwardSearch(requestId, details);
+	}
+
+	async close(requestId: string, details: Record<string, unknown>) {
+		if (this.behavior.close) {
+			return {
+				status: "error" as const,
+				error: "close unavailable",
+				status_details: {
+					protocol_version: 1,
+					supported: false,
+					service_available: false,
+					backend: this.name,
+					backend_identity_ok: false,
+					closed: false,
+					reason: "backend unavailable",
+					error_code: "backend_unavailable",
+					handle: details.handle,
+				},
+			};
+		}
+		return super.close(requestId, details);
+	}
+}
+
 function parseMcpFrame(raw: string): unknown {
 	const frames = parseMcpFrames(raw);
 	assert.equal(frames.length, 1);
@@ -339,7 +454,7 @@ test("daemon returns MCP-style tool errors for unimplemented tools", async () =>
 			id: 8,
 			method: "tools/call",
 			params: {
-				name: "open_pdf",
+				name: "does_not_exist",
 			},
 		});
 		const response = await sendFramedRequest(socketPath, payload);
@@ -352,9 +467,467 @@ test("daemon returns MCP-style tool errors for unimplemented tools", async () =>
 	}
 });
 
+test("daemon resolves relative open_pdf and jump_pdf paths against workspace_context.cwd", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-open-jump-relative-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-jump-relative-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const pdfPath = join(workspaceDir, "paper.pdf");
+	const sourcePath = join(workspaceDir, "paper.tex");
+	const socketPath = join(baseDir, "host-service.sock");
+	writeFileSync(pdfPath, "%PDF-1.7\n%");
+	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n");
+	const backend = new TestManagedViewerBackend();
+	const server = new HostServiceServer({ socketPath, viewerBackend: backend });
+	await server.start();
+	try {
+		const openResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 11,
+			method: "tools/call",
+			params: {
+				name: "open_pdf",
+				arguments: {
+					pdf_file_path: "paper.pdf",
+					workspace_context: {
+						cwd: workspaceDir,
+					},
+				},
+			},
+		}))) as {
+			result: {
+				isError?: boolean;
+				content: Array<{ text: string }>;
+				details: {
+					pdf_id?: number;
+					managed_record?: { pdfPath?: string; id?: number; handle?: string };
+				};
+			};
+		};
+		assert.equal(openResponse.result.isError, undefined);
+		assert.equal(openResponse.result.details.managed_record?.pdfPath, pdfPath);
+		const lastOpen = backend.openRequests.at(-1);
+		assert.ok(lastOpen !== undefined);
+		assert.equal(typeof lastOpen?.details.pdf_path, "string");
+		assert.equal(lastOpen?.details.pdf_path, pdfPath);
+
+		const pdfId = openResponse.result.details.pdf_id;
+		assert.equal(typeof pdfId, "number");
+		const jumpResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 12,
+			method: "tools/call",
+			params: {
+				name: "jump_pdf",
+				arguments: {
+					pdf_id: pdfId,
+					line: 3,
+					source_file: "paper.tex",
+					workspace_context: {
+						cwd: workspaceDir,
+					},
+				},
+			},
+		}))) as {
+			result: {
+				isError?: boolean;
+				details: {
+					source_file?: string;
+					handled?: boolean;
+					error_code?: string;
+				};
+			};
+		};
+		assert.equal(jumpResponse.result.isError, undefined);
+		assert.equal(jumpResponse.result.details.handled, true);
+		const lastJump = backend.forwardSearchRequests.at(-1);
+		assert.ok(lastJump !== undefined);
+		assert.equal(lastJump?.details.source_file, sourcePath);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon supports MCP managed open/jump/close without callback", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-managed-open-jump-close-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-managed-open-jump-close-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const pdfPath = join(workspaceDir, "paper.pdf");
+	const sourcePath = join(workspaceDir, "paper.tex");
+	const socketPath = join(baseDir, "host-service.sock");
+	writeFileSync(pdfPath, "%PDF-1.7\n%");
+	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n");
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: new TestManagedViewerBackend(),
+	});
+	await server.start();
+	const openPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 11,
+		method: "tools/call",
+		params: {
+			name: "open_pdf",
+			arguments: {
+				pdf_file_path: pdfPath,
+			},
+		},
+	});
+	try {
+		const openResponse = (await sendFramedRequest(socketPath, openPayload)) as {
+			result: { isError?: boolean; content: Array<{ text: string }>; details: { pdf_id?: number } };
+		};
+		assert.equal(openResponse.result.isError, undefined);
+		assert.equal(openResponse.result.content[0].text.startsWith("open_pdf ok:"), true);
+		const pdfId = openResponse.result.details.pdf_id;
+		assert.equal(typeof pdfId, "number");
+
+		const jumpPayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 12,
+			method: "tools/call",
+			params: {
+				name: "jump_pdf",
+				arguments: {
+					pdf_id: pdfId,
+					line: 2,
+					source_file: sourcePath,
+				},
+			},
+		});
+		const jumpResponse = (await sendFramedRequest(socketPath, jumpPayload)) as {
+			result: { isError?: boolean; details: { handled?: boolean; reopened?: boolean } };
+		};
+		assert.equal(jumpResponse.result.isError, undefined);
+		assert.equal(jumpResponse.result.details.handled, true);
+
+		const closePayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 13,
+			method: "tools/call",
+			params: {
+				name: "close_pdf",
+				arguments: {
+					pdf_id: pdfId,
+				},
+			},
+		});
+		const closeResponse = (await sendFramedRequest(socketPath, closePayload)) as {
+			result: { isError?: boolean; details: { closed?: boolean; pdf_id?: number } };
+		};
+		assert.equal(closeResponse.result.isError, undefined);
+		assert.equal(closeResponse.result.details.closed, true);
+		assert.equal(closeResponse.result.details.pdf_id, pdfId);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon reuses managed PDF ID for repeated no-callback open of the same PDF", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-managed-open-reuse-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-managed-open-reuse-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const pdfPath = join(workspaceDir, "paper.pdf");
+	const socketPath = join(baseDir, "host-service.sock");
+	writeFileSync(pdfPath, "%PDF-1.7\n%");
+	const backend = new TestManagedViewerBackend();
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: backend,
+	});
+	await server.start();
+	const openOncePayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 20,
+		method: "tools/call",
+		params: {
+			name: "open_pdf",
+			arguments: {
+				pdf_file_path: pdfPath,
+			},
+		},
+	});
+	const openTwicePayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 21,
+		method: "tools/call",
+		params: {
+			name: "open_pdf",
+			arguments: {
+				pdf_file_path: pdfPath,
+			},
+		},
+	});
+	try {
+		const openOnce = (await sendFramedRequest(socketPath, openOncePayload)) as {
+			result: { isError?: boolean; details: { pdf_id?: number; managed_record?: { id?: number; handle?: string } } };
+		};
+		const openTwice = (await sendFramedRequest(socketPath, openTwicePayload)) as {
+			result: { isError?: boolean; details: { pdf_id?: number; managed_record?: { id?: number; handle?: string } } };
+		};
+		assert.equal(openOnce.result.isError, undefined);
+		assert.equal(openTwice.result.isError, undefined);
+		assert.equal(openOnce.result.details.pdf_id, openTwice.result.details.pdf_id);
+		assert.equal(openOnce.result.details.managed_record?.id, openTwice.result.details.managed_record?.id);
+		assert.equal(openOnce.result.details.managed_record?.handle, openTwice.result.details.managed_record?.handle);
+		assert.equal(backend.openRequests.length, 2);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon accepts MCP open_pdf with valid callback metadata", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-open-callback-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-callback-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const pdfPath = join(workspaceDir, "paper.pdf");
+	const socketPath = join(baseDir, "host-service.sock");
+	writeFileSync(pdfPath, "%PDF-1.7\n%");
+	const backend = new TestManagedViewerBackend();
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/callback.sock",
+		token: "token-abc",
+	};
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: backend,
+	});
+	await server.start();
+	try {
+		const openResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 30,
+			method: "tools/call",
+			params: {
+				name: "open_pdf",
+				arguments: {
+					pdf_file_path: pdfPath,
+					callback,
+				},
+			},
+		}))) as {
+			result: {
+				isError?: boolean;
+				details: {
+					managed_record?: { callback?: typeof callback };
+				};
+			};
+		};
+		assert.equal(openResponse.result.isError, undefined);
+		const lastOpen = backend.openRequests.at(-1);
+		assert.ok(lastOpen !== undefined);
+		assert.deepEqual(lastOpen?.details.callback, callback);
+		assert.deepEqual(openResponse.result.details.managed_record?.callback, callback);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon rejects MCP open_pdf with malformed callback metadata", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-open-callback-invalid-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-callback-invalid-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const pdfPath = join(workspaceDir, "paper.pdf");
+	const socketPath = join(baseDir, "host-service.sock");
+	writeFileSync(pdfPath, "%PDF-1.7\n%");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new TestManagedViewerBackend() });
+	await server.start();
+	try {
+		const response = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 31,
+			method: "tools/call",
+			params: {
+				name: "open_pdf",
+				arguments: {
+					pdf_file_path: pdfPath,
+					callback: {
+						kind: "pi-synctex-callback-v1",
+						transport: "unix",
+						socket_path: "/tmp/callback.sock",
+					},
+				},
+			},
+		}))) as { error: { code: number; message: string } };
+		assert.equal(response.error.code, -32602);
+		assert.equal(response.error.message, "callback.token must be a non-empty string");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon surfaces managed open backend failures in MCP tool responses", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-open-backend-fail-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-backend-fail-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const pdfPath = join(workspaceDir, "paper.pdf");
+	const socketPath = join(baseDir, "host-service.sock");
+	writeFileSync(pdfPath, "%PDF-1.7\n%");
+	const backend = new FailingManagedViewerBackend({ open: true });
+	const server = new HostServiceServer({ socketPath, viewerBackend: backend });
+	await server.start();
+	try {
+		const openResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 40,
+			method: "tools/call",
+			params: {
+				name: "open_pdf",
+				arguments: {
+					pdf_file_path: pdfPath,
+				},
+			},
+		}))) as {
+			result: { isError?: boolean; content: Array<{ text: string }>; details: { error_code?: string } };
+		};
+		assert.equal(openResponse.result.isError, true);
+		assert.equal(openResponse.result.details.error_code, "backend_unavailable");
+		assert.match(openResponse.result.content[0].text, /backend unavailable/);
+		assert.match(openResponse.result.content[0].text, /code=backend_unavailable/);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon surfaces managed jump and close backend errors in MCP responses", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-jump-close-backend-fail-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-jump-close-backend-fail-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const pdfPath = join(workspaceDir, "paper.pdf");
+	const sourcePath = join(workspaceDir, "paper.tex");
+	const socketPath = join(baseDir, "host-service.sock");
+	writeFileSync(pdfPath, "%PDF-1.7\n%");
+	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n");
+	const backend = new FailingManagedViewerBackend({ forwardSearch: true, close: true });
+	const server = new HostServiceServer({
+		socketPath,
+		viewerBackend: backend,
+	});
+	await server.start();
+	const openPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 50,
+		method: "tools/call",
+		params: {
+			name: "open_pdf",
+			arguments: {
+				pdf_file_path: pdfPath,
+			},
+		},
+	});
+	const jumpPayload = (pdfId: number) => JSON.stringify({
+		jsonrpc: "2.0",
+		id: 51,
+		method: "tools/call",
+		params: {
+			name: "jump_pdf",
+			arguments: {
+				pdf_id: pdfId,
+				line: 1,
+				source_file: sourcePath,
+			},
+		},
+	});
+	const closePayload = (pdfId: number) => JSON.stringify({
+		jsonrpc: "2.0",
+		id: 52,
+		method: "tools/call",
+		params: {
+			name: "close_pdf",
+			arguments: {
+				pdf_id: pdfId,
+			},
+		},
+	});
+	try {
+		const openResponse = (await sendFramedRequest(socketPath, openPayload)) as {
+			result: { isError?: boolean; details: { pdf_id?: number } };
+		};
+		assert.equal(openResponse.result.isError, undefined);
+		const pdfId = openResponse.result.details.pdf_id;
+		if (typeof pdfId !== "number") {
+			throw new Error("open_pdf response did not include pdf_id");
+		}
+		const jumpResponse = (await sendFramedRequest(socketPath, jumpPayload(pdfId))) as {
+			result: { isError?: boolean; details: { handled?: boolean; error_code?: string; reason?: string } };
+		};
+		assert.equal(jumpResponse.result.details.error_code, "backend_unavailable");
+		assert.equal(jumpResponse.result.details.reason, "backend unavailable");
+		if (jumpResponse.result.isError !== undefined) {
+			assert.equal(jumpResponse.result.isError, true);
+		} else {
+			assert.equal(jumpResponse.result.details.handled, false);
+		}
+
+		const closeResponse = (await sendFramedRequest(socketPath, closePayload(pdfId))) as {
+			result: { isError?: boolean; content: Array<{ text: string }>; details: { error_code?: string } };
+		};
+		assert.equal(closeResponse.result.isError, true);
+		assert.equal(closeResponse.result.details.error_code, "backend_unavailable");
+		assert.match(closeResponse.result.content[0].text, /close unavailable/);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon rejects relative open_pdf path without workspace_context", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-open-rel-reject-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-rel-reject-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new TestManagedViewerBackend() });
+	await server.start();
+	const pdfPath = join(workspaceDir, "paper.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n%");
+	const requestPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 14,
+		method: "tools/call",
+		params: {
+			name: "open_pdf",
+			arguments: {
+				pdf_file_path: "paper.pdf",
+			},
+		},
+	});
+	try {
+		const response = (await sendFramedRequest(socketPath, requestPayload)) as { error: { code: number; message: string } };
+		assert.equal(response.error.code, -32602);
+		assert.equal(response.error.message, "relative pdf_file_path requires workspace_context.cwd");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
 test("daemon rejects compile_latex_file relative path without workspace_context", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-compile-rel-reject-");
 	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-compile-rel-reject-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
 	const socketPath = join(baseDir, "host-service.sock");
 	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
 	const fakeCompilerDir = join(baseDir, "fake-bin");

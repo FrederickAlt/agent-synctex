@@ -64,7 +64,7 @@ interface ZathuraSession {
 	pdfPath: string;
 	handle: string;
 	backendPath: string;
-	callback: HostServiceCallbackTarget;
+	callback?: HostServiceCallbackTarget;
 	pid: number;
 	owned: boolean;
 	process?: ChildProcess;
@@ -114,7 +114,10 @@ function normalizeCallback(callback: unknown): HostServiceCallbackTarget | undef
 	};
 }
 
-function callbackKey(callback: HostServiceCallbackTarget): string {
+function callbackKey(callback?: HostServiceCallbackTarget): string {
+	if (!callback) {
+		return "<no-callback>";
+	}
 	return `${callback.kind}|${callback.transport}|${callback.socket_path}|${callback.token}`;
 }
 
@@ -136,7 +139,7 @@ function validateOpenRequest(details: Record<string, unknown>): string | undefin
 	if (!isString(details.pdf_path) || !details.pdf_path.trim()) {
 		return "missing or invalid pdf_path";
 	}
-	if (normalizeCallback(details.callback) === undefined) {
+	if (details.callback !== undefined && normalizeCallback(details.callback) === undefined) {
 		return "missing or invalid callback";
 	}
 	if (details.reuse_existing !== undefined && !isBoolean(details.reuse_existing)) {
@@ -494,7 +497,7 @@ export interface FakeViewerBackendOptions {
 interface FakeSession {
 	path: string;
 	handle: string;
-	callback: HostServiceCallbackTarget;
+	callback?: HostServiceCallbackTarget;
 	pid: number;
 }
 
@@ -523,7 +526,7 @@ export class FakeViewerBackend implements ViewerBackendAdapter {
 		this.available = available;
 	}
 
-	private keyFor(pdfPath: string, callback: HostServiceCallbackTarget): string {
+	private keyFor(pdfPath: string, callback?: HostServiceCallbackTarget): string {
 		return `${pdfPath}\n${callbackKey(callback)}`;
 	}
 
@@ -586,7 +589,7 @@ export class FakeViewerBackend implements ViewerBackendAdapter {
 				}),
 			};
 		}
-		const callback = normalizeCallback(details.callback)!;
+		const callback = normalizeCallback(details.callback);
 		const reuseExisting = details.reuse_existing !== false;
 		const pdfPath = resolve(details.pdf_path as string);
 		if (reuseExisting) {
@@ -794,7 +797,10 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 		return "zathura";
 	}
 
-	private buildCallbackCommand(callback: HostServiceCallbackTarget): string {
+	private buildCallbackCommand(callback?: HostServiceCallbackTarget): string | undefined {
+		if (!callback) {
+			return;
+		}
 		return createSynctexCallbackCommand({
 			nodePath: this.nodePath,
 			callbackScriptPath: this.callbackScriptPath,
@@ -812,7 +818,7 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 		return resolve(pdfPath);
 	}
 
-	private callbackMatch(session: ZathuraSession, callback: HostServiceCallbackTarget): boolean {
+	private callbackMatch(session: ZathuraSession, callback?: HostServiceCallbackTarget): boolean {
 		return callbackKey(session.callback) === callbackKey(callback);
 	}
 
@@ -843,7 +849,7 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 
 	private async isReusableSession(
 		pdfPath: string,
-		callback: HostServiceCallbackTarget,
+		callback?: HostServiceCallbackTarget,
 	): Promise<ZathuraSession | undefined> {
 		const session = this.sessions.get(pdfPath);
 		if (!session) return;
@@ -881,7 +887,7 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 		handle: string,
 		backendPath: string,
 		pdfPath: string,
-		callback: HostServiceCallbackTarget,
+		callback: HostServiceCallbackTarget | undefined,
 		pid: number,
 		process?: ChildProcess,
 	): ZathuraSession {
@@ -1005,7 +1011,7 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 			};
 		}
 		const pdfPath = pdfValidation.normalizedPath;
-		const callback = normalizeCallback(details.callback)!;
+		const callback = normalizeCallback(details.callback);
 		const backendPath = this.resolvePath();
 		if (!this.isAvailable()) {
 			return {
@@ -1046,11 +1052,12 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 			await this.retireSession(currentSession, "backend-session-replaced");
 		}
 		const callbackCommand = this.buildCallbackCommand(callback);
+		const spawnArgs = callbackCommand === undefined ? [pdfPath] : [`--synctex-editor-command=${callbackCommand}`, pdfPath];
 		const handle = this.makeHandle();
 		const observedPidsBeforeSpawn = new Set(iterPidsForPdf(backendPath, [pdfPath], false));
 		let child: ChildProcess;
 		try {
-			child = spawn(backendPath, [`--synctex-editor-command=${callbackCommand}`, pdfPath], {
+			child = spawn(backendPath, spawnArgs, {
 				stdio: "ignore",
 			});
 		} catch (error) {
@@ -1079,16 +1086,17 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 			const discoveredCandidatePids = iterPidsForPdf(backendPath, [pdfPath], false)
 				.filter((pid) => !observedPidsBeforeSpawn.has(pid))
 				.sort((a, b) => a - b);
-			const callbackArg = `--synctex-editor-command=${callbackCommand}`;
-			const matchingCallbackPids = discoveredCandidatePids.filter((pid) => {
-				try {
-					const commandlineText = readFileSync(join("/", "proc", String(pid), "cmdline")).toString("utf8");
-					const commandline = commandlineText.split("\u0000").filter(Boolean);
-					return commandline.includes(callbackArg);
-				} catch {
-					return false;
-				}
-			});
+			const matchingCallbackPids = callbackCommand === undefined
+				? []
+				: discoveredCandidatePids.filter((pid) => {
+					try {
+						const commandlineText = readFileSync(join("/", "proc", String(pid), "cmdline")).toString("utf8");
+						const commandline = commandlineText.split("\u0000").filter(Boolean);
+						return commandline.includes(`--synctex-editor-command=${callbackCommand}`);
+					} catch {
+						return false;
+					}
+				});
 			if (matchingCallbackPids.length > 0) {
 				ownedPid = matchingCallbackPids.at(-1);
 			} else {

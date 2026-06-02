@@ -126,7 +126,7 @@ export interface HostServiceOpenRequest {
 	workspace_context: HostServiceWorkspaceContext;
 	details: {
 		pdf_path: string;
-		callback: HostServiceCallbackTarget;
+		callback?: HostServiceCallbackTarget;
 		reuse_existing?: boolean;
 		require_persistent_viewer?: boolean;
 	};

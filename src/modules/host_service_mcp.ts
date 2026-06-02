@@ -1,8 +1,21 @@
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { getLatexPreambleFilePath } from "./runtime_preamble.ts";
 import { writeLatexPreambleToTmpdir } from "./runtime_preamble.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
-import type { HostServiceCompileRequest, HostServiceCompileResponseEnvelope, HostServiceCompileSnippetRequest, HostServiceCompileSnippetResponseEnvelope, HostServiceWorkspaceContext } from "./host_service_protocol.ts";
+import type {
+	HostServiceCallbackTarget,
+	HostServiceCloseRequest,
+	HostServiceCloseResponseEnvelope,
+	HostServiceCompileRequest,
+	HostServiceCompileResponseEnvelope,
+	HostServiceCompileSnippetRequest,
+	HostServiceCompileSnippetResponseEnvelope,
+	HostServiceJumpRequest,
+	HostServiceJumpResponseEnvelope,
+	HostServiceOpenRequest,
+	HostServiceOpenResponseEnvelope,
+	HostServiceWorkspaceContext,
+} from "./host_service_protocol.ts";
 
 const MCP_JSONRPC_VERSION = "2.0" as const;
 export const MCP_TOOL_NAME = "tex-actions" as const;
@@ -18,6 +31,12 @@ const MCP_HOST_SERVICE_PROTOCOL_VERSION = 1;
 const MCP_HOST_SERVICE_DAEMON_REQUEST_PREFIX = "mcp-host-service";
 const MCP_DEFAULT_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
 let mcpHostServiceRequestCounter = 0;
+
+interface HostServiceMcpPdfOperations {
+	openPdf?: (request: HostServiceOpenRequest) => Promise<HostServiceOpenResponseEnvelope>;
+	jumpPdf?: (request: HostServiceJumpRequest) => Promise<HostServiceJumpResponseEnvelope>;
+	closePdf?: (request: HostServiceCloseRequest) => Promise<HostServiceCloseResponseEnvelope>;
+}
 
 const mcpCompileService = new HostServiceCompileService({
 	protocolVersion: MCP_HOST_SERVICE_PROTOCOL_VERSION,
@@ -162,6 +181,14 @@ function parseStringArg(args: Record<string, unknown>, key: string): string {
 	return value;
 }
 
+function parsePositiveIntegerArg(args: Record<string, unknown>, key: string): number {
+	const value = args[key];
+	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+		throw new Error(`${key} must be a positive integer`);
+	}
+	return value;
+}
+
 function parseCompileWorkspaceContext(sourcePath: string, rawWorkspaceContext: unknown): HostServiceWorkspaceContext {
 	if (rawWorkspaceContext === undefined) {
 		if (!isAbsolute(sourcePath)) {
@@ -199,6 +226,70 @@ function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompil
 	};
 }
 
+function parseCallbackTargetArg(args: Record<string, unknown>): HostServiceCallbackTarget | undefined {
+	const rawCallback = args.callback;
+	if (rawCallback === undefined) {
+		return;
+	}
+	if (!isRecord(rawCallback)) {
+		throw new Error("callback must be an object");
+	}
+	if (typeof rawCallback.kind !== "string" || !rawCallback.kind.trim()) {
+		throw new Error("callback.kind must be a non-empty string");
+	}
+	if (typeof rawCallback.transport !== "string" || !rawCallback.transport.trim()) {
+		throw new Error("callback.transport must be a non-empty string");
+	}
+	if (typeof rawCallback.socket_path !== "string" || !rawCallback.socket_path.trim()) {
+		throw new Error("callback.socket_path must be a non-empty string");
+	}
+	if (typeof rawCallback.token !== "string" || !rawCallback.token.trim()) {
+		throw new Error("callback.token must be a non-empty string");
+	}
+	const kind = rawCallback.kind;
+	const transport = rawCallback.transport;
+	if (kind !== "pi-synctex-callback-v1") {
+		throw new Error("callback.kind must be pi-synctex-callback-v1");
+	}
+	if (transport !== "unix") {
+		throw new Error("callback.transport must be unix");
+	}
+	return {
+		kind,
+		transport,
+		socket_path: rawCallback.socket_path,
+		token: rawCallback.token,
+	};
+}
+
+function parseOpenWorkspaceContext(pdfPath: string, rawWorkspaceContext: unknown): HostServiceWorkspaceContext {
+	if (rawWorkspaceContext === undefined) {
+		if (!isAbsolute(pdfPath)) {
+			throw new Error("relative pdf_file_path requires workspace_context.cwd");
+		}
+		return MCP_DEFAULT_WORKSPACE_CONTEXT;
+	}
+	const workspaceContext = normalizeWorkspaceContext(rawWorkspaceContext);
+	if (!isAbsolute(workspaceContext.cwd)) {
+		throw new Error("workspace_context.cwd must be absolute for open_pdf");
+	}
+	return workspaceContext;
+}
+
+function parseJumpWorkspaceContext(rawWorkspaceContext: unknown, sourceFile?: string): HostServiceWorkspaceContext {
+	if (rawWorkspaceContext === undefined) {
+		if (sourceFile !== undefined && !isAbsolute(sourceFile)) {
+			throw new Error("relative source_file requires workspace_context.cwd");
+		}
+		return MCP_DEFAULT_WORKSPACE_CONTEXT;
+	}
+	const workspaceContext = normalizeWorkspaceContext(rawWorkspaceContext);
+	if (!isAbsolute(workspaceContext.cwd)) {
+		throw new Error("workspace_context.cwd must be absolute for jump_pdf");
+	}
+	return workspaceContext;
+}
+
 function parseCompileLatexFileRequest(args: Record<string, unknown>): HostServiceCompileRequest {
 	const latexFilePath = parseStringArg(args, "latex_file_path");
 	const compiler = parseOptionalStringArg(args, "compiler");
@@ -222,6 +313,64 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): HostServic
 	};
 }
 
+function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequest {
+	const pdfPath = parseOptionalStringArg(args, "pdf_file_path")
+		?? parseOptionalStringArg(args, "pdf_path");
+	if (pdfPath === undefined) {
+		throw new Error("pdf_file_path must be a non-empty string");
+	}
+	const rawWorkspaceContext = args.workspace_context;
+	const workspaceContext = parseOpenWorkspaceContext(pdfPath, rawWorkspaceContext);
+	const resolvedPdfPath = isAbsolute(pdfPath) ? pdfPath : resolve(workspaceContext.cwd, pdfPath);
+	const callback = parseCallbackTargetArg(args);
+	const reuseExisting = parseBooleanArg(args, "reuse_existing");
+	const requirePersistentViewer = parseBooleanArg(args, "require_persistent_viewer");
+	return {
+		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
+		request_id: nextHostServiceRequestId(),
+		operation: "open_pdf",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: workspaceContext,
+		details: {
+			pdf_path: resolvedPdfPath,
+			...(callback === undefined ? {} : { callback }),
+			...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
+			...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
+		},
+	};
+}
+
+function parseJumpPdfRequest(args: Record<string, unknown>): HostServiceJumpRequest {
+	const pdfId = parsePositiveIntegerArg(args, "pdf_id");
+	const line = parsePositiveIntegerArg(args, "line");
+	const sourceFile = parseOptionalStringArg(args, "source_file");
+	const workspaceContext = parseJumpWorkspaceContext(args.workspace_context, sourceFile);
+	const resolvedSourceFile = sourceFile === undefined
+		? undefined
+		: isAbsolute(sourceFile) ? sourceFile : resolve(workspaceContext.cwd, sourceFile);
+	return {
+		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
+		request_id: nextHostServiceRequestId(),
+		operation: "jump_pdf",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: workspaceContext,
+		pdf_id: pdfId,
+		line,
+		...(resolvedSourceFile === undefined ? {} : { source_file: resolvedSourceFile }),
+	};
+}
+function parseClosePdfRequest(args: Record<string, unknown>): HostServiceCloseRequest {
+	const pdfId = parsePositiveIntegerArg(args, "pdf_id");
+	return {
+		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
+		request_id: nextHostServiceRequestId(),
+		operation: "close_pdf",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: MCP_DEFAULT_WORKSPACE_CONTEXT,
+		pdf_id: pdfId,
+	};
+}
+
 function parseToolResult(
 	response: HostServiceCompileResponseEnvelope | HostServiceCompileSnippetResponseEnvelope,
 	successText: string,
@@ -237,6 +386,48 @@ function parseToolResult(
 	return {
 		isError: true,
 		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}` }],
+		details,
+	};
+}
+
+function parseManagedPdfToolResult(
+	response: HostServiceOpenResponseEnvelope | HostServiceJumpResponseEnvelope | HostServiceCloseResponseEnvelope,
+	successPrefix: string,
+): McpToolResult {
+	const details = response.status_details as unknown as Record<string, unknown>;
+	if (response.status === "ok") {
+		const line =
+			typeof details.line === "number" && Number.isInteger(details.line)
+				? ` line=${details.line}`
+				: "";
+		const pdf =
+			typeof details.pdf === "string" && details.pdf
+				? ` pdf=${details.pdf}`
+				: "";
+		const pdfId =
+			typeof details.pdf_id === "number" && details.pdf_id > 0
+				? ` pdf_id=${details.pdf_id}`
+				: "";
+		const handled =
+				typeof details.handled === "boolean" && details.handled
+					? " handled"
+					: "";
+		const closed =
+				typeof details.closed === "boolean" && details.closed
+					? " closed"
+					: "";
+		return {
+			content: [{
+				type: "text",
+				text: `${successPrefix}${pdf}${pdfId}${line}${handled}${closed}`.trim() || successPrefix,
+			}],
+			details,
+		};
+	}
+	const errorCode = typeof details.error_code === "string" ? ` (code=${details.error_code})` : "";
+	return {
+		isError: true,
+		content: [{ type: "text", text: `${response.error || "operation failed"}${errorCode}` }],
 		details,
 	};
 }
@@ -373,18 +564,56 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "open_pdf",
-			description: "Open an existing PDF for host-service tracking and interaction.",
-			inputSchema: { type: "object", additionalProperties: true },
+			description: "Open a PDF through the host-service viewer and return a daemon-owned PDF id.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					pdf_file_path: { type: "string", minLength: 1 },
+					callback: {
+						type: "object",
+						properties: {
+							kind: { type: "string", const: "pi-synctex-callback-v1" },
+							transport: { type: "string", const: "unix" },
+							socket_path: { type: "string", minLength: 1 },
+							token: { type: "string", minLength: 1 },
+						},
+						required: ["kind", "transport", "socket_path", "token"],
+						additionalProperties: false,
+					},
+					reuse_existing: { type: "boolean" },
+					require_persistent_viewer: { type: "boolean" },
+					workspace_context: workspaceContextSchema(),
+				},
+				required: ["pdf_file_path"],
+				additionalProperties: false,
+			},
 		},
 		{
 			name: "jump_pdf",
 			description: "Jump a tracked PDF to a source line via forward SyncTeX.",
-			inputSchema: { type: "object", additionalProperties: true },
+			inputSchema: {
+				type: "object",
+				properties: {
+					pdf_id: { type: "number", minimum: 1 },
+					line: { type: "number", minimum: 1 },
+					source_file: { type: "string", minLength: 1 },
+					workspace_context: workspaceContextSchema(),
+				},
+				required: ["pdf_id", "line"],
+				additionalProperties: false,
+			},
 		},
 		{
 			name: "close_pdf",
 			description: "Close a tracked PDF by id.",
-			inputSchema: { type: "object", additionalProperties: true },
+			inputSchema: {
+				type: "object",
+				properties: {
+					pdf_id: { type: "number", minimum: 1 },
+				},
+				required: ["pdf_id"],
+				additionalProperties: false,
+			},
 		},
 		{
 			name: "set_latex_preamble",
@@ -414,7 +643,10 @@ export function mcpFramedResponse(payload: McpResponsePayload): string {
 	return encodeResponse(payload);
 }
 
-export async function handleMcpRequest(rawPayload: string): Promise<McpResponsePayload | null> {
+export async function handleMcpRequest(
+	rawPayload: string,
+	pdfOperations: HostServiceMcpPdfOperations = {},
+): Promise<McpResponsePayload | null> {
 	let request: McpParsedRequest;
 	try {
 		request = parseRequest(rawPayload);
@@ -520,6 +752,90 @@ export async function handleMcpRequest(rawPayload: string): Promise<McpResponseP
 						});
 					}
 				}
+					case "open_pdf": {
+						let openRequest: HostServiceOpenRequest;
+						try {
+							openRequest = parseOpenPdfRequest(call.args);
+						} catch (error) {
+							return buildMcpErrorResponse(
+								request.id,
+								MCP_ERROR_INVALID_PARAMS,
+								error instanceof Error ? error.message : String(error),
+							);
+						}
+						if (!pdfOperations.openPdf) {
+							return buildSuccess(request.id, {
+								isError: true,
+								content: [{ type: "text", text: "open_pdf is not yet implemented by the daemon" }],
+							});
+						}
+						try {
+							const openResponse = await pdfOperations.openPdf(openRequest);
+							return buildSuccess(request.id, parseManagedPdfToolResult(openResponse, "open_pdf ok:"));
+						} catch (error) {
+							const details = error instanceof Error ? error.message : String(error);
+							return buildSuccess(request.id, {
+								isError: true,
+								content: [{ type: "text", text: `open_pdf failed: ${details}` }],
+							});
+						}
+					}
+					case "jump_pdf": {
+						let jumpRequest: HostServiceJumpRequest;
+						try {
+							jumpRequest = parseJumpPdfRequest(call.args);
+						} catch (error) {
+							return buildMcpErrorResponse(
+								request.id,
+								MCP_ERROR_INVALID_PARAMS,
+								error instanceof Error ? error.message : String(error),
+							);
+						}
+						if (!pdfOperations.jumpPdf) {
+							return buildSuccess(request.id, {
+								isError: true,
+								content: [{ type: "text", text: "jump_pdf is not yet implemented by the daemon" }],
+							});
+						}
+						try {
+							const jumpResponse = await pdfOperations.jumpPdf(jumpRequest);
+							return buildSuccess(request.id, parseManagedPdfToolResult(jumpResponse, "jump_pdf ok:"));
+						} catch (error) {
+							const details = error instanceof Error ? error.message : String(error);
+							return buildSuccess(request.id, {
+								isError: true,
+								content: [{ type: "text", text: `jump_pdf failed: ${details}` }],
+							});
+						}
+					}
+					case "close_pdf": {
+						let closeRequest: HostServiceCloseRequest;
+						try {
+							closeRequest = parseClosePdfRequest(call.args);
+						} catch (error) {
+							return buildMcpErrorResponse(
+								request.id,
+								MCP_ERROR_INVALID_PARAMS,
+								error instanceof Error ? error.message : String(error),
+							);
+						}
+						if (!pdfOperations.closePdf) {
+							return buildSuccess(request.id, {
+								isError: true,
+								content: [{ type: "text", text: "close_pdf is not yet implemented by the daemon" }],
+							});
+						}
+						try {
+							const closeResponse = await pdfOperations.closePdf(closeRequest);
+							return buildSuccess(request.id, parseManagedPdfToolResult(closeResponse, "close_pdf ok:"));
+						} catch (error) {
+							const details = error instanceof Error ? error.message : String(error);
+							return buildSuccess(request.id, {
+								isError: true,
+								content: [{ type: "text", text: `close_pdf failed: ${details}` }],
+							});
+						}
+					}
 				case "set_latex_preamble": {
 					try {
 						const preamble = call.args.latex_preamble;
@@ -555,8 +871,11 @@ export async function handleMcpRequest(rawPayload: string): Promise<McpResponseP
 	}
 }
 
-export async function handleFramedMcpRequest(rawPayload: string): Promise<string | null> {
-	const response = await handleMcpRequest(rawPayload);
+export async function handleFramedMcpRequest(
+	rawPayload: string,
+	pdfOperations?: HostServiceMcpPdfOperations,
+): Promise<string | null> {
+	const response = await handleMcpRequest(rawPayload, pdfOperations);
 	if (response === null) {
 		return null;
 	}

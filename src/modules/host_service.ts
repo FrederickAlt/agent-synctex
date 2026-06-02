@@ -1033,7 +1033,11 @@ export class HostServiceServer {
 
 	private respondToMcpRequest(raw: string, socket: Socket): void {
 		void (async () => {
-			const response = await handleFramedMcpRequest(raw);
+			const response = await handleFramedMcpRequest(raw, {
+				openPdf: (request) => this.managedViewerService.openViewer(request),
+				jumpPdf: (request) => this.managedViewerService.jumpViewer(request),
+				closePdf: (request) => this.managedViewerService.closeViewer(request),
+			});
 			if (response === null) {
 				return;
 			}
@@ -1677,7 +1681,7 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 			if (typeof rawDetails.pdf_path !== "string" || !rawDetails.pdf_path.trim()) {
 				throw new Error("missing pdf_path");
 			}
-			if (!isValidCallbackTarget(rawDetails.callback)) {
+			if (rawDetails.callback !== undefined && !isValidCallbackTarget(rawDetails.callback)) {
 				throw new Error("invalid callback");
 			}
 			if (rawDetails.reuse_existing !== undefined && typeof rawDetails.reuse_existing !== "boolean") {
