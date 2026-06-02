@@ -13,8 +13,9 @@
     "check": "tsc --noEmit",
     "test": "node --test \"*.test.ts\" \"test/**/*.test.ts\"",
     "verify": "npm run check && npm test",
-    "host-service:start": "node scripts/agent-synctex-host-service.ts start",
-    "host-service:status": "node scripts/agent-synctex-host-service.ts status"
+    "host-service:start": "node scripts/tex-actionsctl.ts start",
+    "host-service:status": "node scripts/tex-actionsctl.ts status",
+    "tex-actionsctl": "node scripts/tex-actionsctl.ts"
   },
   "keywords": [
     "pi-extension",

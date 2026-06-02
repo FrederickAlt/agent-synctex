@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
-import { FakeViewerBackend, HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
+import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, FakeViewerBackend, HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 
@@ -101,7 +101,7 @@ const TYPEBOX_STUB_SOURCE = `export const Type = {
 const ORIGINAL_MCP_TMPDIR = process.env.MCP_TMPDIR;
 const MCP_TMPDIR = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-service-"));
 process.env.MCP_TMPDIR = MCP_TMPDIR;
-const MCP_FIXED_PREVIEW_PDF_PATH = resolve(MCP_TMPDIR, "show-latex.pdf");
+const MCP_FIXED_PREVIEW_PDF_PATH = resolve(MCP_TMPDIR, "tex-actions.pdf");
 
 type CompiledShowLatexApi = {
 	registerTool: (tool: { name: string; [key: string]: unknown }) => void;
@@ -508,7 +508,7 @@ type HostServiceMode = "ok" | "backend_unavailable" | "hang" | "service_unavaila
 async function withHostService(mode: HostServiceMode, fn: (backend: { openRequests: HostServiceOpenRequestRecord[] }) => Promise<void>, backendOverride?: FakeViewerBackend): Promise<void> {
 	const serviceDir = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-service-"));
 	const socketPath = resolve(serviceDir, "host-service.sock");
-	const previousSocketPath = process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+	const previousSocketPath = process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 	const defaultBackend = mode === "backend_unavailable"
 		? new BackendUnavailableFakeViewerBackend({ name: "fake-host-backend", capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true } })
 		: mode === "hang"
@@ -517,16 +517,16 @@ async function withHostService(mode: HostServiceMode, fn: (backend: { openReques
 				? new ServiceUnavailableFakeViewerBackend({ name: "fake-host-backend", capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true } })
 				: new RecordingFakeViewerBackend({ name: "fake-host-backend", capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true } });
 	const backend = backendOverride ?? defaultBackend;
-	const hostServiceServer = new HostServiceServer({ socketPath, serviceName: "agent-synctex-show-latex", viewerBackend: backend as FakeViewerBackend });
-	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = socketPath;
+	const hostServiceServer = new HostServiceServer({ socketPath, serviceName: "tex-actions-show-latex", viewerBackend: backend as FakeViewerBackend });
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
 	await hostServiceServer.start();
 	try {
 		await fn(backend as { openRequests: HostServiceOpenRequestRecord[] });
 	} finally {
 		if (previousSocketPath === undefined) {
-			delete process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+			delete process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 		} else {
-			process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = previousSocketPath;
+			process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = previousSocketPath;
 		}
 		await hostServiceServer.stop();
 		rmSync(serviceDir, { recursive: true, force: true });

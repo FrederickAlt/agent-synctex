@@ -63,7 +63,7 @@ export interface LatexFileCompileToolSupport {
 	buildToolResult(result: LatexFileCompileResult): LatexFileToolDetails;
 }
 
-const MCP_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "show-latex");
+const MCP_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "tex-actions");
 const REQUEST_TIMEOUT_MS = 60_000;
 const MAX_OUTPUT_BYTES = 12_000;
 const MAX_TAIL_BYTES = 30_000;

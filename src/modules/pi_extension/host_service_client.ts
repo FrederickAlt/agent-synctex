@@ -1,8 +1,8 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { HostServiceWorkspaceContext } from "../host_service_protocol.ts";
-import { defaultHostServiceSocketPath, HostServiceClient } from "../host_service.ts";
+import { defaultHostServiceSocketPath, HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostServiceClient } from "../host_service.ts";
 
-export const HOST_SERVICE_SESSION_ENV_VAR = "PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH";
+export const HOST_SERVICE_SESSION_ENV_VAR = HOST_SERVICE_SOCKET_PATH_ENV_VAR;
 export const HOST_SERVICE_REQUEST_TIMEOUT_MS = 5_000;
 
 export interface HostServiceCallbackTargetWorkspace {
@@ -11,7 +11,11 @@ export interface HostServiceCallbackTargetWorkspace {
 }
 
 export function hostServiceSocketPath(): string {
-	return process.env[HOST_SERVICE_SESSION_ENV_VAR] ?? defaultHostServiceSocketPath();
+	const override = process.env[HOST_SERVICE_SESSION_ENV_VAR];
+	if (override) {
+		return override;
+	}
+	return defaultHostServiceSocketPath();
 }
 
 export function createHostServiceClient(socketPath = hostServiceSocketPath(), requestTimeoutMs = HOST_SERVICE_REQUEST_TIMEOUT_MS): HostServiceClient {

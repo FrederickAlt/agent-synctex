@@ -22,7 +22,7 @@ import type {
 } from "./host_service_protocol.ts";
 
 const REQUIRED_DIRECTORY_MODE = 0o700;
-const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "show-latex");
+const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "tex-actions");
 const HOST_SERVICE_SNIPPET_WORKDIR_NAME = "host-service-snippets";
 const HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES = [
 	"preamble.tex",

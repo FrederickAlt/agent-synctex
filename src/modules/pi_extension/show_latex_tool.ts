@@ -159,8 +159,8 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 			"Use optional front matter only when changing options, for example: ---\ncompiler: xelatex\ninline: false\n---",
 			"show_latex renders inline by default; set inline=false only when the user wants an external viewer.",
 			"Do not use verbatim-like LaTeX constructs (for example, \\begin{verbatim}, lstlisting, minted, or \\verb) to show the user LaTeX code; provide real LaTeX that compiles and renders the requested content.",
-			"In an existing LaTeX project, assume ./preamble.tex or ./praeamble.tex has already been copied into ${XDG_RUNTIME_DIR}/show-latex/preamble.tex. Do not add a standalone \\documentclass or repeat the project preamble unless the user explicitly asks.",
-			"If a project snippet preview fails, inspect the log and project preamble, or restore the project preamble in ${XDG_RUNTIME_DIR}/show-latex/preamble.tex. Do not call set_latex_preamble with a minimal preamble as a workaround unless the user explicitly asks to change the active preview preamble.",
+			"In an existing LaTeX project, assume ./preamble.tex or ./praeamble.tex has already been copied into ${XDG_RUNTIME_DIR}/tex-actions/preamble.tex. Do not add a standalone \\documentclass or repeat the project preamble unless the user explicitly asks.",
+			"If a project snippet preview fails, inspect the log and project preamble, or restore the project preamble in ${XDG_RUNTIME_DIR}/tex-actions/preamble.tex. Do not call set_latex_preamble with a minimal preamble as a workaround unless the user explicitly asks to change the active preview preamble."
 		],
 		renderShell: "self",
 		parameters: ShowLatexParams,

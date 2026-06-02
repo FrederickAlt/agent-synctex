@@ -6,9 +6,9 @@ import {
 	lstatSync,
 	mkdirSync,
 	rmSync,
-	statSync,
 } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { HostServiceCompileService } from "./host_service_compile.ts";
 import {
@@ -140,11 +140,10 @@ export interface HostServiceServerOptions {
 }
 
 const PROTOCOL_VERSION = 1;
-const DEFAULT_HOST_SERVICE_SOCKET_PATH = resolve(
-	process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(),
-	"agent-synctex",
-	"host-service.sock",
-);
+const DEFAULT_HOST_SERVICE_NAME = "tex-actions-host-service";
+const HOST_SERVICE_RUNTIME_DIR_NAME = "tex-actions";
+const HOST_SERVICE_SOCKET_NAME = "host-service.sock";
+export const HOST_SERVICE_SOCKET_PATH_ENV_VAR = "TEX_ACTIONS_HOST_SERVICE_SOCKET_PATH";
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const REQUIRED_DIRECTORY_MODE = 0o700;
 const REQUIRED_SOCKET_MODE = 0o600;
@@ -164,8 +163,40 @@ interface HostServiceStoredCallbackTarget {
 	staleAfterNs?: number;
 }
 
+export interface HostServiceSocketResolutionOptions {
+	platform?: NodeJS.Platform;
+	runtimeDir?: string;
+	homeDir?: string;
+	fallbackDir?: string;
+	socketPathOverride?: string;
+}
+
+export function resolveHostServiceSocketDirectory(options: HostServiceSocketResolutionOptions = {}): string {
+	const platform = options.platform ?? process.platform;
+	const runtimeDir = options.runtimeDir ?? process.env.XDG_RUNTIME_DIR;
+	const homeDir = options.homeDir ?? process.env.HOME;
+	const fallbackDir = options.fallbackDir ?? tmpdir();
+	if (platform === "darwin") {
+		if (homeDir) {
+			return join(homeDir, "Library", "Caches", HOST_SERVICE_RUNTIME_DIR_NAME);
+		}
+		return join(fallbackDir, "Library", "Caches", HOST_SERVICE_RUNTIME_DIR_NAME);
+	}
+	const baseDir = runtimeDir ?? homeDir ?? fallbackDir;
+	return join(baseDir, HOST_SERVICE_RUNTIME_DIR_NAME);
+}
+
+export function resolveHostServiceSocketPath(options: HostServiceSocketResolutionOptions = {}): string {
+	const socketPathOverride = options.socketPathOverride ?? process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
+	if (socketPathOverride) {
+		return resolve(socketPathOverride);
+	}
+	const socketDirectory = resolveHostServiceSocketDirectory(options);
+	return resolve(socketDirectory, HOST_SERVICE_SOCKET_NAME);
+}
+
 export function defaultHostServiceSocketPath(): string {
-	return DEFAULT_HOST_SERVICE_SOCKET_PATH;
+	return resolveHostServiceSocketPath();
 }
 
 export class HostServicePdfIdRegistry {
@@ -319,7 +350,7 @@ export class HostServiceClient {
 	private readonly makeRequestId: () => string;
 
 	constructor(options: HostServiceClientOptions = {}) {
-		this.socketPath = resolve(options.socketPath ?? DEFAULT_HOST_SERVICE_SOCKET_PATH);
+		this.socketPath = resolve(options.socketPath ?? defaultHostServiceSocketPath());
 		this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 		this.makeRequestId = options.requestIdFactory ?? (() => `host-${crypto.randomUUID()}`);
 	}
@@ -851,8 +882,8 @@ export class HostServiceServer {
 	private readonly callbackTargets = new Map<string, HostServiceStoredCallbackTarget>();
 
 	constructor(options: HostServiceServerOptions = {}) {
-		this.socketPath = resolve(options.socketPath ?? DEFAULT_HOST_SERVICE_SOCKET_PATH);
-		this.serviceName = options.serviceName ?? "agent-synctex-host-service";
+		this.socketPath = resolve(options.socketPath ?? defaultHostServiceSocketPath());
+		this.serviceName = options.serviceName ?? DEFAULT_HOST_SERVICE_NAME;
 		this.serviceInstanceId = options.serviceInstanceId ?? `host-service-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 		this.viewerBackend = options.viewerBackend ?? new ZathuraViewerBackend();
 		this.managedViewerRecords = options.managedViewerRecords ?? new HostServicePdfIdRegistry();
@@ -2633,8 +2664,7 @@ function ensureDirectory(path: string): void {
 	}
 }
 
-function assertDirectorySafe(path: string, options: { enforceMode?: boolean } = {}): void {
-	const { enforceMode = true } = options;
+function assertDirectorySafe(path: string): void {
 	const st = lstatSync(path);
 	if (st.isSymbolicLink()) {
 		throw new Error(`host service path is a symlink: ${path}`);
@@ -2645,11 +2675,8 @@ function assertDirectorySafe(path: string, options: { enforceMode?: boolean } = 
 	if (process.getuid?.() !== undefined && st.uid !== process.getuid()) {
 		throw new Error(`host service path is not owned by current user: ${path}`);
 	}
-	if (enforceMode && (st.mode & 0o777) !== REQUIRED_DIRECTORY_MODE) {
-		chmodSync(path, REQUIRED_DIRECTORY_MODE);
-		if ((statSync(path).mode & 0o777) !== REQUIRED_DIRECTORY_MODE) {
-			throw new Error(`host service path mode check failed after correction: ${path}`);
-		}
+	if ((st.mode & 0o777) !== REQUIRED_DIRECTORY_MODE) {
+		throw new Error(`host service path has unsafe mode: ${path}`);
 	}
 }
 

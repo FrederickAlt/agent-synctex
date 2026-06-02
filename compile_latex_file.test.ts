@@ -8,6 +8,7 @@ import * as ts from "typescript";
 import { clearPdfTrackerForContext, closeTrackedPdfForContext, jumpTrackedPdfForContext } from "./src/modules/pdf_session/pdf_session.ts";
 import {
 	FakeViewerBackend,
+	HOST_SERVICE_SOCKET_PATH_ENV_VAR,
 	HostServiceClient,
 	HostServicePdfIdRegistry,
 	HostServiceServer,
@@ -378,16 +379,16 @@ async function withHostService<T>(
 		viewerBackend: backend,
 		...(options.managedViewerRecords === undefined ? {} : { managedViewerRecords: options.managedViewerRecords }),
 	});
-	const previousSocketPath = process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+	const previousSocketPath = process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 	await server.start();
-	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = socketPath;
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
 	try {
 		return await fn();
 	} finally {
 		if (typeof previousSocketPath === "undefined") {
-			delete process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+			delete process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 		} else {
-			process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = previousSocketPath;
+			process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = previousSocketPath;
 		}
 		await server.stop();
 		rmSync(serviceDir, { recursive: true, force: true });
@@ -407,16 +408,16 @@ function makeFixedHostServicePdfIdRegistry(pdfId: number): HostServicePdfIdRegis
 }
 
 async function withHostServiceUnavailable<T>(fn: () => Promise<T>): Promise<T> {
-	const previousSocketPath = process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+	const previousSocketPath = process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 	const fallbackSocketPath = mkdtempSync(resolve(tmpdir(), "pdf-preview-missing-host-service-"));
-	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = resolve(fallbackSocketPath, "missing.sock");
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = resolve(fallbackSocketPath, "missing.sock");
 	try {
 		return await fn();
 	} finally {
 		if (typeof previousSocketPath === "undefined") {
-			delete process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+			delete process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 		} else {
-			process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = previousSocketPath;
+			process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = previousSocketPath;
 		}
 		rmSync(fallbackSocketPath, { recursive: true, force: true });
 	}
@@ -885,7 +886,7 @@ test("jump_pdf and close_pdf surface errors for unknown or closed host-service I
 				);
 				const openDetails = openResult.details as { pdf_id: number; pdf: string };
 				assert.equal(openDetails.pdf_id, fixedPdfId);
-				const hostServiceClient = new HostServiceClient({ socketPath: process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH });
+				const hostServiceClient = new HostServiceClient({ socketPath: process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] });
 				await hostServiceClient.requestClosePdf({ cwd: root }, openDetails.pdf_id);
 
 				let staleJumpError: unknown;

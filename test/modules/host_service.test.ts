@@ -2264,7 +2264,7 @@ test("host service client accepts rasterize response artifact paths from XDG_RUN
 	const originalXdgRuntimeDir = process.env.XDG_RUNTIME_DIR;
 	const originalMcpTmpDir = process.env.MCP_TMPDIR;
 	const runtimeRoot = mkdtempSync(resolve(tmpdir(), "host-service-rasterize-runtime-dir-"));
-	const runtimeInlineDir = resolve(runtimeRoot, "show-latex", "inline");
+	const runtimeInlineDir = resolve(runtimeRoot, "tex-actions", "inline");
 	const expectedRequestId = "rasterize-runtime-artifact-id";
 
 	try {
@@ -2471,6 +2471,21 @@ test("host service rejects symlinked socket directory", async () => {
 	const socketPath = join(linkedDir, "host-service.sock");
 	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-symlink" });
 	await assert.rejects(() => server.start(), /symlink/);
+
+	rmSync(baseDir, { recursive: true, force: true });
+});
+
+test("host service rejects socket directory with unsafe permissions", async () => {
+	const baseDir = temporaryDir("host-service-unsafe-mode-");
+	const socketDir = join(baseDir, "unsafe");
+	const socketPath = join(socketDir, "host-service.sock");
+	mkdirSync(socketDir, { mode: 0o777, recursive: true });
+	chmodSync(socketDir, 0o777);
+	const beforeMode = lstatSync(socketDir).mode & 0o777;
+
+	const server = new HostServiceServer({ socketPath, serviceName: "tex-actions-socket-unsafe-mode" });
+	await assert.rejects(() => server.start(), /unsafe mode/);
+	assert.equal((lstatSync(socketDir).mode & 0o777), beforeMode, "unsafe socket directory mode should not be corrected in place");
 
 	rmSync(baseDir, { recursive: true, force: true });
 });

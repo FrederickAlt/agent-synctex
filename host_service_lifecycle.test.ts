@@ -14,7 +14,7 @@ import { pathToFileURL } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as ts from "typescript";
 import { contextSessionKey } from "./src/modules/pdf_session/pdf_session.ts";
-import { HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
+import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 
@@ -110,7 +110,7 @@ const TYPEBOX_STUB_SOURCE = `export const Type = {
 const FAKE_VIEWER_SERVICE_SCRIPT = String.raw`const fs = require("node:fs");
 const path = require("node:path");
 
-const baseDir = process.env.MCP_TMPDIR || resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "show-latex");
+const baseDir = process.env.MCP_TMPDIR || resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "tex-actions");
 const failOpen = process.env.FAKE_VIEWER_OPEN_FAIL === "1";
 const protocolDirectories = {
 	base: baseDir,
@@ -297,7 +297,7 @@ setInterval(scanRequests, 20);
 `;
 
 const ORIGINAL_MCP_TMPDIR = process.env.MCP_TMPDIR;
-const ORIGINAL_HOST_SERVICE_SOCKET_PATH = process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+const ORIGINAL_HOST_SERVICE_SOCKET_PATH = process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 const MCP_TMPDIR = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-service-"));
 process.env.MCP_TMPDIR = MCP_TMPDIR;
 
@@ -371,9 +371,9 @@ after(() => {
 		process.env.MCP_TMPDIR = ORIGINAL_MCP_TMPDIR;
 	}
 	if (typeof ORIGINAL_HOST_SERVICE_SOCKET_PATH === "undefined") {
-		delete process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH;
+		delete process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 	} else {
-		process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = ORIGINAL_HOST_SERVICE_SOCKET_PATH;
+		process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = ORIGINAL_HOST_SERVICE_SOCKET_PATH;
 	}
 	rmSync(MCP_TMPDIR, { recursive: true, force: true });
 	cleanupRuntimeStubs();
@@ -535,8 +535,8 @@ function readOpenSummary(): { detail_keys: string[]; callback?: { kind: string; 
 
 function nextHostServiceSocketPath(): string {
 	const baseDir = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-service-"));
-	const socketDir = resolve(baseDir, "agent-synctex");
-	mkdirSync(socketDir, { recursive: true });
+	const socketDir = resolve(baseDir, "tex-actions");
+	mkdirSync(socketDir, { recursive: true, mode: 0o700 });
 	return resolve(socketDir, "host-service.sock");
 }
 
@@ -551,7 +551,7 @@ async function withHostServiceClient<T>(socketPath: string, fn: (client: HostSer
 }
 
 async function withHostService<T>(socketPath: string, fn: (server: HostServiceServer) => Promise<T>): Promise<T> {
-	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-issue-51" });
+	const server = new HostServiceServer({ socketPath, serviceName: "tex-actions-issue-51" });
 	await server.start();
 	try {
 		return await fn(server);
@@ -564,7 +564,7 @@ async function withHostService<T>(socketPath: string, fn: (server: HostServiceSe
 test("session startup notifies clearly when host service is unavailable", async () => {
 	const suite = await captureExtensionHandlersAndTools();
 	const hostServiceSocketPath = nextHostServiceSocketPath();
-	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = hostServiceSocketPath;
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = hostServiceSocketPath;
 
 	const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-no-service-"));
 	const contextNotifications: string[] = [];
@@ -581,7 +581,7 @@ test("session startup notifies clearly when host service is unavailable", async 
 test("session startup registers host service callback target and shutdown unregisters it", async () => {
 	const suite = await captureExtensionHandlersAndTools();
 	const socketPath = nextHostServiceSocketPath();
-	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = socketPath;
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
 
 	await withHostService(socketPath, async () => {
 			const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-register-"));
@@ -608,7 +608,7 @@ test("session startup registers host service callback target and shutdown unregi
 test("session startup callback target becomes unavailable when callback socket is removed", async () => {
 	const suite = await captureExtensionHandlersAndTools();
 	const socketPath = nextHostServiceSocketPath();
-	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = socketPath;
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
 
 	await withHostService(socketPath, async () => {
 		const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-stale-"));
@@ -635,11 +635,11 @@ test("session startup callback target becomes unavailable when callback socket i
 test("missing host service during shutdown is handled without throwing", async () => {
 	const suite = await captureExtensionHandlersAndTools();
 	const socketPath = nextHostServiceSocketPath();
-	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = socketPath;
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
 	const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-missing-on-shutdown-"));
 	const contextNotifications: string[] = [];
 	const context = createSessionContext(root, contextNotifications);
-	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-issue-51" });
+	const server = new HostServiceServer({ socketPath, serviceName: "tex-actions-issue-51" });
 	await server.start();
 	await runSessionStart(suite.start, context);
 	await server.stop();
@@ -658,7 +658,7 @@ test("compile_latex_file fails when host service is unavailable", async () => {
 	writeFakeCompiler(binDir);
 	const originalPath = process.env.PATH ?? "";
 	process.env.PATH = `${binDir}:${originalPath}`;
-	process.env.PDF_PREVIEW_HOST_SERVICE_SOCKET_PATH = resolve(root, "missing-host-service.sock");
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = resolve(root, "missing-host-service.sock");
 	const notifications: string[] = [];
 	const context = createSessionContext(root, notifications);
 	let threw = false;

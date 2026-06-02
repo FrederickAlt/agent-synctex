@@ -43,7 +43,7 @@ function inlinePreviewDirectoryCandidates(): string[] {
 		roots.add(resolve(process.env.MCP_TMPDIR, "inline"));
 	}
 	if (process.env.XDG_RUNTIME_DIR) {
-		roots.add(resolve(process.env.XDG_RUNTIME_DIR, "show-latex", "inline"));
+		roots.add(resolve(process.env.XDG_RUNTIME_DIR, "tex-actions", "inline"));
 	}
 
 	return [...roots];

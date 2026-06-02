@@ -6,9 +6,6 @@ whitelist ${HOME}/.cache/pdf-preview-servicectl
 read-write ${HOME}/.cache/pdf-preview-servicectl
 
 # Runtime scratch and socket directories used by host-service-backed preview flows.
-mkdir ${RUNUSER}/show-latex
-whitelist ${RUNUSER}/show-latex
-read-write ${RUNUSER}/show-latex
-mkdir ${RUNUSER}/agent-synctex
-whitelist ${RUNUSER}/agent-synctex
-read-write ${RUNUSER}/agent-synctex
+mkdir ${RUNUSER}/tex-actions
+whitelist ${RUNUSER}/tex-actions
+read-write ${RUNUSER}/tex-actions
