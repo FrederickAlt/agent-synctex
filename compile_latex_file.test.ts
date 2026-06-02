@@ -13,6 +13,7 @@ import {
 	HostServicePdfIdRegistry,
 	HostServiceServer,
 } from "./src/modules/host_service.ts";
+import { HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS } from "./src/modules/pi_extension/host_service_client.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 
@@ -491,6 +492,50 @@ test("compile_latex_file compiles without opening by default", async () => {
 		});
 	} finally {
 		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("compile_latex_file requests compilation with extended timeout", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	const expectedPdf = resolve(root, "paper.pdf");
+	const expectedSource = sourcePath;
+	const expectedLog = resolve(root, "paper.log");
+	let compileTimeoutMs: number | undefined;
+	const proto = HostServiceClient.prototype as { requestCompileLatexFile: HostServiceClient["requestCompileLatexFile"] };
+	const originalRequestCompileLatexFile = proto.requestCompileLatexFile;
+	const fakeResponse: Awaited<ReturnType<HostServiceClient["requestCompileLatexFile"]>> = {
+		protocol_version: 1,
+		supported: true,
+		service_available: true,
+		workspace_context: { cwd: root },
+		request_id: "compile-timeout-test",
+		operation: "compile_latex_file",
+		source: expectedSource,
+		pdf: expectedPdf,
+		log: expectedLog,
+		artifact_paths: [expectedPdf],
+		clean: false,
+		cleaned_artifacts: [],
+	};
+
+	try {
+		proto.requestCompileLatexFile = async (_request, _workspaceContext, _signal, requestTimeoutMs) => {
+			compileTimeoutMs = requestTimeoutMs;
+			return fakeResponse;
+		};
+
+		const result = await tool.execute("compile-latex-file", { latex_file_path: sourcePath }, undefined, undefined, undefined);
+		assert.equal(compileTimeoutMs, HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS);
+		const details = result.details as {
+			source: string;
+			pdf: string;
+		};
+		assert.equal(details.source, expectedSource);
+		assert.equal(details.pdf, expectedPdf);
+	} finally {
+		proto.requestCompileLatexFile = originalRequestCompileLatexFile;
 		rmSync(root, { recursive: true, force: true });
 	}
 });

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
 import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, FakeViewerBackend, HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
+import { HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS } from "./src/modules/pi_extension/host_service_client.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 
@@ -978,6 +979,80 @@ test("show_latex inline flow routes through host service rasterization", async (
 		trace.restore();
 		await runSessionShutdown(context);
 		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("show_latex inline compile snippet uses extended timeout", async () => {
+	const { root, sourceContent } = withTemporaryProject();
+	const tool = await captureShowLatexTool();
+	const fakePdf = "__preview__/snippet.pdf";
+	const fakePng = "__preview__/snippet-page-1.png";
+	let compileTimeoutMs: number | undefined;
+	const proto = HostServiceClient.prototype as {
+		requestCompileLatexSnippet: HostServiceClient["requestCompileLatexSnippet"];
+		requestRasterizePdf: HostServiceClient["requestRasterizePdf"];
+	};
+	const originalCompile = proto.requestCompileLatexSnippet;
+	const originalRasterize = proto.requestRasterizePdf;
+	const fakeSnippetResponse: Awaited<ReturnType<HostServiceClient["requestCompileLatexSnippet"]>> = {
+		protocol_version: 1,
+		supported: true,
+		service_available: true,
+		workspace_context: { cwd: process.cwd() },
+		request_id: "show-latex-snippet-timeout-test",
+		operation: "compile_latex_snippet",
+		source: "inline.tex",
+		pdf: fakePdf,
+		log: "inline.log",
+		artifact_paths: [fakePdf],
+		clean: false,
+		cleaned_artifacts: [],
+	};
+	const fakeRasterizeResponse: Awaited<ReturnType<HostServiceClient["requestRasterizePdf"]>> = {
+		protocol_version: 1,
+		supported: true,
+		service_available: true,
+		workspace_context: { cwd: process.cwd() },
+		request_id: "show-latex-rasterize-timeout-test",
+		operation: "rasterize",
+		pdf_path: fakePdf,
+		artifacts: [
+			{
+				pngPath: fakePng,
+				page: 1,
+				dpi: 150,
+				renderer: "mutool",
+				trimmed: false,
+				fullPageWidthPx: 320,
+				fullPageHeightPx: 240,
+				widthPx: 320,
+				heightPx: 240,
+			},
+		],
+		artifact_paths: [fakePng],
+	};
+
+	try {
+		proto.requestCompileLatexSnippet = async (_request, _workspaceContext, _signal, requestTimeoutMs) => {
+			compileTimeoutMs = requestTimeoutMs;
+			return fakeSnippetResponse;
+		};
+		proto.requestRasterizePdf = async () => fakeRasterizeResponse;
+
+		const result = await tool.execute("show-latex-inline", { source: sourceContent, inline: true }, undefined, undefined, undefined);
+		assert.equal(compileTimeoutMs, HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS);
+		const details = result.details as {
+			inline?: boolean;
+			inline_previews?: unknown[];
+			image_path?: string;
+		};
+		assert.equal(details.inline, true);
+		assert.equal(details.inline_previews?.length, 1);
+		assert.equal((details.image_path?.length ?? 0) > 0, true);
+	} finally {
+		proto.requestCompileLatexSnippet = originalCompile;
+		proto.requestRasterizePdf = originalRasterize;
 		rmSync(root, { recursive: true, force: true });
 	}
 });

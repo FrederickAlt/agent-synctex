@@ -21,6 +21,7 @@ import {
 	createHostServiceClient,
 	extractHostServiceErrorCode,
 	hostServiceSocketPath,
+	HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS,
 	hostServiceWorkspaceContextForRequest,
 } from "./host_service_client.ts";
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
@@ -69,6 +70,7 @@ const showLatexPreviewPipeline = createShowLatexPreviewPipeline({
 			},
 			workspaceContext,
 			signal,
+			HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS,
 		);
 		return { text: "ok", pdfPath: compileResult.pdf, sourcePath: compileResult.source };
 	},

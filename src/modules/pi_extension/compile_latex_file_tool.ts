@@ -20,6 +20,7 @@ import {
 	createHostServiceClient,
 	extractHostServiceErrorCode,
 	hostServiceSocketPath,
+	HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS,
 	hostServiceWorkspaceContextForRequest,
 } from "./host_service_client.ts";
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
@@ -150,7 +151,12 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 					compileRequest.open_pdf = true;
 					compileRequest.callback_target_id = targetId;
 				}
-				const compileResponse = await client.requestCompileLatexFile(compileRequest, workspaceContext, signal);
+				const compileResponse = await client.requestCompileLatexFile(
+					compileRequest,
+					workspaceContext,
+					signal,
+					HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS,
+				);
 				compileResult = {
 					source: compileResponse.source,
 					pdf: compileResponse.pdf,
