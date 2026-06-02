@@ -72,15 +72,24 @@ The viewer should jump here for target B. Please click this text for inverse Syn
 
 ### Close behavior
 
-- Managed close request returned
-  `ok: ... closed_pids=none`.
-- Full close visual confirmation was still pending at time of note capture; this should be confirmed in a follow-up desktop session.
+- First managed close request returned
+  `ok: ... closed_pids=none`; visual confirmation was deferred because another viewer window was still open.
+- Follow-up desktop validation after service restart used `tmp/hitl-71-round2/main.pdf` and daemon `pdf_id=42806141`.
+- Human confirmed the viewer visibly jumped to **Round 2 Jump Target B**.
+- Inverse SyncTeX click produced:
+
+```text
+PDF click: tmp/hitl-71-round2/main.tex:12
+\section*{Round 2 Jump Target B}
+```
+
+- Managed `close_pdf(pdf_id=42806141)` returned `ok: ... closed_pids=none`, and the human confirmed the Round 2 PDF viewer closed.
 
 ## 4) Caveats and residual risk
 
 - Desktop GUI/session assertions from `tex-actionsctl doctor` are expectedly incomplete in the sandbox; they should be interpreted as service/daemon diagnostics only.
-- `close_pdf` returned `closed_pids=none`, so viewer termination success was confirmed by protocol response but not independently visually.
-- No regressions were observed for path handling, jump, or callback behavior in this pass.
+- `close_pdf` may report `closed_pids=none` for reused/unowned-safe handles; in the Round 2 HITL run, the human visually confirmed the intended viewer closed despite that response detail.
+- No regressions were observed for path handling, jump, close, or callback behavior in this pass.
 
 ## 5) Out-of-scope confirmation
 
