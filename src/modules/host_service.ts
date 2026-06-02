@@ -69,6 +69,13 @@ import type {
 	HostServiceViewerBackendCapabilities,
 	HostServiceWorkspaceContext,
 } from "./host_service_protocol.ts";
+import {
+	buildMcpErrorResponse,
+	handleFramedMcpRequest,
+	HostServiceMcpFrameReader,
+	mcpFramedResponse,
+	MCP_ERROR_PARSE_ERROR,
+} from "./host_service_mcp.ts";
 import type { ViewerBackendAdapter } from "./host_service_viewer_protocol.ts";
 export { FakeViewerBackend, ZathuraViewerBackend };
 export type {
@@ -974,25 +981,46 @@ export class HostServiceServer {
 
 	private handleConnection(socket: Socket): void {
 		this.activeConnections.add(socket);
-		socket.setEncoding("utf8");
 		socket.setTimeout(ACTIVE_CONNECTION_TIMEOUT_MS, () => {
 			socket.destroy();
 		});
-		let raw = "";
-		const handleData = (chunk: string | Buffer) => {
-			raw += String(chunk);
-			if (raw.length > MAX_PAYLOAD_BYTES) {
-				socket.end(buildErrorResponse(this.protocolVersion, this.socketPath, this.serviceName, this.serviceInstanceId, "", "request too large", "invalid_request"));
+		const frameReader = new HostServiceMcpFrameReader({ maxPayloadBytes: MAX_PAYLOAD_BYTES });
+		const handleData = (chunk: Buffer) => {
+			try {
+				frameReader.write(chunk);
+				while (true) {
+					const frame = frameReader.nextFrame();
+					if (!frame) {
+						return;
+					}
+					if (frame.protocol === "host-service") {
+						socket.off("data", handleData);
+						socket.removeAllListeners("timeout");
+						this.respondToRequest(frame.payload, socket);
+						return;
+					}
+					this.respondToMcpRequest(frame.payload, socket);
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (frameReader.detectedProtocol === "mcp") {
+					const response = mcpFramedResponse(buildMcpErrorResponse(null, MCP_ERROR_PARSE_ERROR, message));
+					socket.write(response);
+				} else {
+					socket.end(
+						buildErrorResponse(
+							this.protocolVersion,
+							this.socketPath,
+							this.serviceName,
+							this.serviceInstanceId,
+							"",
+							message,
+							"invalid_request",
+						),
+					);
+				}
 				socket.destroy();
-				return;
 			}
-			const lineBreak = raw.indexOf("\n");
-			if (lineBreak < 0) {
-				return;
-			}
-			socket.off("data", handleData);
-			socket.removeAllListeners("timeout");
-			this.respondToRequest(raw.slice(0, lineBreak).trim(), socket);
 		};
 		socket.on("data", handleData);
 		socket.once("close", () => {
@@ -1001,6 +1029,14 @@ export class HostServiceServer {
 		socket.on("error", () => {
 			socket.destroy();
 		});
+	}
+
+	private respondToMcpRequest(raw: string, socket: Socket): void {
+		const response = handleFramedMcpRequest(raw);
+		if (response === null) {
+			return;
+		}
+		socket.write(response);
 	}
 
 	private respondToRequest(raw: string, socket: Socket): void {

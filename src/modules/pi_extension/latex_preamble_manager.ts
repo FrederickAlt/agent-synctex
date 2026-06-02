@@ -1,16 +1,17 @@
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { MCP_FIXED_PREVIEW_PDF_PATH, LATEX_PREAMBLE_FILE_NAMES, LATEX_PREAMBLE_PATH, MCP_TMPDIR } from "./runtime_paths.ts";
-
-function ensurePreviewTmpdirAccessible(): void {
-	try {
-		mkdirSync(MCP_TMPDIR, { recursive: true, mode: 0o700 });
-		accessSync(MCP_TMPDIR, constants.F_OK | constants.R_OK | constants.W_OK | constants.X_OK);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`Cannot access preview temp directory at ${MCP_TMPDIR}: ${message}`);
-	}
-}
+import {
+	LATEX_PREAMBLE_FILE_NAMES,
+	LATEX_PREAMBLE_PATH,
+	MCP_FIXED_PREVIEW_PDF_PATH,
+	MCP_TMPDIR,
+	getLatexPreamblePath,
+	getMcpTmpDir,
+} from "./runtime_paths.ts";
+import {
+	ensureMcpRuntimeDirectory,
+	writeLatexPreambleToTmpdir as writeLatexPreambleToTmpdirShared,
+} from "../runtime_preamble.ts";
 
 function findPreambleFile(directory: string): string | null {
 	for (const fileName of LATEX_PREAMBLE_FILE_NAMES) {
@@ -30,28 +31,24 @@ function resolvePreambleFile(directory: string): string | null {
 export function initializeLatexPreambleFile(): void {
 	const cwdPreambleFile = resolvePreambleFile(process.cwd());
 	if (!cwdPreambleFile) {
-		ensurePreviewTmpdirAccessible();
+		ensureMcpRuntimeDirectory(getMcpTmpDir());
 		return;
 	}
 
 	try {
-		ensurePreviewTmpdirAccessible();
 		const preamble = readFileSync(cwdPreambleFile, "utf8");
-		writeLatexPreambleToTmpdir(preamble);
+		writeLatexPreambleToTmpdirShared(preamble);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`Failed to copy cwd preamble ${cwdPreambleFile} to ${LATEX_PREAMBLE_PATH}: ${message}`);
+		throw new Error(`Failed to copy cwd preamble ${cwdPreambleFile} to ${getLatexPreamblePath()}: ${message}`);
 	}
 }
 
 export function writeLatexPreambleToTmpdir(latexPreamble: string): number {
-	ensurePreviewTmpdirAccessible();
-	const preamble = latexPreamble.trim();
-	writeFileSync(LATEX_PREAMBLE_PATH, preamble ? `${preamble}\n` : "", { mode: 0o600 });
-	return preamble.length;
+	return writeLatexPreambleToTmpdirShared(latexPreamble);
 }
 
-export { MCP_FIXED_PREVIEW_PDF_PATH, LATEX_PREAMBLE_PATH, MCP_TMPDIR };
+export { LATEX_PREAMBLE_PATH, MCP_FIXED_PREVIEW_PDF_PATH, MCP_TMPDIR };
 
 export function getPreambleFileFromDirectory(directory: string): string | null {
 	return resolvePreambleFile(directory);
