@@ -284,10 +284,12 @@ test("Systemd host service unit is named and configured for TeX Actions", () => 
 	const unitSource = readFileSync(unitPath, "utf8");
 
 	assert.equal(existsSync(legacyUnitPath), false, "Legacy systemd unit filename should be removed");
-	assert.match(unitSource, /WorkingDirectory=.*%h\/projects\/AI\/pi_extensions\/pdf-preview/);
+	assert.equal(unitSource.includes("{{") || unitSource.includes("}}"), false, "systemd unit should not contain unresolved template placeholders");
+	assert.match(unitSource, /WorkingDirectory=/);
 	assert.match(unitSource, /ExecStart=.*tex-actionsctl\.ts daemon/);
+	assert.match(unitSource, /DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=%t\/bus}"/);
+	assert.match(unitSource, /Environment=MCP_TMPDIR=%t\/tex-actions/);
 	assert.match(unitSource, /Restart=on-failure/);
-	assert.match(unitSource, /DBUS_SESSION_BUS_ADDRESS=/);
 	assert.match(unitSource, /PartOf=graphical-session\.target/);
 	assert.match(unitSource, /WantedBy=graphical-session\.target/);
 });
