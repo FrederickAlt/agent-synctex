@@ -1,4 +1,4 @@
-# Host-Service broker migration notes (Issue #55, updated after #66)
+# Host-Service broker migration notes (Issue #55, updated after #71)
 
 This file captures the parts of the migration that remain outside this repo and the exact checks this repo can still run.
 
@@ -6,6 +6,7 @@ This file captures the parts of the migration that remain outside this repo and 
 
 Issue #55 replaced callback-command/Python viewer tooling with the TypeScript Host Service.
 Issue #66 and post-#66 runtime now run the TeX Actions host service end-to-end from this repo's unit definition.
+This phase explicitly does not include Codex relay work; any Codex-facing client should target the daemon MCP endpoint in a future phase instead of adding another transport relay.
 
 This repository assumes the following host broker and environment files are maintained by the user-side installation and are not tracked here:
 
@@ -15,15 +16,19 @@ This repository assumes the following host broker and environment files are main
 - `~/.local/bin/pi-jail` (sets `MCP_TMPDIR`)
 
 This repo can still verify that those externals target the expected service contract:
-`show-latex.service` + TypeScript Host Service + `zathura` backend.
+`show-latex.service` + TypeScript Host Service + `tex-actions-host-service` identity + `zathura` backend.
 
 ## Expected service contract
 
 - **Unit/service name:** `show-latex.service`
 - **Repo unit source:** `systemd/show-latex.service`
 - **Host service executable contract:** TypeScript Host Service, service name `tex-actions-host-service`
+  - single runtime MCP socket (no alternate/legacy socket): `${XDG_RUNTIME_DIR}/tex-actions/host-service.sock`
   - started from `scripts/tex-actionsctl.ts daemon`
   - default viewer backend reported as `zathura`
+  - expected MCP tools: `show_latex`, `compile_latex_file`, `open_pdf`, `jump_pdf`, `close_pdf`, `set_latex_preamble`
+  - expected protocol methods: `initialize`, `ping`, `tools/list`
+- **Runtime contract:** host-service operations resolve relative paths from caller-provided `workspace_context.cwd`; absolute paths may be used as-is. Callback metadata (`kind`, `transport`, `socket_path`, `token`) is optional.
 
 ## Expected runtime/socket directories
 
@@ -31,6 +36,8 @@ This repo can still verify that those externals target the expected service cont
 - Host service artifacts/logs: `${XDG_RUNTIME_DIR}/tex-actions`
 - Inline artifacts: `${XDG_RUNTIME_DIR}/tex-actions/inline`
 - External broker cache socket: `${HOME}/.cache/pdf-preview-servicectl/broker.sock`
+
+Runtime PDF IDs are created by the daemon on this channel and are service-owned; reopening is required after daemon restart.
 
 The runtime now has no legacy socket fallback path.
 
@@ -95,6 +102,18 @@ Expected JSON payload includes at least:
 
 `service_available: true` is the key signal that the in-sandbox request path can talk to the host daemon.
 
+## Runtime-only CLI for operations
+
+The canonical in-repo runtime command remains `tex-actionsctl`, including:
+
+```bash
+npm run tex-actionsctl -- setup
+npm run tex-actionsctl -- uninstall
+npm run tex-actionsctl -- doctor
+```
+
+These commands are independent of viewer/broker paths and do not replace `systemctl --user` status.
+
 ## Historical evidence retained
 
 Older legacy command/output examples from Issue #56 are still useful but may not reflect current runtime names. Keep them in `docs/hitl-56-host-service-smoke.md` as historical notes, especially around
@@ -102,4 +121,4 @@ legacy smoke traces and shim naming.
 
 ## Suggested closing comment for GitHub issue tracking
 
-> Issue #55/#56 migration notes are current through #66 for runtime naming: the repository docs, service contract, and broker verification paths are now aligned with the `tex-actions` runtime identity and `tex-actions-host-service` service name. This file keeps stale legacy references only in clearly labeled historical notes.
+> Issue #55/#56 migration notes are current through #71 for runtime naming: the repository docs, service contract, and broker verification paths are now aligned with the `tex-actions` runtime identity and `tex-actions-host-service` service name. This file keeps stale legacy references only in clearly labeled historical notes.

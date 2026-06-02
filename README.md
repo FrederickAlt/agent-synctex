@@ -3,13 +3,15 @@
 Runtime identity: `tex-actions` (`TeX Actions` display name). Pi extension that exposes six tools:
 
 - `show_latex` — FREEFORM/raw LaTeX preview with optional front matter for `compiler` and `inline`; renders inline by default, or pass `inline=false` for a host-service external preview. It automatically loads `./preamble.tex` or `./praeamble.tex` from the current working directory when present, so do not repeat that preamble in the snippet.
-- `open_pdf` — request the host service to open an existing local PDF and return a session-local numeric `pdf_id` for later PDF actions.
+- `open_pdf` — request the host service to open an existing local PDF and return a daemon-owned runtime numeric `pdf_id` for later PDF actions.
 - `close_pdf` — close a host-service-tracked PDF by `pdf_id`.
 - `jump_pdf` — perform a line-based host-service forward SyncTeX jump in a tracked PDF by `pdf_id`, returning a short “line N contains:” header followed by the jumped-to LaTeX source line.
 - `compile_latex_file` — compile a local LaTeX source file in place, optionally sending a host service open request to track the resulting PDF.
 - `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
 
 The TypeScript Host Service now owns backend `show_latex` compilation/open/jump/close flows and viewer backend dispatch. Pi remains the frontend coordinator for tool registration, inline rendering, and editor paste behavior.
+
+The daemon is the single runtime MCP owner on this socket: `${XDG_RUNTIME_DIR}/tex-actions/host-service.sock`. It supports `initialize`, `ping`, `tools/list`, and host-tool calls (`show_latex`, `compile_latex_file`, `open_pdf`, `jump_pdf`, `close_pdf`, `set_latex_preamble`) over that same socket.
 
 When `inline=false`, previews are opened through the local host service using this extension's request context. Each successful preview writes an operation-scoped PDF and refreshes a fixed `${XDG_RUNTIME_DIR}/tex-actions/tex-actions.pdf` external-preview copy only for external preview calls.
 For example:
@@ -93,6 +95,17 @@ Runtime socket path is `${XDG_RUNTIME_DIR}/tex-actions/host-service.sock` (no le
 
 `npm run host-service:start` and `npm run host-service:status` are foreground debug helpers in HITL/firejail; they are not the default production runtime.
 During HITL, run them in a separate terminal (or as a tracked background job), and avoid using them as the long-running service.
+
+`tex-actionsctl` is the repo CLI for service operations and supports:
+
+```bash
+npm run tex-actionsctl -- setup
+npm run tex-actionsctl -- uninstall
+npm run tex-actionsctl -- doctor
+```
+
+`show-latex.service` is the installed unit filename kept for compatibility; the daemon's identity exposed in runtime status remains `tex-actions-host-service`.
+
 If your project has `pdf-preview-servicectl`, it should target `show-latex.service` for host-service maintenance
 commands (`sync`, `restart`, `status`, and `logs`).
 
@@ -132,6 +145,7 @@ pdf-preview-servicectl sync
 pdf-preview-servicectl restart
 pdf-preview-servicectl status
 npm run host-service:status
+npm run tex-actionsctl -- doctor
 journalctl --user -u show-latex.service -n 100 --no-pager
 ```
 
@@ -140,13 +154,17 @@ journalctl --user -u show-latex.service -n 100 --no-pager
 - **Backend unavailable**: failures like `viewer backend is unavailable` or `(code=backend_unavailable)` usually mean
   the configured backend command is missing/unlaunchable. Run
   `npm run host-service:status` and check returned backend/daemon diagnostics before restarting the service.
+- Callback metadata is optional for host-service requests (`kind`, `transport`, `socket_path`, `token`). Pi sends it for interactive sessions so inverse SyncTeX can paste click targets; non-interactive MCP callers may omit it and inverse callback remains disabled.
 - The extension sends the service structured callback data (`kind`, `transport`, `socket_path`, `token`); raw callback commands are internal and are not a public tool path.
 - For host-open failures, inspect `${XDG_RUNTIME_DIR}/tex-actions/*.log` for details.
 - If LaTeX compilation fails (for `show_latex` or `compile_latex_file`), check `${XDG_RUNTIME_DIR}/tex-actions/*.log`; compile and service failures are separate.
 
 ## PDF tracking and jumps
 
-`open_pdf(pdf_file_path)` validates that the path exists, is readable, and is a regular PDF file. In normal mode, it sends an open/reuse request to the host service, stores service metadata (`viewer_handle`, `viewer_backend`, capability flags), and returns a session-local `pdf_id`. IDs are short-lived session values only; they are cleared on Pi session shutdown and are not persisted across restarts. Opening the same normalized PDF path again reuses the existing ID where practical.
+`open_pdf(pdf_file_path)` validates that the path exists, is readable, and is a regular PDF file. In normal mode, it sends an open/reuse request to the host service, stores service metadata (`viewer_handle`, `viewer_backend`, capability flags), and returns a runtime `pdf_id` allocated and owned by the daemon. Runtime PDF IDs are valid only while the daemon tracks the record (until service restart/close) and are recreated on re-open.
+Opening the same normalized PDF path again reuses the existing ID where practical.
+
+Workspace contract: relative paths require `workspace_context.cwd` in the MCP request; absolute paths can be sent directly. The daemon does not resolve user paths relative to its own process cwd.
 
 Tracked PDFs also remember a default source file when possible. `compile_latex_file(..., open_pdf=true)` stores the compiled source path exactly. `open_pdf(existing.pdf)` attempts to infer a default source from `<basename>.tex` next to the normalized PDF and from available `.synctex`/`.synctex.gz` input records.
 
@@ -180,12 +198,16 @@ Install dev dependencies once with `npm install`, then run `npm run verify` to t
 
 For service and viewer behavior, also run a manual smoke test from Pi after starting/restarting the host daemon via `systemctl --user restart show-latex.service` (or `npm run host-service:start` for foreground debug; this remains a human-only verification and is not covered by `npm run verify`):
 
+The latest human-verified desktop checks for #71 are summarized in `docs/hitl-71-tex-actions-daemon-service.md`.
+
 1. `show_latex` default inline flow shows an inline preview artifact in Pi UI.
 2. `show_latex` with `inline=false` opens a Zathura window through the TypeScript Host Service backend.
 3. `compile_latex_file(path/to/file.tex, {"open_pdf": true})` returns `pdf_id` and opens the compiled PDF through the TypeScript Host Service.
 4. `jump_pdf(pdf_id, line)` sends a Host Service forward-search request and jumps the viewer to the matching source location.
 5. Trigger a SyncTeX click in the viewer (e.g. click a body equation): the editor should receive a pasted block like `PDF click: path/to/file.tex:NN` with the source line.
 6. `close_pdf(pdf_id)` requests close; only service-owned handles should terminate the expected window while unowned/reused views remain untouched.
+
+The Codex relay is explicitly out of scope for this phase and should be implemented later against the same daemon MCP endpoint (`tex-actions-host-service`) instead of bypassing this service.
 
 When diagnosing that smoke test, prefer service logs/status over sandboxed shell invocations of `zathura`, because bare commands run from the agent sandbox do not exercise the same unsandboxed service environment. Inline previews require either `mutool` (from `mupdf-tools`) or `pdftoppm` (from `poppler-utils`) at runtime; optional whitespace trimming uses ImageMagick's `magick` when available. Actual terminal image display requires Pi/TUI image support in the current terminal (Kitty, Ghostty, WezTerm, or iTerm2; tmux/screen generally disable it).
 
