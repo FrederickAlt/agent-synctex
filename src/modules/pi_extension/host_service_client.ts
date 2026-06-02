@@ -4,7 +4,7 @@ import { defaultHostServiceSocketPath, HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostSer
 
 export const HOST_SERVICE_SESSION_ENV_VAR = HOST_SERVICE_SOCKET_PATH_ENV_VAR;
 export const HOST_SERVICE_REQUEST_TIMEOUT_MS = 5_000;
-export const HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS = 30_000;
+export const HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS = 300_000;
 
 export interface HostServiceCallbackTargetWorkspace {
 	cwd: string;
