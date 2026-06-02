@@ -15,7 +15,12 @@
     "verify": "npm run check && npm test",
     "host-service:start": "node scripts/tex-actionsctl.ts start",
     "host-service:status": "node scripts/tex-actionsctl.ts status",
-    "tex-actionsctl": "node scripts/tex-actionsctl.ts"
+    "tex-actionsctl": "node scripts/tex-actionsctl.ts",
+    "tex-actions:mcp": "node scripts/tex-actions-mcp.ts",
+    "pdf-preview-mcp": "node scripts/pdf-preview-mcp.ts"
+  },
+  "bin": {
+    "tex-actions-mcp": "scripts/tex-actions-mcp.ts"
   },
   "keywords": [
     "pi-extension",
@@ -23,12 +28,12 @@
     "latex",
     "show-latex"
   ],
-  "devDependencies": {
-    "@types/node": "^22.19.19",
-    "typescript": "^6.0.3"
-  },
   "dependencies": {
     "@mariozechner/pi-tui": "^0.73.1",
     "typebox": "^1.1.39"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "typescript": "^6.0.3"
   }
 }

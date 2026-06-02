@@ -93,6 +93,18 @@ The unit runs the daemon via `scripts/tex-actionsctl.ts daemon` and registers se
 Runtime socket path is `${XDG_RUNTIME_DIR}/tex-actions/host-service.sock` (no legacy socket fallback).
 `systemd/show-latex.service` is the canonical unit source in this repo.
 
+### MCP relay entrypoint (`tex-actions`)
+
+For daemon MCP transport, start the relay with a **direct node entrypoint** so stdout remains pure MCP frames:
+
+```bash
+node scripts/tex-actions-mcp.ts
+# or, when installed in PATH via `bin`, `tex-actions-mcp`
+```
+
+`npm run tex-actions:mcp` points to the same script, but plain `npm run` prepends an npm log banner to stdout and should not be used for MCP stdio transport.
+`scripts/pdf-preview-mcp.ts` remains as a compatibility shim only.
+
 `npm run host-service:start` and `npm run host-service:status` are foreground debug helpers in HITL/firejail; they are not the default production runtime.
 During HITL, run them in a separate terminal (or as a tracked background job), and avoid using them as the long-running service.
 
@@ -207,7 +219,7 @@ The latest human-verified desktop checks for #71 are summarized in `docs/hitl-71
 5. Trigger a SyncTeX click in the viewer (e.g. click a body equation): the editor should receive a pasted block like `PDF click: path/to/file.tex:NN` with the source line.
 6. `close_pdf(pdf_id)` requests close; only service-owned handles should terminate the expected window while unowned/reused views remain untouched.
 
-The Codex relay is explicitly out of scope for this phase and should be implemented later against the same daemon MCP endpoint (`tex-actions-host-service`) instead of bypassing this service.
+The Codex relay is implemented as a thin transport wrapper over the same daemon MCP endpoint (`tex-actions-host-service`) and does not host or register any tools locally.
 
 When diagnosing that smoke test, prefer service logs/status over sandboxed shell invocations of `zathura`, because bare commands run from the agent sandbox do not exercise the same unsandboxed service environment. Inline previews require either `mutool` (from `mupdf-tools`) or `pdftoppm` (from `poppler-utils`) at runtime; optional whitespace trimming uses ImageMagick's `magick` when available. Actual terminal image display requires Pi/TUI image support in the current terminal (Kitty, Ghostty, WezTerm, or iTerm2; tmux/screen generally disable it).
 
