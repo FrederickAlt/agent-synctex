@@ -309,7 +309,7 @@ test("Codex MCP relay surfaces actionable daemon-unavailable errors", async () =
 	}
 });
 
-test("Relay returns tools/list passthrough from daemon without desktop viewer", async () => {
+test("Relay returns Codex tools/list without inline show_latex parameter", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-tools-list-"));
 	const socketPath = join(baseDir, "host-service.sock");
 	const expectedToolNames = [...HOST_SERVICE_TOOL_NAMES];
@@ -322,7 +322,17 @@ test("Relay returns tools/list passthrough from daemon without desktop viewer", 
 					tools: expectedToolNames.map((name) => ({
 						name,
 						description: `daemon ${name}`,
-						inputSchema: {},
+						inputSchema:
+							name === "show_latex"
+								? {
+									type: "object",
+									properties: {
+										source: { type: "string" },
+										inline: { type: "boolean" },
+									},
+									required: ["source", "inline"],
+								}
+								: {},
 					})),
 				},
 			};
@@ -344,6 +354,12 @@ test("Relay returns tools/list passthrough from daemon without desktop viewer", 
 		assert.equal(responses[0]!.id, 4);
 		const names = responses[0]!.result.tools.map((tool) => tool.name);
 		assert.deepEqual(names, expectedToolNames);
+		const showLatex = responses[0]!.result.tools.find((tool) => tool.name === "show_latex") as
+			| { inputSchema?: { properties?: Record<string, unknown>; required?: string[] } }
+			| undefined;
+		assert.ok(showLatex);
+		assert.deepEqual(showLatex.inputSchema?.properties, { source: { type: "string" } });
+		assert.deepEqual(showLatex.inputSchema?.required, ["source"]);
 	} finally {
 		await daemon.close();
 		relay.stop();
@@ -389,6 +405,56 @@ test("Relay reads socket path override from TEX_ACTIONS_HOST_SERVICE_SOCKET_PATH
 		} else {
 			process.env[overrideKey] = previousOverride;
 		}
+		await daemon.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Relay forces Codex show_latex calls to inline false", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-show-latex-inline-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	let observedArguments: unknown;
+	const daemon = await startFakeDaemon(socketPath, (request) => {
+		if (request.method === "tools/call") {
+			const params = (request as { params?: { arguments?: unknown } }).params;
+			observedArguments = params?.arguments;
+		}
+		return {
+			jsonrpc: "2.0",
+			id: request.id,
+			result: { content: [{ type: "text", text: "ok" }] },
+		};
+	});
+	const relay = await startRelayFixture(socketPath);
+
+	try {
+		const output = collectFrames(relay.relayOutput, 1);
+		relay.relayInput.write(
+			encodeFrame(
+				JSON.stringify({
+					jsonrpc: "2.0",
+					id: 12,
+					method: "tools/call",
+					params: {
+						name: "show_latex",
+						arguments: {
+							source: "\\[x\\]",
+							inline: true,
+						},
+					},
+				}),
+			),
+		);
+		const raw = await output;
+		const responses = parseFrames(raw) as Array<{ id: number; result: { content: unknown[] } }>;
+		assert.equal(responses.length, 1);
+		assert.equal(responses[0]!.id, 12);
+		assert.deepEqual(observedArguments, {
+			source: "\\[x\\]",
+			inline: false,
+		});
+	} finally {
+		relay.stop();
 		await daemon.close();
 		rmSync(baseDir, { recursive: true, force: true });
 	}

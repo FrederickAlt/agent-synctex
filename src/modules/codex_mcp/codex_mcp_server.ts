@@ -60,6 +60,95 @@ function requestMetadata(payload: string): { requestId: McpRequestId; expectsRes
 	}
 }
 
+function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
+	return { ...value };
+}
+
+function omitRecordKey(value: unknown, key: string): unknown {
+	if (!isRecord(value)) {
+		return value;
+	}
+	const clone = cloneRecord(value);
+	delete clone[key];
+	return clone;
+}
+
+function omitArrayValue(value: unknown, item: string): unknown {
+	if (!Array.isArray(value)) {
+		return value;
+	}
+	return value.filter((entry) => entry !== item);
+}
+
+function hideInlineFromShowLatexTool(tool: unknown): unknown {
+	if (!isRecord(tool) || tool.name !== "show_latex" || !isRecord(tool.inputSchema)) {
+		return tool;
+	}
+	const inputSchema = cloneRecord(tool.inputSchema);
+	inputSchema.properties = omitRecordKey(inputSchema.properties, "inline");
+	inputSchema.required = omitArrayValue(inputSchema.required, "inline");
+	return {
+		...tool,
+		inputSchema,
+	};
+}
+
+function rewriteToolsListForCodex(response: Record<string, unknown>): Record<string, unknown> {
+	if (!isRecord(response.result) || !Array.isArray(response.result.tools)) {
+		return response;
+	}
+	return {
+		...response,
+		result: {
+			...response.result,
+			tools: response.result.tools.map(hideInlineFromShowLatexTool),
+		},
+	};
+}
+
+function forceShowLatexOpenPdfForCodex(request: Record<string, unknown>): Record<string, unknown> {
+	if (request.method !== "tools/call" || !isRecord(request.params) || request.params.name !== "show_latex") {
+		return request;
+	}
+	const currentArguments = isRecord(request.params.arguments) ? request.params.arguments : {};
+	return {
+		...request,
+		params: {
+			...request.params,
+			arguments: {
+				...currentArguments,
+				inline: false,
+			},
+		},
+	};
+}
+
+function rewriteClientRequestForCodex(payload: string): string {
+	try {
+		const parsed = JSON.parse(payload);
+		if (!isRecord(parsed)) {
+			return payload;
+		}
+		const rewritten = forceShowLatexOpenPdfForCodex(parsed);
+		return rewritten === parsed ? payload : JSON.stringify(rewritten);
+	} catch {
+		return payload;
+	}
+}
+
+function rewriteDaemonResponseForCodex(payload: string): string {
+	try {
+		const parsed = JSON.parse(payload);
+		if (!isRecord(parsed)) {
+			return payload;
+		}
+		const rewritten = rewriteToolsListForCodex(parsed);
+		return rewritten === parsed ? payload : JSON.stringify(rewritten);
+	} catch {
+		return payload;
+	}
+}
+
 function daemonUnavailableMessage(socketPath: string): string {
 	return [
 		`TeX Actions daemon is unavailable at ${socketPath}.`,
@@ -153,7 +242,8 @@ export class CodexMcpDaemonRelay {
 	}
 
 	private async forwardToDaemon(payload: string, expectsResponse: boolean, clientProtocol: ClientFrameProtocol): Promise<void> {
-		const framed = framePayload(payload);
+		const daemonPayload = rewriteClientRequestForCodex(payload);
+		const framed = framePayload(daemonPayload);
 		if (!expectsResponse) {
 			await this.writeNotification(framed);
 			return;
@@ -203,7 +293,8 @@ export class CodexMcpDaemonRelay {
 						finalize(new Error("Daemon returned non-MCP protocol response."));
 						return;
 					}
-					void this.writeOutput(frameClientPayload(frame.payload, clientProtocol)).then(
+					const clientPayload = rewriteDaemonResponseForCodex(frame.payload);
+					void this.writeOutput(frameClientPayload(clientPayload, clientProtocol)).then(
 						() => finalize(),
 						(error) => finalize(asError(error)),
 					);
