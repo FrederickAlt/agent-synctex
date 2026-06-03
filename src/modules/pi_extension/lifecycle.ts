@@ -1,8 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { errorMessage } from "./error_utils.ts";
-import {
-	clearPdfTrackerForContext,
-} from "../pdf_session/pdf_session.ts";
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
 import { cleanupTerminalRefresh, clearTerminalInvalidators, installTerminalRefreshForSession } from "./inline_renderer.ts";
 import { hostServiceSocketPath } from "./host_service_client.ts";
@@ -37,7 +34,6 @@ export function registerLifecycleHandlers(
 		cleanupTerminalRefresh();
 		clearTerminalInvalidators();
 		if (ctx) {
-			clearPdfTrackerForContext(ctx);
 			const contextKey = callbackManager.contextKeyForContext(ctx);
 			try {
 				await callbackManager.unregisterHostServiceCallbackTarget(contextKey);

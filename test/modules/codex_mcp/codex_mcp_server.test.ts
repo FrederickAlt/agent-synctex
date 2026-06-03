@@ -42,6 +42,14 @@ function parseFrames(raw: string): unknown[] {
 	return frames;
 }
 
+function parseLines(raw: string): unknown[] {
+	return raw
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0)
+		.map((line) => JSON.parse(line));
+}
+
 type StreamDataSource = {
 	on: (event: "data", handler: (chunk: string | Buffer) => void) => void;
 	off: (event: "data", handler: (chunk: string | Buffer) => void) => void;
@@ -59,6 +67,32 @@ function collectFrames(stream: StreamDataSource, expectedFrames: number, timeout
 		const onData = (chunk: string | Buffer) => {
 			raw += String(chunk);
 			if (parseFrames(raw).length >= expectedFrames) {
+				cleanup();
+				resolve(raw);
+			}
+		};
+
+		const cleanup = () => {
+			clearTimeout(timer);
+			stream.off("data", onData);
+		};
+
+		stream.on("data", onData);
+	});
+}
+
+function collectLines(stream: StreamDataSource, expectedLines: number, timeoutMs = 1_000): Promise<string> {
+	return new Promise((resolve, reject) => {
+		let raw = "";
+		const timer = setTimeout(() => {
+			cleanup();
+			reject(new Error("timed out waiting for response"));
+		}, timeoutMs);
+		timer.unref?.();
+
+		const onData = (chunk: string | Buffer) => {
+			raw += String(chunk);
+			if (parseLines(raw).length >= expectedLines) {
 				cleanup();
 				resolve(raw);
 			}
@@ -206,6 +240,42 @@ test("Codex MCP relay handles partial response chunks from daemon", async () => 
 		assert.equal(parsed.length, 1);
 		assert.equal(parsed[0]!.id, 2);
 		assert.deepEqual(parsed[0]!.result, { tools: [] });
+	} finally {
+		relay.stop();
+		await daemon.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Codex MCP relay mirrors newline JSON-RPC framing from Codex", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-line-json-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const observedMethods: string[] = [];
+	const daemon = await startFakeDaemon(socketPath, (request) => {
+		if (typeof request.method === "string") {
+			observedMethods.push(request.method);
+		}
+		return {
+			jsonrpc: "2.0",
+			id: request.id,
+			result: {
+				protocolVersion: "2025-03-26",
+				serverInfo: { name: "tex-actions", version: "0.1.0" },
+			},
+		};
+	});
+	const relay = await startRelayFixture(socketPath);
+
+	try {
+		const output = collectLines(relay.relayOutput, 1);
+		relay.relayInput.write(`${JSON.stringify({ jsonrpc: "2.0", id: 11, method: "initialize", params: {} })}\n`);
+		const raw = await output;
+		assert.doesNotMatch(raw, /Content-Length/i);
+		const responses = parseLines(raw) as Array<{ id: number; result: { serverInfo: { name: string } } }>;
+		assert.equal(responses.length, 1);
+		assert.equal(responses[0]!.id, 11);
+		assert.equal(responses[0]!.result.serverInfo.name, "tex-actions");
+		assert.deepEqual(observedMethods, ["initialize"]);
 	} finally {
 		relay.stop();
 		await daemon.close();

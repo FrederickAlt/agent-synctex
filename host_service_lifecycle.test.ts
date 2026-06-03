@@ -8,12 +8,11 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { spawn, type ChildProcess } from "node:child_process";
 import * as ts from "typescript";
-import { contextSessionKey } from "./src/modules/pdf_session/pdf_session.ts";
+import { contextSessionKey } from "./src/modules/pi_extension/context_session.ts";
 import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
@@ -107,195 +106,6 @@ const TYPEBOX_STUB_SOURCE = `export const Type = {
 };
 `;
 
-const FAKE_VIEWER_SERVICE_SCRIPT = String.raw`const fs = require("node:fs");
-const path = require("node:path");
-
-const baseDir = process.env.MCP_TMPDIR || resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "tex-actions");
-const failOpen = process.env.FAKE_VIEWER_OPEN_FAIL === "1";
-const protocolDirectories = {
-	base: baseDir,
-	requests: path.join(baseDir, "viewer-requests"),
-	results: path.join(baseDir, "viewer-results"),
-	state: path.join(baseDir, "viewer-state.json"),
-};
-const capabilities = {
-	open: true,
-	close: true,
-	forward_search: true,
-	inverse_search: true,
-	reuse: true,
-};
-const serviceStartedNs = Number(process.hrtime.bigint());
-const openRequestSummaryPath = path.join(baseDir, "open-request-summary.json");
-const openCountPath = path.join(baseDir, "open-count.json");
-const deprecatedDetailKeys = ["synctex_callback_command", "synctex_editor_command", "zathura_args"];
-let openCount = 0;
-
-function writeOpenCount() {
-	fs.writeFileSync(openCountPath, JSON.stringify({ open_count: openCount }), { mode: 0o600 });
-}
-
-function writeResult(filePath, response) {
-	const tempPath = filePath + ".tmp";
-	fs.writeFileSync(tempPath, JSON.stringify(response), { mode: 0o600 });
-	fs.renameSync(tempPath, filePath);
-}
-
-function writeOpenSummary(requestId, details, callback, validationError) {
-	const detailKeys = details && typeof details === "object" ? Object.keys(details) : [];
-	const detailsCallback = callback && typeof callback === "object" ? {
-		kind: callback.kind,
-		transport: callback.transport,
-		socket_path: callback.socket_path,
-		token: callback.token,
-	} : null;
-	fs.writeFileSync(openRequestSummaryPath, JSON.stringify({
-		request_id: requestId,
-		detail_keys: detailKeys,
-		callback: detailsCallback,
-		validation_error: validationError || null,
-	}), { mode: 0o600 });
-}
-
-function validateOpenRequest(request) {
-	const details = request?.details;
-	if (!details || typeof details !== "object") {
-		return "open request details must be an object";
-	}
-	const forbiddenFields = deprecatedDetailKeys.filter((field) => Object.prototype.hasOwnProperty.call(details, field));
-	if (forbiddenFields.length > 0) {
-		return "open request details contain deprecated fields: " + forbiddenFields.join(",");
-	}
-	const callback = details.callback;
-	if (!callback || typeof callback !== "object") {
-		return "open request callback must be a structured object";
-	}
-	if (callback.kind !== "pi-synctex-callback-v1") {
-		return "callback.kind must be pi-synctex-callback-v1";
-	}
-	if (callback.transport !== "unix") {
-		return "callback.transport must be unix";
-	}
-	if (typeof callback.socket_path !== "string" || callback.socket_path.length === 0) {
-		return "callback.socket_path must be a non-empty string";
-	}
-	if (typeof callback.token !== "string" || callback.token.length === 0) {
-		return "callback.token must be a non-empty string";
-	}
-	return null;
-}
-
-function responseBase(requestId) {
-	return {
-		protocol_version: 1,
-		supported: true,
-		service_available: true,
-		backend: "fake-viewer",
-		backend_identity_ok: true,
-		protocol_directories: protocolDirectories,
-		service_instance_started_ns: serviceStartedNs,
-		request_id: requestId,
-		operation: "open",
-	};
-}
-
-function handleOpenRequest(request) {
-	const requestId = request.request_id;
-	if (typeof requestId !== "string" || requestId.length === 0) return;
-	const responsePath = path.join(protocolDirectories.results, requestId + ".json");
-	const details = request.details;
-	const callback = details && typeof details === "object" ? details.callback : undefined;
-	const validationError = validateOpenRequest(request);
-	writeOpenSummary(requestId, details, callback, validationError);
-
-	if (validationError) {
-		writeResult(responsePath, {
-			protocol_version: 1,
-			request_id: requestId,
-			operation: "open",
-			status: "error",
-			generated_at_ns: Number(process.hrtime.bigint()),
-			status_details: {
-				...responseBase(requestId),
-				owned: false,
-				reused: false,
-				capabilities,
-				error_code: "invalid_open_request",
-			},
-			error: validationError,
-		});
-		return;
-	}
-
-	if (failOpen) {
-		writeResult(responsePath, {
-			protocol_version: 1,
-			request_id: requestId,
-			operation: "open",
-			status: "error",
-			generated_at_ns: Number(process.hrtime.bigint()),
-			status_details: {
-				...responseBase(requestId),
-				owned: false,
-				reused: false,
-				capabilities,
-				error_code: "backend_unavailable",
-			},
-			error: "fake viewer backend unavailable",
-		});
-		return;
-	}
-
-	openCount += 1;
-	writeOpenCount();
-	writeResult(responsePath, {
-		protocol_version: 1,
-		request_id: requestId,
-		operation: "open",
-		status: "ok",
-		generated_at_ns: Number(process.hrtime.bigint()),
-		status_details: {
-			...responseBase(requestId),
-			owned: true,
-			reused: false,
-			capabilities,
-			handle: "fake-viewer-open-" + String(openCount),
-			pid: 222222,
-		},
-	});
-}
-
-function handleRequest(fileName) {
-	if (!fileName.endsWith(".json")) return;
-	const requestPath = path.join(protocolDirectories.requests, fileName);
-	const payload = JSON.parse(fs.readFileSync(requestPath, "utf8"));
-	if (payload.operation === "status") return;
-	if (payload.operation === "open") handleOpenRequest(payload);
-}
-
-function scanRequests() {
-	let entries;
-	try {
-		entries = fs.readdirSync(protocolDirectories.requests);
-	} catch {
-		entries = [];
-	}
-	for (const entry of entries) {
-		try {
-			handleRequest(entry);
-			fs.rmSync(path.join(protocolDirectories.requests, entry), { force: true });
-		} catch {
-			/* ignore */
-		}
-	}
-}
-
-for (const directory of [protocolDirectories.requests, protocolDirectories.results]) {
-	fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-}
-setInterval(scanRequests, 20);
-`;
-
 const ORIGINAL_MCP_TMPDIR = process.env.MCP_TMPDIR;
 const ORIGINAL_HOST_SERVICE_SOCKET_PATH = process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 const MCP_TMPDIR = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-service-"));
@@ -304,7 +114,6 @@ process.env.MCP_TMPDIR = MCP_TMPDIR;
 let runtimeModulesInstalled = false;
 let runtimeModulesRoot: string | undefined;
 let compiledIndexModule: Promise<LoadedExtensionModule> | undefined;
-let fakeViewerServiceProcess: ChildProcess | undefined;
 
 type CompiledShowLatexApi = {
 	registerTool: (tool: { name: string; [key: string]: unknown }) => void;
@@ -485,52 +294,6 @@ async function runSessionStart(handler: SessionLifecycleHandler, ctx: unknown): 
 
 async function runSessionShutdown(handler: SessionLifecycleHandler, ctx: unknown): Promise<void> {
 	await handler("session_shutdown", ctx);
-}
-
-async function withFakeViewerService(mode: "ok" | "backend_unavailable", fn: () => Promise<void>): Promise<void> {
-	const serviceDir = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-viewer-service-"));
-	const scriptPath = resolve(serviceDir, "service.js");
-	writeFileSync(scriptPath, FAKE_VIEWER_SERVICE_SCRIPT, { mode: 0o700 });
-	fakeViewerServiceProcess = spawn(process.execPath, [scriptPath], {
-		env: { ...process.env, MCP_TMPDIR, FAKE_VIEWER_OPEN_FAIL: mode === "backend_unavailable" ? "1" : "0" },
-		stdio: ["ignore", "ignore", "ignore"],
-	});
-	await new Promise<void>((resolveStart) => setTimeout(resolveStart, 25));
-	try {
-		await fn();
-	} finally {
-		await new Promise<void>((resolveStop) => {
-			const proc = fakeViewerServiceProcess;
-			if (!proc || proc.exitCode !== null) {
-				resolveStop();
-				return;
-			}
-			let stopped = false;
-			const finish = () => {
-				if (stopped) return;
-				stopped = true;
-				resolveStop();
-			};
-			proc.once("exit", finish);
-			proc.kill("SIGTERM");
-			setTimeout(() => {
-				if (!stopped) proc.kill("SIGINT");
-				setTimeout(finish, 25);
-			}, 50);
-		});
-		fakeViewerServiceProcess = undefined;
-		rmSync(serviceDir, { recursive: true, force: true });
-	}
-}
-
-function readOpenSummary(): { detail_keys: string[]; callback?: { kind: string; transport: string; socket_path: string; token: string }; validation_error: string | null } {
-	const payload = readFileSync(join(MCP_TMPDIR, "open-request-summary.json"), "utf8").trim();
-	if (!payload.length) throw new Error("expected open request summary");
-	return JSON.parse(payload) as {
-		detail_keys: string[];
-		callback?: { kind: string; transport: string; socket_path: string; token: string };
-		validation_error: string | null;
-	};
 }
 
 function nextHostServiceSocketPath(): string {

@@ -6,7 +6,7 @@ This file captures the parts of the migration that remain outside this repo and 
 
 Issue #55 replaced callback-command/Python viewer tooling with the TypeScript Host Service.
 Issue #66 and post-#66 runtime now run the TeX Actions host service end-to-end from this repo's unit definition.
-This phase explicitly does not include Codex relay work; any Codex-facing client should target the daemon MCP endpoint in a future phase instead of adding another transport relay.
+Codex relay support now exists as a thin stdio/daemon-MCP transport wrapper over the daemon MCP endpoint. It does not add a separate tool host or broaden the broker; any Codex-facing path should continue to target `tex-actions-host-service` through that relay.
 
 This repository assumes the following host broker and environment files are maintained by the user-side installation and are not tracked here:
 

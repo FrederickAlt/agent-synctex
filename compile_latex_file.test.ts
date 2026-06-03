@@ -1,11 +1,11 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:net";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
-import { clearPdfTrackerForContext, closeTrackedPdfForContext, jumpTrackedPdfForContext } from "./src/modules/pdf_session/pdf_session.ts";
 import {
 	FakeViewerBackend,
 	HOST_SERVICE_SOCKET_PATH_ENV_VAR,
@@ -622,76 +622,258 @@ test("compile_latex_file opens through host service when open_pdf=true", async (
 		rmSync(root, { recursive: true, force: true });
 	}
 });
-test("compile_latex_file open results can be used with internal close/jump tracker helpers", async () => {
-		const { root, sourcePath } = withTemporaryProject();
-		const tool = await captureCompileTool();
-		const originalPath = process.env.PATH ?? "";
-		const binDir = resolve(root, "bin");
-		mkdirSync(binDir, { recursive: true });
-		writeFakeCompiler(binDir);
-		process.env.PATH = `${binDir}:${originalPath}`;
 
-		const context = createSessionContext(root);
-		try {
-			await withHostServiceDefault(async () => {
-				await runSessionStart(context);
-				const result = await tool.execute(
-					"compile-latex-file-open-track",
-					{ latex_file_path: sourcePath, open_pdf: true },
-					undefined,
-					undefined,
-					context,
-				);
-				const details = result.details as {
-					pdf_id: number;
-					pdf: string;
-					source: string;
-					viewer_handle: string;
-					viewer_backend: string;
-				};
-				const jump = await jumpTrackedPdfForContext(
-					context,
-					details.pdf_id,
-					1,
-					sourcePath,
-					undefined,
-					{
-						requestForwardSearch: async (viewerHandle, viewerBackend, resolvedSourceFile, jumpLine) => {
-							assert.equal(viewerHandle, details.viewer_handle);
-							assert.equal(viewerBackend, details.viewer_backend);
-							assert.equal(resolvedSourceFile, sourcePath);
-							assert.equal(jumpLine, 1);
-							return { handled: true };
+test("compile_latex_file(open_pdf=true) fails when compile response omits pdf_id", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	const socketDir = mkdtempSync(resolve(tmpdir(), "pdf-preview-compile-no-pdf-id-"));
+	const socketPath = resolve(socketDir, "host-service.sock");
+	const context = createSessionContext(root);
+	const previousSocketPath = process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
+	const server = createServer((socket) => {
+		socket.on("data", (chunk) => {
+			const line = String(chunk).split("\n").find((entry) => entry.trim().length > 0);
+			if (!line) {
+				return;
+			}
+			const request = JSON.parse(line);
+			const requestId = typeof request.request_id === "string" ? request.request_id : "unknown";
+			const workspaceContext = typeof request.workspace_context === "object" && request.workspace_context !== null
+				? (request.workspace_context as Record<string, unknown>)
+				: { cwd: root };
+			const nowNs = Date.now() * 1_000_000;
+			const operation = typeof request.operation === "string" ? request.operation : "compile_latex_file";
+			if (operation === "status") {
+				socket.end(
+					`${JSON.stringify({
+						protocol_version: 1,
+						request_id: requestId,
+						operation,
+						status: "ok",
+						generated_at_ns: nowNs,
+						status_details: {
+							protocol_version: 1,
+							supported: true,
+							service_available: true,
+							service_name: "fake-host-service",
+							socket_path: socketPath,
+							service_instance_started_ns: nowNs,
+							service_instance_id: "fake-host-service",
+							workspace_context: workspaceContext,
+							request_id: requestId,
+							operation,
+							uptime_ns: 0,
+							total_requests: 1,
+							viewer_backend_name: "fake",
+							viewer_backend_available: true,
+							viewer_backend_capabilities: {
+								open: true,
+								close: true,
+								forward_search: true,
+								inverse_search: true,
+								reuse: true,
+							},
 						},
-						requestJumpFromHostService: async () => {
-							return { handled: true, source_file: sourcePath };
+					})}\n`,
+			);
+				return;
+			}
+			if (operation === "register_callback_target") {
+				socket.end(
+					`${JSON.stringify({
+						protocol_version: 1,
+						request_id: requestId,
+						operation,
+						status: "ok",
+						generated_at_ns: nowNs,
+						status_details: {
+							protocol_version: 1,
+							supported: true,
+							service_available: true,
+							service_name: "fake-host-service",
+							socket_path: socketPath,
+							service_instance_started_ns: nowNs,
+							service_instance_id: "fake-host-service",
+							workspace_context: workspaceContext,
+							request_id: requestId,
+							operation,
+							target_id: typeof request.target_id === "string" ? request.target_id : "",
+							callback_registered: true,
+							callback_replaced: false,
+							target: request.target,
+							uptime_ns: 0,
+							total_requests: 1,
 						},
+					})}\n`,
+			);
+				return;
+			}
+			if (operation === "unregister_callback_target") {
+				socket.end(
+					`${JSON.stringify({
+						protocol_version: 1,
+						request_id: requestId,
+						operation,
+						status: "ok",
+						generated_at_ns: nowNs,
+						status_details: {
+							protocol_version: 1,
+							supported: true,
+							service_available: true,
+							service_name: "fake-host-service",
+							socket_path: socketPath,
+							service_instance_started_ns: nowNs,
+							service_instance_id: "fake-host-service",
+							workspace_context: workspaceContext,
+							request_id: requestId,
+							operation,
+							target_id: typeof request.target_id === "string" ? request.target_id : "",
+							removed: true,
+							uptime_ns: 0,
+							total_requests: 1,
+						},
+					})}\n`,
+			);
+				return;
+			}
+			socket.end(
+				`${JSON.stringify({
+					protocol_version: 1,
+					request_id: requestId,
+					operation: "compile_latex_file",
+					status: "ok",
+					generated_at_ns: nowNs,
+					status_details: {
+						protocol_version: 1,
+						supported: true,
+						service_available: true,
+						workspace_context: workspaceContext,
+						request_id: requestId,
+						service_instance_started_ns: nowNs,
+						service_instance_id: "fake-host-service",
+						uptime_ns: 0,
+						total_requests: 1,
+						source: sourcePath,
+						pdf: resolve(root, "paper.pdf"),
+						log: "",
+						clean: false,
+						cleaned_artifacts: [],
+						artifact_paths: [],
+						operation: "compile_latex_file",
 					},
-				);
-				assert.equal(jump.pdf, details.pdf);
-				assert.equal(jump.sourceFile, sourcePath);
-				const close = await closeTrackedPdfForContext(
-					context,
-					details.pdf_id,
-					async (viewerHandle, viewerBackend) => {
-						assert.equal(viewerHandle, details.viewer_handle);
-						assert.equal(viewerBackend, details.viewer_backend);
-						return { closed: true };
-					},
-					undefined,
-					async () => {
-						return { closed: true };
-					},
-				);
-				assert.equal(close.closed, true);
-				assert.equal(close.pdf, resolve(root, "paper.pdf"));
-			});
-		} finally {
-			await runSessionShutdown(context);
-			process.env.PATH = originalPath;
-			rmSync(root, { recursive: true, force: true });
-		}
+				})}\n`,
+			);
+		});
 	});
+
+	let observed: unknown;
+	try {
+		await new Promise<void>((resolve, reject) => {
+			server.listen(socketPath, (error?: Error) => {
+				if (error) {
+					reject(error);
+				} else {
+					resolve();
+				}
+			});
+		});
+		process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
+		await runSessionStart(context);
+		await tool.execute(
+			"compile-latex-file-open-missing-pdf-id",
+			{ latex_file_path: sourcePath, open_pdf: true },
+			undefined,
+			undefined,
+			context,
+		);
+	} catch (error) {
+		observed = error;
+	} finally {
+		await runSessionShutdown(context);
+		if (previousSocketPath === undefined) {
+			delete process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
+		} else {
+			process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = previousSocketPath;
+		}
+		await new Promise<void>((resolve, reject) => {
+			server.close((error?: Error) => {
+				if (error) {
+					reject(error);
+				} else {
+					resolve();
+				}
+			});
+		});
+		rmSync(root, { recursive: true, force: true });
+		rmSync(socketDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(
+		observed.message,
+		/host service returned no pdf_id for open_pdf=true compile request/,
+	);
+});
+
+test("compile_latex_file open results can be used with registered close_pdf and jump_pdf tools", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tools = await captureTools();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompiler(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+
+	const context = createSessionContext(root);
+	const sourceLine = "\\begin{document}ok\\end{document}";
+	try {
+		await withHostService(new FakeJumpableViewerBackend(), async () => {
+			await runSessionStart(context);
+			const result = await tools.compileTool.execute(
+				"compile-latex-file-open-track",
+				{ latex_file_path: sourcePath, open_pdf: true },
+				undefined,
+				undefined,
+				context,
+			);
+			const details = result.details as {
+				pdf_id: number;
+				pdf: string;
+				source: string;
+			};
+			const jumpResult = await tools.jumpPdfTool.execute(
+				"compile-latex-file-jump",
+				{ pdf_id: details.pdf_id, line: 1, source_file: details.source },
+				undefined,
+				undefined,
+				context,
+			);
+			const closeResult = await tools.closePdfTool.execute(
+				"compile-latex-file-close",
+				{ pdf_id: details.pdf_id },
+				undefined,
+				undefined,
+				context,
+			);
+			const jumpDetails = jumpResult.details as {
+				pdf_id: number;
+				source: string;
+				source_line: string;
+			};
+			const closeDetails = closeResult.details as { pdf_id: number; closed: boolean; reason?: string };
+
+			assert.equal(jumpDetails.pdf_id, details.pdf_id);
+			assert.equal(jumpDetails.source, details.source);
+			assert.equal(jumpDetails.source_line, sourceLine);
+			assert.equal(jumpResult.content[0].text, `line 1 contains:\n${sourceLine}`);
+			assert.equal(closeDetails.pdf_id, details.pdf_id);
+			assert.equal(closeDetails.closed, true);
+		});
+	} finally {
+		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
 test("compile_latex_file(open_pdf=true) can be followed by registered jump_pdf and close_pdf tools", async () => {
 	const { root, sourcePath } = withTemporaryProject();
@@ -744,7 +926,7 @@ test("compile_latex_file(open_pdf=true) can be followed by registered jump_pdf a
 				undefined,
 				context,
 			);
-			const closeDetails = closeResult.details as { pdf: string; closed: boolean };
+			const closeDetails = closeResult.details as { pdf_id: number; closed: boolean; reason?: string };
 
 			assert.equal(typeof compileDetails.pdf_id, "number");
 			assert.equal(compileDetails.pdf_id > 0, true);
@@ -754,7 +936,7 @@ test("compile_latex_file(open_pdf=true) can be followed by registered jump_pdf a
 			assert.equal(jumpDetails.reopened, false);
 			assert.equal(jumpResult.content[0].text, `line 1 contains:\n${sourceLine}`);
 			assert.equal(jumpDetails.source_line, sourceLine);
-			assert.equal(closeDetails.pdf, compileDetails.pdf);
+			assert.equal(closeDetails.pdf_id, compileDetails.pdf_id);
 			assert.equal(closeDetails.closed, true);
 		});
 	} finally {
@@ -812,9 +994,9 @@ test("open_pdf exposes host-service PDF IDs and supports jump/close", async () =
 					undefined,
 					context,
 				);
-				const closeDetails = closeResult.details as { closed: boolean; pdf: string };
+				const closeDetails = closeResult.details as { closed: boolean; pdf_id: number; reason?: string };
 				assert.equal(closeDetails.closed, true);
-				assert.equal(closeDetails.pdf, sourcePdfPath);
+				assert.equal(closeDetails.pdf_id, openDetails.pdf_id);
 			},
 			{ managedViewerRecords: makeFixedHostServicePdfIdRegistry(7777) },
 		);
@@ -1028,7 +1210,6 @@ test("close_pdf and jump_pdf work when the host-service ID is active but not loc
 				);
 				const openDetails = openResult.details as { pdf_id: number; pdf: string };
 				assert.equal(openDetails.pdf_id, fixedPdfId);
-				clearPdfTrackerForContext(context);
 				const jumpResult = await tools.jumpPdfTool.execute(
 					"jump-pdf-tool-untracked",
 					{ pdf_id: openDetails.pdf_id, line: 1, source_file: sourcePath },
@@ -1128,7 +1309,7 @@ test("compile_latex_file(open_pdf=true) refreshes host-service metadata after se
 					undefined,
 					context,
 				);
-				const closeDetails = closeResult.details as { pdf: string; closed: boolean };
+				const closeDetails = closeResult.details as { pdf_id: number; closed: boolean; reason?: string };
 
 				assert.equal(jumpDetails.pdf_id, secondDetails.pdf_id);
 				assert.equal(jumpDetails.pdf, resolve(root, "paper.pdf"));
@@ -1136,7 +1317,7 @@ test("compile_latex_file(open_pdf=true) refreshes host-service metadata after se
 				assert.equal(jumpDetails.source_line, sourceLine);
 				assert.equal(jumpResult.content[0].text, `line 1 contains:\n${sourceLine}`);
 				assert.equal(jumpDetails.reopened === true || jumpDetails.reopened === false, true);
-				assert.equal(closeDetails.pdf, resolve(root, "paper.pdf"));
+				assert.equal(closeDetails.pdf_id, secondDetails.pdf_id);
 				assert.equal(closeDetails.closed, true);
 			},
 			{ managedViewerRecords: makeFixedHostServicePdfIdRegistry(2222) },

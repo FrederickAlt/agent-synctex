@@ -24,6 +24,7 @@ export interface CodexMcpDaemonRelayOptions {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_FRAME_SIZE_BYTES = 16_384;
+type ClientFrameProtocol = HostServiceDaemonFrame["protocol"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -31,6 +32,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function framePayload(payload: string): string {
 	return `Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n${payload}`;
+}
+
+function frameClientPayload(payload: string, protocol: ClientFrameProtocol): string {
+	if (protocol === "mcp") {
+		return framePayload(payload);
+	}
+	return `${payload}\n`;
 }
 
 function requestMetadata(payload: string): { requestId: McpRequestId; expectsResponse: boolean } {
@@ -129,36 +137,31 @@ export class CodexMcpDaemonRelay {
 
 	private async handleFrame(frame: HostServiceDaemonFrame): Promise<void> {
 		const { requestId, expectsResponse } = requestMetadata(frame.payload);
-		if (frame.protocol !== "mcp") {
-			if (expectsResponse) {
-				await this.sendErrorFrame(
-					requestId,
-					MCP_ERROR_PARSE_ERROR,
-					`Expected MCP Content-Length framing from Codex client; got ${frame.protocol} protocol.`,
-				);
-			}
-			return;
-		}
 		try {
-			await this.forwardToDaemon(frame.payload, expectsResponse);
+			await this.forwardToDaemon(frame.payload, expectsResponse, frame.protocol);
 		} catch (error) {
 			if (!expectsResponse) {
 				return;
 			}
-			await this.sendErrorFrame(requestId, MCP_ERROR_INTERNAL, `${daemonUnavailableMessage(this.socketPath)} ${asError(error).message}`);
+			await this.sendErrorFrame(
+				requestId,
+				MCP_ERROR_INTERNAL,
+				`${daemonUnavailableMessage(this.socketPath)} ${asError(error).message}`,
+				frame.protocol,
+			);
 		}
 	}
 
-	private async forwardToDaemon(payload: string, expectsResponse: boolean): Promise<void> {
+	private async forwardToDaemon(payload: string, expectsResponse: boolean, clientProtocol: ClientFrameProtocol): Promise<void> {
 		const framed = framePayload(payload);
 		if (!expectsResponse) {
 			await this.writeNotification(framed);
 			return;
 		}
-		await this.writeRequestAndReadResponse(framed);
+		await this.writeRequestAndReadResponse(framed, clientProtocol);
 	}
 
-	private async writeRequestAndReadResponse(framedRequest: string): Promise<void> {
+	private async writeRequestAndReadResponse(framedRequest: string, clientProtocol: ClientFrameProtocol): Promise<void> {
 		await new Promise<void>((resolve, reject) => {
 			const socket = createConnection({ path: this.socketPath });
 			const responseReader = new HostServiceMcpFrameReader({ maxPayloadBytes: this.maxPayloadBytes });
@@ -189,7 +192,6 @@ export class CodexMcpDaemonRelay {
 				socket.write(framedRequest);
 			};
 			const onData = (chunk: string) => {
-				void this.writeOutput(chunk);
 				try {
 					responseReader.write(chunk);
 					const frame = responseReader.nextFrame();
@@ -201,14 +203,17 @@ export class CodexMcpDaemonRelay {
 						finalize(new Error("Daemon returned non-MCP protocol response."));
 						return;
 					}
-					finalize();
+					void this.writeOutput(frameClientPayload(frame.payload, clientProtocol)).then(
+						() => finalize(),
+						(error) => finalize(asError(error)),
+					);
+					return;
 				} catch (error) {
 					finalize(asError(error));
 				}
 			};
 			const onClose = () => {
 				if (sawFrame) {
-					finalize();
 					return;
 				}
 				finalize(new Error("TeX Actions daemon disconnected before response."));
@@ -252,8 +257,13 @@ export class CodexMcpDaemonRelay {
 		});
 	}
 
-	private async sendErrorFrame(requestId: McpRequestId, code: number, message: string): Promise<void> {
-		await this.writeOutput(mcpFramedResponse(buildMcpErrorResponse(requestId, code, message)));
+	private async sendErrorFrame(requestId: McpRequestId, code: number, message: string, protocol: ClientFrameProtocol = "mcp"): Promise<void> {
+		const response = buildMcpErrorResponse(requestId, code, message);
+		if (protocol === "mcp") {
+			await this.writeOutput(mcpFramedResponse(response));
+			return;
+		}
+		await this.writeOutput(`${JSON.stringify(response)}\n`);
 	}
 
 	private async writeOutput(payload: string): Promise<void> {

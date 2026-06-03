@@ -15,11 +15,9 @@ import {
 	type HostServiceCompileResponseDetails,
 	type HostServiceCompileSnippetResponseDetails,
 } from "../host_service.ts";
-import { openTrackedPdfForContext } from "../pdf_session/pdf_session.ts";
 import {
 	createHostServiceClient,
 	extractHostServiceErrorCode,
-	hostServiceSocketPath,
 	HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS,
 	hostServiceWorkspaceContextForRequest,
 } from "./host_service_client.ts";
@@ -115,8 +113,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 		"compile_latex_file": async (_toolCallId, params, signal, _onUpdate, ctx) => {
 			let requestedPath = "";
 			let compileResult: { source: string; pdf: string; clean: boolean; cleaned_artifacts: string[] } | undefined;
-			let openResult: { pdf_id?: number; pdf: string; source: string } | undefined;
-			let synctexCommand = "";
+
 			let compiler: LatexCompiler | undefined;
 			let shouldOpenPdf = false;
 			let shouldClean = false;
@@ -179,55 +176,31 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				if (!ctx) {
 					throw new Error("compile_latex_file with open_pdf=true requires a Pi agent session context");
 				}
-				synctexCommand = (await callbackManager.ensureSynctexCallbacks(ctx)).command;
-				const trackedPdf = await openTrackedPdfForContext(
-					ctx,
-					compileResponse.pdf,
-					signal,
-					async () => {
-						const managedRecord = compileResponse.managed_record;
-						return {
-							pid: managedRecord?.pid,
-							viewerHandle: managedRecord?.viewerHandle,
-							viewerBackend: managedRecord?.viewerBackend,
-							viewerOwned: managedRecord?.viewerOwned,
-							viewerCapabilities: managedRecord?.capabilities,
-							hostServicePdfId: compileResponse.pdf_id,
-							hostServiceSocketPath: hostServiceSocketPath(),
-							hostServiceCallbackTargetId: targetId,
-						};
-					},
-					compileResponse.source,
-					synctexCommand,
-					{
-						reuseTrackedPdf: false,
-						pdfId: compileResponse.pdf_id,
-					},
-				);
-				openResult = {
-					pdf_id: trackedPdf.id,
-					pdf: trackedPdf.path,
-					source: trackedPdf.sourceFile ?? compileResponse.source,
-				};
-				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
+				await callbackManager.ensureSynctexCallbacks(ctx);
+				if (compileResponse.pdf_id === undefined) {
+					throw new Error("host service returned no pdf_id for open_pdf=true compile request");
+				}
+				const managedRecord = compileResponse.managed_record;
+				const pidText = managedRecord?.pid === undefined ? "" : ` pid=${managedRecord.pid}`;
 				return {
-					content: [{ type: "text", text: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}` }],
+					content: [{ type: "text", text: `ok: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}` }],
 					details: {
-						source: trackedPdf.sourceFile ?? compileResponse.source,
-						pdf: trackedPdf.path,
-						pdf_id: trackedPdf.id,
-						pid: trackedPdf.pid,
-						viewer_handle: trackedPdf.viewerHandle,
-						viewer_backend: trackedPdf.viewerBackend,
-						viewer_owned: trackedPdf.viewerOwned,
-						viewer_capabilities: trackedPdf.viewerCapabilities,
+						source: compileResponse.source,
+						pdf: compileResponse.pdf,
+						pdf_id: compileResponse.pdf_id,
+						pid: managedRecord?.pid,
+						viewer_handle: managedRecord?.viewerHandle,
+						viewer_backend: managedRecord?.viewerBackend,
+						viewer_owned: managedRecord?.viewerOwned,
+						viewer_capabilities: managedRecord?.capabilities,
+						managed_record: managedRecord,
 						clean: compileResponse.clean,
 						cleaned_artifacts: compileResponse.cleaned_artifacts,
 					},
 				};
 			} catch (error) {
 				const failureContext = describeCompileFailureContext(requestedPath, compileResult, error);
-				if (openResult === undefined && shouldOpenPdf && isOpenFailureFromCompileError(error)) {
+				if (shouldOpenPdf && isOpenFailureFromCompileError(error)) {
 					throw latexToolFailure("compile-latex-file", "LaTeX compile succeeded but opening failed", {
 						requested_path: requestedPath,
 						source: failureContext.source,

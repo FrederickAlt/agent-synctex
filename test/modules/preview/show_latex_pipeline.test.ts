@@ -11,17 +11,15 @@ import type { LatexCompiler } from "../../../src/modules/latex/latex_file_compil
 
 function createFakePipeline(dependencies?: Partial<ShowLatexPipelineDependencies>) {
 	let sourceCalls: string[] = [];
-	let optionsCalls: Array<{ writeFixed?: boolean; suppressPageNumbers?: boolean; cropToContent?: boolean; writeReady?: boolean; workspaceContext?: { cwd: string; workspace_root?: string; session_id?: string } }> = [];
+	let optionsCalls: Array<{ fixedPreview?: boolean; suppressPageNumbers?: boolean; cropToContent?: boolean; workspaceContext?: { cwd: string; workspace_root?: string; session_id?: string } }> = [];
 	let rasterizeCalls: Array<{ pdfPath: string; dpi?: number; workspaceContext?: { cwd: string; workspace_root?: string; session_id?: string } }> = [];
-	let synctexCommands: Array<string | undefined> = [];
 	const inlineStateIds = ["inline-preview-id"];
 	let nextStateIndex = 0;
 	const pipeline = createShowLatexPreviewPipeline({
 		resolveLatexCompiler: (compiler) => (compiler ? (typeof compiler === "string" ? (compiler as LatexCompiler) : "lualatex") : undefined),
-		callShowLatex: async (latexSource, _compiler, synctexEditorCommand, _signal, options) => {
+		callShowLatex: async (latexSource, _compiler, _signal, options) => {
 			sourceCalls.push(latexSource);
 			optionsCalls.push(options ?? {});
-			synctexCommands.push(synctexEditorCommand);
 			return {
 				text: `tex:${sourceCalls.length}`,
 				pdfPath: `/tmp/show-latex-${sourceCalls.length}.pdf`,
@@ -67,7 +65,7 @@ function createFakePipeline(dependencies?: Partial<ShowLatexPipelineDependencies
 	return {
 		pipeline,
 		getState() {
-			return { sourceCalls, optionsCalls, synctexCommands, rasterizeCalls };
+			return { sourceCalls, optionsCalls, rasterizeCalls };
 		},
 	};
 }
@@ -107,20 +105,19 @@ test("passes raw source to host-service compile and forwards page-number options
 	};
 	const inlineResult = await pipeline.compileAndPreviewLatex(request);
 
-	const { sourceCalls, optionsCalls, synctexCommands } = getState();
+	const { sourceCalls, optionsCalls } = getState();
 	assert.equal(inlineResult.inline, true);
 	assert.equal(sourceCalls.length, 1);
 	assert.equal(sourceCalls[0], "sample body");
-	assert.equal(synctexCommands[0], undefined);
 	assert.equal(optionsCalls[0].suppressPageNumbers, true);
-	assert.equal(optionsCalls[0].writeFixed, false);
+	assert.equal(optionsCalls[0].fixedPreview, false);
 	assert.equal(optionsCalls[0].cropToContent, false);
 
 	const externalResult = await pipeline.compileAndPreviewLatex({ ...request, inline: false });
 	assert.equal(externalResult.inline, false);
 	assert.equal(sourceCalls[1], "sample body");
 	assert.equal(getState().optionsCalls[1].suppressPageNumbers, false);
-	assert.equal(getState().optionsCalls[1].writeFixed, true);
+	assert.equal(getState().optionsCalls[1].fixedPreview, true);
 });
 
 test("defaults inline=true when unspecified", async () => {

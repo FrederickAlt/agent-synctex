@@ -14,6 +14,9 @@ The TypeScript Host Service now owns backend `show_latex` compilation/open/jump/
 The daemon is the single runtime MCP owner on this socket: `${XDG_RUNTIME_DIR}/tex-actions/host-service.sock`. It supports `initialize`, `ping`, `tools/list`, and host-tool calls (`show_latex`, `compile_latex_file`, `open_pdf`, `jump_pdf`, `close_pdf`, `set_latex_preamble`) over that same socket.
 
 When `inline=false`, previews are opened through the local host service using this extension's request context. Each successful preview writes an operation-scoped PDF and refreshes a fixed `${XDG_RUNTIME_DIR}/tex-actions/tex-actions.pdf` external-preview copy only for external preview calls.
+
+Managed-open timeout behavior: a timed-out open returns no `pdf_id`. If a service-owned, non-reused viewer backend open completes after that timeout, the daemon best-effort closes it during late cleanup.
+
 For example:
 
 ```tex
@@ -26,14 +29,13 @@ x
 \]
 ```
 
-By default, `show_latex` leaves the ready descriptor and fixed preview files untouched, rasterizes each
+By default, `show_latex` rasterizes each
 PDF page to a local PNG with `mutool` or `pdftoppm`, trims image whitespace when ImageMagick is available,
 and, for multi-page PDFs, merges the page PNGs into one vertical image when ImageMagick is available
 (falling back to sequential PNGs otherwise). It renders inline in Pi chat without returning image bytes in
 the tool result; the text result includes an `image_path=<png>` field for the primary local preview image.
 Inline image width is proportional to the cropped content width relative to the full PDF
-page width, so small symbols stay small while wide formulas use more of the TUI. With `inline=false`, it
-refreshes fixed external-preview files and submits an `open` request to the host service. The extension does not use a ready-marker watcher and never launches Zathura or any GUI viewer directly; it only sends host-service protocol requests.
+page width, so small symbols stay small while wide formulas use more of the TUI. With `inline=false`, the Host Service/daemon refreshes fixed external-preview artifacts and submits an `open` request. The extension does not use a ready-marker watcher and never launches Zathura or any GUI viewer directly; it only sends host-service protocol requests.
 Inline preview details persist metadata locally in the tool result (`image_path`, `inline_previews`, and `pdf`), containing only
 safe artifact paths plus dimensions, so repeated renders in the same process can reuse an in-memory preview ID while a
 `/reload` can still recover images from the persisted metadata as long as `${XDG_RUNTIME_DIR}/tex-actions/inline` artifacts
@@ -51,7 +53,7 @@ LaTeX compile workflows (snippets and files), plus open/jump/close/external prev
   - `terminal_refresh_policy.ts` manages terminal/kitty refresh invalidation behavior for inline previews.
 - `src/modules/synctex/synctex.ts` — session-scoped inverse SyncTeX callback server and click parsing helpers.
 - `src/modules/host_service.ts` — protocol client for host-service operations (open/close/jump/compile) and response handling.
-- `src/modules/pdf_tracking/pdf_tracking.ts` + `src/modules/pdf_session/pdf_session.ts` — protocol-agnostic PDF open/jump/close session orchestration and per-Pi-context tracking metadata.
+- `src/modules/pdf_tracking/pdf_tracking.ts` — PDF/source-file validation and default source inference helpers used by managed host-service viewer flows.
 - `src/modules/host_service_viewer_backends.ts` and `scripts/tex-actionsctl.ts` — host-service backed viewer protocol and host-process transport (`scripts/agent-synctex-host-service.ts` remains a tiny compatibility shim).
 - `scripts/pi_synctex_callback.mjs` — callback helper used by advanced manual callback validation paths.
 
@@ -63,8 +65,8 @@ LaTeX compile workflows (snippets and files), plus open/jump/close/external prev
 - `src/modules/latex/latex_preamble.ts` — preamble merge/normalization helpers.
 - `src/modules/preview/*` — preview pipeline, inline rendering, placeholder/image adapters, and terminal refresh handling.
 - `src/modules/synctex/synctex.ts` — session-scoped SyncTeX callback socket support.
-- `src/modules/pdf_tracking/pdf_tracking.ts` — shared PDF tracking, open/jump/close metadata state.
-- `src/modules/pdf_session/pdf_session.ts` — per-context wrapper around tracking with Pi-session callbacks.
+- `src/modules/pdf_tracking/pdf_tracking.ts` — PDF/source-file validation and SyncTeX-based default source inference helpers.
+- `src/modules/pi_extension/context_session.ts` — stable Pi-session key generation used for callback target context mapping.
 - `src/modules/host_service.ts` — protocol client for the host service.
 - `scripts/tex-actionsctl.ts` — host service executable (`start` subcommand runs the daemon).
 - `scripts/pi_synctex_callback.mjs` — callback script helper for advanced setups and debugging.
@@ -182,7 +184,7 @@ Tracked PDFs also remember a default source file when possible. `compile_latex_f
 
 `jump_pdf(pdf_id, line, source_file?)` performs a forward SyncTeX jump via service forward-search using the tracked numeric `pdf_id`; it does not accept arbitrary PDF paths. The public tool is line-based, so callers do not pass a column. If the default source is unknown, call it again with `source_file`. For content located in a file included with `\input`, `\include`, or similar, pass that included file as `source_file` and use the line number from that file, not the parent file’s include directive line. If the tracked service handle is stale, the tool requests reopen through the host service before retrying the jump. After a successful jump, the text result names the line and then shows the verbatim LaTeX source line that was jumped to (metadata remains in tool details), so the agent can immediately notice when edits shifted the intended row. The agent should not tell the user which line it jumped to unless the user explicitly asks for the exact line; the user will see the line in the PDF viewer.
 
-`close_pdf(pdf_id)` forwards close via service metadata and removes that PDF from the in-memory tracking table.
+`close_pdf(pdf_id)` forwards close via service metadata and removes that PDF from the daemon registry.
 
 Open, close, and jump failures are reported as tool errors and logged under `${XDG_RUNTIME_DIR}/tex-actions` and `${XDG_RUNTIME_DIR}/tex-actions/*.log`. These include service timeout, timeout-like unavailability, stale/unknown handle, and backend availability failures.
 
@@ -265,6 +267,6 @@ The preamble can also be changed at runtime with `set_latex_preamble`, which wri
 ## Firejail note
 
 Your Pi runtime is firejail sandboxed. Keep `${XDG_RUNTIME_DIR}/tex-actions` accessible to the sandbox
-so the extension and host service can communicate via request/result files and preview artifacts.
+so the extension and Host Service can share runtime sockets and preview artifacts.
 
 If the daemon is started directly inside the sandbox/agent (for example `npm run host-service:start`), GUI opening may fail; prefer the normal user service path (`systemctl --user restart show-latex.service` or `pdf-preview-servicectl restart`) for managed viewer operations.

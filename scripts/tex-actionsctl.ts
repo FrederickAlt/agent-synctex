@@ -99,6 +99,7 @@ interface DoctorReport {
 
 interface ServiceInstallOutcome {
 	serviceFilePath: string;
+	codexConfigPath: string;
 	source: string;
 	commands: Array<{ command: string; args: string[] }>;
 }
@@ -151,6 +152,14 @@ function resolveServiceInstallDir(context: CliRunContext): string {
 
 function resolveServiceInstallPath(context: CliRunContext): string {
 	return resolve(resolveServiceInstallDir(context), SERVICE_SOURCE_NAME);
+}
+
+function resolveCodexConfigPath(context: Pick<CliRunContext, "homeDir">): string {
+	const homeDir = context.homeDir;
+	if (!homeDir || homeDir.length === 0) {
+		throw new Error("HOME is required to locate Codex config");
+	}
+	return resolve(homeDir, ".codex", "config.toml");
 }
 
 function defaultContext(): CliRunContext {
@@ -432,7 +441,8 @@ function renderServiceFile(context: CliRunContext): string {
 		.replaceAll("{{NODE_PATH}}", context.nodePath)
 		.replaceAll("{{SCRIPT_PATH}}", scriptPath)
 		.replaceAll("{{REPO_ROOT}}", context.repoRoot)
-		.replaceAll("{{SERVICE_NAME}}", context.serviceName);
+		.replaceAll("{{SERVICE_NAME}}", context.serviceName)
+		.replaceAll("{{SOCKET_PATH}}", resolve(context.socketPath));
 	if (!content.includes(SERVICE_MARKER)) {
 		content = `${SERVICE_MARKER}\n${content}`;
 	}
@@ -443,16 +453,77 @@ function hasMarker(content: string): boolean {
 	return content.includes(SERVICE_MARKER);
 }
 
+function isLegacyOwnedServiceUnit(content: string): boolean {
+	return content.includes("Description=tex-actions Host Service")
+		&& content.includes("Documentation=https://github.com/FrederickAlt/agent-synctex")
+		&& content.includes("tex-actionsctl.ts daemon");
+}
+
+function tomlString(value: string): string {
+	return JSON.stringify(value);
+}
+
+function removeTomlTable(source: string, tableName: string): string {
+	const lines = source.split(/\r?\n/);
+	const output: string[] = [];
+	let skipping = false;
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed === `[${tableName}]`) {
+			skipping = true;
+			continue;
+		}
+		if (skipping && trimmed.startsWith("[") && trimmed.endsWith("]")) {
+			skipping = false;
+		}
+		if (!skipping) {
+			output.push(line);
+		}
+	}
+	return output.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+}
+
+function renderCodexMcpConfigBlock(context: CliRunContext): string {
+	const relayScriptPath = resolve(context.repoRoot, "scripts", "tex-actions-mcp.ts");
+	return [
+		"[mcp_servers.pdf-preview]",
+		`command = ${tomlString(context.nodePath)}`,
+		`args = [${tomlString(relayScriptPath)}]`,
+		"startup_timeout_sec = 20",
+		"tool_timeout_sec = 60",
+		"",
+		"[mcp_servers.pdf-preview.env]",
+		`TEX_ACTIONS_HOST_SERVICE_SOCKET_PATH = ${tomlString(resolve(context.socketPath))}`,
+	].join("\n");
+}
+
+function renderCodexConfigWithMcpServer(existing: string, context: CliRunContext): string {
+	let next = removeTomlTable(existing, "mcp_servers.pdf-preview.env");
+	next = removeTomlTable(next, "mcp_servers.pdf-preview");
+	const prefix = next.trimEnd();
+	const block = renderCodexMcpConfigBlock(context);
+	return `${prefix ? `${prefix}\n\n` : ""}${block}\n`;
+}
+
+function writeCodexMcpConfig(context: CliRunContext): string {
+	const configPath = resolveCodexConfigPath(context);
+	const existing = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+	const next = renderCodexConfigWithMcpServer(existing, context);
+	mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
+	writeFileSync(configPath, next, { mode: 0o600 });
+	return configPath;
+}
+
 async function runSetup(context: CliRunContext): Promise<ServiceInstallOutcome> {
 	if (context.platform !== "linux") {
 		context.diagnosticOutput.warn("setup currently supports Linux user services only");
 		context.diagnosticOutput.warn("macOS setup is intentionally not implemented here; use your own LaunchAgent wiring.");
-		return { serviceFilePath: resolveServiceInstallPath(context), source: "", commands: [] };
+		return { serviceFilePath: resolveServiceInstallPath(context), codexConfigPath: resolveCodexConfigPath(context), source: "", commands: [] };
 	}
 	const serviceFilePath = resolveServiceInstallPath(context);
 	if (existsSync(serviceFilePath)) {
 		const existing = readFileSync(serviceFilePath, "utf8");
-		if (!hasMarker(existing)) {
+		if (!hasMarker(existing) && !isLegacyOwnedServiceUnit(existing)) {
 			const message = `setup refused: existing unowned systemd unit found at ${serviceFilePath}`;
 			throw new Error(`${message}; remediation: remove or replace this unit file before rerunning tex-actionsctl setup`);
 		}
@@ -460,6 +531,7 @@ async function runSetup(context: CliRunContext): Promise<ServiceInstallOutcome> 
 	const unitContent = renderServiceFile(context);
 	mkdirSync(dirname(serviceFilePath), { recursive: true, mode: 0o700 });
 	writeFileSync(serviceFilePath, unitContent, { mode: 0o644 });
+	const codexConfigPath = writeCodexMcpConfig(context);
 	const commands: Array<{ command: string; args: string[] }> = [];
 
 	const daemonReload = await context.commandRunner("systemctl", ["--user", "daemon-reload"]);
@@ -480,6 +552,7 @@ async function runSetup(context: CliRunContext): Promise<ServiceInstallOutcome> 
 
 	return {
 		serviceFilePath,
+		codexConfigPath,
 		source: unitContent,
 		commands,
 	};

@@ -36,17 +36,30 @@ interface HostServiceMcpPdfOperations {
 	openPdf?: (request: HostServiceOpenRequest) => Promise<HostServiceOpenResponseEnvelope>;
 	jumpPdf?: (request: HostServiceJumpRequest) => Promise<HostServiceJumpResponseEnvelope>;
 	closePdf?: (request: HostServiceCloseRequest) => Promise<HostServiceCloseResponseEnvelope>;
+	resolveManagedOpenCallback?: (
+		workspaceContext: HostServiceWorkspaceContext,
+		callbackTargetId: string | undefined,
+		callbackTarget: HostServiceCallbackTarget | undefined,
+	) => Promise<HostServiceCallbackTarget | undefined>;
 }
 
-const mcpCompileService = new HostServiceCompileService({
-	protocolVersion: MCP_HOST_SERVICE_PROTOCOL_VERSION,
-	managedViewerService: {
-		async openViewer() {
-			throw new Error("open_pdf is not supported by daemon MCP tools");
+function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): HostServiceCompileService {
+	return new HostServiceCompileService({
+		protocolVersion: MCP_HOST_SERVICE_PROTOCOL_VERSION,
+		managedViewerService: {
+			async openViewer(openRequest) {
+				if (!pdfOperations.openPdf) {
+					throw new Error("open_pdf is not implemented by the daemon");
+				}
+				return pdfOperations.openPdf(openRequest);
+			},
 		},
-	},
-	resolveManagedOpenCallback: async () => undefined,
-});
+		resolveManagedOpenCallback: async (workspaceContext, callbackTargetId, callbackTarget) =>
+			pdfOperations.resolveManagedOpenCallback
+				? pdfOperations.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget)
+				: callbackTarget,
+	});
+}
 
 export type McpRequestId = string | number | null;
 
@@ -206,6 +219,15 @@ function parseCompileWorkspaceContext(sourcePath: string, rawWorkspaceContext: u
 function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompileSnippetRequest {
 	const source = parseStringArg(args, "source");
 	const compiler = parseOptionalStringArg(args, "compiler");
+	const inline = parseBooleanArg(args, "inline");
+	const openPdf = inline === false ? true : parseBooleanArg(args, "open_pdf");
+	if (args.fixed_preview_pdf_path !== undefined) {
+		throw new Error("fixed_preview_pdf_path is not supported; use fixed_preview");
+	}
+	const fixedPreview = openPdf ? (inline === false ? true : parseBooleanArg(args, "fixed_preview")) : undefined;
+	const reuseExisting = openPdf ? parseBooleanArg(args, "reuse_existing") : undefined;
+	const requirePersistentViewer = openPdf ? parseBooleanArg(args, "require_persistent_viewer") : undefined;
+	const callback = openPdf ? parseCallbackTargetArg(args) : undefined;
 	const rawWorkspaceContext = args.workspace_context;
 	const workspaceContext = rawWorkspaceContext === undefined
 		? { cwd: MCP_DEFAULT_WORKSPACE_CONTEXT.cwd }
@@ -222,6 +244,15 @@ function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompil
 		details: {
 			latex_source: source,
 			...(compiler === undefined ? {} : { compiler }),
+			...(openPdf === true ? { open_pdf: true } : {}),
+			...(openPdf === true
+				? {
+					...(fixedPreview === undefined ? {} : { fixed_preview: fixedPreview }),
+					reuse_existing: reuseExisting,
+					require_persistent_viewer: requirePersistentViewer,
+					...(callback === undefined ? {} : { callback }),
+				}
+				: {}),
 		},
 	};
 }
@@ -295,9 +326,10 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): HostServic
 	const compiler = parseOptionalStringArg(args, "compiler");
 	const clean = parseBooleanArg(args, "clean");
 	const openPdf = parseBooleanArg(args, "open_pdf");
-	if (openPdf === true) {
-		throw new Error("open_pdf is not supported by daemon MCP compile_latex_file");
-	}
+	const callback = openPdf ? parseCallbackTargetArg(args) : undefined;
+	const callbackTargetId = openPdf ? parseOptionalStringArg(args, "callback_target_id") : undefined;
+	const reuseExisting = openPdf ? parseBooleanArg(args, "reuse_existing") : undefined;
+	const requirePersistentViewer = openPdf ? parseBooleanArg(args, "require_persistent_viewer") : undefined;
 	const workspaceContext = parseCompileWorkspaceContext(latexFilePath, args.workspace_context);
 	return {
 		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
@@ -309,6 +341,11 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): HostServic
 			latex_file_path: latexFilePath,
 			...(compiler === undefined ? {} : { compiler }),
 			...(clean === undefined ? {} : { clean }),
+			...(openPdf === undefined ? {} : { open_pdf: openPdf }),
+			...(callback === undefined ? {} : { callback }),
+			...(callbackTargetId === undefined ? {} : { callback_target_id: callbackTargetId }),
+			...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
+			...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
 		},
 	};
 }
@@ -377,8 +414,11 @@ function parseToolResult(
 ): McpToolResult {
 	const details = response.status_details;
 	if (response.status === "ok") {
+		const pdfId = details.pdf_id === undefined ? "" : ` pdf_id=${details.pdf_id}`;
+		const pdf = details.pdf ? ` pdf=${details.pdf}` : "";
+		const compileOnlyPdf = !pdfId && details.pdf ? ` ${details.pdf}` : "";
 		return {
-			content: [{ type: "text", text: `${successText}${details.pdf ? ` ${details.pdf}` : ""}`.trim() }],
+			content: [{ type: "text", text: `${successText}${pdfId}${pdfId ? pdf : compileOnlyPdf}`.trim() }],
 			details,
 		};
 	}
@@ -396,10 +436,13 @@ function parseManagedPdfToolResult(
 ): McpToolResult {
 	const details = response.status_details as unknown as Record<string, unknown>;
 	if (response.status === "ok") {
-		const line =
-			typeof details.line === "number" && Number.isInteger(details.line)
-				? ` line=${details.line}`
-				: "";
+		const lineNumber = typeof details.line === "number" && Number.isInteger(details.line)
+			? details.line
+			: undefined;
+		const line = lineNumber === undefined ? "" : ` line=${lineNumber}`;
+		const sourceLine = typeof details.source_line === "string" && lineNumber !== undefined
+			? `\nline ${lineNumber} contains:\n${details.source_line}`
+			: "";
 		const pdf =
 			typeof details.pdf === "string" && details.pdf
 				? ` pdf=${details.pdf}`
@@ -419,7 +462,7 @@ function parseManagedPdfToolResult(
 		return {
 			content: [{
 				type: "text",
-				text: `${successPrefix}${pdf}${pdfId}${line}${handled}${closed}`.trim() || successPrefix,
+				text: (`${successPrefix}${pdf}${pdfId}${line}${handled}${closed}`.trim() || successPrefix) + sourceLine,
 			}],
 			details,
 		};
@@ -540,6 +583,21 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 					source: { type: "string", minLength: 1 },
 					compiler: { type: "string" },
 					inline: { type: "boolean" },
+					open_pdf: { type: "boolean" },
+					fixed_preview: { type: "boolean" },
+					reuse_existing: { type: "boolean" },
+					require_persistent_viewer: { type: "boolean" },
+					callback: {
+						type: "object",
+						properties: {
+							kind: { type: "string", const: "pi-synctex-callback-v1" },
+							transport: { type: "string", const: "unix" },
+							socket_path: { type: "string", minLength: 1 },
+							token: { type: "string", minLength: 1 },
+						},
+						required: ["kind", "transport", "socket_path", "token"],
+						additionalProperties: false,
+					},
 					workspace_context: workspaceContextSchema(),
 				},
 				required: ["source"],
@@ -556,6 +614,20 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 					compiler: { type: "string" },
 					clean: { type: "boolean" },
 					open_pdf: { type: "boolean" },
+					callback_target_id: { type: "string", minLength: 1 },
+					callback: {
+						type: "object",
+						properties: {
+							kind: { type: "string", const: "pi-synctex-callback-v1" },
+							transport: { type: "string", const: "unix" },
+							socket_path: { type: "string", minLength: 1 },
+							token: { type: "string", minLength: 1 },
+						},
+						required: ["kind", "transport", "socket_path", "token"],
+						additionalProperties: false,
+					},
+					reuse_existing: { type: "boolean" },
+					require_persistent_viewer: { type: "boolean" },
 					workspace_context: workspaceContextSchema(),
 				},
 				required: ["latex_file_path"],
@@ -639,6 +711,202 @@ export const HOST_SERVICE_TOOL_NAMES = [
 	"set_latex_preamble",
 ] as const;
 
+type HostServiceToolName = (typeof HOST_SERVICE_TOOL_NAMES)[number];
+
+type HostServiceMcpToolHandler = (
+	requestId: ParsedMcpRequestId,
+	args: Record<string, unknown>,
+	pdfOperations: HostServiceMcpPdfOperations,
+	mcpCompileService: HostServiceCompileService,
+) => Promise<McpResponsePayload>;
+
+async function handleShowLatexTool(
+	requestId: ParsedMcpRequestId,
+	args: Record<string, unknown>,
+	_pdfOperations: HostServiceMcpPdfOperations,
+	mcpCompileService: HostServiceCompileService,
+): Promise<McpResponsePayload> {
+	let compileRequest: HostServiceCompileSnippetRequest;
+	try {
+		compileRequest = parseShowLatexRequest(args);
+	} catch (error) {
+		return buildMcpErrorResponse(
+			requestId,
+			MCP_ERROR_INVALID_PARAMS,
+			error instanceof Error ? error.message : String(error),
+		);
+	}
+	try {
+		const compileResponse = await mcpCompileService.compileLatexSnippetRequest(compileRequest);
+		return buildSuccess(requestId, parseToolResult(compileResponse, "ok"));
+	} catch (error) {
+		const details = error instanceof Error ? error.message : String(error);
+		return buildSuccess(requestId, {
+			isError: true,
+			content: [{ type: "text", text: `show_latex failed: ${details}` }],
+		});
+	}
+}
+
+async function handleCompileLatexFileTool(
+	requestId: ParsedMcpRequestId,
+	args: Record<string, unknown>,
+	_pdfOperations: HostServiceMcpPdfOperations,
+	mcpCompileService: HostServiceCompileService,
+): Promise<McpResponsePayload> {
+	let compileRequest: HostServiceCompileRequest;
+	try {
+		compileRequest = parseCompileLatexFileRequest(args);
+	} catch (error) {
+		return buildMcpErrorResponse(
+			requestId,
+			MCP_ERROR_INVALID_PARAMS,
+			error instanceof Error ? error.message : String(error),
+		);
+	}
+	try {
+		const compileResponse = await mcpCompileService.compileLatexFileRequest(compileRequest);
+		return buildSuccess(requestId, parseToolResult(compileResponse, "ok:"));
+	} catch (error) {
+		const details = error instanceof Error ? error.message : String(error);
+		return buildSuccess(requestId, {
+			isError: true,
+			content: [{ type: "text", text: `compile_latex_file failed: ${details}` }],
+		});
+	}
+}
+
+async function handleOpenPdfTool(
+	requestId: ParsedMcpRequestId,
+	args: Record<string, unknown>,
+	pdfOperations: HostServiceMcpPdfOperations,
+	_mcpCompileService: HostServiceCompileService,
+): Promise<McpResponsePayload> {
+	let openRequest: HostServiceOpenRequest;
+	try {
+		openRequest = parseOpenPdfRequest(args);
+	} catch (error) {
+		return buildMcpErrorResponse(
+			requestId,
+			MCP_ERROR_INVALID_PARAMS,
+			error instanceof Error ? error.message : String(error),
+		);
+	}
+	if (!pdfOperations.openPdf) {
+		return buildSuccess(requestId, {
+			isError: true,
+			content: [{ type: "text", text: "open_pdf is not yet implemented by the daemon" }],
+		});
+	}
+	try {
+		const openResponse = await pdfOperations.openPdf(openRequest);
+		return buildSuccess(requestId, parseManagedPdfToolResult(openResponse, "open_pdf ok:"));
+	} catch (error) {
+		const details = error instanceof Error ? error.message : String(error);
+		return buildSuccess(requestId, {
+			isError: true,
+			content: [{ type: "text", text: `open_pdf failed: ${details}` }],
+		});
+	}
+}
+
+async function handleJumpPdfTool(
+	requestId: ParsedMcpRequestId,
+	args: Record<string, unknown>,
+	pdfOperations: HostServiceMcpPdfOperations,
+	_mcpCompileService: HostServiceCompileService,
+): Promise<McpResponsePayload> {
+	let jumpRequest: HostServiceJumpRequest;
+	try {
+		jumpRequest = parseJumpPdfRequest(args);
+	} catch (error) {
+		return buildMcpErrorResponse(
+			requestId,
+			MCP_ERROR_INVALID_PARAMS,
+			error instanceof Error ? error.message : String(error),
+		);
+	}
+	if (!pdfOperations.jumpPdf) {
+		return buildSuccess(requestId, {
+			isError: true,
+			content: [{ type: "text", text: "jump_pdf is not yet implemented by the daemon" }],
+		});
+	}
+	try {
+		const jumpResponse = await pdfOperations.jumpPdf(jumpRequest);
+		return buildSuccess(requestId, parseManagedPdfToolResult(jumpResponse, "jump_pdf ok:"));
+	} catch (error) {
+		const details = error instanceof Error ? error.message : String(error);
+		return buildSuccess(requestId, {
+			isError: true,
+			content: [{ type: "text", text: `jump_pdf failed: ${details}` }],
+		});
+	}
+}
+
+async function handleClosePdfTool(
+	requestId: ParsedMcpRequestId,
+	args: Record<string, unknown>,
+	pdfOperations: HostServiceMcpPdfOperations,
+	_mcpCompileService: HostServiceCompileService,
+): Promise<McpResponsePayload> {
+	let closeRequest: HostServiceCloseRequest;
+	try {
+		closeRequest = parseClosePdfRequest(args);
+	} catch (error) {
+		return buildMcpErrorResponse(
+			requestId,
+			MCP_ERROR_INVALID_PARAMS,
+			error instanceof Error ? error.message : String(error),
+		);
+	}
+	if (!pdfOperations.closePdf) {
+		return buildSuccess(requestId, {
+			isError: true,
+			content: [{ type: "text", text: "close_pdf is not yet implemented by the daemon" }],
+		});
+	}
+	try {
+		const closeResponse = await pdfOperations.closePdf(closeRequest);
+		return buildSuccess(requestId, parseManagedPdfToolResult(closeResponse, "close_pdf ok:"));
+	} catch (error) {
+		const details = error instanceof Error ? error.message : String(error);
+		return buildSuccess(requestId, {
+			isError: true,
+			content: [{ type: "text", text: `close_pdf failed: ${details}` }],
+		});
+	}
+}
+
+async function handleSetLatexPreambleTool(
+	requestId: ParsedMcpRequestId,
+	args: Record<string, unknown>,
+	_pdfOperations: HostServiceMcpPdfOperations,
+	_mcpCompileService: HostServiceCompileService,
+): Promise<McpResponsePayload> {
+	try {
+		const preamble = args.latex_preamble;
+		if (typeof preamble !== "string") {
+			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble requires latex_preamble to be a string");
+		}
+		const preambleLength = writeLatexPreambleToTmpdir(preamble);
+		const preamblePath = mcpPreamblePath();
+		const resultText = preambleLength
+			? `LaTeX preamble set (${preambleLength} characters) at ${preamblePath}`
+			: `LaTeX preamble cleared at ${preamblePath}`;
+		const toolResult: McpToolResult = {
+			content: [{ type: "text", text: resultText }],
+		};
+		return buildSuccess(requestId, toolResult);
+	} catch (error) {
+		const details = error instanceof Error ? error.message : String(error);
+		return buildSuccess(requestId, {
+			isError: true,
+			content: [{ type: "text", text: `set_latex_preamble failed: ${details}` }],
+		});
+	}
+}
+
 export function mcpFramedResponse(payload: McpResponsePayload): string {
 	return encodeResponse(payload);
 }
@@ -703,168 +971,24 @@ export async function handleMcpRequest(
 				});
 			}
 
-			switch (call.name) {
-				case "show_latex": {
-					let compileRequest: HostServiceCompileSnippetRequest;
-					try {
-						const inlineValue = call.args.inline;
-						if (inlineValue !== undefined && typeof inlineValue !== "boolean") {
-							throw new Error("inline must be a boolean");
-						}
-						compileRequest = parseShowLatexRequest(call.args);
-					} catch (error) {
-						return buildMcpErrorResponse(
-							request.id,
-							MCP_ERROR_INVALID_PARAMS,
-							error instanceof Error ? error.message : String(error),
-						);
-					}
-					try {
-						const compileResponse = await mcpCompileService.compileLatexSnippetRequest(compileRequest);
-						return buildSuccess(request.id, parseToolResult(compileResponse, "ok"));
-					} catch (error) {
-						const details = error instanceof Error ? error.message : String(error);
-						return buildSuccess(request.id, {
-							isError: true,
-							content: [{ type: "text", text: `show_latex failed: ${details}` }],
-						});
-					}
-				}
-				case "compile_latex_file": {
-					let compileRequest: HostServiceCompileRequest;
-					try {
-						compileRequest = parseCompileLatexFileRequest(call.args);
-					} catch (error) {
-						return buildMcpErrorResponse(
-							request.id,
-							MCP_ERROR_INVALID_PARAMS,
-							error instanceof Error ? error.message : String(error),
-						);
-					}
-					try {
-						const compileResponse = await mcpCompileService.compileLatexFileRequest(compileRequest);
-						return buildSuccess(request.id, parseToolResult(compileResponse, "ok:"));
-					} catch (error) {
-						const details = error instanceof Error ? error.message : String(error);
-						return buildSuccess(request.id, {
-							isError: true,
-							content: [{ type: "text", text: `compile_latex_file failed: ${details}` }],
-						});
-					}
-				}
-					case "open_pdf": {
-						let openRequest: HostServiceOpenRequest;
-						try {
-							openRequest = parseOpenPdfRequest(call.args);
-						} catch (error) {
-							return buildMcpErrorResponse(
-								request.id,
-								MCP_ERROR_INVALID_PARAMS,
-								error instanceof Error ? error.message : String(error),
-							);
-						}
-						if (!pdfOperations.openPdf) {
-							return buildSuccess(request.id, {
-								isError: true,
-								content: [{ type: "text", text: "open_pdf is not yet implemented by the daemon" }],
-							});
-						}
-						try {
-							const openResponse = await pdfOperations.openPdf(openRequest);
-							return buildSuccess(request.id, parseManagedPdfToolResult(openResponse, "open_pdf ok:"));
-						} catch (error) {
-							const details = error instanceof Error ? error.message : String(error);
-							return buildSuccess(request.id, {
-								isError: true,
-								content: [{ type: "text", text: `open_pdf failed: ${details}` }],
-							});
-						}
-					}
-					case "jump_pdf": {
-						let jumpRequest: HostServiceJumpRequest;
-						try {
-							jumpRequest = parseJumpPdfRequest(call.args);
-						} catch (error) {
-							return buildMcpErrorResponse(
-								request.id,
-								MCP_ERROR_INVALID_PARAMS,
-								error instanceof Error ? error.message : String(error),
-							);
-						}
-						if (!pdfOperations.jumpPdf) {
-							return buildSuccess(request.id, {
-								isError: true,
-								content: [{ type: "text", text: "jump_pdf is not yet implemented by the daemon" }],
-							});
-						}
-						try {
-							const jumpResponse = await pdfOperations.jumpPdf(jumpRequest);
-							return buildSuccess(request.id, parseManagedPdfToolResult(jumpResponse, "jump_pdf ok:"));
-						} catch (error) {
-							const details = error instanceof Error ? error.message : String(error);
-							return buildSuccess(request.id, {
-								isError: true,
-								content: [{ type: "text", text: `jump_pdf failed: ${details}` }],
-							});
-						}
-					}
-					case "close_pdf": {
-						let closeRequest: HostServiceCloseRequest;
-						try {
-							closeRequest = parseClosePdfRequest(call.args);
-						} catch (error) {
-							return buildMcpErrorResponse(
-								request.id,
-								MCP_ERROR_INVALID_PARAMS,
-								error instanceof Error ? error.message : String(error),
-							);
-						}
-						if (!pdfOperations.closePdf) {
-							return buildSuccess(request.id, {
-								isError: true,
-								content: [{ type: "text", text: "close_pdf is not yet implemented by the daemon" }],
-							});
-						}
-						try {
-							const closeResponse = await pdfOperations.closePdf(closeRequest);
-							return buildSuccess(request.id, parseManagedPdfToolResult(closeResponse, "close_pdf ok:"));
-						} catch (error) {
-							const details = error instanceof Error ? error.message : String(error);
-							return buildSuccess(request.id, {
-								isError: true,
-								content: [{ type: "text", text: `close_pdf failed: ${details}` }],
-							});
-						}
-					}
-				case "set_latex_preamble": {
-					try {
-						const preamble = call.args.latex_preamble;
-						if (typeof preamble !== "string") {
-							return buildMcpErrorResponse(request.id, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble requires latex_preamble to be a string");
-						}
-						const preambleLength = writeLatexPreambleToTmpdir(preamble);
-						const preamblePath = mcpPreamblePath();
-						const resultText = preambleLength
-							? `LaTeX preamble set (${preambleLength} characters) at ${preamblePath}`
-							: `LaTeX preamble cleared at ${preamblePath}`;
-						const toolResult: McpToolResult = {
-							content: [{ type: "text", text: resultText }],
-						};
-						return buildSuccess(request.id, toolResult);
-					} catch (error) {
-						const details = error instanceof Error ? error.message : String(error);
-						return buildSuccess(request.id, {
-							isError: true,
-							content: [{ type: "text", text: `set_latex_preamble failed: ${details}` }],
-						});
-					}
-				}
-				default:
-					return buildSuccess(request.id, {
-						isError: true,
-						content: [{ type: "text", text: `${call.name} is not yet implemented by the daemon` }],
-					});
+			const mcpCompileService = createMcpCompileService(pdfOperations);
+			const toolHandlers: Record<HostServiceToolName, HostServiceMcpToolHandler> = {
+				show_latex: handleShowLatexTool,
+				compile_latex_file: handleCompileLatexFileTool,
+				open_pdf: handleOpenPdfTool,
+				jump_pdf: handleJumpPdfTool,
+				close_pdf: handleClosePdfTool,
+				set_latex_preamble: handleSetLatexPreambleTool,
+			};
+			const handler = toolHandlers[call.name as HostServiceToolName] ?? null;
+			if (handler === null) {
+				return buildSuccess(request.id, {
+					isError: true,
+					content: [{ type: "text", text: `${call.name} is not yet implemented by the daemon` }],
+				});
 			}
+
+			return await handler(request.id, call.args, pdfOperations, mcpCompileService);
 		}
 		default:
 			return buildMcpErrorResponse(request.id, MCP_ERROR_METHOD_NOT_FOUND, `method not found: ${request.method}`);

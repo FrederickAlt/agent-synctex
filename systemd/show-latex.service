@@ -7,7 +7,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=%h/projects/AI/pi_extensions/pdf-preview
-ExecStart=/usr/bin/env sh -c 'DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=%t/bus}" exec /usr/bin/node %h/projects/AI/pi_extensions/pdf-preview/scripts/tex-actionsctl.ts daemon'
+ExecStart=/usr/bin/env sh -c 'DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=%t/bus}" exec /usr/bin/node %h/projects/AI/pi_extensions/pdf-preview/scripts/tex-actionsctl.ts daemon --socket %t/tex-actions/host-service.sock'
 Restart=on-failure
 RestartSec=2
 Environment=NODE_NO_WARNINGS=1

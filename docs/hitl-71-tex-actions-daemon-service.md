@@ -73,7 +73,7 @@ The viewer should jump here for target B. Please click this text for inverse Syn
 ### Close behavior
 
 - First managed close request returned
-  `ok: ... closed_pids=none`; visual confirmation was deferred because another viewer window was still open.
+  `ok: ... closed=false reason=not_service_owned`; visual confirmation was deferred because another viewer window was still open.
 - Follow-up desktop validation after service restart used `tmp/hitl-71-round2/main.pdf` and daemon `pdf_id=42806141`.
 - Human confirmed the viewer visibly jumped to **Round 2 Jump Target B**.
 - Inverse SyncTeX click produced:
@@ -83,14 +83,14 @@ PDF click: tmp/hitl-71-round2/main.tex:12
 \section*{Round 2 Jump Target B}
 ```
 
-- Managed `close_pdf(pdf_id=42806141)` returned `ok: ... closed_pids=none`, and the human confirmed the Round 2 PDF viewer closed.
+- Managed `close_pdf(pdf_id=42806141)` returned `ok: ... closed=true`, and the human confirmed the Round 2 PDF viewer closed.
 
 ## 4) Caveats and residual risk
 
 - Desktop GUI/session assertions from `tex-actionsctl doctor` are expectedly incomplete in the sandbox; they should be interpreted as service/daemon diagnostics only.
-- `close_pdf` may report `closed_pids=none` for reused/unowned-safe handles; in the Round 2 HITL run, the human visually confirmed the intended viewer closed despite that response detail.
+- `close_pdf` may report `closed=false reason=...` for reused/unowned-safe handles, while service-owned successful closes report `closed=true`; in the Round 2 HITL run, the human visually confirmed the intended viewer closed.
 - No regressions were observed for path handling, jump, close, or callback behavior in this pass.
 
 ## 5) Out-of-scope confirmation
 
-As required for this phase, no Codex relay implementation was added or validated here. If/when added, it should target the same daemon MCP endpoint (`tex-actions-host-service`) rather than adding a parallel relay path.
+The Codex relay now exists as a thin stdio/daemon-MCP transport over the same daemon MCP endpoint (`tex-actions-host-service`) rather than a parallel tool-host path. This HITL pass did not separately validate the relay.

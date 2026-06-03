@@ -1,5 +1,9 @@
 node_modules/
 
+/tmp/
+/host-service-snippets/
+/pdf-tools-test.*
+
 tmux-client-*.log
 tmux-server-*.log
 tmux-out-*.log

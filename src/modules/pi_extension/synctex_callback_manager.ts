@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { contextSessionKey } from "../pdf_session/pdf_session.ts";
+import { contextSessionKey } from "./context_session.ts";
 import { SynctexCallbackServer, type SynctexPasteTarget } from "../synctex/synctex.ts";
 import { getMcpTmpDir } from "./runtime_paths.ts";
 import { createHostServiceClient, hostServiceSocketPath, type HostServiceCallbackTargetWorkspace } from "./host_service_client.ts";

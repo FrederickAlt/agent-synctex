@@ -1,3 +1,4 @@
+import { type HostServiceManagedViewerRecord } from "../host_service_protocol.ts";
 import type { LatexCompiler } from "../latex/latex_file_compiler.ts";
 import { mergeInlinePreviewArtifacts, rasterizePdfPages, type InlinePreviewArtifact } from "./inline_preview.ts";
 import { buildInlinePreviewToolPayload, type InlinePreviewToolPayload } from "./inline_preview_payload.ts";
@@ -13,11 +14,22 @@ export interface ShowLatexPreviewResult {
 	text: string;
 	pdfPath: string;
 	sourcePath?: string;
+	operationPdfPath?: string;
+	targetPdfId?: number;
+	managedRecord?: HostServiceManagedViewerRecord;
 }
 
 export interface ShowLatexCallOptions {
-	writeReady?: boolean;
-	writeFixed?: boolean;
+	openPdf?: boolean;
+	openPdfReuseExisting?: boolean;
+	openPdfRequirePersistentViewer?: boolean;
+	openPdfCallback?: {
+		kind: "pi-synctex-callback-v1";
+		transport: "unix";
+		socket_path: string;
+		token: string;
+	};
+	fixedPreview?: boolean;
 	cropToContent?: boolean;
 	suppressPageNumbers?: boolean;
 }
@@ -33,7 +45,6 @@ export interface ShowLatexPipelineDependencies {
 	callShowLatex: (
 		latexSource: string,
 		compiler: LatexCompiler | undefined,
-		synctexEditorCommand: string | undefined,
 		signal: AbortSignal | undefined,
 		options: ShowLatexCallOptions & { workspaceContext?: ShowLatexWorkspaceContext },
 	) => Promise<ShowLatexPreviewResult>;
@@ -57,9 +68,18 @@ export interface ShowLatexPipelineCompileRequest {
 	latexSource: string;
 	compiler?: LatexCompiler;
 	inline?: boolean;
-	synctexEditorCommand?: string;
 	signal?: AbortSignal;
 	workspaceContext?: ShowLatexWorkspaceContext;
+	openPdf?: boolean;
+	openPdfReuseExisting?: boolean;
+	openPdfRequirePersistentViewer?: boolean;
+	openPdfCallback?: {
+		kind: "pi-synctex-callback-v1";
+		transport: "unix";
+		socket_path: string;
+		token: string;
+	};
+	fixedPreview?: boolean;
 }
 
 export interface ShowLatexCompiledPreview {
@@ -67,6 +87,9 @@ export interface ShowLatexCompiledPreview {
 	previewPdfPath: string;
 	inline: boolean;
 	sourcePath?: string;
+	operationPdfPath?: string;
+	targetPdfId?: number;
+	managedRecord?: HostServiceManagedViewerRecord;
 	workspaceContext?: ShowLatexWorkspaceContext;
 }
 
@@ -176,12 +199,14 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 		const preview = await dependencies.callShowLatex(
 			request.latexSource,
 			request.compiler,
-			request.synctexEditorCommand,
 			request.signal,
 			{
-				writeReady: false,
-				writeFixed: !inline,
 				cropToContent: false,
+				openPdf: request.openPdf === undefined ? !inline : request.openPdf,
+				openPdfReuseExisting: request.openPdfReuseExisting,
+				openPdfRequirePersistentViewer: request.openPdfRequirePersistentViewer,
+				openPdfCallback: request.openPdfCallback,
+				fixedPreview: request.fixedPreview ?? !inline,
 				suppressPageNumbers: inline,
 				workspaceContext: request.workspaceContext,
 			},
@@ -191,6 +216,9 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 			text: preview.text,
 			previewPdfPath: preview.pdfPath,
 			sourcePath: preview.sourcePath,
+			operationPdfPath: preview.operationPdfPath,
+			targetPdfId: preview.targetPdfId,
+			managedRecord: preview.managedRecord,
 			inline,
 			workspaceContext: request.workspaceContext,
 		};

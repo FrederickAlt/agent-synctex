@@ -1,12 +1,5 @@
-import { resolve } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import {
-	closeTrackedPdfForContext,
-	describePdfJumpFailureContextForContext,
-	jumpTrackedPdfForContext,
-	openTrackedPdfForContext,
-} from "../pdf_session/pdf_session.ts";
 import type { HostServiceOpenResponseDetails } from "../host_service_protocol.ts";
 import { createHostServiceClient, extractHostServiceErrorCode, hostServiceSocketPath, hostServiceWorkspaceContextForRequest } from "./host_service_client.ts";
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
@@ -15,7 +8,7 @@ import { errorMessage, latexToolFailure } from "./error_utils.ts";
 const OpenPdfParams = Type.Object(
 	{
 		pdf_file_path: Type.String({
-			description: "Path to an existing local PDF file to send to the host service for opening/tracking and later SyncTeX actions.",
+			description: "Path to an existing local PDF file to send to the host service for opening and later SyncTeX actions.",
 			minLength: 1,
 		}),
 	},
@@ -62,19 +55,18 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 	pi.registerTool({
 		name: "open_pdf",
 		label: "Open PDF",
-		description: "Open an existing local PDF through the host service and track it for later SyncTeX actions. Returns a host-service pdf_id for this Pi session. Opening the same PDF path again reuses the existing tracked or visible viewer where practical. The viewer is configured with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
-		promptSnippet: "Open and track a local PDF through the host service",
+		description: "Open an existing local PDF through the host service for later SyncTeX actions. Returns a daemon-owned host-service pdf_id. Opening the same PDF path again reuses the existing daemon-managed or visible viewer where practical. The viewer is configured with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
+		promptSnippet: "Open a local PDF through the host service",
 		promptGuidelines: [
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
-			"Pass an existing local PDF path. The returned pdf_id is the host-service ID for this Pi session.",
-			"Opening the same normalized PDF path again should return the existing pdf_id instead of creating a duplicate viewer where practical.",
+			"Pass an existing local PDF path. The returned pdf_id is allocated and owned by the host-service daemon.",
+			"Opening the same normalized PDF path again should return the existing daemon pdf_id instead of creating a duplicate viewer where practical.",
 			"PDFs opened through the host service are wired to paste inverse SyncTeX clicks into the current interactive editor without triggering an agent turn when the backend supports it.",
 		],
 		parameters: OpenPdfParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			let requestedPath = "";
 			let pdfPath = "";
-			let synctexCommand = "";
 			let workspaceContext: { cwd: string; session_id?: string; workspace_root?: string } | undefined;
 			let openResponse: HostServiceOpenResponseDetails | undefined;
 			let socketPath = hostServiceSocketPath();
@@ -87,9 +79,7 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 					throw new Error("open_pdf requires a Pi agent session context");
 				}
 				workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
-				const callbackTargetId = await callbackManager.ensureHostServiceCallbackTarget(ctx);
 				const callbackServer = await callbackManager.ensureSynctexCallbacks(ctx);
-				synctexCommand = callbackServer.command;
 				socketPath = hostServiceSocketPath();
 				const hostServiceClient = createHostServiceClient(socketPath);
 				openResponse = await hostServiceClient.requestOpenPdf(
@@ -102,41 +92,22 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 					},
 					signal,
 				);
-				const trackedPdfPath = resolve(workspaceContext.cwd, openResponse.managed_record?.pdfPath ?? requestedPath);
-				const trackedPdf = await openTrackedPdfForContext(
-					ctx,
-					trackedPdfPath,
-					signal,
-					() => Promise.resolve({
-						pid: openResponse!.pid,
-						viewerHandle: openResponse!.handle,
-						viewerBackend: openResponse!.backend,
-						viewerOwned: openResponse!.owned,
-						viewerCapabilities: openResponse!.capabilities,
-						hostServicePdfId: openResponse!.pdf_id,
-						hostServiceSocketPath: socketPath,
-						hostServiceCallbackTargetId: callbackTargetId,
-					}),
-					undefined,
-					synctexCommand,
-					{
-						reuseTrackedPdf: false,
-						pdfId: openResponse!.pdf_id,
-					},
-				);
-				pdfPath = trackedPdf.path;
-				const pidText = trackedPdf.pid === undefined ? "" : ` pid=${trackedPdf.pid}`;
+				if (openResponse.pdf_id === undefined) {
+					throw new Error("Host service open response missing pdf_id");
+				}
+				pdfPath = openResponse.pdf || openResponse.managed_record?.pdfPath || requestedPath;
+				const pidText = openResponse.pid === undefined ? "" : ` pid=${openResponse.pid}`;
 				return {
-					content: [{ type: "text", text: `ok: pdf_id=${trackedPdf.id}${pidText} pdf=${trackedPdf.path}` }],
+					content: [{ type: "text", text: `ok: pdf_id=${openResponse.pdf_id}${pidText} pdf=${pdfPath}` }],
 					details: {
-						pdf_id: trackedPdf.id,
-						pid: trackedPdf.pid,
-						pdf: trackedPdf.path,
-						source: trackedPdf.sourceFile,
-						viewer_handle: trackedPdf.viewerHandle,
-						viewer_backend: trackedPdf.viewerBackend,
-						viewer_owned: trackedPdf.viewerOwned,
-						viewer_capabilities: trackedPdf.viewerCapabilities,
+						pdf_id: openResponse.pdf_id,
+						pid: openResponse.pid,
+						pdf: pdfPath,
+						source: openResponse.managed_record?.defaultSourcePath,
+						viewer_handle: openResponse.handle,
+						viewer_backend: openResponse.backend,
+						viewer_owned: openResponse.owned,
+						viewer_capabilities: openResponse.capabilities,
 					},
 				};
 			} catch (error) {
@@ -156,10 +127,10 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 	pi.registerTool({
 		name: "close_pdf",
 		label: "Close PDF",
-		description: "Request the host service to close an extension-tracked PDF by pdf_id. Service-managed windows are closed through private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The PDF is then removed from this session's tracking table when the close request succeeds.",
+		description: "Request the host service to close a daemon-managed PDF by pdf_id. Service-managed windows are closed through private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The active PDF ID is then removed from the daemon registry when close succeeds.",
 		promptSnippet: "Close a tracked PDF via host service",
 		promptGuidelines: [
-			"Use close_pdf when the user asks to close a PDF previously opened or tracked by this extension.",
+			"Use close_pdf when the user asks to close a PDF previously opened and managed by the host service.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true).",
 		],
 		parameters: ClosePdfParams,
@@ -167,28 +138,17 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 			let pdfId = 0;
 			try {
 				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
-				const result = await closeTrackedPdfForContext(
-					ctx,
-					pdfId,
-					async (viewerHandle, viewerBackend, closeSignal) => {
-						throw new Error("closeTrackedPdf requires host-service metadata in normal operation mode");
-					},
-					signal,
-					async (hostPdfId, trackedHostServiceSocketPath, closeSignal) => {
-						const socketPath = trackedHostServiceSocketPath || hostServiceSocketPath();
-						const closeResponse = await createHostServiceClient(socketPath).requestClosePdf({
-							cwd: ctx?.cwd ?? process.cwd(),
-						}, hostPdfId, closeSignal);
-						return { closed: closeResponse.closed, reason: closeResponse.reason };
-					},
-				);
+				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
+				const result = await createHostServiceClient(hostServiceSocketPath()).requestClosePdf(workspaceContext, pdfId, signal);
 				const reasonText = result.reason ? ` reason=${result.reason}` : "";
-				const closedText = result.closed
-					? `closed_pids=${result.closedPids.length ? result.closedPids.join(",") : "none"}`
-					: "closed=false";
+				const closedText = result.closed ? "closed=true" : "closed=false";
 				return {
-					content: [{ type: "text", text: `ok: pdf_id=${pdfId} pdf=${result.pdf} ${closedText}${reasonText}` }],
-					details: { pdf_id: pdfId, pdf: result.pdf, closed: result.closed, reason: result.reason, closed_pids: result.closedPids },
+					content: [{ type: "text", text: `ok: pdf_id=${result.pdf_id} ${closedText}${reasonText}` }],
+					details: {
+						pdf_id: result.pdf_id,
+						closed: result.closed,
+						reason: result.reason,
+					},
 				};
 			} catch (error) {
 				throw latexToolFailure("close-pdf", "Close PDF failed", {
@@ -218,7 +178,6 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 			let pdfId = 0;
 			let line = 0;
 			let sourceFile: string | undefined;
-			let synctexCommand = "";
 			try {
 				pdfId = resolvePositiveInteger(params.pdf_id, "pdf_id");
 				line = resolvePositiveInteger(params.line, "line");
@@ -229,67 +188,35 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 				if (!ctx) {
 					throw new Error("jump_pdf requires a Pi agent session context");
 				}
-				synctexCommand = (await callbackManager.ensureSynctexCallbacks(ctx)).command;
+				await callbackManager.ensureSynctexCallbacks(ctx);
 				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
-				const result = await jumpTrackedPdfForContext(
-					ctx,
-					pdfId,
-					line,
-					sourceFile,
-					signal,
+				const result = await createHostServiceClient().requestJumpPdf(
+					workspaceContext,
 					{
-						synctexEditorCommand: synctexCommand || undefined,
-						opener: async () => {
-						throw new Error("jumpTrackedPdf requires host-service metadata in normal operation mode");
-					},
-						requestForwardSearch: async () => {
-						throw new Error("jumpTrackedPdf requires host-service metadata in normal operation mode");
-					},
-						requestJumpFromHostService: async (
-						hostPdfId,
-						hostServiceSocket,
-						hostSourceFile,
-						jumpLine,
-						jumpSignal,
-					) => {
-						const socketPath = hostServiceSocket || hostServiceSocketPath();
-						const response = await createHostServiceClient(socketPath).requestJumpPdf(
-							workspaceContext,
-							{ pdf_id: hostPdfId, line: jumpLine, source_file: hostSourceFile },
-							jumpSignal,
-						);
-						return {
-							handled: response.handled,
-							pdf: response.pdf,
-							source_file: response.source_file,
-							source_line: response.source_line,
-							reopened: response.reopened,
-						};
-					},
-						cwd: ctx.cwd,
-					},
-				);
-				return {
-					content: [{ type: "text", text: `line ${result.line} contains:\n${result.sourceLine}` }],
-					details: {
 						pdf_id: pdfId,
 						line,
-						source: result.sourceFile,
+						...(sourceFile === undefined ? {} : { source_file: sourceFile }),
+					},
+					signal,
+				);
+				const sourceLine = result.source_line ?? "";
+				return {
+					content: [{ type: "text", text: `line ${result.line ?? line} contains:\n${sourceLine}` }],
+					details: {
+						pdf_id: result.pdf_id ?? pdfId,
+						line: result.line ?? line,
+						source: result.source_file ?? sourceFile,
 						pdf: result.pdf,
 						reopened: result.reopened,
-						source_line: result.sourceLine,
+						source_line: sourceLine,
 					},
 				};
 			} catch (error) {
-				const failureContext: Record<string, unknown> = {
+				throw latexToolFailure("jump-pdf", "PDF jump failed", {
 					pdf_id: pdfId || params.pdf_id,
 					line: line || params.line,
 					source_file: sourceFile ?? params.source_file,
-				};
-				if (ctx && pdfId > 0) {
-					failureContext.jump_failure_context = describePdfJumpFailureContextForContext(ctx, pdfId, synctexCommand || undefined);
-				}
-				throw latexToolFailure("jump-pdf", "PDF jump failed", failureContext, error);
+				}, error);
 			}
 		},
 	});

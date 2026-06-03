@@ -422,7 +422,7 @@ class ServiceUnavailableFakeViewerBackend extends RecordingFakeViewerBackend {
 		}
 		return {
 			status: "error",
-			error: "fake viewer service unavailable",
+			error: "fake host service managed viewer unavailable",
 			status_details: {
 				...(response.status_details as Record<string, unknown>),
 				error_code: "service_unavailable",
@@ -713,8 +713,8 @@ test("show_latex external flow distinguishes service timeout", async () => {
 				assert.fail("expected show_latex timeout to throw");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				assert.equal(/Host service request timed out while opening preview/.test(message), true);
-				assert.equal(/code=timeout|code=service_timeout/.test(message), false);
+				assert.equal(/Host service managed viewer request timed out while opening preview/.test(message), true);
+				assert.equal(/code=service_timeout/.test(message), true);
 			}
 		});
 	} finally {
@@ -741,7 +741,7 @@ test("show_latex external flow distinguishes backend open failure", async () => 
 				assert.fail("expected show_latex open failure");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				assert.equal(/Host service backend unavailable while opening preview/.test(message), true);
+				assert.equal(/Host service managed viewer backend unavailable while opening preview/.test(message), true);
 				assert.equal(/code=backend_unavailable/.test(message), true);
 			}
 		});
@@ -769,7 +769,7 @@ test("show_latex external flow distinguishes service unavailable", async () => {
 				assert.fail("expected show_latex open failure");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				assert.equal(/Host service unavailable while opening preview/.test(message), true);
+				assert.equal(/Host service managed viewer unavailable while opening preview/.test(message), true);
 				assert.equal(/code=service_unavailable/.test(message), true);
 				assert.equal(backend.openRequests.length, 1);
 			}
@@ -799,7 +799,7 @@ test("show_latex external compile failure is reported distinctly", async () => {
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				assert.equal(/LaTeX preview compilation failed/.test(message), true);
-				assert.equal(/Host service|viewer service/.test(message), false);
+				assert.equal(/Host service|viewer backend|managed viewer/.test(message), false);
 				assert.equal(backend.openRequests.length, 0);
 			}
 		});
@@ -830,12 +830,13 @@ test("show_latex external flow supports jump_pdf and close_pdf through host serv
 				undefined,
 				context,
 			);
-			const openDetails = openResult.details as { pdf_id: number; pdf: string };
+			const openDetails = openResult.details as { pdf_id: number; pdf: string; source?: string };
 			assert.equal(openDetails.pdf_id > 0, true);
+			assert.equal(typeof openDetails.source, "string");
 
 			const jumpResult = await jumpPdf.execute(
 				"show-latex-jump",
-				{ pdf_id: openDetails.pdf_id, line: 1 },
+				{ pdf_id: openDetails.pdf_id, line: 1, source_file: openDetails.source },
 				undefined,
 				undefined,
 				context,
@@ -854,9 +855,8 @@ test("show_latex external flow supports jump_pdf and close_pdf through host serv
 				undefined,
 				context,
 			);
-			const closeDetails = closeResult.details as { closed: boolean; pdf_id: number; pdf: string };
+			const closeDetails = closeResult.details as { closed: boolean; pdf_id: number };
 			assert.equal(closeDetails.pdf_id, openDetails.pdf_id);
-			assert.equal(closeDetails.pdf, openDetails.pdf);
 			assert.equal(closeDetails.closed, true);
 		}, backend);
 	} finally {
@@ -1053,6 +1053,74 @@ test("show_latex inline compile snippet uses extended timeout", async () => {
 	} finally {
 		proto.requestCompileLatexSnippet = originalCompile;
 		proto.requestRasterizePdf = originalRasterize;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("show_latex external flow uses compile timeout when open is requested", async () => {
+	const { root, sourceContent } = withTemporaryProject();
+	const tool = await captureShowLatexTool();
+	let compileTimeoutMs: number | undefined;
+	const context = createSessionContext(root);
+	const proto = HostServiceClient.prototype as {
+		requestCompileLatexSnippet: HostServiceClient["requestCompileLatexSnippet"];
+	};
+	const originalCompile = proto.requestCompileLatexSnippet;
+	const fakePdf = resolve(root, "snippet.pdf");
+	const fakeSnippetResponse: Awaited<ReturnType<HostServiceClient["requestCompileLatexSnippet"]>> = {
+		protocol_version: 1,
+		supported: true,
+		service_available: true,
+		workspace_context: { cwd: root },
+		request_id: "show-latex-snippet-open-timeout-test",
+		operation: "compile_latex_snippet",
+		source: resolve(root, "snippet.tex"),
+		pdf: fakePdf,
+		log: resolve(root, "snippet.log"),
+		artifact_paths: [fakePdf],
+		clean: false,
+		cleaned_artifacts: [],
+		pdf_id: 123,
+		managed_record: {
+			id: 123,
+			pdfPath: fakePdf,
+			viewerHandle: "fake-viewer",
+			viewerBackend: "fake",
+			viewerOwned: true,
+			createdAtNs: Date.now() * 1_000_000,
+			capabilities: {
+				open: true,
+				close: true,
+				forward_search: false,
+				inverse_search: false,
+				reuse: true,
+			},
+		},
+	};
+
+	try {
+		proto.requestCompileLatexSnippet = async (_request, _workspaceContext, _signal, requestTimeoutMs) => {
+			compileTimeoutMs = requestTimeoutMs;
+			return fakeSnippetResponse;
+		};
+
+		const result = await tool.execute(
+			"show-latex-external-timeout-test",
+			{ source: sourceContent, inline: false },
+			undefined,
+			undefined,
+			context,
+		);
+		assert.equal(compileTimeoutMs, HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS);
+		const details = result.details as {
+			inline?: boolean;
+			pdf_id?: number;
+		};
+		assert.equal(details.inline, false);
+		assert.equal(details.pdf_id, 123);
+	} finally {
+		proto.requestCompileLatexSnippet = originalCompile;
+		await runSessionShutdown(context);
 		rmSync(root, { recursive: true, force: true });
 	}
 });

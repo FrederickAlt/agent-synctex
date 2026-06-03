@@ -1,4 +1,8 @@
-import { assertReadableSourceFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
+import {
+	assertReadablePdfFile,
+	assertReadableSourceFile,
+	inferDefaultSourceFileForPdf,
+} from "./pdf_tracking/pdf_tracking.ts";
 import { readSourceLine } from "./synctex/synctex.ts";
 import type {
 	HostServiceCloseRequest,
@@ -45,23 +49,139 @@ function isValidViewerBackendCapabilities(value: unknown): value is HostServiceV
 	);
 }
 
+const MANAGED_VIEWER_OPEN_TIMEOUT_MS = 2_000;
+const VIEWER_BACKEND_TIMEOUT_ERROR_TEXT = "viewer backend request timed out while opening preview";
+
+function withTimeout<T>(
+	operation: () => Promise<T>,
+	timeoutMs: number,
+	onLateSuccess?: (value: T) => void | Promise<void>,
+): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			reject(new Error(VIEWER_BACKEND_TIMEOUT_ERROR_TEXT));
+		}, timeoutMs);
+		timer.unref?.();
+
+		let operationPromise: Promise<T>;
+		try {
+			operationPromise = operation();
+		} catch (error) {
+			clearTimeout(timer);
+			reject(error instanceof Error ? error : new Error(String(error)));
+			return;
+		}
+
+		operationPromise
+			.then((value) => {
+				clearTimeout(timer);
+				if (timedOut) {
+					void Promise.resolve(onLateSuccess?.(value)).catch(() => undefined);
+					return;
+				}
+				resolve(value);
+			})
+			.catch((error) => {
+				clearTimeout(timer);
+				if (timedOut) {
+					return;
+				}
+				reject(error instanceof Error ? error : new Error(String(error)));
+			});
+	});
+}
+
 export class HostServiceManagedViewerService {
 	private readonly viewerBackend: ViewerBackendAdapter;
 	private readonly managedViewerRecords: HostServicePdfIdRegistryLike;
 	private readonly protocolVersion: number;
+	private readonly openTimeoutMs: number;
 
 	constructor(options: {
 		viewerBackend: ViewerBackendAdapter;
 		managedViewerRecords: HostServicePdfIdRegistryLike;
 		protocolVersion: number;
+		openTimeoutMs?: number;
 	}) {
 		this.viewerBackend = options.viewerBackend;
 		this.managedViewerRecords = options.managedViewerRecords;
 		this.protocolVersion = options.protocolVersion;
+		this.openTimeoutMs = options.openTimeoutMs ?? MANAGED_VIEWER_OPEN_TIMEOUT_MS;
 	}
 
 	async openViewer(request: HostServiceOpenRequest): Promise<HostServiceOpenResponseEnvelope> {
-		const backendResult = await this.viewerBackend.open(request.request_id, request.details as Record<string, unknown>);
+		try {
+			assertReadablePdfFile(request.details.pdf_path);
+		} catch (error) {
+			const errorText = error instanceof Error ? error.message : String(error);
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "open_pdf",
+				status: "error",
+				generated_at_ns: Date.now() * 1_000_000,
+				error: errorText,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "open_pdf",
+					backend: this.viewerBackend.name,
+					backend_path: this.viewerBackend.name,
+					capabilities: this.viewerBackend.capabilities,
+					handle: undefined,
+					owned: false,
+					reused: false,
+					pid: undefined,
+					pid_diagnostic: undefined,
+					pdf: request.details.pdf_path,
+					error_code: errorText.includes("must point to a PDF file") ? "invalid_pdf" : "invalid_request",
+					reason: errorText,
+				},
+			};
+		}
+		let backendResult: Awaited<ReturnType<ViewerBackendAdapter["open"]>>;
+		try {
+			backendResult = await withTimeout(
+				() => this.viewerBackend.open(request.request_id, request.details as Record<string, unknown>),
+				this.openTimeoutMs,
+				(result) => this.closeTimedOutOpenResult(request.request_id, result),
+			);
+		} catch (error) {
+			const errorText = error instanceof Error ? error.message : String(error);
+			const isTimeout = errorText === VIEWER_BACKEND_TIMEOUT_ERROR_TEXT;
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "open_pdf",
+				status: "error",
+				generated_at_ns: Date.now() * 1_000_000,
+				error: errorText,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "open_pdf",
+					backend: this.viewerBackend.name,
+					backend_path: this.viewerBackend.name,
+					capabilities: this.viewerBackend.capabilities,
+					handle: undefined,
+					owned: false,
+					reused: false,
+					pid: undefined,
+					pid_diagnostic: undefined,
+					pdf: request.details.pdf_path,
+					error_code: isTimeout ? "service_timeout" : "backend_unavailable",
+					reason: errorText,
+				},
+			};
+		}
 		const nowNs = Date.now() * 1_000_000;
 		const backendDetails = backendResult.status_details as Record<string, unknown>;
 		const backendPath =
@@ -110,6 +230,7 @@ export class HostServiceManagedViewerService {
 						reused: false,
 						pid: undefined,
 						pid_diagnostic: undefined,
+						pdf: request.details.pdf_path,
 						error_code: "internal_error",
 						reason: "viewer backend response missing handle",
 					},
@@ -172,6 +293,7 @@ export class HostServiceManagedViewerService {
 				operation: "open_pdf",
 				status: "ok",
 				generated_at_ns: nowNs,
+				pdf: managedRecord.pdfPath,
 				status_details: {
 					protocol_version: this.protocolVersion,
 					supported: true,
@@ -187,6 +309,7 @@ export class HostServiceManagedViewerService {
 					reused,
 					pid,
 					pid_diagnostic: pidDiagnostic,
+					pdf: managedRecord.pdfPath,
 					pdf_id: managedRecord.id,
 					managed_record: managedRecord,
 				},
@@ -215,6 +338,7 @@ export class HostServiceManagedViewerService {
 				reused,
 				pid,
 				pid_diagnostic: pidDiagnostic,
+				pdf: request.details.pdf_path,
 				error_code: typeof backendDetails.error_code === "string"
 					? backendDetails.error_code
 					: "backend_unavailable",
@@ -770,6 +894,37 @@ export class HostServiceManagedViewerService {
 					managed_record: managedRecord,
 				},
 			};
+	}
+
+	private async closeTimedOutOpenResult(
+		requestId: string,
+		backendResult: Awaited<ReturnType<ViewerBackendAdapter["open"]>>,
+	): Promise<void> {
+		if (backendResult.status !== "ok") {
+			return;
+		}
+		const backendDetails = backendResult.status_details as Record<string, unknown>;
+		const handle =
+			typeof backendDetails.handle === "string" && backendDetails.handle.trim()
+				? backendDetails.handle
+				: undefined;
+		if (!handle || !Boolean(backendDetails.owned) || Boolean(backendDetails.reused)) {
+			return;
+		}
+		const capabilities = isValidViewerBackendCapabilities(backendDetails.capabilities)
+			? backendDetails.capabilities
+			: this.viewerBackend.capabilities;
+		if (!capabilities.close) {
+			return;
+		}
+		try {
+			await this.viewerBackend.close(`${requestId}:late-open-cleanup`, {
+				handle,
+				backend: this.viewerBackend.name,
+			});
+		} catch {
+			// Best effort: the original request already timed out and no pdf_id was returned.
+		}
 	}
 
 	private trackManagedRecord(record: HostServiceManagedViewerRecordInput): HostServiceManagedViewerRecord {

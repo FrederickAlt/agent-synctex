@@ -28,7 +28,7 @@ Pi and other clients act as frontends to this service. Pi may preserve richer fr
 - Multiple agents can use the same host service while receiving distinct random active PDF IDs from daemon allocation.
 - Relative MCP call paths are resolved against caller-provided `workspace_context.cwd`; the daemon never resolves against its own process cwd.
 - Callback metadata (`kind`, `transport`, `socket_path`, `token`) is optional in host-service requests; when omitted, inverse SyncTeX callback behavior is disabled but open/jump still function.
-- Codex relay is intentionally out of scope in this ADR; any Codex-oriented client should target this daemon MCP endpoint in a later phase.
+- Codex relay now exists as a thin stdio/daemon-MCP transport over this same endpoint; earlier ADR drafts that scoped it out are historical.
 - Viewer open, jump, close, and callback routing are centralized.
 - The previous narrow viewer-service role has been absorbed into the MCP host service; the Host Service now owns and enforces these legacy behaviors directly.
 - The service needs lifecycle, restart, cleanup, state validation, and stale-handle handling.

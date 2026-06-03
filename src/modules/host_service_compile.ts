@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -10,6 +10,8 @@ import {
 	LoggedToolError,
 	type LatexFileCompileRequest,
 } from "./latex/latex_file_compiler.ts";
+import { resolveFixedPreviewPdfPath } from "./host_service_fixed_preview_pdf_path.ts";
+import { getMcpFixedPreviewPdfPath } from "./runtime_paths.ts";
 import type {
 	HostServiceCallbackTarget,
 	HostServiceCompileRequest,
@@ -82,62 +84,18 @@ export class HostServiceCompileService {
 				cleanArtifacts.push(cleaned);
 			}
 			const artifactPaths = getExistingArtifacts(result.pdfPath, resultLogPath);
-			let openResponse: HostServiceOpenResponseEnvelope | undefined;
-			if (request.details.open_pdf) {
-				const openCallback = await this.resolveManagedOpenCallback(
-					request.workspace_context,
-					request.details.callback_target_id,
-					request.details.callback,
-				);
-				if (openCallback === undefined) {
-					return this.buildCompileOpenFailureResponse(
-						request,
-						result.source,
-						result.pdfPath,
-						resultLogPath,
-						shouldClean,
-						cleanArtifacts,
-						artifactPaths,
-						"open_pdf callback configuration is missing or stale for this workspace",
-						"invalid_request",
-						nowNs,
-					);
-				}
-				try {
-					openResponse = await this.openCompiledPdfThroughManagedViewer(
-						request.request_id,
-						request.workspace_context,
-						result.pdfPath,
-						openCallback,
-					);
-				} catch (error) {
-					return this.buildCompileOpenFailureResponse(
-						request,
-						result.source,
-						result.pdfPath,
-						resultLogPath,
-						shouldClean,
-						cleanArtifacts,
-						artifactPaths,
-						error instanceof Error ? error.message : String(error),
-						"backend_unavailable",
-						nowNs,
-					);
-				}
-				if (openResponse !== undefined && openResponse.status === "error") {
-					return this.buildCompileOpenFailureResponse(
-						request,
-						result.source,
-						result.pdfPath,
-						resultLogPath,
-						shouldClean,
-						cleanArtifacts,
-						artifactPaths,
-						openResponse.error || "failed to open compiled PDF",
-						openResponse.status_details.error_code ?? "backend_unavailable",
-						nowNs,
-					);
-				}
+			const openResponse = await this.openCompiledPdfThroughManagedViewerAfterCompile(
+				request,
+				result.source,
+				result.pdfPath,
+				resultLogPath,
+				shouldClean,
+				cleanArtifacts,
+				artifactPaths,
+				nowNs,
+			);
+			if (openResponse !== undefined && openResponse.operation !== "open_pdf") {
+				return openResponse;
 			}
 			return {
 				protocol_version: this.protocolVersion,
@@ -216,63 +174,27 @@ export class HostServiceCompileService {
 			const result = await hostServiceLatexFileCompiler.compileLatexFile(compileRequest);
 			const logPath = inferLatexLogPath(result.source);
 			const nowNs = this.nowNs();
-			const artifactPaths = getExistingArtifacts(result.pdfPath, logPath);
-			let openResponse: HostServiceOpenResponseEnvelope | undefined;
-			if (request.details.open_pdf) {
-				const openCallback = await this.resolveManagedOpenCallback(
-					request.workspace_context,
-					request.details.callback_target_id,
-					request.details.callback,
-				);
-				if (openCallback === undefined) {
-					return this.buildCompileOpenFailureResponse(
-						request,
-						result.source,
-						result.pdfPath,
-						logPath,
-						shouldClean,
-						cleanArtifacts,
-						artifactPaths,
-						"open_pdf callback configuration is missing or stale for this workspace",
-						"invalid_request",
-						nowNs,
-					);
-				}
-				try {
-					openResponse = await this.openCompiledPdfThroughManagedViewer(
-						request.request_id,
-						request.workspace_context,
-						result.pdfPath,
-						openCallback,
-					);
-				} catch (error) {
-					return this.buildCompileOpenFailureResponse(
-						request,
-						result.source,
-						result.pdfPath,
-						logPath,
-						shouldClean,
-						cleanArtifacts,
-						artifactPaths,
-						error instanceof Error ? error.message : String(error),
-						"backend_unavailable",
-						nowNs,
-					);
-				}
-				if (openResponse !== undefined && openResponse.status === "error") {
-					return this.buildCompileOpenFailureResponse(
-						request,
-						result.source,
-						result.pdfPath,
-						logPath,
-						shouldClean,
-						cleanArtifacts,
-						artifactPaths,
-						openResponse.error || "failed to open compiled PDF",
-						openResponse.status_details.error_code ?? "backend_unavailable",
-						nowNs,
-					);
-				}
+			const operationPdfPath = result.pdfPath;
+			const operationArtifactPaths = getExistingArtifacts(operationPdfPath, logPath);
+			const fixedPreviewPdfPath = request.details.open_pdf && request.details.fixed_preview === true
+				? resolveFixedPreviewPdfPath(getMcpFixedPreviewPdfPath())
+				: undefined;
+			const previewPdfPath = fixedPreviewPdfPath ?? operationPdfPath;
+			const artifactPaths = fixedPreviewPdfPath === undefined
+				? operationArtifactPaths
+				: [...this.copySnippetArtifactsToFixedPath(operationPdfPath, fixedPreviewPdfPath), ...getExistingArtifacts(logPath)];
+			const openResponse = await this.openCompiledPdfThroughManagedViewerAfterCompile(
+				request,
+				result.source,
+				previewPdfPath,
+				logPath,
+				shouldClean,
+				cleanArtifacts,
+				artifactPaths,
+				nowNs,
+			);
+			if (openResponse !== undefined && openResponse.operation !== "open_pdf") {
+				return openResponse;
 			}
 			return {
 				protocol_version: this.protocolVersion,
@@ -288,11 +210,13 @@ export class HostServiceCompileService {
 					request_id: request.request_id,
 					operation: request.operation,
 					source: result.source,
-					pdf: result.pdfPath,
+					pdf: previewPdfPath,
+					operation_pdf: operationPdfPath,
 					log: logPath,
 					clean: shouldClean,
 					cleaned_artifacts: cleanArtifacts,
 					artifact_paths: artifactPaths,
+					operation_artifact_paths: operationArtifactPaths,
 					pdf_id: openResponse?.status_details.pdf_id,
 					managed_record: openResponse?.status_details.managed_record,
 				},
@@ -326,6 +250,111 @@ export class HostServiceCompileService {
 				},
 			};
 		}
+	}
+
+	private openCompiledPdfThroughManagedViewerAfterCompile(
+		request: HostServiceCompileRequest,
+		source: string,
+		pdf: string,
+		log: string,
+		clean: boolean,
+		cleanedArtifacts: string[],
+		artifactPaths: string[],
+		nowNs: number,
+	): Promise<HostServiceOpenResponseEnvelope | HostServiceCompileResponseEnvelope | undefined>;
+	private openCompiledPdfThroughManagedViewerAfterCompile(
+		request: HostServiceCompileSnippetRequest,
+		source: string,
+		pdf: string,
+		log: string,
+		clean: boolean,
+		cleanedArtifacts: string[],
+		artifactPaths: string[],
+		nowNs: number,
+	): Promise<HostServiceOpenResponseEnvelope | HostServiceCompileSnippetResponseEnvelope | undefined>;
+	private async openCompiledPdfThroughManagedViewerAfterCompile(
+		request: CompileRequest,
+		source: string,
+		pdf: string,
+		log: string,
+		clean: boolean,
+		cleanedArtifacts: string[],
+		artifactPaths: string[],
+		nowNs: number,
+	): Promise<HostServiceOpenResponseEnvelope | HostServiceCompileResponseEnvelope | HostServiceCompileSnippetResponseEnvelope | undefined> {
+		if (!request.details.open_pdf) {
+			return undefined;
+		}
+
+		const buildCompileOpenFailureResponse = (errorText: string, errorCode: string) => {
+			return request.operation === "compile_latex_file"
+				? this.buildCompileOpenFailureResponse(
+						request,
+						source,
+						pdf,
+						log,
+						clean,
+						cleanedArtifacts,
+						artifactPaths,
+						errorText,
+						errorCode,
+						nowNs,
+					)
+				: this.buildCompileOpenFailureResponse(
+						request,
+						source,
+						pdf,
+						log,
+						clean,
+						cleanedArtifacts,
+						artifactPaths,
+						errorText,
+						errorCode,
+						nowNs,
+					);
+		};
+
+		const requiresCallbackResolution = request.details.callback_target_id !== undefined || request.details.callback !== undefined;
+		const openCallback = requiresCallbackResolution
+			? await this.resolveManagedOpenCallback(
+				request.workspace_context,
+				request.details.callback_target_id,
+				request.details.callback,
+			)
+			: undefined;
+
+		if (requiresCallbackResolution && openCallback === undefined) {
+			return buildCompileOpenFailureResponse(
+				"open_pdf callback configuration is missing or stale for this workspace",
+				"invalid_request",
+			);
+		}
+
+		let openResponse: HostServiceOpenResponseEnvelope;
+		try {
+			openResponse = await this.openCompiledPdfThroughManagedViewer(
+				request.request_id,
+				request.workspace_context,
+				pdf,
+				openCallback,
+				request.details.reuse_existing,
+				request.details.require_persistent_viewer,
+			);
+		} catch (error) {
+			return buildCompileOpenFailureResponse(
+				error instanceof Error ? error.message : String(error),
+				"backend_unavailable",
+			);
+		}
+
+		if (openResponse.status === "error") {
+			return buildCompileOpenFailureResponse(
+				openResponse.error || "failed to open compiled PDF",
+				openResponse.status_details.error_code ?? "backend_unavailable",
+			);
+		}
+
+		return openResponse;
 	}
 
 	private buildCompileOpenFailureResponse(
@@ -393,7 +422,9 @@ export class HostServiceCompileService {
 		requestId: string,
 		workspaceContext: HostServiceWorkspaceContext,
 		pdfPath: string,
-		callback: HostServiceCallbackTarget,
+		callback: HostServiceCallbackTarget | undefined,
+		reuseExisting?: boolean,
+		requirePersistentViewer?: boolean,
 	): Promise<HostServiceOpenResponseEnvelope> {
 		return this.managedViewerService.openViewer({
 			protocol_version: this.protocolVersion,
@@ -403,11 +434,37 @@ export class HostServiceCompileService {
 			workspace_context: workspaceContext,
 			details: {
 				pdf_path: pdfPath,
-				callback,
-				reuse_existing: true,
-				require_persistent_viewer: false,
+				...(callback === undefined ? {} : { callback }),
+				reuse_existing: reuseExisting ?? true,
+				require_persistent_viewer: requirePersistentViewer ?? false,
 			},
 		});
+	}
+
+	private copySnippetArtifactsToFixedPath(operationPdfPath: string, fixedPdfPath: string): string[] {
+		const operationBase = operationPdfPath.toLowerCase().endsWith(".pdf") ? operationPdfPath.slice(0, -4) : operationPdfPath;
+		const fixedBase = fixedPdfPath.toLowerCase().endsWith(".pdf") ? fixedPdfPath.slice(0, -4) : fixedPdfPath;
+		ensureDirectory(dirname(fixedPdfPath));
+		if (existsSync(operationPdfPath) && operationPdfPath !== fixedPdfPath) {
+			copyFileSync(operationPdfPath, fixedPdfPath);
+		}
+		for (const extension of [".synctex", ".synctex.gz"] as const) {
+			const operationArtifactPath = `${operationBase}${extension}`;
+			const fixedArtifactPath = `${fixedBase}${extension}`;
+			if (existsSync(operationArtifactPath)) {
+				if (operationArtifactPath !== fixedArtifactPath) {
+					copyFileSync(operationArtifactPath, fixedArtifactPath);
+				}
+				continue;
+			}
+			if (existsSync(fixedArtifactPath)) {
+				rmSync(fixedArtifactPath);
+			}
+		}
+		if (!existsSync(fixedPdfPath)) {
+			throw new Error(`failed to copy stable snippet PDF to fixed preview path: ${fixedPdfPath}`);
+		}
+		return getExistingArtifacts(fixedPdfPath, `${fixedBase}.synctex`, `${fixedBase}.synctex.gz`);
 	}
 }
 

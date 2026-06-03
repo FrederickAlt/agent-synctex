@@ -409,9 +409,12 @@ export class HostServiceClient {
 				...(request.compiler === undefined ? {} : { compiler: request.compiler }),
 				...(request.clean === undefined ? {} : { clean: request.clean }),
 				...(request.open_pdf === undefined ? {} : { open_pdf: request.open_pdf }),
+				...(request.reuse_existing === undefined ? {} : { reuse_existing: request.reuse_existing }),
+				...(request.require_persistent_viewer === undefined ? {} : { require_persistent_viewer: request.require_persistent_viewer }),
 				...(request.callback_target_id === undefined ? {} : { callback_target_id: request.callback_target_id }),
 				...(request.callback === undefined ? {} : { callback: request.callback }),
 			},
+
 		},
 			signal,
 			requestTimeoutMs ?? this.requestTimeoutMs,
@@ -453,9 +456,13 @@ export class HostServiceClient {
 					: { suppress_page_numbers: request.suppress_page_numbers }),
 				...(request.crop_to_content === undefined ? {} : { crop_to_content: request.crop_to_content }),
 				...(request.open_pdf === undefined ? {} : { open_pdf: request.open_pdf }),
+				...(request.fixed_preview === undefined ? {} : { fixed_preview: request.fixed_preview }),
+				...(request.reuse_existing === undefined ? {} : { reuse_existing: request.reuse_existing }),
+				...(request.require_persistent_viewer === undefined ? {} : { require_persistent_viewer: request.require_persistent_viewer }),
 				...(request.callback_target_id === undefined ? {} : { callback_target_id: request.callback_target_id }),
 				...(request.callback === undefined ? {} : { callback: request.callback }),
 			},
+
 		},
 			signal,
 			requestTimeoutMs ?? this.requestTimeoutMs,
@@ -1037,6 +1044,8 @@ export class HostServiceServer {
 				openPdf: (request) => this.managedViewerService.openViewer(request),
 				jumpPdf: (request) => this.managedViewerService.jumpViewer(request),
 				closePdf: (request) => this.managedViewerService.closeViewer(request),
+				resolveManagedOpenCallback: (workspaceContext, callbackTargetId, callbackTarget) =>
+					this.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget),
 			});
 			if (response === null) {
 				return;
@@ -1507,10 +1516,38 @@ function parseResponse(
 	} catch {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
-	if (!isValidHostServiceResponse(parsed, expectedRequestId, expectedOperation)) {
+	const normalized = normalizeHostServiceResponsePayload(parsed);
+	if (!isValidHostServiceResponse(normalized, expectedRequestId, expectedOperation)) {
 		throw new Error(`Malformed host service response payload: ${raw}`);
 	}
-	return parsed;
+	return normalized;
+}
+
+function normalizeHostServiceResponsePayload(value: unknown): unknown {
+	if (!isStringRecord(value) || value.operation !== "open_pdf") {
+		return value;
+	}
+	if (!isStringRecord(value.status_details)) {
+		return value;
+	}
+	const details = value.status_details;
+	const managedRecordPdf = isStringRecord(details.managed_record) && typeof details.managed_record.pdfPath === "string"
+		? details.managed_record.pdfPath
+		: undefined;
+	const detailsPdf = typeof details.pdf === "string" && details.pdf ? details.pdf : undefined;
+	const envelopePdf = typeof value.pdf === "string" && value.pdf ? value.pdf : undefined;
+	const pdf = detailsPdf ?? envelopePdf ?? managedRecordPdf;
+	if (pdf === undefined) {
+		return value;
+	}
+	return {
+		...value,
+		pdf,
+		status_details: {
+			...details,
+			pdf,
+		},
+	};
 }
 
 function validateHostServiceRequest(value: unknown): HostServiceRequest {
@@ -1556,6 +1593,12 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 			if (rawDetails.open_pdf !== undefined && typeof rawDetails.open_pdf !== "boolean") {
 				throw new Error("open_pdf must be a boolean");
 			}
+			if (rawDetails.reuse_existing !== undefined && typeof rawDetails.reuse_existing !== "boolean") {
+				throw new Error("reuse_existing must be a boolean");
+			}
+			if (rawDetails.require_persistent_viewer !== undefined && typeof rawDetails.require_persistent_viewer !== "boolean") {
+				throw new Error("require_persistent_viewer must be a boolean");
+			}
 			if (rawDetails.callback_target_id !== undefined && typeof rawDetails.callback_target_id !== "string") {
 				throw new Error("callback_target_id must be a non-empty string");
 			}
@@ -1566,9 +1609,6 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				throw new Error("callback must be a valid callback target");
 			}
 			const openPdf = rawDetails.open_pdf === true;
-			if (openPdf && rawDetails.callback === undefined && rawDetails.callback_target_id === undefined) {
-				throw new Error("open_pdf requires callback or callback_target_id");
-			}
 			const workspaceContext = normalizeWorkspaceContextForCompile(value.workspace_context);
 			return {
 				protocol_version: PROTOCOL_VERSION,
@@ -1581,6 +1621,8 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 					compiler: rawDetails.compiler,
 					clean: rawDetails.clean === true,
 					open_pdf: openPdf,
+					reuse_existing: rawDetails.reuse_existing,
+					require_persistent_viewer: rawDetails.require_persistent_viewer,
 					callback_target_id: rawDetails.callback_target_id,
 					callback: rawDetails.callback as HostServiceCallbackTarget | undefined,
 				},
@@ -1612,13 +1654,22 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 			if (rawDetails.callback_target_id !== undefined && !rawDetails.callback_target_id.trim()) {
 				throw new Error("callback_target_id must be a non-empty string");
 			}
+			if (rawDetails.fixed_preview_pdf_path !== undefined) {
+				throw new Error("fixed_preview_pdf_path is not supported; use fixed_preview");
+			}
+			if (rawDetails.fixed_preview !== undefined && typeof rawDetails.fixed_preview !== "boolean") {
+				throw new Error("fixed_preview must be a boolean");
+			}
+			if (rawDetails.reuse_existing !== undefined && typeof rawDetails.reuse_existing !== "boolean") {
+				throw new Error("reuse_existing must be a boolean");
+			}
+			if (rawDetails.require_persistent_viewer !== undefined && typeof rawDetails.require_persistent_viewer !== "boolean") {
+				throw new Error("require_persistent_viewer must be a boolean");
+			}
 			if (rawDetails.callback !== undefined && !isValidCallbackTarget(rawDetails.callback)) {
 				throw new Error("callback must be a valid callback target");
 			}
 			const openPdf = rawDetails.open_pdf === true;
-			if (openPdf && rawDetails.callback === undefined && rawDetails.callback_target_id === undefined) {
-				throw new Error("open_pdf requires callback or callback_target_id");
-			}
 			const workspaceContext = normalizeWorkspaceContextForSnippetCompile(value.workspace_context);
 			return {
 				protocol_version: PROTOCOL_VERSION,
@@ -1632,6 +1683,9 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 					suppress_page_numbers: rawDetails.suppress_page_numbers,
 					crop_to_content: rawDetails.crop_to_content,
 					open_pdf: openPdf,
+					fixed_preview: rawDetails.fixed_preview,
+					reuse_existing: rawDetails.reuse_existing,
+					require_persistent_viewer: rawDetails.require_persistent_viewer,
 					callback_target_id: rawDetails.callback_target_id,
 					callback: rawDetails.callback as HostServiceCallbackTarget | undefined,
 				},
@@ -2250,6 +2304,8 @@ function isValidOpenResponse(response: unknown, expectedRequestId: string): resp
 		if (typeof details.pid !== "number" || !Number.isInteger(details.pid) || details.pid <= 0) return false;
 	}
 	if (details.pid_diagnostic !== undefined && typeof details.pid_diagnostic !== "string") return false;
+	if (details.pdf !== undefined && typeof details.pdf !== "string") return false;
+	if (response.status === "ok" && (typeof details.pdf !== "string" || !details.pdf)) return false;
 	if (details.error_code !== undefined && typeof details.error_code !== "string") return false;
 	if (response.status === "error" && typeof details.error_code !== "string") return false;
 	if (response.status === "ok" && details.error_code !== undefined) return false;
@@ -2633,6 +2689,7 @@ function buildViewerOperationErrorResponse(
 		};
 		(base.status_details as Record<string, unknown>).owned = false;
 		(base.status_details as Record<string, unknown>).reused = false;
+		(base.status_details as Record<string, unknown>).pdf = "";
 	}
 	if (operation === "close_pdf") {
 		(base.status_details as Record<string, unknown>).backend = "unknown";

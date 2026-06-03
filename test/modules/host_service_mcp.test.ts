@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { getLatexPreamblePath } from "../../src/modules/runtime_paths.ts";
+import { getLatexPreamblePath, getMcpFixedPreviewPdfPath } from "../../src/modules/runtime_paths.ts";
 import { FakeViewerBackend, HostServiceServer } from "../../src/modules/host_service.ts";
 import { HostServiceMcpFrameReader } from "../../src/modules/host_service_mcp.ts";
 
@@ -29,7 +29,7 @@ function writeFakeLatexCompiler(binDir: string): void {
 	mkdirSync(binDir, { mode: 0o700, recursive: true });
 	writeFileSync(
 		compilerPath,
-		"#!/bin/sh\nset -eu\ntex_file=\"\"\nfor arg in \"$@\"; do\n  tex_file=\"$arg\"\ndone\nbase=\"${tex_file##*/}\"\nname=\"${base%.*}\"\nout_dir=\"$(dirname \"$tex_file\")\"\nif [ -z \"$tex_file\" ]; then\n  exit 1\nfi\nprintf \"fake compiler output\\n\" > \"$out_dir/$name.log\"\ntouch \"$out_dir/$name.pdf\"\ntouch \"$out_dir/$name.aux\"\nexit 0\n",
+		"#!/bin/sh\nset -eu\ntex_file=\"\"\nfor arg in \"$@\"; do\n  tex_file=\"$arg\"\ndone\nbase=\"${tex_file##*/}\"\nname=\"${base%.*}\"\nout_dir=\"$(dirname \"$tex_file\")\"\nif [ -z \"$tex_file\" ]; then\n  exit 1\nfi\nprintf \"fake compiler output\\n\" > \"$out_dir/$name.log\"\nprintf '%s' '%PDF-1.4\\n' > \"$out_dir/$name.pdf\"\ntouch \"$out_dir/$name.aux\"\nexit 0\n",
 		{ mode: 0o700 },
 	);
 	chmodSync(compilerPath, 0o700);
@@ -361,6 +361,16 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.ok(compileFileTool);
 		assert.equal(typeof showLatexTool.inputSchema.properties.workspace_context, "object");
 		assert.equal(typeof compileFileTool.inputSchema.properties.workspace_context, "object");
+		assert.ok(compileFileTool.inputSchema.properties.callback_target_id);
+		assert.ok(compileFileTool.inputSchema.properties.callback);
+		assert.ok(compileFileTool.inputSchema.properties.reuse_existing);
+		assert.ok(compileFileTool.inputSchema.properties.require_persistent_viewer);
+		assert.deepEqual((showLatexTool.inputSchema.properties as { callback?: { required?: string[] } }).callback?.required, ["kind", "transport", "socket_path", "token"]);
+		assert.equal(showLatexTool.inputSchema.properties.fixed_preview_pdf_path, undefined);
+		assert.ok(showLatexTool.inputSchema.properties.fixed_preview);
+		assert.ok(showLatexTool.inputSchema.properties.reuse_existing);
+		assert.ok(showLatexTool.inputSchema.properties.require_persistent_viewer);
+		assert.ok(showLatexTool.inputSchema.properties.callback);
 		const setPreamblePayload = JSON.stringify({
 			jsonrpc: "2.0",
 			id: 4,
@@ -1074,14 +1084,17 @@ test("daemon rejects compile_latex_file absolute path with non-absolute workspac
 	}
 });
 
-test("daemon rejects compile_latex_file open_pdf support", async () => {
+test("daemon compile_latex_file open_pdf opens and returns a managed PDF id", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-compile-open-pdf-");
 	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-compile-open-pdf-"));
 	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
 	const latexPath = join(workspaceDir, "main.tex");
 	writeFileSync(latexPath, "\\documentclass{article}\\begin{document}Hello\\end{document}\n");
 	const socketPath = join(baseDir, "host-service.sock");
-	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	const backend = new TestManagedViewerBackend();
+	const server = new HostServiceServer({ socketPath, viewerBackend: backend });
+	const fakeCompilerDir = join(baseDir, "fake-bin");
+	writeFakeLatexCompiler(fakeCompilerDir);
 	await server.start();
 	const requestPayload = JSON.stringify({
 		jsonrpc: "2.0",
@@ -1096,9 +1109,17 @@ test("daemon rejects compile_latex_file open_pdf support", async () => {
 		},
 	});
 	try {
-		const response = (await sendFramedRequest(socketPath, requestPayload)) as { error: { code: number; message: string } };
-		assert.equal(response.error.code, -32602);
-		assert.equal(response.error.message, "open_pdf is not supported by daemon MCP compile_latex_file");
+		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
+			return await sendFramedRequest(socketPath, requestPayload);
+		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details: { pdf?: string; pdf_id?: number; managed_record?: { pdfPath?: string; id?: number } } } };
+		assert.equal(response.result.isError, undefined);
+		assert.equal(typeof response.result.details.pdf_id, "number");
+		assert.equal(response.result.details.managed_record?.id, response.result.details.pdf_id);
+		assert.equal(response.result.details.managed_record?.pdfPath, response.result.details.pdf);
+		assert.match(response.result.content[0].text, /pdf_id=\d+/);
+		assert.equal(backend.openRequests.length, 1);
+		assert.equal(backend.openRequests[0]?.details.pdf_path, response.result.details.pdf);
+		assert.equal(backend.openRequests[0]?.details.callback, undefined);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -1138,6 +1159,109 @@ test("daemon renders show_latex through compile flow", async () => {
 		assert.equal(response.result.isError, undefined);
 		const resultText = response.result.content[0].text;
 		assert.match(resultText, /\.pdf$/);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon show_latex inline=false compiles, opens, and returns a managed PDF id", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-show-open-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-show-open-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const backend = new TestManagedViewerBackend();
+	const server = new HostServiceServer({ socketPath, viewerBackend: backend });
+	const fakeCompilerDir = join(baseDir, "fake-bin");
+	writeFakeLatexCompiler(fakeCompilerDir);
+	await server.start();
+	const workspaceContext = {
+		cwd: baseDir,
+		workspace_root: baseDir,
+	};
+	const callback = {
+		kind: "pi-synctex-callback-v1",
+		transport: "unix",
+		socket_path: "/tmp/test-callback.sock",
+		token: "token",
+	};
+	const requestPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 12,
+		method: "tools/call",
+		params: {
+			name: "show_latex",
+			arguments: {
+				source: "x",
+				inline: false,
+				reuse_existing: false,
+				require_persistent_viewer: true,
+				callback,
+				workspace_context: workspaceContext,
+			},
+		},
+	});
+	try {
+		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
+			return await sendFramedRequest(socketPath, requestPayload);
+		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details: { pdf?: string; pdf_id?: number; managed_record?: { pdfPath?: string; id?: number } } } };
+		assert.equal(response.result.isError, undefined);
+		assert.equal(typeof response.result.details.pdf_id, "number");
+		assert.equal(response.result.details.managed_record?.id, response.result.details.pdf_id);
+		assert.equal(response.result.details.managed_record?.pdfPath, response.result.details.pdf);
+		assert.equal(response.result.details.pdf, getMcpFixedPreviewPdfPath());
+		assert.match(response.result.content[0].text, /pdf_id=\d+/);
+		assert.equal(backend.openRequests.length, 1);
+		assert.equal(backend.openRequests[0]?.details.pdf_path, response.result.details.pdf);
+		assert.deepEqual(backend.openRequests[0]?.details.callback, callback);
+		assert.equal(backend.openRequests[0]?.details.reuse_existing, false);
+		assert.equal(backend.openRequests[0]?.details.require_persistent_viewer, true);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon rejects public show_latex fixed_preview_pdf_path", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-show-fixed-preview-outside-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-show-fixed-preview-outside-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new TestManagedViewerBackend() });
+	const fakeCompilerDir = join(baseDir, "fake-bin");
+	writeFakeLatexCompiler(fakeCompilerDir);
+	await server.start();
+	const workspaceContext = {
+		cwd: baseDir,
+		workspace_root: baseDir,
+	};
+	const invalidPreviewPath = join(tmpdir(), `host-service-show-latex-invalid-${Date.now()}.pdf`);
+	if (existsSync(invalidPreviewPath)) {
+		rmSync(invalidPreviewPath, { force: true });
+	}
+	const requestPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 13,
+		method: "tools/call",
+		params: {
+			name: "show_latex",
+			arguments: {
+				source: "x",
+				inline: false,
+				fixed_preview_pdf_path: invalidPreviewPath,
+				workspace_context: workspaceContext,
+			},
+		},
+	});
+	try {
+		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
+			return await sendFramedRequest(socketPath, requestPayload);
+		})) as { error: { code: number; message: string } };
+		assert.equal(response.error.code, -32602);
+		assert.equal(response.error.message, "fixed_preview_pdf_path is not supported; use fixed_preview");
+		assert.equal(existsSync(invalidPreviewPath), false);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });

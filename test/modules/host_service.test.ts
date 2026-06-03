@@ -22,7 +22,10 @@ import {
 	HostServicePdfIdRegistry,
 	HostServiceServer,
 	ZathuraViewerBackend,
+	type HostServiceOpenRequest,
 } from "../../src/modules/host_service.ts";
+import { HostServiceManagedViewerService } from "../../src/modules/host_service_managed_viewer.ts";
+import { getMcpFixedPreviewPdfPath } from "../../src/modules/runtime_paths.ts";
 import { INLINE_PREVIEW_DIR } from "../../src/modules/preview/inline_preview.ts";
 
 function temporaryDir(prefix: string): string {
@@ -83,7 +86,7 @@ mkdir -p "$out_dir"${withLog ? `
 if [ ! -z "$out_dir" ]; then
   echo "fake compiler output" > "$out_dir/$name.log"
 fi` : ""}
-touch "$out_dir/$name.pdf"
+printf '%s' '%PDF-1.4\n' > "$out_dir/$name.pdf"
 exit ${exitCode}
 `, { mode: 0o700 });
 	chmodSync(compilerPath, 0o700);
@@ -686,6 +689,36 @@ class ThrowingViewerBackend extends FakeViewerBackend {
 	}
 }
 
+class HangingManagedViewerBackend extends FakeViewerBackend {
+	async open(): ReturnType<FakeViewerBackend["open"]> {
+		return await new Promise(() => undefined);
+	}
+}
+
+class LateSuccessManagedViewerBackend extends CountingOpenViewerBackend {
+	public closeResults: Awaited<ReturnType<FakeViewerBackend["close"]>>[] = [];
+	private readonly delayMs: number;
+
+	constructor(delayMs: number) {
+		super({
+			name: "agent-synctex-late-success-backend",
+			capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+		});
+		this.delayMs = delayMs;
+	}
+
+	async open(requestId: string, details: Record<string, unknown>): ReturnType<FakeViewerBackend["open"]> {
+		await sleep(this.delayMs);
+		return await super.open(requestId, details);
+	}
+
+	async close(requestId: string, details: Record<string, unknown>): ReturnType<FakeViewerBackend["close"]> {
+		const result = await super.close(requestId, details);
+		this.closeResults.push(result);
+		return result;
+	}
+}
+
 
 async function writeHostServiceRequest(
 	path: string,
@@ -1030,6 +1063,48 @@ test("host service rasterize returns artifact metadata", async () => {
 	}
 });
 
+test("host service compile_latex_snippet rejects public fixed_preview_pdf_path", async () => {
+	const originalMcpTmpdir = process.env.MCP_TMPDIR;
+	const baseDir = temporaryDir("host-service-snippet-fixed-preview-");
+	const socketPath = join(baseDir, "host-service.sock");
+	process.env.MCP_TMPDIR = baseDir;
+	const invalidPath = "/etc/passwd";
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-snippet-fixed-preview-validation",
+	});
+	await server.start();
+	const requestPayload = {
+		protocol_version: 1,
+		request_id: "snippet-fixed-preview-invalid-path",
+		operation: "compile_latex_snippet",
+		created_at_ns: Date.now() * 1_000_000,
+		workspace_context: { cwd: baseDir },
+		details: {
+			latex_source: "\\section{Hello}",
+			open_pdf: true,
+			fixed_preview_pdf_path: invalidPath,
+		},
+	};
+	let response: { operation: string; status: string; status_details: { error_code?: string }; error?: string };
+	try {
+		const raw = await writeHostServiceRequest(socketPath, requestPayload as Record<string, unknown>, 2_000);
+		response = JSON.parse(raw.trim());
+	} finally {
+		if (originalMcpTmpdir === undefined) {
+			delete process.env.MCP_TMPDIR;
+		} else {
+			process.env.MCP_TMPDIR = originalMcpTmpdir;
+		}
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.equal(response.operation, "compile_latex_snippet");
+	assert.equal(response.status, "error");
+	assert.equal(response.status_details.error_code, "invalid_request");
+	assert.match(response.error ?? "", /fixed_preview_pdf_path is not supported; use fixed_preview/);
+});
+
 test("host service compile_latex_snippet malformed requests avoid raw snippet in error details", async () => {
 	const baseDir = temporaryDir("host-service-snippet-malformed-");
 	const socketPath = join(baseDir, "host-service.sock");
@@ -1057,31 +1132,46 @@ test("host service compile_latex_snippet malformed requests avoid raw snippet in
 	assert.match(response.error, /missing compile details/);
 });
 
-test("host service compile_latex_file open_pdf requires callback or callback_target_id", async () => {
-	const baseDir = temporaryDir("host-service-open-pdf-requires-callback-");
+test("host service compile_latex_file open_pdf allows opening without callback", async () => {
+	const baseDir = temporaryDir("host-service-open-pdf-no-callback-");
 	const socketPath = join(baseDir, "host-service.sock");
-	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-open-requires-callback" });
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nHello\\end{document}\n");
+	const backend = new DeterministicManagedViewerBackend({ name: "agent-synctex-compile-open-no-callback-backend" });
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-compile-open-no-callback",
+		viewerBackend: backend,
+	});
 	await server.start();
 	const requestPayload = {
 		protocol_version: 1,
-		request_id: "compile-latex-file-open-missing-callback",
+		request_id: "compile-latex-file-open-no-callback",
 		operation: "compile_latex_file",
 		created_at_ns: Date.now() * 1_000_000,
 		workspace_context: { cwd: baseDir },
 		details: {
 			latex_file_path: "paper.tex",
+			compiler: "lualatex",
 			open_pdf: true,
 		},
 	};
-	const raw = await writeHostServiceRequest(socketPath, requestPayload as Record<string, unknown>);
-	const response = JSON.parse(raw.trim());
-	await server.stop();
-	rmSync(baseDir, { recursive: true, force: true });
+	try {
+		const raw = await writeHostServiceRequest(socketPath, requestPayload as Record<string, unknown>, 2_000);
+		const response = JSON.parse(raw.trim());
 
-	assert.equal(response.operation, "compile_latex_file");
-	assert.equal(response.status, "error");
-	assert.equal(response.status_details.error_code, "invalid_request");
-	assert.match(response.error, /open_pdf requires callback or callback_target_id/);
+		assert.equal(response.operation, "compile_latex_file");
+		assert.equal(response.status, "ok");
+		assert.equal(typeof response.status_details.pdf_id, "number");
+		assert.equal(response.status_details.managed_record.id, response.status_details.pdf_id);
+		assert.equal(response.status_details.managed_record.callback, undefined);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
 });
 
 test("host service compile_latex_file with managed open returns active id and jump/close", async () => {
@@ -1477,6 +1567,84 @@ test("host service compile_latex_snippet managed-open failure keeps compile succ
 	assert.match(observed.message, /backend_unavailable/);
 	assert.match(observed.message, /code=backend_unavailable/);
 	assert.doesNotMatch(observed.message, /compile_failed/);
+});
+
+test("host service compile_latex_snippet with hanging viewer open returns service timeout", async () => {
+	const baseDir = temporaryDir("host-service-snippet-open-timeout-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"));
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	const backend = new HangingManagedViewerBackend({
+		name: "agent-synctex-snippet-open-timeout-backend",
+		capabilities: { open: true, close: true, forward_search: true, inverse_search: true, reuse: true },
+	});
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "agent-synctex-snippet-open-timeout",
+		viewerBackend: backend,
+	});
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 10_000,
+	});
+	let observed: unknown;
+	try {
+		await client.requestCompileLatexSnippet(
+			{ latex_source: "\\section{Hello}", open_pdf: true },
+			{ cwd: baseDir },
+		);
+	} catch (error) {
+		observed = error;
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.ok(observed instanceof Error);
+	assert.match(observed.message, /service_timeout/);
+	assert.match(observed.message, /viewer backend request timed out while opening preview/);
+});
+
+test("managed viewer closes a late successful open after timeout", async () => {
+	const baseDir = temporaryDir("host-service-late-open-cleanup-");
+	try {
+		const pdfPath = join(baseDir, "late.pdf");
+		writeFileSync(pdfPath, "%PDF-1.4\n%%EOF\n");
+		const backend = new LateSuccessManagedViewerBackend(35);
+		const registry = new HostServicePdfIdRegistry();
+		const service = new HostServiceManagedViewerService({
+			viewerBackend: backend,
+			managedViewerRecords: registry,
+			protocolVersion: 1,
+			openTimeoutMs: 5,
+		});
+		const request: HostServiceOpenRequest = {
+			protocol_version: 1,
+			request_id: "late-open-cleanup",
+			operation: "open_pdf",
+			created_at_ns: Date.now() * 1_000_000,
+			workspace_context: { cwd: baseDir },
+			details: { pdf_path: pdfPath },
+		};
+
+		const response = await service.openViewer(request);
+		assert.equal(response.status, "error");
+		assert.equal(response.status_details.error_code, "service_timeout");
+
+		const deadline = Date.now() + 500;
+		while (backend.closeCalls === 0 && Date.now() < deadline) {
+			await sleep(10);
+		}
+		assert.equal(backend.openCalls, 1);
+		assert.equal(backend.closeCalls, 1);
+		assert.equal(backend.closeResults[0]?.status, "ok");
+		assert.equal(backend.closeResults[0]?.status_details.closed, true);
+		assert.equal(registry.activeCount, 0);
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
 });
 
 
@@ -1913,6 +2081,176 @@ test("host service client surfaces malformed response payloads", async () => {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });
+
+test("host service client accepts open_pdf responses with envelope-level pdf", async () => {
+	const baseDir = temporaryDir("host-service-open-envelope-pdf-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const expectedRequestId = "open-existing-pdf-response-id";
+	const pdfPath = join(baseDir, "paper.pdf");
+	const handle = "fake-viewer:opened-existing-pdf";
+	const responsePayload = JSON.stringify({
+		protocol_version: 1,
+		request_id: expectedRequestId,
+		operation: "open_pdf",
+		status: "ok",
+		generated_at_ns: Date.now() * 1_000_000,
+		pdf: pdfPath,
+		status_details: {
+			protocol_version: 1,
+			supported: true,
+			service_available: true,
+			workspace_context: { cwd: baseDir },
+			request_id: expectedRequestId,
+			operation: "open_pdf",
+			backend: "fake-viewer",
+			backend_path: "fake-viewer",
+			capabilities: {
+				open: true,
+				close: true,
+				forward_search: true,
+				inverse_search: true,
+				reuse: true,
+			},
+			handle,
+			owned: true,
+			reused: false,
+			pid: 123456,
+			pdf_id: 4242,
+			managed_record: {
+				id: 4242,
+				pdfPath,
+				viewerHandle: handle,
+				viewerBackend: "fake-viewer",
+				viewerOwned: true,
+				createdAtNs: Date.now() * 1_000_000,
+				pid: 123456,
+				reused: false,
+				capabilities: {
+					open: true,
+					close: true,
+					forward_search: true,
+					inverse_search: true,
+					reuse: true,
+				},
+				backendPath: "fake-viewer",
+			},
+		},
+	}) + "\n";
+	const openServer = createServer((socket) => {
+		socket.end(responsePayload, () => {
+			socket.destroy();
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		openServer.once("error", reject);
+		openServer.listen(socketPath, () => {
+			resolve();
+		});
+	});
+
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+		requestIdFactory: () => expectedRequestId,
+	});
+	try {
+		const response = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: pdfPath, reuse_existing: true },
+		);
+		assert.equal(response.pdf, pdfPath);
+		assert.equal(response.pdf_id, 4242);
+		assert.equal(response.managed_record?.pdfPath, pdfPath);
+	} finally {
+		await new Promise<void>((resolve) => {
+			openServer.close(() => resolve());
+		});
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service client normalizes open_pdf pdf from managed_record pdfPath", async () => {
+	const baseDir = temporaryDir("host-service-open-managed-record-pdf-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const expectedRequestId = "open-existing-pdf-managed-record-response-id";
+	const pdfPath = join(baseDir, "paper.pdf");
+	const handle = "fake-viewer:opened-existing-pdf-managed-record";
+	const capabilities = {
+		open: true,
+		close: true,
+		forward_search: true,
+		inverse_search: true,
+		reuse: true,
+	};
+	const responsePayload = JSON.stringify({
+		protocol_version: 1,
+		request_id: expectedRequestId,
+		operation: "open_pdf",
+		status: "ok",
+		generated_at_ns: Date.now() * 1_000_000,
+		status_details: {
+			protocol_version: 1,
+			supported: true,
+			service_available: true,
+			workspace_context: { cwd: baseDir },
+			request_id: expectedRequestId,
+			operation: "open_pdf",
+			backend: "fake-viewer",
+			backend_path: "fake-viewer",
+			capabilities,
+			handle,
+			owned: true,
+			reused: false,
+			pid: 123456,
+			pdf_id: 16227649,
+			managed_record: {
+				id: 16227649,
+				pdfPath,
+				viewerHandle: handle,
+				viewerBackend: "fake-viewer",
+				viewerOwned: true,
+				createdAtNs: Date.now() * 1_000_000,
+				pid: 123456,
+				reused: false,
+				capabilities,
+				backendPath: "fake-viewer",
+			},
+		},
+	}) + "\n";
+	const openServer = createServer((socket) => {
+		socket.end(responsePayload, () => {
+			socket.destroy();
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		openServer.once("error", reject);
+		openServer.listen(socketPath, () => {
+			resolve();
+		});
+	});
+
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 1_000,
+		requestIdFactory: () => expectedRequestId,
+	});
+	try {
+		const response = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: pdfPath, reuse_existing: true },
+		);
+		assert.equal(response.pdf, pdfPath);
+		assert.equal(response.pdf_id, 16227649);
+		assert.equal(response.managed_record?.pdfPath, pdfPath);
+	} finally {
+		await new Promise<void>((resolve) => {
+			openServer.close(() => resolve());
+		});
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 
 test("host service client surfaces server error envelopes as service errors", async () => {
 	const baseDir = temporaryDir("host-service-error-envelope-");
@@ -2955,6 +3293,70 @@ test("host service open_pdf returns backend-provided invalid-PDF errors", async 
 	}
 });
 
+test("host service managed open validation rejects missing, non-PDF, and non-regular files without backend calls or records", async () => {
+	const scenarios = [
+		{
+			name: "missing",
+			path: "missing.pdf",
+			prepare: (_baseDir: string): void => {},
+			errCode: "invalid_request",
+		},
+		{
+			name: "non-pdf",
+			path: "not-pdf.txt",
+			prepare: (baseDir: string): void => {
+				writeFileSync(join(baseDir, "not-pdf.txt"), "just text\n");
+			},
+			errCode: "invalid_pdf",
+		},
+		{
+			name: "directory",
+			path: "dir",
+			prepare: (baseDir: string): void => {
+				mkdirSync(join(baseDir, "dir"), { mode: 0o700, recursive: true });
+			},
+			errCode: "invalid_request",
+		},
+	];
+	for (const scenario of scenarios) {
+		const baseDir = temporaryDir(`host-service-open-validation-${scenario.name}-`);
+		const socketPath = join(baseDir, "host-service.sock");
+		const managedRecords = new HostServicePdfIdRegistry();
+		scenario.prepare(baseDir);
+		const backend = new CountingOpenViewerBackend({ name: `managed-open-validator-${scenario.name}` });
+		const server = new HostServiceServer({
+			socketPath,
+			viewerBackend: backend,
+			managedViewerRecords: managedRecords,
+		});
+		await server.start();
+
+		const payload = {
+			protocol_version: 1,
+			request_id: `invalid-open-${scenario.name}`,
+			operation: "open_pdf",
+			created_at_ns: Date.now() * 1_000_000,
+			workspace_context: { cwd: baseDir },
+			details: {
+				pdf_path: scenario.path,
+			},
+		};
+		try {
+			const raw = await writeHostServiceRequest(socketPath, payload as Record<string, unknown>);
+			const response = JSON.parse(raw.trim());
+			assert.equal(response.operation, "open_pdf");
+			assert.equal(response.status, "error");
+			assert.equal(response.status_details.error_code, scenario.errCode);
+			assert.equal(response.status_details.pdf_id, undefined);
+			assert.equal(response.status_details.managed_record, undefined);
+			assert.equal(backend.openCalls, 0);
+			assert.equal(managedRecords.activeCount, 0);
+		} finally {
+			await server.stop();
+			rmSync(baseDir, { recursive: true, force: true });
+		}
+	}
+});
 
 test("host service client surfaces invalid_request for malformed open_pdf payloads", async () => {
 	const baseDir = temporaryDir("host-service-open-pdf-invalid-request-");

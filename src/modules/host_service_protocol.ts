@@ -32,6 +32,8 @@ export interface HostServiceCompileRequest {
 		compiler?: unknown;
 		clean?: boolean;
 		open_pdf?: boolean;
+		reuse_existing?: boolean;
+		require_persistent_viewer?: boolean;
 		callback_target_id?: string;
 		callback?: HostServiceCallbackTarget;
 	};
@@ -49,6 +51,9 @@ export interface HostServiceCompileSnippetRequest {
 		suppress_page_numbers?: boolean;
 		crop_to_content?: boolean;
 		open_pdf?: boolean;
+		fixed_preview?: boolean;
+		reuse_existing?: boolean;
+		require_persistent_viewer?: boolean;
 		callback_target_id?: string;
 		callback?: HostServiceCallbackTarget;
 	};
@@ -226,11 +231,12 @@ export interface HostServiceCompileSnippetResponseDetails {
 	artifact_paths: string[];
 	clean: boolean;
 	cleaned_artifacts: string[];
+	operation_pdf?: string;
+	operation_artifact_paths?: string[];
 	pdf_id?: number;
 	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
 }
-
 export interface HostServiceRegisterCallbackTargetResponseDetails {
 	protocol_version: number;
 	supported: boolean;
@@ -303,6 +309,7 @@ export interface HostServiceOpenResponseDetails {
 	reused: boolean;
 	pid?: number;
 	pid_diagnostic?: string;
+	pdf?: string;
 	pdf_id?: number;
 	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
@@ -398,6 +405,7 @@ export interface HostServiceOpenResponseEnvelope {
 	status: "ok" | "error";
 	generated_at_ns: number;
 	error?: string;
+	pdf?: string;
 	status_details: HostServiceOpenResponseDetails;
 }
 
