@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildKittyPlaceholderImageRender } from "../../../src/modules/preview/kitty_placeholder_image.ts";
-import { KittyPlaceholderOracle } from "../../../src/modules/preview/kitty_placeholder_oracle.ts";
+import { KittyPlaceholderOracle } from "../../support/kitty_placeholder_oracle.ts";
 import { INLINE_PREVIEW_DIR } from "../../../src/modules/preview/inline_preview.ts";
 import { inlinePreviewRenderStateFromDetails, type InlinePreviewRenderState } from "../../../src/modules/preview/inline_preview_metadata.ts";
 import {

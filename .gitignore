@@ -9,3 +9,4 @@ tmux-server-*.log
 tmux-out-*.log
 __pycache__/
 *.pyc
+.skylos

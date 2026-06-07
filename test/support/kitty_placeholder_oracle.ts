@@ -1,4 +1,4 @@
-import { KITTY_PLACEHOLDER, ROW_COLUMN_DIACRITICS } from "./kitty_placeholder_image.ts";
+import { KITTY_PLACEHOLDER, ROW_COLUMN_DIACRITICS } from "../../src/modules/preview/kitty_placeholder_image.ts";
 
 const ESC = "\x1b";
 const ST = `${ESC}\\`;

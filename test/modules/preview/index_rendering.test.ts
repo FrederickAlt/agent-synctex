@@ -21,7 +21,7 @@ import {
 	type InlinePreviewRenderComponent,
 	type InlinePreviewRenderContainer,
 } from "../../../src/modules/preview/inline_preview_renderer.ts";
-import { KittyPlaceholderOracle } from "../../../src/modules/preview/kitty_placeholder_oracle.ts";
+import { KittyPlaceholderOracle } from "../../support/kitty_placeholder_oracle.ts";
 import { buildKittyPlaceholderImageRender, KittyPreviewInvalidationRegistry } from "../../../src/modules/preview/kitty_placeholder_image.ts";
 import { inlinePreviewRenderStateFromDetails } from "../../../src/modules/preview/inline_preview_metadata.ts";
 import { INLINE_PREVIEW_DIR } from "../../../src/modules/preview/inline_preview.ts";

@@ -1,6 +1,6 @@
 import { createServer, type Server, type Socket } from "node:net";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 
 export interface SynctexPasteTarget {
@@ -127,6 +127,13 @@ function requestEditorRender(ui: NonNullable<SynctexPasteTarget["ui"]>): void {
 
 function logSynctexShutdownTimeout(message: string): void {
 	console.error(`[pdf-preview] ${message}`);
+}
+
+function isSynctexTokenMatch(candidate: unknown, expected: string): boolean {
+	if (typeof candidate !== "string") return false;
+	const candidateBuffer = Buffer.from(candidate, "utf8");
+	const expectedBuffer = Buffer.from(expected, "utf8");
+	return candidateBuffer.length === expectedBuffer.length && timingSafeEqual(candidateBuffer, expectedBuffer);
 }
 
 function waitForWithTimeout(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
@@ -296,7 +303,7 @@ export class SynctexCallbackServer {
 			return { ok: false, error: "invalid JSON" };
 		}
 
-		if (message.token !== this.token) {
+		if (!isSynctexTokenMatch(message.token, this.token)) {
 			return { ok: false, error: "invalid token" };
 		}
 		if (typeof message.file !== "string" || message.file.length === 0) {

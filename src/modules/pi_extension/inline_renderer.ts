@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import type { Component, } from "@mariozechner/pi-tui";
 import { Container, getCapabilities, getCellDimensions, getPngDimensions, Image, Text } from "@mariozechner/pi-tui";
 import {
@@ -99,7 +99,7 @@ const inlinePreviewRenderer = createInlinePreviewRenderer({
 	calculateDisplayColumns: calculateInlineDisplayColumns,
 	getCellDimensions,
 	getPngDimensions: (base64Data) => getPngDimensions(base64Data) ?? undefined,
-	allocateImageId: () => Math.floor(Math.random() * 0xfffffe) + 1,
+	allocateImageId: () => randomInt(1, 0xfffffe + 1),
 	rememberInvalidator: (context) => terminalRefreshPolicy.rememberInvalidator(context),
 });
 

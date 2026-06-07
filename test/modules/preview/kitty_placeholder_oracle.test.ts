@@ -7,7 +7,7 @@ import {
 	KITTY_CHUNK_SIZE,
 	wrapKittySequenceForTmux,
 } from "../../../src/modules/preview/kitty_placeholder_image.ts";
-import { KittyPlaceholderOracle } from "../../../src/modules/preview/kitty_placeholder_oracle.ts";
+import { KittyPlaceholderOracle } from "../../support/kitty_placeholder_oracle.ts";
 
 const PNG_BASE64 = "iVBORw0KGgo=";
 

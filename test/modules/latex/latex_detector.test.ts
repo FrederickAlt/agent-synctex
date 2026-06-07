@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { detectLatexBlocks, isPureLatexLine } from "../../../src/modules/latex/latex_detector.ts";
+import { detectLatexBlocks, isPureLatexLine } from "../../support/latex_detector.ts";
 
 test("classifies obvious pure LaTeX lines", () => {
 	assert.equal(isPureLatexLine(String.raw`e\in\bar\E_\out(\V_\bou).`), true);

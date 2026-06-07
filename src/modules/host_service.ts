@@ -1,3 +1,4 @@
+import { randomInt, randomUUID } from "node:crypto";
 import {
 	accessSync,
 	chmodSync,
@@ -227,7 +228,7 @@ export class HostServicePdfIdRegistry {
 		) {
 			throw new Error("invalid pdf id range");
 		}
-		this.makePdfId = options.makePdfId ?? (() => this.minPdfId + Math.floor(Math.random() * (this.maxPdfId - this.minPdfId + 1)));
+		this.makePdfId = options.makePdfId ?? (() => randomInt(this.minPdfId, this.maxPdfId + 1));
 		this.maxAllocationAttempts = options.maxAllocationAttempts ?? DEFAULT_ACTIVE_PDF_ID_ALLOCATION_ATTEMPTS;
 		if (!Number.isInteger(this.maxAllocationAttempts) || this.maxAllocationAttempts <= 0) {
 			throw new Error("invalid maxAllocationAttempts");
@@ -359,7 +360,7 @@ export class HostServiceClient {
 	constructor(options: HostServiceClientOptions = {}) {
 		this.socketPath = resolve(options.socketPath ?? defaultHostServiceSocketPath());
 		this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-		this.makeRequestId = options.requestIdFactory ?? (() => `host-${crypto.randomUUID()}`);
+		this.makeRequestId = options.requestIdFactory ?? (() => `host-${randomUUID()}`);
 	}
 
 	async requestStatus(
@@ -898,7 +899,7 @@ export class HostServiceServer {
 	constructor(options: HostServiceServerOptions = {}) {
 		this.socketPath = resolve(options.socketPath ?? defaultHostServiceSocketPath());
 		this.serviceName = options.serviceName ?? DEFAULT_HOST_SERVICE_NAME;
-		this.serviceInstanceId = options.serviceInstanceId ?? `host-service-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+		this.serviceInstanceId = options.serviceInstanceId ?? `host-service-${Date.now()}-${randomUUID()}`;
 		this.viewerBackend = options.viewerBackend ?? new ZathuraViewerBackend();
 		this.managedViewerRecords = options.managedViewerRecords ?? new HostServicePdfIdRegistry();
 		this.managedViewerService = new HostServiceManagedViewerService({
