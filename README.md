@@ -2,12 +2,12 @@
 
 Runtime identity: `tex-actions` (`TeX Actions` display name). Pi extension that exposes six tools:
 
-- `show_latex` — FREEFORM/raw LaTeX preview with optional front matter for `compiler` and `inline`; renders inline by default, or pass `inline=false` for a host-service external preview. It automatically loads `./preamble.tex` or `./praeamble.tex` from the current working directory when present, so do not repeat that preamble in the snippet.
+- `show_latex` — FREEFORM/raw LaTeX preview with optional front matter for `compiler` and `inline`; renders inline by default, or pass `inline=false` for a host-service external preview. It uses the current agent’s TeX Actions runtime preamble, seeded from `./preamble.tex` or `./praeamble.tex` when available, so do not repeat that preamble in the snippet.
 - `open_pdf` — request the host service to open an existing local PDF and return a daemon-owned runtime numeric `pdf_id` for later PDF actions.
 - `close_pdf` — close a host-service-tracked PDF by `pdf_id`.
 - `jump_pdf` — perform a line-based host-service forward SyncTeX jump in a tracked PDF by `pdf_id`, returning a short “line N contains:” header followed by the jumped-to LaTeX source line.
 - `compile_latex_file` — compile a local LaTeX source file in place, optionally sending a host service open request to track the resulting PDF.
-- `set_latex_preamble` — write preamble lines to the fixed temp preamble used by snippet compiles.
+- `set_latex_preamble` — write preamble lines to the current agent’s TeX Actions runtime preamble used by snippet compiles.
 
 The TypeScript Host Service now owns backend `show_latex` compilation/open/jump/close flows and viewer backend dispatch. Pi remains the frontend coordinator for tool registration, inline rendering, and editor paste behavior.
 
@@ -255,14 +255,16 @@ details to `${XDG_RUNTIME_DIR}/tex-actions/*.log`.
 
 For production flows, extension behavior is fixed to service-driven viewer control.
 
-Runtime paths are hardcoded:
+Runtime paths are rooted at `${XDG_RUNTIME_DIR}/tex-actions`:
 
-- Preview temp directory: `${XDG_RUNTIME_DIR}/tex-actions`
-- Active preamble file: `${XDG_RUNTIME_DIR}/tex-actions/preamble.tex`
+- Host-service socket: `${XDG_RUNTIME_DIR}/tex-actions/host-service.sock`
+- Per-agent runtime: `${XDG_RUNTIME_DIR}/tex-actions/agents/<agent-id>`
+- Current agent preamble: `${XDG_RUNTIME_DIR}/tex-actions/agents/<agent-id>/preamble.tex`
+- Current agent snippet workdirs: `${XDG_RUNTIME_DIR}/tex-actions/agents/<agent-id>/host-service-snippets/`
 
-At extension initialization, `./preamble.tex` or `./praeamble.tex` in the Pi agent's current working directory is searched in that order. If one exists, its contents are copied to `${XDG_RUNTIME_DIR}/tex-actions/preamble.tex` and become the default preamble. During `show_latex` snippet compilation, the extension loads the preamble from `${XDG_RUNTIME_DIR}/tex-actions/preamble.tex`; `${XDG_RUNTIME_DIR}/tex-actions/praeamble.tex` is also accepted as a fallback if no canonical preamble exists. This means the model should assume the preamble is already in effect and provide only the body unless it intentionally wants to override those definitions.
+Each client process resolves an agent id from `TEX_ACTIONS_AGENT_ID`, then the Pi session id when available, then a process-stable UUID. At session startup, `./preamble.tex` or `./praeamble.tex` in the Pi agent's current working directory is searched in that order. If one exists, its contents are copied into the current agent runtime preamble and become the default preamble for that agent. During `show_latex` snippet compilation, the host service loads the preamble from the injected per-agent workspace root. This means the model should assume the current agent's preamble is already in effect and provide only the body unless it intentionally wants to override those definitions.
 
-The preamble can also be changed at runtime with `set_latex_preamble`, which writes `${XDG_RUNTIME_DIR}/tex-actions/preamble.tex`. Preamble files should contain only pre-`\begin{document}` code such as `\documentclass`, `\usepackage`, and macro definitions. `show_latex` inputs should then contain only the document body, or the `\begin{document}`...`\end{document}` block. `compile_latex_file` compiles complete files directly and does not inject this temp preamble.
+The preamble can also be changed at runtime with `set_latex_preamble`, which writes the current agent's runtime `preamble.tex`. Preamble files should contain only pre-`\begin{document}` code such as `\documentclass`, `\usepackage`, and macro definitions. `show_latex` inputs should then contain only the document body, or the `\begin{document}`...`\end{document}` block. `compile_latex_file` compiles complete files directly and does not inject this runtime preamble.
 
 ## Firejail note
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
@@ -329,10 +329,20 @@ test("Relay returns Codex tools/list without inline show_latex parameter", async
 									properties: {
 										source: { type: "string" },
 										inline: { type: "boolean" },
+										workspace_context: { type: "object" },
 									},
-									required: ["source", "inline"],
+									required: ["source", "inline", "workspace_context"],
 								}
-								: {},
+								: name === "set_latex_preamble"
+									? {
+										type: "object",
+										properties: {
+											latex_preamble: { type: "string" },
+											workspace_context: { type: "object" },
+										},
+										required: ["latex_preamble", "workspace_context"],
+									}
+									: {},
 					})),
 				},
 			};
@@ -360,6 +370,12 @@ test("Relay returns Codex tools/list without inline show_latex parameter", async
 		assert.ok(showLatex);
 		assert.deepEqual(showLatex.inputSchema?.properties, { source: { type: "string" } });
 		assert.deepEqual(showLatex.inputSchema?.required, ["source"]);
+		const setPreamble = responses[0]!.result.tools.find((tool) => tool.name === "set_latex_preamble") as
+			| { inputSchema?: { properties?: Record<string, unknown>; required?: string[] } }
+			| undefined;
+		assert.ok(setPreamble);
+		assert.deepEqual(setPreamble.inputSchema?.properties, { latex_preamble: { type: "string" } });
+		assert.deepEqual(setPreamble.inputSchema?.required, ["latex_preamble"]);
 	} finally {
 		await daemon.close();
 		relay.stop();
@@ -410,9 +426,13 @@ test("Relay reads socket path override from TEX_ACTIONS_HOST_SERVICE_SOCKET_PATH
 	}
 });
 
-test("Relay forces Codex show_latex calls to inline false", async () => {
+test("Relay forces Codex show_latex calls to inline false and injects workspace context", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-show-latex-inline-"));
 	const socketPath = join(baseDir, "host-service.sock");
+	const previousMcpTmpdir = process.env.MCP_TMPDIR;
+	const previousAgentId = process.env.TEX_ACTIONS_AGENT_ID;
+	process.env.MCP_TMPDIR = join(baseDir, "runtime");
+	process.env.TEX_ACTIONS_AGENT_ID = "codex-agent-A";
 	let observedArguments: unknown;
 	const daemon = await startFakeDaemon(socketPath, (request) => {
 		if (request.method === "tools/call") {
@@ -449,12 +469,147 @@ test("Relay forces Codex show_latex calls to inline false", async () => {
 		const responses = parseFrames(raw) as Array<{ id: number; result: { content: unknown[] } }>;
 		assert.equal(responses.length, 1);
 		assert.equal(responses[0]!.id, 12);
-		assert.deepEqual(observedArguments, {
-			source: "\\[x\\]",
-			inline: false,
-		});
+		const args = observedArguments as Record<string, unknown>;
+		const workspaceContext = args.workspace_context as Record<string, unknown>;
+		assert.equal(args.source, "\\[x\\]");
+		assert.equal(args.inline, false);
+		assert.equal(workspaceContext.cwd, process.cwd());
+		assert.equal(workspaceContext.session_id, "codex-agent-A");
+		assert.equal(workspaceContext.workspace_root, resolve(process.env.MCP_TMPDIR, "agents", "codex-agent-A"));
 	} finally {
 		relay.stop();
+		if (previousMcpTmpdir === undefined) {
+			delete process.env.MCP_TMPDIR;
+		} else {
+			process.env.MCP_TMPDIR = previousMcpTmpdir;
+		}
+		if (previousAgentId === undefined) {
+			delete process.env.TEX_ACTIONS_AGENT_ID;
+		} else {
+			process.env.TEX_ACTIONS_AGENT_ID = previousAgentId;
+		}
+		await daemon.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Relay injects workspace context into set_latex_preamble calls", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-set-preamble-context-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const previousMcpTmpdir = process.env.MCP_TMPDIR;
+	const previousAgentId = process.env.TEX_ACTIONS_AGENT_ID;
+	process.env.MCP_TMPDIR = join(baseDir, "runtime");
+	process.env.TEX_ACTIONS_AGENT_ID = "codex-agent-B";
+	let observedArguments: unknown;
+	const daemon = await startFakeDaemon(socketPath, (request) => {
+		if (request.method === "tools/call") {
+			observedArguments = (request as { params?: { arguments?: unknown } }).params?.arguments;
+		}
+		return {
+			jsonrpc: "2.0",
+			id: request.id,
+			result: { content: [{ type: "text", text: "ok" }] },
+		};
+	});
+	const relay = await startRelayFixture(socketPath);
+
+	try {
+		const output = collectFrames(relay.relayOutput, 1);
+		relay.relayInput.write(
+			encodeFrame(
+				JSON.stringify({
+					jsonrpc: "2.0",
+					id: 13,
+					method: "tools/call",
+					params: {
+						name: "set_latex_preamble",
+						arguments: {
+							latex_preamble: "\\usepackage{array}",
+						},
+					},
+				}),
+			),
+		);
+		const raw = await output;
+		const responses = parseFrames(raw) as Array<{ id: number; result: { content: unknown[] } }>;
+		assert.equal(responses.length, 1);
+		assert.equal(responses[0]!.id, 13);
+		const args = observedArguments as Record<string, unknown>;
+		const workspaceContext = args.workspace_context as Record<string, unknown>;
+		assert.equal(args.latex_preamble, "\\usepackage{array}");
+		assert.equal(workspaceContext.session_id, "codex-agent-B");
+		assert.equal(workspaceContext.workspace_root, resolve(process.env.MCP_TMPDIR, "agents", "codex-agent-B"));
+	} finally {
+		relay.stop();
+		if (previousMcpTmpdir === undefined) {
+			delete process.env.MCP_TMPDIR;
+		} else {
+			process.env.MCP_TMPDIR = previousMcpTmpdir;
+		}
+		if (previousAgentId === undefined) {
+			delete process.env.TEX_ACTIONS_AGENT_ID;
+		} else {
+			process.env.TEX_ACTIONS_AGENT_ID = previousAgentId;
+		}
+		await daemon.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Relay seeds Codex agent runtime preamble from project preamble without overwriting later changes", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-project-preamble-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const projectDir = join(baseDir, "project");
+	const previousMcpTmpdir = process.env.MCP_TMPDIR;
+	const previousAgentId = process.env.TEX_ACTIONS_AGENT_ID;
+	const previousCwd = process.cwd();
+	mkdirSync(projectDir, { recursive: true });
+	writeFileSync(join(projectDir, "preamble.tex"), "\\usepackage{array}");
+	process.env.MCP_TMPDIR = join(baseDir, "runtime");
+	process.env.TEX_ACTIONS_AGENT_ID = "codex-agent-preamble";
+	process.chdir(projectDir);
+	const runtimePreamblePath = resolve(process.env.MCP_TMPDIR, "agents", "codex-agent-preamble", "preamble.tex");
+	const daemon = await startFakeDaemon(socketPath, (request) => ({
+		jsonrpc: "2.0",
+		id: request.id,
+		result: { content: [{ type: "text", text: "ok" }] },
+	}));
+	const relay = await startRelayFixture(socketPath);
+
+	try {
+		let output = collectFrames(relay.relayOutput, 1);
+		relay.relayInput.write(encodeFrame(JSON.stringify({
+			jsonrpc: "2.0",
+			id: 14,
+			method: "tools/call",
+			params: { name: "show_latex", arguments: { source: "\\[x\\]" } },
+		})));
+		await output;
+		assert.equal(readFileSync(runtimePreamblePath, "utf8"), "\\usepackage{array}\n");
+
+		writeFileSync(runtimePreamblePath, "\\usepackage{booktabs}\n");
+		output = collectFrames(relay.relayOutput, 1);
+		relay.relayInput.write(encodeFrame(JSON.stringify({
+			jsonrpc: "2.0",
+			id: 15,
+			method: "tools/call",
+			params: { name: "show_latex", arguments: { source: "\\[y\\]" } },
+		})));
+		await output;
+		assert.equal(readFileSync(runtimePreamblePath, "utf8"), "\\usepackage{booktabs}\n");
+	} finally {
+		relay.stop();
+		process.chdir(previousCwd);
+		if (previousMcpTmpdir === undefined) {
+			delete process.env.MCP_TMPDIR;
+		} else {
+			process.env.MCP_TMPDIR = previousMcpTmpdir;
+		}
+		if (previousAgentId === undefined) {
+			delete process.env.TEX_ACTIONS_AGENT_ID;
+		} else {
+			process.env.TEX_ACTIONS_AGENT_ID = previousAgentId;
+		}
 		await daemon.close();
 		rmSync(baseDir, { recursive: true, force: true });
 	}

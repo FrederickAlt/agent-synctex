@@ -1,5 +1,5 @@
 import { createConnection } from "node:net";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
@@ -357,10 +357,13 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		const byName = new Map(toolsListResponse.result.tools.map((tool) => [tool.name, tool]));
 		const showLatexTool = byName.get("show_latex");
 		const compileFileTool = byName.get("compile_latex_file");
+		const setPreambleTool = byName.get("set_latex_preamble");
 		assert.ok(showLatexTool);
 		assert.ok(compileFileTool);
+		assert.ok(setPreambleTool);
 		assert.equal(typeof showLatexTool.inputSchema.properties.workspace_context, "object");
 		assert.equal(typeof compileFileTool.inputSchema.properties.workspace_context, "object");
+		assert.equal(typeof setPreambleTool.inputSchema.properties.workspace_context, "object");
 		assert.ok(compileFileTool.inputSchema.properties.callback_target_id);
 		assert.ok(compileFileTool.inputSchema.properties.callback);
 		assert.ok(compileFileTool.inputSchema.properties.reuse_existing);
@@ -417,6 +420,120 @@ test("daemon handles multiple MCP frames on one socket and ignores notifications
 		assert.equal((responses[1] as { id: number }).id, 2);
 		const names = ((responses[1] as { result: { tools: Array<{ name: string }> } }).result.tools).map((tool) => tool.name);
 		assert.deepEqual(names, HOST_TOOL_NAMES);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
+test("daemon set_latex_preamble writes workspace preamble when workspace_context is provided", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-agent-preamble-runtime-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-agent-preamble-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const tmpAgentDir = join(runtime.dir, "agents", "agent-A");
+	mkdirSync(tmpAgentDir, { recursive: true });
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	await server.start();
+	try {
+		const agentPayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 41,
+			method: "tools/call",
+			params: {
+				name: "set_latex_preamble",
+				arguments: {
+					latex_preamble: "\\usepackage{array}",
+					workspace_context: {
+						cwd: baseDir,
+						session_id: "agent-A",
+						workspace_root: tmpAgentDir,
+					},
+				},
+			},
+		});
+		const agentResponse = (await sendFramedRequest(socketPath, agentPayload)) as { id: 41; result: { isError?: boolean; content: Array<{ text: string }> } };
+		assert.equal(agentResponse.result.isError, undefined);
+		assert.equal(readFileSync(join(tmpAgentDir, "preamble.tex"), "utf8"), "\\usepackage{array}\n");
+
+		const outsideRuntimePayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 43,
+			method: "tools/call",
+			params: {
+				name: "set_latex_preamble",
+				arguments: {
+					latex_preamble: "bad",
+					workspace_context: {
+						cwd: baseDir,
+						session_id: "agent-A",
+						workspace_root: join(baseDir, "outside-runtime"),
+					},
+				},
+			},
+		});
+		const outsideRuntimeResponse = (await sendFramedRequest(socketPath, outsideRuntimePayload)) as { id: 43; error: { code: number; message: string } };
+		assert.equal(outsideRuntimeResponse.error.code, -32602);
+		assert.match(outsideRuntimeResponse.error.message, /workspace_root must match the agent runtime directory/);
+
+		const missingWorkspaceRootPayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 44,
+			method: "tools/call",
+			params: {
+				name: "set_latex_preamble",
+				arguments: {
+					latex_preamble: "bad",
+					workspace_context: {
+						cwd: baseDir,
+						session_id: "agent-A",
+					},
+				},
+			},
+		});
+		const missingWorkspaceRootResponse = (await sendFramedRequest(socketPath, missingWorkspaceRootPayload)) as { id: 44; error: { code: number; message: string } };
+		assert.equal(missingWorkspaceRootResponse.error.code, -32602);
+		assert.match(missingWorkspaceRootResponse.error.message, /requires workspace_root/);
+
+		const symlinkTarget = join(baseDir, "symlink-target");
+		mkdirSync(symlinkTarget, { recursive: true });
+		const symlinkAgentDir = join(runtime.dir, "agents", "agent-symlink");
+		symlinkSync(symlinkTarget, symlinkAgentDir, "dir");
+		const symlinkPayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 45,
+			method: "tools/call",
+			params: {
+				name: "set_latex_preamble",
+				arguments: {
+					latex_preamble: "bad",
+					workspace_context: {
+						cwd: baseDir,
+						session_id: "agent-symlink",
+						workspace_root: symlinkAgentDir,
+					},
+				},
+			},
+		});
+		const symlinkResponse = (await sendFramedRequest(socketPath, symlinkPayload)) as { id: 45; result: { isError?: boolean; content: Array<{ text: string }> } };
+		assert.equal(symlinkResponse.result.isError, true);
+		assert.match(symlinkResponse.result.content[0].text, /runtime directory is a symlink/);
+
+		const legacyPayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 42,
+			method: "tools/call",
+			params: {
+				name: "set_latex_preamble",
+				arguments: {
+					latex_preamble: "legacy",
+				},
+			},
+		});
+		const legacyResponse = (await sendFramedRequest(socketPath, legacyPayload)) as { id: 42; result: { isError?: boolean; content: Array<{ text: string }> } };
+		assert.equal(legacyResponse.result.isError, undefined);
+		assert.equal(readFileSync(getLatexPreamblePath(), "utf8"), "legacy\n");
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });

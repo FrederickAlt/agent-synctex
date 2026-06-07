@@ -1,6 +1,7 @@
 import { isAbsolute, resolve } from "node:path";
 import { getLatexPreambleFilePath } from "./runtime_preamble.ts";
 import { writeLatexPreambleToTmpdir } from "./runtime_preamble.ts";
+import { resolveTexActionsAgentRuntimeDir } from "./agent_runtime_context.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
 import type {
 	HostServiceCallbackTarget,
@@ -555,8 +556,26 @@ function encodeResponse(payload: McpResponsePayload): string {
 	return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`;
 }
 
-function mcpPreamblePath(): string {
-	return getLatexPreambleFilePath();
+function mcpPreamblePath(runtimeDirectory?: string): string {
+	return getLatexPreambleFilePath(runtimeDirectory);
+}
+
+function resolveSetPreambleRuntimeDirectory(rawWorkspaceContext: unknown): string | undefined {
+	if (rawWorkspaceContext === undefined) {
+		return undefined;
+	}
+	const workspaceContext = normalizeWorkspaceContext(rawWorkspaceContext);
+	if (workspaceContext.workspace_root === undefined) {
+		throw new Error("set_latex_preamble workspace_context requires workspace_root");
+	}
+	if (workspaceContext.session_id === undefined) {
+		throw new Error("set_latex_preamble workspace_context requires session_id");
+	}
+	const expectedRuntimeDirectory = resolveTexActionsAgentRuntimeDir(workspaceContext.session_id);
+	if (resolve(workspaceContext.workspace_root) !== expectedRuntimeDirectory) {
+		throw new Error("set_latex_preamble workspace_context.workspace_root must match the agent runtime directory");
+	}
+	return expectedRuntimeDirectory;
 }
 
 function workspaceContextSchema(): { type: "object"; properties: Record<string, unknown>; required: string[]; additionalProperties: boolean } {
@@ -689,11 +708,12 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "set_latex_preamble",
-			description: "Set the active LaTeX preview preamble in the daemon runtime.",
+			description: "Set the active LaTeX preview preamble in the provided workspace runtime, or the daemon runtime for legacy callers.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					latex_preamble: { type: "string" },
+					workspace_context: workspaceContextSchema(),
 				},
 				required: ["latex_preamble"],
 				additionalProperties: false,
@@ -884,13 +904,22 @@ async function handleSetLatexPreambleTool(
 	_pdfOperations: HostServiceMcpPdfOperations,
 	_mcpCompileService: HostServiceCompileService,
 ): Promise<McpResponsePayload> {
+	const preamble = args.latex_preamble;
+	if (typeof preamble !== "string") {
+		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble requires latex_preamble to be a string");
+	}
+	let runtimeDirectory: string | undefined;
 	try {
-		const preamble = args.latex_preamble;
-		if (typeof preamble !== "string") {
-			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble requires latex_preamble to be a string");
-		}
-		const preambleLength = writeLatexPreambleToTmpdir(preamble);
-		const preamblePath = mcpPreamblePath();
+		runtimeDirectory = resolveSetPreambleRuntimeDirectory(args.workspace_context);
+	} catch (error) {
+		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, error instanceof Error ? error.message : String(error));
+	}
+	try {
+		const preambleLength = writeLatexPreambleToTmpdir(
+			preamble,
+			runtimeDirectory === undefined ? {} : { runtimeDirectory },
+		);
+		const preamblePath = mcpPreamblePath(runtimeDirectory);
 		const resultText = preambleLength
 			? `LaTeX preamble set (${preambleLength} characters) at ${preamblePath}`
 			: `LaTeX preamble cleared at ${preamblePath}`;

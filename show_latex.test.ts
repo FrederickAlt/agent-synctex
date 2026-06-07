@@ -371,8 +371,9 @@ function withTemporaryProject(): { root: string; sourceContent: string } {
 	return { root, sourceContent: "\\begin{document}abc\\end{document}" };
 }
 
-function createSessionContext(cwd: string) {
+function createSessionContext(cwd: string, sessionId?: string) {
 	return {
+		...(sessionId === undefined ? {} : { session_id: sessionId }),
 		hasUI: false,
 		cwd,
 		ui: {
@@ -941,6 +942,48 @@ test("set_latex_preamble is honored by host-service snippet compilation", async 
 		});
 	} finally {
 		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("set_latex_preamble and show_latex use independent per-session preambles", async () => {
+	const { root, sourceContent } = withTemporaryProject();
+	const { showLatex, setLatexPreamble } = await captureTools();
+	const capturedSourcePath = resolve(root, "captured-snippet-source.txt");
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompilerWithSourceCapture(binDir, capturedSourcePath);
+	process.env.PATH = `${binDir}:${originalPath}`;
+	const contextA = createSessionContext(root, "session-A");
+	const contextB = createSessionContext(root, "session-B");
+	const preambleA = "\\usepackage{array}";
+	const preambleB = "\\usepackage{booktabs}";
+	const preamblePathA = resolve(MCP_TMPDIR, "agents", "session-A", "preamble.tex");
+	const preamblePathB = resolve(MCP_TMPDIR, "agents", "session-B", "preamble.tex");
+
+	try {
+		await withHostService("ok", async () => {
+			await setLatexPreamble.execute("set-preamble-A", { latex_preamble: preambleA }, undefined, undefined, contextA);
+			await setLatexPreamble.execute("set-preamble-B", { latex_preamble: preambleB }, undefined, undefined, contextB);
+
+			assert.equal(readFileSync(preamblePathA, "utf8"), `${preambleA}\n`);
+			assert.equal(readFileSync(preamblePathB, "utf8"), `${preambleB}\n`);
+
+			await showLatex.execute("show-latex-A", { source: sourceContent, inline: false }, undefined, undefined, contextA);
+			const renderedSourceA = readFileSync(capturedSourcePath, "utf8");
+			assert.equal(renderedSourceA.includes(preambleA), true);
+			assert.equal(renderedSourceA.includes(preambleB), false);
+
+			await showLatex.execute("show-latex-B", { source: sourceContent, inline: false }, undefined, undefined, contextB);
+			const renderedSourceB = readFileSync(capturedSourcePath, "utf8");
+			assert.equal(renderedSourceB.includes(preambleA), false);
+			assert.equal(renderedSourceB.includes(preambleB), true);
+		});
+	} finally {
+		await runSessionShutdown(contextA);
+		await runSessionShutdown(contextB);
 		process.env.PATH = originalPath;
 		rmSync(root, { recursive: true, force: true });
 	}

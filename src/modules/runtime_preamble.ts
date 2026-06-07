@@ -1,4 +1,4 @@
-import { accessSync, constants, mkdirSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, lstatSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { getLatexPreamblePath, getMcpTmpDir } from "./runtime_paths.ts";
 
@@ -10,6 +10,20 @@ export interface LatexPreambleWriterOptions {
 
 export function ensureMcpRuntimeDirectory(runtimeDirectory: string = getMcpTmpDir()): void {
 	mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
+	const st = lstatSync(runtimeDirectory);
+	if (st.isSymbolicLink()) {
+		throw new Error(`runtime directory is a symlink: ${runtimeDirectory}`);
+	}
+	if (!st.isDirectory()) {
+		throw new Error(`runtime path is not a directory: ${runtimeDirectory}`);
+	}
+	if (process.getuid?.() !== undefined && st.uid !== process.getuid()) {
+		throw new Error(`runtime directory is not owned by current user: ${runtimeDirectory}`);
+	}
+	chmodSync(runtimeDirectory, 0o700);
+	if ((statSync(runtimeDirectory).mode & 0o777) !== 0o700) {
+		throw new Error(`runtime directory mode check failed after correction: ${runtimeDirectory}`);
+	}
 	accessSync(runtimeDirectory, constants.F_OK | constants.R_OK | constants.W_OK | constants.X_OK);
 }
 

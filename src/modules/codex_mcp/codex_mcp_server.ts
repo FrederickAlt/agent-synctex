@@ -11,7 +11,9 @@ import {
 	buildMcpErrorResponse,
 	mcpFramedResponse,
 } from "../host_service_mcp.ts";
+import { resolveAgentWorkspaceContext } from "../agent_runtime_context.ts";
 import { resolveHostServiceSocketPath } from "../host_service.ts";
+import { initializeLatexPreambleFile } from "../pi_extension/latex_preamble_manager.ts";
 
 export interface CodexMcpDaemonRelayOptions {
 	socketPath?: string;
@@ -80,13 +82,17 @@ function omitArrayValue(value: unknown, item: string): unknown {
 	return value.filter((entry) => entry !== item);
 }
 
-function hideInlineFromShowLatexTool(tool: unknown): unknown {
-	if (!isRecord(tool) || tool.name !== "show_latex" || !isRecord(tool.inputSchema)) {
+function hideInternalArgumentsFromTool(tool: unknown): unknown {
+	if (!isRecord(tool) || !isRecord(tool.inputSchema)) {
 		return tool;
 	}
 	const inputSchema = cloneRecord(tool.inputSchema);
-	inputSchema.properties = omitRecordKey(inputSchema.properties, "inline");
-	inputSchema.required = omitArrayValue(inputSchema.required, "inline");
+	inputSchema.properties = omitRecordKey(inputSchema.properties, "workspace_context");
+	inputSchema.required = omitArrayValue(inputSchema.required, "workspace_context");
+	if (tool.name === "show_latex") {
+		inputSchema.properties = omitRecordKey(inputSchema.properties, "inline");
+		inputSchema.required = omitArrayValue(inputSchema.required, "inline");
+	}
 	return {
 		...tool,
 		inputSchema,
@@ -101,23 +107,41 @@ function rewriteToolsListForCodex(response: Record<string, unknown>): Record<str
 		...response,
 		result: {
 			...response.result,
-			tools: response.result.tools.map(hideInlineFromShowLatexTool),
+			tools: response.result.tools.map(hideInternalArgumentsFromTool),
 		},
 	};
 }
 
-function forceShowLatexOpenPdfForCodex(request: Record<string, unknown>): Record<string, unknown> {
-	if (request.method !== "tools/call" || !isRecord(request.params) || request.params.name !== "show_latex") {
+const WORKSPACE_CONTEXT_TOOL_NAMES = new Set([
+	"show_latex",
+	"compile_latex_file",
+	"open_pdf",
+	"jump_pdf",
+	"set_latex_preamble",
+]);
+
+function rewriteToolCallArgumentsForCodex(request: Record<string, unknown>): Record<string, unknown> {
+	if (request.method !== "tools/call" || !isRecord(request.params) || typeof request.params.name !== "string") {
+		return request;
+	}
+	if (!WORKSPACE_CONTEXT_TOOL_NAMES.has(request.params.name)) {
 		return request;
 	}
 	const currentArguments = isRecord(request.params.arguments) ? request.params.arguments : {};
+	const workspaceContext = resolveAgentWorkspaceContext();
+	initializeLatexPreambleFile({
+		cwd: workspaceContext.cwd,
+		runtimeDirectory: workspaceContext.workspace_root,
+		overwrite: false,
+	});
 	return {
 		...request,
 		params: {
 			...request.params,
 			arguments: {
 				...currentArguments,
-				inline: false,
+				...(request.params.name === "show_latex" ? { inline: false } : {}),
+				workspace_context: workspaceContext,
 			},
 		},
 	};
@@ -129,7 +153,7 @@ function rewriteClientRequestForCodex(payload: string): string {
 		if (!isRecord(parsed)) {
 			return payload;
 		}
-		const rewritten = forceShowLatexOpenPdfForCodex(parsed);
+		const rewritten = rewriteToolCallArgumentsForCodex(parsed);
 		return rewritten === parsed ? payload : JSON.stringify(rewritten);
 	} catch {
 		return payload;

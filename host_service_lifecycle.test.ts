@@ -12,6 +12,7 @@ import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
+import { resolveAgentWorkspaceContext } from "./src/modules/agent_runtime_context.ts";
 import { contextSessionKey } from "./src/modules/pi_extension/context_session.ts";
 import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
 
@@ -352,15 +353,16 @@ test("session startup registers host service callback target and shutdown unregi
 		await runSessionStart(suite.start, context);
 
 		const expectedTargetId = `pi:${contextSessionKey(context as never)}`;
+		const workspaceContext = resolveAgentWorkspaceContext(context as never);
 		await withHostServiceClient(socketPath, async (client) => {
-			const resolve = await client.requestResolveCallbackTarget({ cwd: context.cwd }, expectedTargetId);
+			const resolve = await client.requestResolveCallbackTarget(workspaceContext, expectedTargetId);
 			assert.equal(resolve.callback_available, true);
 			assert.equal(resolve.target?.kind, "pi-synctex-callback-v1");
 		});
 
 		await runSessionShutdown(suite.shutdown, context);
 		await withHostServiceClient(socketPath, async (client) => {
-			const resolveAfterShutdown = await client.requestResolveCallbackTarget({ cwd: context.cwd }, expectedTargetId);
+			const resolveAfterShutdown = await client.requestResolveCallbackTarget(workspaceContext, expectedTargetId);
 			assert.equal(resolveAfterShutdown.callback_available, false);
 		});
 
@@ -379,14 +381,15 @@ test("session startup callback target becomes unavailable when callback socket i
 		await runSessionStart(suite.start, context);
 
 		const targetId = `pi:${contextSessionKey(context as never)}`;
+		const workspaceContext = resolveAgentWorkspaceContext(context as never);
 		await withHostServiceClient(socketPath, async (client) => {
-			const resolveBefore = await client.requestResolveCallbackTarget({ cwd: root }, targetId);
+			const resolveBefore = await client.requestResolveCallbackTarget(workspaceContext, targetId);
 			assert.equal(resolveBefore.callback_available, true);
 			if (!resolveBefore.target?.socket_path) {
 				throw new Error("expected host service to return callback target socket");
 			}
 			rmSync(resolveBefore.target.socket_path);
-			const resolveAfter = await client.requestResolveCallbackTarget({ cwd: root }, targetId);
+			const resolveAfter = await client.requestResolveCallbackTarget(workspaceContext, targetId);
 			assert.equal(resolveAfter.callback_available, false);
 		});
 

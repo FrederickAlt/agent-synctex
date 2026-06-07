@@ -431,8 +431,9 @@ function withTemporaryProject(): { root: string; sourcePath: string; sourceConte
 	return { root, sourcePath, sourceContent: "\\begin{document}ok\\end{document}" };
 }
 
-function createSessionContext(cwd: string) {
+function createSessionContext(cwd: string, sessionId?: string) {
 	return {
+		...(sessionId === undefined ? {} : { session_id: sessionId }),
 		hasUI: false,
 		cwd,
 		ui: {
@@ -460,6 +461,34 @@ function readCompileFailureLog(error: unknown): string {
 	const logPath = extractCompileFailureLogPath(error);
 	return readFileSync(logPath, "utf8");
 }
+
+test("session_start copies project preambles into independent per-session runtime dirs", async () => {
+	await captureTools();
+	const projectA = mkdtempSync(resolve(tmpdir(), "pdf-preview-preamble-A-"));
+	const projectB = mkdtempSync(resolve(tmpdir(), "pdf-preview-preamble-B-"));
+	const preambleA = "\\usepackage{array}";
+	const preambleB = "\\usepackage{booktabs}";
+	writeFileSync(resolve(projectA, "preamble.tex"), preambleA);
+	writeFileSync(resolve(projectB, "preamble.tex"), preambleB);
+	const contextA = createSessionContext(projectA, "compile-session-A");
+	const contextB = createSessionContext(projectB, "compile-session-B");
+	const preamblePathA = resolve(MCP_TMPDIR, "agents", "compile-session-A", "preamble.tex");
+	const preamblePathB = resolve(MCP_TMPDIR, "agents", "compile-session-B", "preamble.tex");
+
+	try {
+		await withHostServiceDefault(async () => {
+			await runSessionStart(contextA);
+			await runSessionStart(contextB);
+			assert.equal(readFileSync(preamblePathA, "utf8"), `${preambleA}\n`);
+			assert.equal(readFileSync(preamblePathB, "utf8"), `${preambleB}\n`);
+		});
+	} finally {
+		await runSessionShutdown(contextA);
+		await runSessionShutdown(contextB);
+		rmSync(projectA, { recursive: true, force: true });
+		rmSync(projectB, { recursive: true, force: true });
+	}
+});
 
 test("compile_latex_file compiles without opening by default", async () => {
 	const { root, sourcePath } = withTemporaryProject();

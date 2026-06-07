@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { contextSessionKey } from "./context_session.ts";
 import { SynctexCallbackServer, type SynctexPasteTarget } from "../synctex/synctex.ts";
+import { resolveAgentWorkspaceContext } from "../agent_runtime_context.ts";
 import { getMcpTmpDir } from "./runtime_paths.ts";
 import { createHostServiceClient, hostServiceSocketPath, type HostServiceCallbackTargetWorkspace } from "./host_service_client.ts";
 
@@ -60,12 +61,7 @@ export class SynctexCallbackManager {
 	}
 
 	hostServiceWorkspaceContextForSession(ctx: ExtensionContext): HostServiceCallbackTargetWorkspace {
-		const context: HostServiceCallbackTargetWorkspace = { cwd: ctx.cwd };
-		const rawSessionId = (ctx as { session_id?: unknown }).session_id;
-		if (typeof rawSessionId === "string" && rawSessionId.length > 0) {
-			context.session_id = rawSessionId;
-		}
-		return context;
+		return resolveAgentWorkspaceContext(ctx);
 	}
 
 	private createSynctexCallbackServer(): SynctexCallbackServer {

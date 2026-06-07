@@ -2,6 +2,8 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { errorMessage } from "./error_utils.ts";
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
 import { cleanupTerminalRefresh, clearTerminalInvalidators, installTerminalRefreshForSession } from "./inline_renderer.ts";
+import { resolveAgentWorkspaceContext } from "../agent_runtime_context.ts";
+import { initializeLatexPreambleFile } from "./latex_preamble_manager.ts";
 import { hostServiceSocketPath } from "./host_service_client.ts";
 
 function notifyHostServiceError(ctx: ExtensionContext, operation: string, error: unknown): void {
@@ -18,6 +20,8 @@ export function registerLifecycleHandlers(
 		installTerminalRefreshForSession(Boolean(ctx?.hasUI), ctx?.ui);
 		try {
 			if (ctx) {
+				const workspaceContext = resolveAgentWorkspaceContext(ctx);
+				initializeLatexPreambleFile({ cwd: ctx.cwd, runtimeDirectory: workspaceContext.workspace_root });
 				await callbackManager.rotateSynctexCallbacks(ctx);
 				await callbackManager.ensureHostServiceCallbackTarget(ctx);
 			}

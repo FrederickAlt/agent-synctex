@@ -1,15 +1,13 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { HostServiceWorkspaceContext } from "../host_service_protocol.ts";
+import { resolveAgentWorkspaceContext } from "../agent_runtime_context.ts";
 import { defaultHostServiceSocketPath, HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostServiceClient } from "../host_service.ts";
 
 export const HOST_SERVICE_SESSION_ENV_VAR = HOST_SERVICE_SOCKET_PATH_ENV_VAR;
 export const HOST_SERVICE_REQUEST_TIMEOUT_MS = 5_000;
 export const HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS = 300_000;
 
-export interface HostServiceCallbackTargetWorkspace {
-	cwd: string;
-	session_id?: string;
-}
+export type HostServiceCallbackTargetWorkspace = HostServiceWorkspaceContext;
 
 export function hostServiceSocketPath(): string {
 	const override = process.env[HOST_SERVICE_SESSION_ENV_VAR];
@@ -30,20 +28,9 @@ export function extractHostServiceErrorCode(error: unknown): string | undefined 
 }
 
 export function hostServiceWorkspaceContextForSession(ctx: ExtensionContext): HostServiceWorkspaceContext {
-	const context: HostServiceWorkspaceContext = {
-		cwd: ctx.cwd,
-	};
-	const rawSessionId = (ctx as { session_id?: unknown }).session_id;
-	if (typeof rawSessionId === "string" && rawSessionId.length > 0) {
-		context.session_id = rawSessionId;
-	}
-
-	return context;
+	return resolveAgentWorkspaceContext(ctx);
 }
 
 export function hostServiceWorkspaceContextForRequest(ctx?: ExtensionContext): HostServiceWorkspaceContext {
-	if (ctx) {
-		return hostServiceWorkspaceContextForSession(ctx);
-	}
-	return { cwd: process.cwd() };
+	return resolveAgentWorkspaceContext(ctx);
 }
