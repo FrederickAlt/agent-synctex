@@ -12,8 +12,8 @@ import {
 	HostServiceClient,
 	HostServicePdfIdRegistry,
 	HostServiceServer,
-} from "./src/modules/host_service.ts";
-import { HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS } from "./src/modules/pi_extension/host_service_client.ts";
+} from "../../../src/modules/host_service.ts";
+import { HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS } from "../../../src/modules/pi_extension/host_service_client.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 

@@ -12,9 +12,9 @@ import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
-import { resolveAgentWorkspaceContext } from "./src/modules/agent_runtime_context.ts";
-import { contextSessionKey } from "./src/modules/pi_extension/context_session.ts";
-import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
+import { resolveAgentWorkspaceContext } from "../../../src/modules/agent_runtime_context.ts";
+import { contextSessionKey } from "../../../src/modules/pi_extension/context_session.ts";
+import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostServiceClient, HostServiceServer } from "../../../src/modules/host_service.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 

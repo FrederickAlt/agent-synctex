@@ -5,8 +5,8 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
-import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, FakeViewerBackend, HostServiceClient, HostServiceServer } from "./src/modules/host_service.ts";
-import { HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS } from "./src/modules/pi_extension/host_service_client.ts";
+import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, FakeViewerBackend, HostServiceClient, HostServiceServer } from "../../../src/modules/host_service.ts";
+import { HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS } from "../../../src/modules/pi_extension/host_service_client.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 
