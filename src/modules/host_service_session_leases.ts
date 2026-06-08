@@ -98,7 +98,21 @@ export class HostServiceSessionLeaseService {
 			throw new Error("session_id is required");
 		}
 		const current = this.pendingNotificationsBySessionId.get(sessionId) ?? [];
-		this.pendingNotificationsBySessionId.set(sessionId, [...current, { ...notification }]);
+		const retained = notification.root_source === undefined
+			? current
+			: current.filter((entry) => entry.root_source !== notification.root_source);
+		this.pendingNotificationsBySessionId.set(sessionId, [...retained, { ...notification, details: notification.details ? { ...notification.details } : undefined }]);
+	}
+
+	clearPendingNotificationsForRoot(rootSource: string): void {
+		for (const [sessionId, notifications] of this.pendingNotificationsBySessionId) {
+			const retained = notifications.filter((notification) => notification.root_source !== rootSource);
+			if (retained.length === 0) {
+				this.pendingNotificationsBySessionId.delete(sessionId);
+			} else if (retained.length !== notifications.length) {
+				this.pendingNotificationsBySessionId.set(sessionId, retained);
+			}
+		}
 	}
 
 	clear(): void {

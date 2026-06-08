@@ -47,6 +47,29 @@ function notifyUnsupportedHeartbeat(ctx: ExtensionContext): void {
 	ctx.ui.notify("Host Service is too old for session heartbeats; restart the Host Service to enable session lease support.", "warning");
 }
 
+function isUnsupportedPendingNotificationsError(error: unknown): boolean {
+	const message = errorMessage(error);
+	return /unsupported operation: get_pending_notifications/.test(message)
+		|| /Malformed host service response payload:.*get_pending_notifications/.test(message);
+}
+
+async function injectPendingSystemInfo(ctx: ExtensionContext): Promise<void> {
+	const client = createHostServiceClient();
+	try {
+		const pending = await client.requestPendingNotifications(hostServiceWorkspaceContextForSession(ctx));
+		const messages = pending.notifications.map((notification) => notification.message).filter((message) => message.trim());
+		if (messages.length > 0) {
+			ctx.ui.pasteToEditor(messages.join("\n\n"));
+		}
+	} catch (error) {
+		if (isUnsupportedPendingNotificationsError(error)) {
+			logger.warn("pending_notifications.unsupported", { error });
+			return;
+		}
+		throw error;
+	}
+}
+
 async function startSessionHeartbeat(ctx: ExtensionContext): Promise<void> {
 	const sessionKey = contextSessionKey(ctx);
 	stopSessionHeartbeat(sessionKey);
@@ -84,6 +107,7 @@ export function registerLifecycleHandlers(
 				const workspaceContext = resolveAgentWorkspaceContext(ctx);
 				initializeLatexPreambleFile({ cwd: ctx.cwd, runtimeDirectory: workspaceContext.workspace_root });
 				await startSessionHeartbeat(ctx);
+				await injectPendingSystemInfo(ctx);
 				await callbackManager.rotateSynctexCallbacks(ctx);
 				await callbackManager.ensureHostServiceCallbackTarget(ctx);
 				logger.info("session_start.end", { cwd: ctx.cwd, workspace_root: workspaceContext.workspace_root });
@@ -107,6 +131,12 @@ export function registerLifecycleHandlers(
 		clearTerminalInvalidators();
 		if (ctx) {
 			const contextKey = callbackManager.contextKeyForContext(ctx);
+			try {
+				await injectPendingSystemInfo(ctx);
+			} catch (error) {
+				logger.error("session_shutdown.pending_notifications.error", { error });
+				notifyHostServiceError(ctx, "pending notification retrieval", error);
+			}
 			stopSessionHeartbeat(contextSessionKey(ctx));
 			try {
 				await callbackManager.unregisterHostServiceCallbackTarget(contextKey);

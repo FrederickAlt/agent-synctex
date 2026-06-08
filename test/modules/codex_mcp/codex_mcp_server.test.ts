@@ -481,6 +481,61 @@ test("Relay heartbeats with injected workspace context while active", async () =
 	}
 });
 
+test("Codex relay surfaces pending continuous compile notifications at request boundaries once", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-pending-system-info-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const previousMcpTmpdir = process.env.MCP_TMPDIR;
+	const previousAgentId = process.env.TEX_ACTIONS_AGENT_ID;
+	process.env.MCP_TMPDIR = join(baseDir, "runtime");
+	process.env.TEX_ACTIONS_AGENT_ID = "codex-pending-agent";
+	const leases = new HostServiceSessionLeaseService();
+	leases.queuePendingNotification("codex-pending-agent", {
+		id: "codex-pending",
+		created_at_ns: 1,
+		root_source: join(baseDir, "paper.tex"),
+		message: "[system info] codex relay pending compile failure",
+	});
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "codex-pending-system-info-test",
+		viewerBackend: new FakeViewerBackend(),
+		sessionLeases: leases,
+	});
+	await server.start();
+	const relay = await startRelayFixture(socketPath, { heartbeatIntervalMs: 0 });
+
+	try {
+		const initializePayload = JSON.stringify({ jsonrpc: "2.0", id: 76, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } } });
+		const firstOutput = collectFrames(relay.relayOutput, 2);
+		relay.relayInput.write(encodeFrame(initializePayload));
+		const firstFrames = parseFrames(await firstOutput) as Array<{ method?: string; id?: number; params?: { data?: string }; result?: unknown }>;
+		assert.equal(firstFrames[0]?.method, "notifications/message");
+		assert.match(firstFrames[0]?.params?.data ?? "", /\[system info\] codex relay pending compile failure/);
+		assert.equal(firstFrames[1]?.id, 76);
+
+		const secondOutput = collectFrames(relay.relayOutput, 1);
+		relay.relayInput.write(encodeFrame(JSON.stringify({ jsonrpc: "2.0", id: 77, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } } })));
+		const secondFrames = parseFrames(await secondOutput) as Array<{ method?: string; id?: number }>;
+		assert.equal(secondFrames.length, 1);
+		assert.equal(secondFrames[0]?.id, 77);
+		assert.notEqual(secondFrames[0]?.method, "notifications/message");
+	} finally {
+		relay.stop();
+		await server.stop();
+		if (previousMcpTmpdir === undefined) {
+			delete process.env.MCP_TMPDIR;
+		} else {
+			process.env.MCP_TMPDIR = previousMcpTmpdir;
+		}
+		if (previousAgentId === undefined) {
+			delete process.env.TEX_ACTIONS_AGENT_ID;
+		} else {
+			process.env.TEX_ACTIONS_AGENT_ID = previousAgentId;
+		}
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("Relay stops heartbeat refresh after close", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-heartbeat-stop-"));
 	const socketPath = join(baseDir, "host-service.sock");

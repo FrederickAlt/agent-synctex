@@ -285,7 +285,7 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function createSessionContext(cwd: string, notifications: string[]) {
+function createSessionContext(cwd: string, notifications: string[], pastedText: string[] = []) {
 	return {
 		hasUI: true,
 		cwd,
@@ -294,7 +294,9 @@ function createSessionContext(cwd: string, notifications: string[]) {
 				notifications.push(message);
 			},
 			onTerminalInput: () => () => undefined,
-			pasteToEditor: () => undefined,
+			pasteToEditor: (message: string) => {
+				pastedText.push(message);
+			},
 			setEditorText: () => undefined,
 			getEditorText: () => "",
 		},
@@ -476,6 +478,46 @@ test("session startup continues clearly when host service is too old for heartbe
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test("Pi lifecycle injects pending continuous compile notifications at session boundaries", async () => {
+	const suite = await captureExtensionHandlersAndTools();
+	const socketPath = nextHostServiceSocketPath();
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
+	const leases = new HostServiceSessionLeaseService();
+
+	await withHostService(socketPath, async () => {
+		const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-pending-"));
+		const pasted: string[] = [];
+		const context = createSessionContext(root, [], pasted);
+		const workspaceContext = resolveAgentWorkspaceContext(context as never);
+		leases.queuePendingNotification(workspaceContext.session_id ?? "", {
+			id: "pending-start",
+			created_at_ns: 1,
+			root_source: resolve(root, "paper.tex"),
+			message: "[system info] pending compile failure at session start",
+		});
+
+		await runSessionStart(suite.start, context);
+		assert.equal(pasted.length, 1);
+		assert.match(pasted[0] ?? "", /pending compile failure at session start/);
+		await withHostServiceClient(socketPath, async (client) => {
+			const afterStart = await client.requestPendingNotifications(workspaceContext);
+			assert.equal(afterStart.delivered_count, 0);
+		});
+
+		leases.queuePendingNotification(workspaceContext.session_id ?? "", {
+			id: "pending-shutdown",
+			created_at_ns: 2,
+			root_source: resolve(root, "paper.tex"),
+			message: "[system info] pending compile failure at session shutdown",
+		});
+		await runSessionShutdown(suite.shutdown, context);
+		assert.equal(pasted.length, 2);
+		assert.match(pasted[1] ?? "", /pending compile failure at session shutdown/);
+
+		rmSync(root, { recursive: true, force: true });
+	}, { sessionLeases: leases });
 });
 
 test("session startup registers host service callback target and shutdown unregisters it", async () => {

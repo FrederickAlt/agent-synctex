@@ -1011,14 +1011,19 @@ export class HostServiceServer {
 			viewerBackend: this.viewerBackend,
 			managedViewerRecords: this.managedViewerRecords,
 		});
+		this.sessionLeases = options.sessionLeases ?? new HostServiceSessionLeaseService();
 		this.continuousCompileManager = options.continuousCompileManager ?? new HostServiceContinuousCompileManager();
+		this.continuousCompileManager.setNotificationSink({
+			isSessionLive: (sessionId) => this.sessionLeases.isLive(sessionId),
+			queuePendingNotification: (sessionId, notification) => this.sessionLeases.queuePendingNotification(sessionId, notification),
+			clearPendingNotificationsForRoot: (rootSource) => this.sessionLeases.clearPendingNotificationsForRoot(rootSource),
+		});
 		this.compileService = new HostServiceCompileService({
 			protocolVersion: this.protocolVersion,
 			managedViewerService: this.managedViewerService,
 			resolveManagedOpenCallback: this.resolveManagedOpenCallback.bind(this),
 			continuousCompileManager: this.continuousCompileManager,
 		});
-		this.sessionLeases = options.sessionLeases ?? new HostServiceSessionLeaseService();
 		this.sessionLeases.onExpiredSessions((sessionIds) => this.continuousCompileManager.removeSessions(sessionIds));
 	}
 

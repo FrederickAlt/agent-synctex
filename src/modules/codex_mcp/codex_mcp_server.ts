@@ -187,6 +187,24 @@ function asError(error: unknown): Error {
 	return error instanceof Error ? error : new Error(String(error));
 }
 
+function systemInfoNotificationPayload(message: string): string {
+	return JSON.stringify({
+		jsonrpc: "2.0",
+		method: "notifications/message",
+		params: {
+			level: "info",
+			logger: "tex-actions",
+			data: message,
+		},
+	});
+}
+
+function isUnsupportedPendingNotificationsError(error: unknown): boolean {
+	const message = asError(error).message;
+	return /unsupported operation: get_pending_notifications/.test(message)
+		|| /Malformed host service get_pending_notifications response payload/.test(message);
+}
+
 export class CodexMcpDaemonRelay {
 	readonly socketPath: string;
 	private readonly stdin: Readable;
@@ -278,7 +296,9 @@ export class CodexMcpDaemonRelay {
 	private async handleFrame(frame: HostServiceDaemonFrame): Promise<void> {
 		const { requestId, expectsResponse } = requestMetadata(frame.payload);
 		try {
+			await this.flushPendingSystemInfo(frame.protocol);
 			await this.forwardToDaemon(frame.payload, expectsResponse, frame.protocol);
+			await this.flushPendingSystemInfo(frame.protocol);
 		} catch (error) {
 			if (!expectsResponse) {
 				return;
@@ -289,6 +309,21 @@ export class CodexMcpDaemonRelay {
 				`${daemonUnavailableMessage(this.socketPath)} ${asError(error).message}`,
 				frame.protocol,
 			);
+		}
+	}
+
+	private async flushPendingSystemInfo(clientProtocol: ClientFrameProtocol): Promise<void> {
+		const workspaceContext = resolveAgentWorkspaceContext();
+		const client = new HostServiceClient({ socketPath: this.socketPath, requestTimeoutMs: this.requestTimeoutMs });
+		try {
+			const pending = await client.requestPendingNotifications(workspaceContext);
+			for (const notification of pending.notifications) {
+				await this.writeOutput(frameClientPayload(systemInfoNotificationPayload(notification.message), clientProtocol));
+			}
+		} catch (error) {
+			if (!isUnsupportedPendingNotificationsError(error)) {
+				this.writeDiagnostic(`Pending TeX Actions system-info retrieval failed: ${asError(error).message}`);
+			}
 		}
 	}
 
