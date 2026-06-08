@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -13,6 +14,30 @@ import {
 
 function temporaryDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));
+}
+
+async function withMalformedResponseServer<T>(
+	response: Record<string, unknown>,
+	fn: (client: HostServiceClient) => Promise<T>,
+): Promise<T> {
+	const baseDir = temporaryDir("host-service-session-malformed-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = createServer((socket) => {
+		socket.once("data", () => {
+			socket.end(`${JSON.stringify(response)}\n`);
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(socketPath, () => resolve());
+	});
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000, requestIdFactory: () => "fixed-request" });
+	try {
+		return await fn(client);
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+		rmSync(baseDir, { recursive: true, force: true });
+	}
 }
 
 async function withServer<T>(
@@ -76,6 +101,41 @@ test("Host Service rejects heartbeat and pending-notification requests without a
 			/error status.*workspace_context\.session_id is required|workspace_context\.session_id is required.*code=invalid_request/,
 		);
 	});
+});
+
+test("Host Service client rejects malformed pending notification response items", async () => {
+	await withMalformedResponseServer(
+		{
+			protocol_version: 1,
+			request_id: "fixed-request",
+			operation: "get_pending_notifications",
+			status: "ok",
+			generated_at_ns: 123,
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				service_name: "malformed-test",
+				socket_path: "/tmp/host-service.sock",
+				service_instance_started_ns: 1,
+				service_instance_id: "malformed-test",
+				workspace_context: { cwd: "/tmp/workspace", session_id: "session-A" },
+				request_id: "fixed-request",
+				operation: "get_pending_notifications",
+				session_id: "session-A",
+				notifications: [{ id: "", created_at_ns: 42, message: "missing id" }],
+				delivered_count: 1,
+				uptime_ns: 1,
+				total_requests: 1,
+			},
+		},
+		async (client) => {
+			await assert.rejects(
+				() => client.requestPendingNotifications({ cwd: "/tmp/workspace", session_id: "session-A" }),
+				/Malformed host service response payload/,
+			);
+		},
+	);
 });
 
 test("Host Service pending notification retrieval is session scoped and can return empty", async () => {

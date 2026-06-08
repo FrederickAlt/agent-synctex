@@ -12,6 +12,7 @@ import {
 	HOST_SERVICE_SOCKET_PATH_ENV_VAR,
 	HostServiceClient,
 	HostServiceServer,
+	HostServiceSessionLeaseService,
 } from "../../../src/modules/host_service.ts";
 import { CodexMcpDaemonRelay } from "../../../src/modules/codex_mcp/codex_mcp_server.ts";
 
@@ -160,7 +161,7 @@ function startFakeDaemon(
 	});
 }
 
-async function startRelayFixture(socketPath: string) {
+async function startRelayFixture(socketPath: string, options: { heartbeatIntervalMs?: number } = {}) {
 	const relayInput = new PassThrough();
 	const relayOutput = new PassThrough();
 	const relay = new CodexMcpDaemonRelay({
@@ -168,6 +169,7 @@ async function startRelayFixture(socketPath: string) {
 		stdin: relayInput,
 		stdout: relayOutput,
 		stderr: new PassThrough(),
+		...(options.heartbeatIntervalMs === undefined ? {} : { heartbeatIntervalMs: options.heartbeatIntervalMs }),
 	});
 	relay.start();
 	return {
@@ -462,6 +464,48 @@ test("Relay heartbeats with injected workspace context while active", async () =
 			await sleep(25);
 		}
 		assert.equal(liveSessionCount, 1);
+	} finally {
+		relay.stop();
+		await server.stop();
+		if (previousMcpTmpdir === undefined) {
+			delete process.env.MCP_TMPDIR;
+		} else {
+			process.env.MCP_TMPDIR = previousMcpTmpdir;
+		}
+		if (previousAgentId === undefined) {
+			delete process.env.TEX_ACTIONS_AGENT_ID;
+		} else {
+			process.env.TEX_ACTIONS_AGENT_ID = previousAgentId;
+		}
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Relay stops heartbeat refresh after close", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-heartbeat-stop-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const previousMcpTmpdir = process.env.MCP_TMPDIR;
+	const previousAgentId = process.env.TEX_ACTIONS_AGENT_ID;
+	process.env.MCP_TMPDIR = join(baseDir, "runtime");
+	process.env.TEX_ACTIONS_AGENT_ID = "codex-heartbeat-stop-agent";
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "codex-heartbeat-stop-test",
+		viewerBackend: new FakeViewerBackend(),
+		sessionLeases: new HostServiceSessionLeaseService({ leaseTtlMs: 80 }),
+	});
+	await server.start();
+	const relay = await startRelayFixture(socketPath, { heartbeatIntervalMs: 20 });
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		await sleep(120);
+		const liveStatus = await client.requestStatus({ cwd: process.cwd() });
+		assert.equal(liveStatus.live_session_count, 1);
+		relay.stop();
+		await sleep(120);
+		const expiredStatus = await client.requestStatus({ cwd: process.cwd() });
+		assert.equal(expiredStatus.live_session_count, 0);
 	} finally {
 		relay.stop();
 		await server.stop();

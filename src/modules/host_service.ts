@@ -1677,6 +1677,16 @@ function isValidLatexDiagnostic(value: unknown): boolean {
 	return true;
 }
 
+function isValidPendingNotification(value: unknown): boolean {
+	if (!isStringRecord(value)) return false;
+	if (typeof value.id !== "string" || !value.id.trim()) return false;
+	if (typeof value.created_at_ns !== "number") return false;
+	if (typeof value.message !== "string" || !value.message.trim()) return false;
+	if (value.root_source !== undefined && typeof value.root_source !== "string") return false;
+	if (value.details !== undefined && !isStringRecord(value.details)) return false;
+	return true;
+}
+
 function parseRequest(raw: string): unknown {
 	try {
 		return JSON.parse(raw);
@@ -2234,6 +2244,9 @@ function isValidGetPendingNotificationsResponse(
 		return false;
 	}
 	if (details.notifications !== undefined && !Array.isArray(details.notifications)) {
+		return false;
+	}
+	if (Array.isArray(details.notifications) && !details.notifications.every(isValidPendingNotification)) {
 		return false;
 	}
 	if (details.delivered_count !== undefined && (typeof details.delivered_count !== "number" || !Number.isInteger(details.delivered_count) || details.delivered_count < 0)) {

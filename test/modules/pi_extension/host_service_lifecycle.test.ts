@@ -10,11 +10,13 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { pathToFileURL } from "node:url";
 import * as ts from "typescript";
 import { resolveAgentWorkspaceContext } from "../../../src/modules/agent_runtime_context.ts";
 import { contextSessionKey } from "../../../src/modules/pi_extension/context_session.ts";
-import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostServiceClient, HostServiceServer } from "../../../src/modules/host_service.ts";
+import { SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR } from "../../../src/modules/pi_extension/lifecycle.ts";
+import { HOST_SERVICE_SOCKET_PATH_ENV_VAR, HostServiceClient, HostServiceServer, HostServiceSessionLeaseService } from "../../../src/modules/host_service.ts";
 
 const PI_TUI_STUB_SOURCE = `let capabilityState = { images: null, trueColor: true, hyperlinks: false };
 
@@ -109,6 +111,7 @@ const TYPEBOX_STUB_SOURCE = `export const Type = {
 
 const ORIGINAL_MCP_TMPDIR = process.env.MCP_TMPDIR;
 const ORIGINAL_HOST_SERVICE_SOCKET_PATH = process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
+const ORIGINAL_SESSION_HEARTBEAT_INTERVAL_MS = process.env[SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR];
 const MCP_TMPDIR = mkdtempSync(resolve(tmpdir(), "pdf-preview-show-latex-service-"));
 process.env.MCP_TMPDIR = MCP_TMPDIR;
 
@@ -184,6 +187,11 @@ after(() => {
 		delete process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR];
 	} else {
 		process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = ORIGINAL_HOST_SERVICE_SOCKET_PATH;
+	}
+	if (typeof ORIGINAL_SESSION_HEARTBEAT_INTERVAL_MS === "undefined") {
+		delete process.env[SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR];
+	} else {
+		process.env[SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR] = ORIGINAL_SESSION_HEARTBEAT_INTERVAL_MS;
 	}
 	rmSync(MCP_TMPDIR, { recursive: true, force: true });
 	cleanupRuntimeStubs();
@@ -273,6 +281,10 @@ function writeFakeCompiler(binDir: string, exitCode = 0): string {
 	return scriptPath;
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function createSessionContext(cwd: string, notifications: string[]) {
 	return {
 		hasUI: true,
@@ -314,13 +326,117 @@ async function withHostServiceClient<T>(socketPath: string, fn: (client: HostSer
 	}
 }
 
-async function withHostService<T>(socketPath: string, fn: (server: HostServiceServer) => Promise<T>): Promise<T> {
-	const server = new HostServiceServer({ socketPath, serviceName: "tex-actions-issue-51" });
+async function withHostService<T>(
+	socketPath: string,
+	fn: (server: HostServiceServer) => Promise<T>,
+	options: { sessionLeases?: HostServiceSessionLeaseService } = {},
+): Promise<T> {
+	const server = new HostServiceServer({ socketPath, serviceName: "tex-actions-issue-51", sessionLeases: options.sessionLeases });
 	await server.start();
 	try {
 		return await fn(server);
 	} finally {
 		await server.stop();
+	}
+}
+
+async function withUnsupportedHeartbeatHostService<T>(socketPath: string, fn: () => Promise<T>): Promise<T> {
+	const server = createServer((socket) => {
+		let raw = "";
+		socket.setEncoding("utf8");
+		socket.on("data", (chunk) => {
+			raw += chunk;
+			const lineBreak = raw.indexOf("\n");
+			if (lineBreak < 0) return;
+			const request = JSON.parse(raw.slice(0, lineBreak)) as Record<string, unknown>;
+			const requestId = String(request.request_id ?? "");
+			const operation = String(request.operation ?? "status");
+			const nowNs = Date.now() * 1_000_000;
+			const workspaceContext = request.workspace_context ?? { cwd: "/" };
+			const common = {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				service_name: "old-host-service-test",
+				socket_path: socketPath,
+				service_instance_started_ns: nowNs,
+				service_instance_id: "old-host-service-test",
+				workspace_context: workspaceContext,
+				request_id: requestId,
+				uptime_ns: 0,
+				total_requests: 1,
+			};
+			if (operation === "session_heartbeat") {
+				socket.end(`${JSON.stringify({
+					protocol_version: 1,
+					request_id: requestId,
+					operation: "status",
+					status: "error",
+					generated_at_ns: nowNs,
+					error: "unsupported operation: session_heartbeat",
+					status_details: { ...common, operation: "status", supported: false, service_available: false, error_code: "invalid_request" },
+				})}\n`);
+				return;
+			}
+			if (operation === "status") {
+				socket.end(`${JSON.stringify({
+					protocol_version: 1,
+					request_id: requestId,
+					operation,
+					status: "ok",
+					generated_at_ns: nowNs,
+					status_details: { ...common, operation, viewer_backend_name: "fake", viewer_backend_available: true },
+				})}\n`);
+				return;
+			}
+			if (operation === "register_callback_target") {
+				socket.end(`${JSON.stringify({
+					protocol_version: 1,
+					request_id: requestId,
+					operation,
+					status: "ok",
+					generated_at_ns: nowNs,
+					status_details: {
+						...common,
+						operation,
+						target_id: request.target_id,
+						callback_registered: true,
+						callback_replaced: false,
+						target: request.target,
+					},
+				})}\n`);
+				return;
+			}
+			if (operation === "unregister_callback_target") {
+				socket.end(`${JSON.stringify({
+					protocol_version: 1,
+					request_id: requestId,
+					operation,
+					status: "ok",
+					generated_at_ns: nowNs,
+					status_details: { ...common, operation, target_id: request.target_id, removed: true },
+				})}\n`);
+				return;
+			}
+			socket.end(`${JSON.stringify({
+				protocol_version: 1,
+				request_id: requestId,
+				operation,
+				status: "error",
+				generated_at_ns: nowNs,
+				error: `unsupported operation: ${operation}`,
+				status_details: { ...common, operation, supported: false, service_available: false, error_code: "invalid_request" },
+			})}\n`);
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(socketPath, () => resolve());
+	});
+	try {
+		return await fn();
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
 	}
 }
 
@@ -342,13 +458,33 @@ test("session startup notifies clearly when host service is unavailable", async 
 	rmSync(root, { recursive: true, force: true });
 });
 
+test("session startup continues clearly when host service is too old for heartbeat", async () => {
+	const suite = await captureExtensionHandlersAndTools();
+	const socketPath = nextHostServiceSocketPath();
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
+	const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-old-heartbeat-"));
+	const notifications: string[] = [];
+	const context = createSessionContext(root, notifications);
+
+	try {
+		await withUnsupportedHeartbeatHostService(socketPath, async () => {
+			await runSessionStart(suite.start, context);
+			assert.equal(notifications.some((message) => /too old for session heartbeats/.test(message)), true);
+			assert.equal(notifications.some((message) => /startup failed/.test(message)), false);
+			await runSessionShutdown(suite.shutdown, context);
+		});
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("session startup registers host service callback target and shutdown unregisters it", async () => {
 	const suite = await captureExtensionHandlersAndTools();
 	const socketPath = nextHostServiceSocketPath();
 	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
 
 	await withHostService(socketPath, async () => {
-			const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-register-"));
+		const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-register-"));
 		const context = createSessionContext(root, []);
 		await runSessionStart(suite.start, context);
 
@@ -370,6 +506,48 @@ test("session startup registers host service callback target and shutdown unregi
 
 		rmSync(root, { recursive: true, force: true });
 	});
+});
+
+test("session shutdown stops Pi heartbeat refresh", async () => {
+	const suite = await captureExtensionHandlersAndTools();
+	const socketPath = nextHostServiceSocketPath();
+	const previousInterval = process.env[SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR];
+	process.env[SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR] = "20";
+	process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] = socketPath;
+
+	try {
+		await withHostService(
+			socketPath,
+			async () => {
+				const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-host-lifecycle-heartbeat-stop-"));
+				try {
+					const context = createSessionContext(root, []);
+					const workspaceContext = resolveAgentWorkspaceContext(context as never);
+					await runSessionStart(suite.start, context);
+					await sleep(120);
+					await withHostServiceClient(socketPath, async (client) => {
+						const liveStatus = await client.requestStatus(workspaceContext);
+						assert.equal(liveStatus.live_session_count, 1);
+					});
+					await runSessionShutdown(suite.shutdown, context);
+					await sleep(120);
+					await withHostServiceClient(socketPath, async (client) => {
+						const expiredStatus = await client.requestStatus(workspaceContext);
+						assert.equal(expiredStatus.live_session_count, 0);
+					});
+				} finally {
+					rmSync(root, { recursive: true, force: true });
+				}
+			},
+			{ sessionLeases: new HostServiceSessionLeaseService({ leaseTtlMs: 80 }) },
+		);
+	} finally {
+		if (previousInterval === undefined) {
+			delete process.env[SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR];
+		} else {
+			process.env[SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR] = previousInterval;
+		}
+	}
 });
 
 test("session startup callback target becomes unavailable when callback socket is removed", async () => {

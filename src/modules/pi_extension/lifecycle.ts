@@ -9,7 +9,8 @@ import { contextSessionKey } from "./context_session.ts";
 import { createLogger } from "../logging.ts";
 
 const logger = createLogger("pi-extension.lifecycle");
-const SESSION_HEARTBEAT_INTERVAL_MS = 10_000;
+const DEFAULT_SESSION_HEARTBEAT_INTERVAL_MS = 10_000;
+export const SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR = "TEX_ACTIONS_SESSION_HEARTBEAT_INTERVAL_MS";
 const sessionHeartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
 
 function notifyHostServiceError(ctx: ExtensionContext, operation: string, error: unknown): void {
@@ -26,18 +27,46 @@ function stopSessionHeartbeat(sessionKey: string): void {
 	sessionHeartbeatTimers.delete(sessionKey);
 }
 
+function sessionHeartbeatIntervalMs(): number {
+	const raw = process.env[SESSION_HEARTBEAT_INTERVAL_MS_ENV_VAR];
+	if (raw === undefined) {
+		return DEFAULT_SESSION_HEARTBEAT_INTERVAL_MS;
+	}
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SESSION_HEARTBEAT_INTERVAL_MS;
+}
+
+function isUnsupportedHeartbeatError(error: unknown): boolean {
+	const message = errorMessage(error);
+	return /unsupported operation: session_heartbeat/.test(message)
+		|| /Malformed host service response payload:.*session_heartbeat/.test(message);
+}
+
+function notifyUnsupportedHeartbeat(ctx: ExtensionContext): void {
+	if (!ctx.hasUI) return;
+	ctx.ui.notify("Host Service is too old for session heartbeats; restart the Host Service to enable session lease support.", "warning");
+}
+
 async function startSessionHeartbeat(ctx: ExtensionContext): Promise<void> {
 	const sessionKey = contextSessionKey(ctx);
 	stopSessionHeartbeat(sessionKey);
 	const workspaceContext = hostServiceWorkspaceContextForSession(ctx);
 	const client = createHostServiceClient();
-	await client.requestSessionHeartbeat(workspaceContext);
-	await client.requestPendingNotifications(workspaceContext);
+	try {
+		await client.requestSessionHeartbeat(workspaceContext);
+	} catch (error) {
+		if (isUnsupportedHeartbeatError(error)) {
+			logger.warn("session_heartbeat.unsupported", { error });
+			notifyUnsupportedHeartbeat(ctx);
+			return;
+		}
+		throw error;
+	}
 	const timer = setInterval(() => {
 		void client.requestSessionHeartbeat(workspaceContext).catch((error) => {
 			logger.warn("session_heartbeat.error", { error });
 		});
-	}, SESSION_HEARTBEAT_INTERVAL_MS);
+	}, sessionHeartbeatIntervalMs());
 	timer.unref?.();
 	sessionHeartbeatTimers.set(sessionKey, timer);
 }
