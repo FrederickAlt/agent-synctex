@@ -107,6 +107,7 @@ function latexmkEngineArgs(compiler: unknown): string[] {
 function latexmkContinuousArgs(rootSource: string, compiler: LatexCompiler | unknown): string[] {
 	return [
 		"-pvc",
+		"-norc",
 		"-view=none",
 		"-recorder",
 		"-synctex=1",

@@ -620,6 +620,9 @@ test("Pi tool descriptions document continuous lifecycle boundaries", async () =
 	assert.match(text, /omit continuous/);
 	assert.match(text, /close_pdf does not stop continuous compilation/);
 	assert.match(text, /latexmk/);
+	assert.match(text, /-norc/);
+	assert.match(text, /latexmkrc/);
+	assert.match(text, /no shell escape|-no-shell-escape/);
 	assert.match(text, /multi-file dependency tracking/);
 	assert.match(text, /heartbeat/);
 	assert.match(text, /\[system info\]/);

@@ -669,7 +669,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 					compiler: { type: "string" },
 					clean: { type: "boolean" },
 					open_pdf: { type: "boolean" },
-					continuous: { type: "boolean", description: "When true, immediately compile then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file. latexmk runs with preview-continuous behavior, recorder/SyncTeX-friendly flags, no shell escape, and no latexmk-owned viewer (-view=none). When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit to leave continuous compilation unchanged." },
+					continuous: { type: "boolean", description: "When true, immediately compile then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file. Continuous latexmk runs with -norc, -view=none, recorder/SyncTeX-friendly flags, and -no-shell-escape engine commands so project latexmkrc files cannot override the default commands; this provides no latexmk-owned viewer launch. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit to leave continuous compilation unchanged." },
 					callback_target_id: { type: "string", minLength: 1 },
 					callback: {
 						type: "object",

@@ -168,7 +168,7 @@ test("continuous compile manager enforces singleton processes and subscriber lif
 	assert.equal(first.status, "started");
 	assert.equal(first.subscriber_count, 1);
 	assert.equal(fixture.spawns.length, 1);
-	assert.deepEqual(fixture.spawns[0]?.args.slice(0, 2), ["-pvc", "-view=none"]);
+	assert.deepEqual(fixture.spawns[0]?.args.slice(0, 3), ["-pvc", "-norc", "-view=none"]);
 
 	const repeated = fixture.manager.ensureSubscription(root, "session-A", "lualatex");
 	assert.equal(repeated.status, "already_active");
@@ -209,6 +209,7 @@ test("continuous latexmk invocation uses preview-continuous, no-viewer, recorder
 		assert.equal(spawn?.options.cwd, "/tmp/project");
 		assert.deepEqual(spawn?.args, [
 			"-pvc",
+			"-norc",
 			"-view=none",
 			"-recorder",
 			"-synctex=1",
