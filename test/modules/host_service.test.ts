@@ -62,11 +62,12 @@ async function waitForProcessExit(pid: number, timeoutMs = 1200): Promise<void> 
 	throw new Error(`timed out waiting for process ${pid} to exit`);
 }
 
-function writeFakeLatexCompiler(binDir: string, options: { exitCode?: number; withLog?: boolean; logText?: string; stdoutText?: string } = {}): string {
+function writeFakeLatexCompiler(binDir: string, options: { exitCode?: number; withLog?: boolean; logText?: string; stdoutText?: string; afterPdfScript?: string } = {}): string {
 	const exitCode = options.exitCode ?? 0;
 	const withLog = options.withLog ?? true;
 	const logText = options.logText ?? "fake compiler output";
 	const stdoutText = options.stdoutText ?? "";
+	const afterPdfScript = options.afterPdfScript ?? "";
 	mkdirSync(binDir, { mode: 0o700, recursive: true });
 	const compilerPath = join(binDir, "lualatex");
 	writeFileSync(compilerPath, `#!/bin/sh
@@ -94,7 +95,8 @@ ${stdoutText ? `cat <<'STDOUTTEXT'
 ${stdoutText}
 STDOUTTEXT
 ` : ""}printf '%s' '%PDF-1.4\n' > "$out_dir/$name.pdf"
-exit ${exitCode}
+${afterPdfScript ? `${afterPdfScript}
+` : ""}exit ${exitCode}
 `, { mode: 0o700 });
 	chmodSync(compilerPath, 0o700);
 	return compilerPath;
@@ -855,6 +857,46 @@ test("host service compiles an existing latex file with explicit workspace conte
 		assert.equal(result.cleaned_artifacts.length, 0);
 		assert.ok(result.artifact_paths.includes(join(baseDir, "paper.pdf")));
 		assert.ok(result.artifact_paths.includes(join(baseDir, "paper.log")));
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service waits for latex compiler process before reporting success", async () => {
+	const baseDir = temporaryDir("host-service-compile-waits-for-exit-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const finishedMarker = join(baseDir, "compiler-finished");
+	writeFakeLatexCompiler(join(baseDir, "bin"), {
+		afterPdfScript: `sleep 0.35\nprintf 'done' > ${JSON.stringify(finishedMarker)}`,
+	});
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-wait-test" });
+	await server.start();
+	const client = new HostServiceClient({
+		socketPath,
+		requestTimeoutMs: 2_000,
+	});
+	try {
+		const startedAt = Date.now();
+		const result = await client.requestCompileLatexFile(
+			{
+				latex_file_path: "paper.tex",
+				compiler: "lualatex",
+				clean: false,
+			},
+			{ cwd: baseDir },
+		);
+		const elapsedMs = Date.now() - startedAt;
+		assert.equal(result.operation, "compile_latex_file");
+		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(existsSync(finishedMarker), true, "compile returned before the compiler reached its final statement");
+		assert.ok(elapsedMs >= 300, `compile returned too quickly: ${elapsedMs}ms`);
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
