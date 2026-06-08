@@ -5,8 +5,9 @@ import type {
 import type { InlinePreviewArtifact } from "./preview/inline_preview.ts";
 import type { LatexCompileStatus, LatexDiagnosticSummary } from "./latex/latex_file_compiler.ts";
 import type { HostServicePendingNotification } from "./host_service_session_leases.ts";
+import type { HostServiceContinuousCompileDetails } from "./host_service_continuous_compile.ts";
 
-export type { HostServiceCallbackTarget, HostServiceViewerBackendCapabilities, HostServicePendingNotification };
+export type { HostServiceCallbackTarget, HostServiceViewerBackendCapabilities, HostServicePendingNotification, HostServiceContinuousCompileDetails };
 
 
 export interface HostServiceWorkspaceContext {
@@ -50,6 +51,7 @@ export interface HostServiceCompileRequest {
 		compiler?: unknown;
 		clean?: boolean;
 		open_pdf?: boolean;
+		continuous?: boolean;
 		reuse_existing?: boolean;
 		require_persistent_viewer?: boolean;
 		callback_target_id?: string;
@@ -286,6 +288,7 @@ export interface HostServiceCompileResponseDetails {
 	diagnostics?: LatexDiagnosticSummary[];
 	pdf_id?: number;
 	managed_record?: HostServiceManagedViewerRecord;
+	continuous?: HostServiceContinuousCompileDetails;
 	error_code?: string;
 }
 

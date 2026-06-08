@@ -25,6 +25,7 @@ import type {
 	HostServiceWorkspaceContext,
 } from "./host_service_protocol.ts";
 import { createLogger } from "./logging.ts";
+import { HostServiceContinuousCompileManager, type HostServiceContinuousCompileDetails } from "./host_service_continuous_compile.ts";
 
 const logger = createLogger("host-service.compile");
 
@@ -64,6 +65,7 @@ export interface HostServiceCompileServiceOptions {
 		callbackTarget: HostServiceCallbackTarget | undefined,
 	) => Promise<HostServiceCallbackTarget | undefined>;
 	nowNs?: () => number;
+	continuousCompileManager?: HostServiceContinuousCompileManager;
 }
 
 export class HostServiceCompileService {
@@ -71,12 +73,14 @@ export class HostServiceCompileService {
 	private readonly managedViewerService: HostServiceManagedViewerServiceLike;
 	private readonly resolveManagedOpenCallback: HostServiceCompileServiceOptions["resolveManagedOpenCallback"];
 	private readonly nowNs: () => number;
+	private readonly continuousCompileManager: HostServiceContinuousCompileManager;
 
 	constructor(options: HostServiceCompileServiceOptions) {
 		this.protocolVersion = options.protocolVersion;
 		this.managedViewerService = options.managedViewerService;
 		this.resolveManagedOpenCallback = options.resolveManagedOpenCallback;
 		this.nowNs = options.nowNs ?? (() => Date.now() * 1_000_000);
+		this.continuousCompileManager = options.continuousCompileManager ?? new HostServiceContinuousCompileManager();
 	}
 
 	async compileLatexFileRequest(request: HostServiceCompileRequest): Promise<HostServiceCompileResponseEnvelope> {
@@ -130,6 +134,8 @@ export class HostServiceCompileService {
 				});
 				return openResponse;
 			}
+			const continuous = this.applyContinuousCompileRequest(request, result.source);
+			const continuousError = continuous && ["unavailable", "error"].includes(continuous.status) ? continuous : undefined;
 			logger.info("compile_file.end", {
 				request_id: request.request_id,
 				duration_ms: Date.now() - startedAt,
@@ -145,12 +151,13 @@ export class HostServiceCompileService {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
 				operation: request.operation,
-				status: "ok",
+				status: continuousError === undefined ? "ok" : "error",
 				generated_at_ns: nowNs,
+				...(continuousError === undefined ? {} : { error: continuousError.error ?? "continuous compilation failed" }),
 				status_details: {
 					protocol_version: this.protocolVersion,
-					supported: true,
-					service_available: true,
+					supported: continuousError === undefined,
+					service_available: continuousError === undefined,
 					workspace_context: request.workspace_context,
 					request_id: request.request_id,
 					operation: request.operation,
@@ -163,6 +170,8 @@ export class HostServiceCompileService {
 					...compileDiagnosticsDetails(result),
 					pdf_id: openResponse?.status_details.pdf_id,
 					managed_record: openResponse?.status_details.managed_record,
+					...(continuous === undefined ? {} : { continuous }),
+					...(continuousError === undefined ? {} : { error_code: continuousError.error_code ?? "continuous_compiler_start_failed" }),
 				},
 			};
 		} catch (error) {
@@ -349,6 +358,30 @@ export class HostServiceCompileService {
 				},
 			};
 		}
+	}
+
+	private applyContinuousCompileRequest(
+		request: HostServiceCompileRequest,
+		rootSource: string,
+	): HostServiceContinuousCompileDetails | undefined {
+		if (request.details.continuous === undefined) {
+			return undefined;
+		}
+		const sessionId = request.workspace_context.session_id?.trim();
+		if (!sessionId) {
+			return {
+				requested: true,
+				status: "error",
+				root_source: rootSource,
+				session_id: "",
+				subscriber_count: 0,
+				error: "workspace_context.session_id is required for continuous compilation",
+				error_code: "invalid_request",
+			};
+		}
+		return request.details.continuous
+			? this.continuousCompileManager.ensureSubscription(rootSource, sessionId, request.details.compiler)
+			: this.continuousCompileManager.removeSubscription(rootSource, sessionId);
 	}
 
 	private openCompiledPdfThroughManagedViewerAfterCompile(

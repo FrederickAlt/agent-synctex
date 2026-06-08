@@ -27,10 +27,16 @@ export class HostServiceSessionLeaseService {
 	private readonly nowNs: () => number;
 	private readonly leasesBySessionId = new Map<string, HostServiceSessionLease>();
 	private readonly pendingNotificationsBySessionId = new Map<string, HostServicePendingNotification[]>();
+	private readonly expiredSessionListeners = new Set<(sessionIds: string[]) => void>();
 
 	constructor(options: HostServiceSessionLeaseServiceOptions = {}) {
 		this.leaseTtlNs = (options.leaseTtlMs ?? DEFAULT_SESSION_LEASE_TTL_MS) * 1_000_000;
 		this.nowNs = options.nowNs ?? (() => Date.now() * 1_000_000);
+	}
+
+	onExpiredSessions(listener: (sessionIds: string[]) => void): () => void {
+		this.expiredSessionListeners.add(listener);
+		return () => this.expiredSessionListeners.delete(listener);
 	}
 
 	heartbeat(workspaceContext: HostServiceWorkspaceContext): HostServiceSessionLease {
@@ -55,6 +61,11 @@ export class HostServiceSessionLeaseService {
 				this.leasesBySessionId.delete(sessionId);
 				this.pendingNotificationsBySessionId.delete(sessionId);
 				expired.push(sessionId);
+			}
+		}
+		if (expired.length > 0) {
+			for (const listener of this.expiredSessionListeners) {
+				listener(expired);
 			}
 		}
 		return expired;

@@ -86,11 +86,12 @@ import {
 } from "./host_service_mcp.ts";
 import type { ViewerBackendAdapter } from "./host_service_viewer_protocol.ts";
 import { createLogger } from "./logging.ts";
+import { HostServiceContinuousCompileManager } from "./host_service_continuous_compile.ts";
 
 const clientLogger = createLogger("host-service.client");
 const serverLogger = createLogger("host-service.server");
 
-export { FakeViewerBackend, HostServiceSessionLeaseService, ZathuraViewerBackend };
+export { FakeViewerBackend, HostServiceContinuousCompileManager, HostServiceSessionLeaseService, ZathuraViewerBackend };
 export type {
 	FakeViewerBackendOptions,
 	HostServiceAnyResponseDetails,
@@ -164,6 +165,7 @@ export interface HostServiceServerOptions {
 	viewerBackend?: ViewerBackendAdapter;
 	managedViewerRecords?: HostServicePdfIdRegistry;
 	sessionLeases?: HostServiceSessionLeaseService;
+	continuousCompileManager?: HostServiceContinuousCompileManager;
 }
 
 const PROTOCOL_VERSION = 1;
@@ -485,6 +487,7 @@ export class HostServiceClient {
 				...(request.compiler === undefined ? {} : { compiler: request.compiler }),
 				...(request.clean === undefined ? {} : { clean: request.clean }),
 				...(request.open_pdf === undefined ? {} : { open_pdf: request.open_pdf }),
+				...(request.continuous === undefined ? {} : { continuous: request.continuous }),
 				...(request.reuse_existing === undefined ? {} : { reuse_existing: request.reuse_existing }),
 				...(request.require_persistent_viewer === undefined ? {} : { require_persistent_viewer: request.require_persistent_viewer }),
 				...(request.callback_target_id === undefined ? {} : { callback_target_id: request.callback_target_id }),
@@ -988,6 +991,7 @@ export class HostServiceServer {
 	private readonly managedViewerService: HostServiceManagedViewerService;
 	private readonly compileService: HostServiceCompileService;
 	private readonly sessionLeases: HostServiceSessionLeaseService;
+	private readonly continuousCompileManager: HostServiceContinuousCompileManager;
 	private server: Server | null = null;
 	private startedAtNs = 0;
 	private serviceInstanceId: string;
@@ -1007,12 +1011,15 @@ export class HostServiceServer {
 			viewerBackend: this.viewerBackend,
 			managedViewerRecords: this.managedViewerRecords,
 		});
+		this.continuousCompileManager = options.continuousCompileManager ?? new HostServiceContinuousCompileManager();
 		this.compileService = new HostServiceCompileService({
 			protocolVersion: this.protocolVersion,
 			managedViewerService: this.managedViewerService,
 			resolveManagedOpenCallback: this.resolveManagedOpenCallback.bind(this),
+			continuousCompileManager: this.continuousCompileManager,
 		});
 		this.sessionLeases = options.sessionLeases ?? new HostServiceSessionLeaseService();
+		this.sessionLeases.onExpiredSessions((sessionIds) => this.continuousCompileManager.removeSessions(sessionIds));
 	}
 
 	async start(): Promise<void> {
@@ -1069,6 +1076,7 @@ export class HostServiceServer {
 
 	async stop(): Promise<void> {
 		serverLogger.info("stop.begin", { socket_path: this.socketPath, service_name: this.serviceName, active_connections: this.activeConnections.size });
+		this.continuousCompileManager.stopAll();
 		await this.closeViewerBackendSessions();
 		const server = this.server;
 		this.server = null;
@@ -1160,6 +1168,7 @@ export class HostServiceServer {
 				closePdf: (request) => this.managedViewerService.closeViewer(request),
 				resolveManagedOpenCallback: (workspaceContext, callbackTargetId, callbackTarget) =>
 					this.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget),
+				continuousCompileManager: this.continuousCompileManager,
 			});
 			if (response === null) {
 				return;
@@ -1293,6 +1302,9 @@ export class HostServiceServer {
 				}
 				case "compile_latex_file": {
 					this.totalRequests += 1;
+					if (request.details.continuous !== undefined) {
+						this.sessionLeases.heartbeat(request.workspace_context);
+					}
 					const response = await this.compileService.compileLatexFileRequest(request);
 					socket.end(`${JSON.stringify(response)}\n`);
 					return;
@@ -1841,6 +1853,9 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 			if (rawDetails.open_pdf !== undefined && typeof rawDetails.open_pdf !== "boolean") {
 				throw new Error("open_pdf must be a boolean");
 			}
+			if (rawDetails.continuous !== undefined && typeof rawDetails.continuous !== "boolean") {
+				throw new Error("continuous must be a boolean");
+			}
 			if (rawDetails.reuse_existing !== undefined && typeof rawDetails.reuse_existing !== "boolean") {
 				throw new Error("reuse_existing must be a boolean");
 			}
@@ -1857,7 +1872,9 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				throw new Error("callback must be a valid callback target");
 			}
 			const openPdf = rawDetails.open_pdf === true;
-			const workspaceContext = normalizeWorkspaceContextForCompile(value.workspace_context);
+			const workspaceContext = rawDetails.continuous === undefined
+				? normalizeWorkspaceContextForCompile(value.workspace_context)
+				: normalizeWorkspaceContextWithSession(normalizeWorkspaceContextForCompile(value.workspace_context));
 			return {
 				protocol_version: PROTOCOL_VERSION,
 				request_id: value.request_id,
@@ -1869,6 +1886,7 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 					compiler: rawDetails.compiler,
 					clean: rawDetails.clean === true,
 					open_pdf: openPdf,
+					continuous: rawDetails.continuous,
 					reuse_existing: rawDetails.reuse_existing,
 					require_persistent_viewer: rawDetails.require_persistent_viewer,
 					callback_target_id: rawDetails.callback_target_id,
@@ -2378,6 +2396,37 @@ function isValidInlinePreviewArtifact(value: unknown): value is HostServiceRaste
 	return true;
 }
 
+function isValidContinuousCompileDetails(value: unknown): boolean {
+	if (!isStringRecord(value)) {
+		return false;
+	}
+	if (value.requested !== true) {
+		return false;
+	}
+	if (!["started", "already_active", "deactivated", "still_active_for_other_subscribers", "stopped", "unavailable", "error"].includes(String(value.status))) {
+		return false;
+	}
+	if (typeof value.root_source !== "string" || !value.root_source) {
+		return false;
+	}
+	if (typeof value.session_id !== "string") {
+		return false;
+	}
+	if (typeof value.subscriber_count !== "number" || !Number.isInteger(value.subscriber_count) || value.subscriber_count < 0) {
+		return false;
+	}
+	if (value.pid !== undefined && (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0)) {
+		return false;
+	}
+	if (value.error !== undefined && typeof value.error !== "string") {
+		return false;
+	}
+	if (value.error_code !== undefined && typeof value.error_code !== "string") {
+		return false;
+	}
+	return true;
+}
+
 function isValidCompileResponseLike(
 	value: unknown,
 	expectedRequestId: string,
@@ -2475,6 +2524,9 @@ function isValidCompileResponseLike(
 		return false;
 	}
 	if (details.managed_record !== undefined && !isValidManagedViewerRecord(details.managed_record)) {
+		return false;
+	}
+	if (details.continuous !== undefined && !isValidContinuousCompileDetails(details.continuous)) {
 		return false;
 	}
 	if (typeof details.error_code !== "undefined" && typeof details.error_code !== "string") {

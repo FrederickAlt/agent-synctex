@@ -50,6 +50,9 @@ const CompileLatexFileParams = Type.Object(
 			description: "When true, remove common LaTeX artifacts for this source file's basename before compiling, including the previous PDF and SyncTeX sidecar. Defaults to false.",
 			default: false,
 		})),
+		continuous: Type.Optional(Type.Boolean({
+			description: "When true, immediately compile then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit to leave continuous compilation unchanged.",
+		})),
 	},
 	{ additionalProperties: false },
 );
@@ -89,12 +92,20 @@ function warningSummary(warnings: LatexDiagnosticSummary[] | undefined, count: n
 	return `\nWarnings:\n${lines.join("\n")}${suffix}`;
 }
 
+function continuousSummary(details: HostServiceCompileResponseDetails): string {
+	const continuous = details.continuous;
+	if (!continuous) return "";
+	const pid = continuous.pid === undefined ? "" : ` pid=${continuous.pid}`;
+	const error = continuous.error ? ` error=${continuous.error}` : "";
+	return `\nContinuous: ${continuous.status} subscribers=${continuous.subscriber_count}${pid} root=${continuous.root_source}${error}`;
+}
+
 function compileSuccessText(details: HostServiceCompileResponseDetails): string {
 	const status = details.compile_status ?? "ok";
 	const warningCount = details.warning_count ? ` warnings=${details.warning_count}` : "";
 	const exitCode = status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 	const prefix = status === "ok" ? "ok" : status;
-	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated)}`;
+	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${continuousSummary(details)}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated)}`;
 }
 
 function describeCompileFailureContext(
@@ -134,6 +145,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 			let compiler: LatexCompiler | undefined;
 			let shouldOpenPdf = false;
 			let shouldClean = false;
+			let continuous: boolean | undefined;
 			let targetId = "";
 			try {
 				requestedPath = String(params.latex_file_path ?? "");
@@ -145,6 +157,12 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				compiler = latexFileCompileToolSupport.resolveLatexCompiler(params.compiler);
 				shouldOpenPdf = params.open_pdf === true;
 				shouldClean = params.clean === true;
+				if (params.continuous !== undefined) {
+					if (typeof params.continuous !== "boolean") {
+						throw new Error("continuous must be a boolean");
+					}
+					continuous = params.continuous;
+				}
 				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
 				const client = createHostServiceClient();
 				const compileRequest: {
@@ -152,6 +170,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 					compiler?: string;
 					clean?: boolean;
 					open_pdf?: boolean;
+					continuous?: boolean;
 					callback_target_id?: string;
 				} = {
 					latex_file_path: requestedPathInWorkspace,
@@ -159,6 +178,9 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				};
 				if (compiler !== undefined) {
 					compileRequest.compiler = compiler;
+				}
+				if (continuous !== undefined) {
+					compileRequest.continuous = continuous;
 				}
 				if (shouldOpenPdf && ctx) {
 					targetId = await callbackManager.ensureHostServiceCallbackTarget(ctx);
@@ -180,6 +202,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 							source: compileResult.source,
 							pdf: compileResult.pdf,
 							log: compileResult.log,
+							continuous: compileResult.continuous,
 							clean: compileResult.clean,
 							cleaned_artifacts: compileResult.cleaned_artifacts,
 							compile_status: compileResult.compile_status,
@@ -204,11 +227,12 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				const status = compileResponse.compile_status ?? "ok";
 				const warningCount = compileResponse.warning_count ? ` warnings=${compileResponse.warning_count}` : "";
 				return {
-					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated)}` }],
+					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${continuousSummary(compileResponse)}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated)}` }],
 					details: {
 						source: compileResponse.source,
 						pdf: compileResponse.pdf,
 						pdf_id: compileResponse.pdf_id,
+						continuous: compileResponse.continuous,
 						pid: managedRecord?.pid,
 						viewer_handle: managedRecord?.viewerHandle,
 						viewer_backend: managedRecord?.viewerBackend,
@@ -260,12 +284,13 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 		name: "compile_latex_file",
 		label: "Compile LaTeX File",
 		description:
-			"Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external service state.",
+			"Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external service state. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc recompilation; set continuous=false to compile once and unsubscribe this session.",
 		promptSnippet: "Compile a local LaTeX file as PDF",
 		promptGuidelines: [
 			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
 			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without requesting external service state; set open_pdf=true only when the user wants the compiled PDF opened/tracked by the host service immediately.",
 			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling.",
+			"Use continuous=true for iterative project editing. Omit continuous for ordinary one-shot compiles that do not alter continuous state. Use continuous=false to stop only this session's subscription; close_pdf does not stop continuous compilation.",
 			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
 			"For multi-file LaTeX projects, compile the root file that produces the PDF, such as main.tex, and use open_pdf=true only when a host-service-tracked PDF is needed. The returned pdf_id identifies the running service-tracked PDF and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
 		],

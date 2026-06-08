@@ -368,6 +368,7 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.ok(compileFileTool.inputSchema.properties.callback);
 		assert.ok(compileFileTool.inputSchema.properties.reuse_existing);
 		assert.ok(compileFileTool.inputSchema.properties.require_persistent_viewer);
+		assert.deepEqual(compileFileTool.inputSchema.properties.continuous, { type: "boolean" });
 		assert.deepEqual((showLatexTool.inputSchema.properties as { callback?: { required?: string[] } }).callback?.required, ["kind", "transport", "socket_path", "token"]);
 		assert.equal(showLatexTool.inputSchema.properties.fixed_preview_pdf_path, undefined);
 		assert.ok(showLatexTool.inputSchema.properties.fixed_preview);
@@ -568,6 +569,55 @@ test("daemon rejects invalid set_latex_preamble arguments", async () => {
 		runtime.restore();
 	}
 });
+
+test("daemon rejects compile_latex_file continuous arguments without session identity", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-continuous-missing-session-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-continuous-missing-session-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	await server.start();
+	try {
+		const payload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 75,
+			method: "tools/call",
+			params: {
+				name: "compile_latex_file",
+				arguments: {
+					latex_file_path: "paper.tex",
+					continuous: true,
+					workspace_context: { cwd: baseDir },
+				},
+			},
+		});
+		const response = (await sendFramedRequest(socketPath, payload)) as { error: { code: number; message: string } };
+		assert.equal(response.error.code, -32602);
+		assert.match(response.error.message, /workspace_context\.session_id is required for continuous compilation/);
+
+		const malformedPayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 76,
+			method: "tools/call",
+			params: {
+				name: "compile_latex_file",
+				arguments: {
+					latex_file_path: "paper.tex",
+					continuous: "true",
+					workspace_context: { cwd: baseDir, session_id: "session-A" },
+				},
+			},
+		});
+		const malformedResponse = (await sendFramedRequest(socketPath, malformedPayload)) as { error: { code: number; message: string } };
+		assert.equal(malformedResponse.error.code, -32602);
+		assert.equal(malformedResponse.error.message, "continuous must be a boolean");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
 
 test("daemon returns MCP-style tool errors for unimplemented tools", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-tool-error-");

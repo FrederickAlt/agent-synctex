@@ -602,6 +602,61 @@ test("compile_latex_file requests compilation with extended timeout", async () =
 	}
 });
 
+test("compile_latex_file passes continuous flag through and renders continuous metadata", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	const expectedPdf = resolve(root, "paper.pdf");
+	const expectedLog = resolve(root, "paper.log");
+	let capturedRequest: Parameters<HostServiceClient["requestCompileLatexFile"]>[0] | undefined;
+	let capturedContext: Parameters<HostServiceClient["requestCompileLatexFile"]>[1] | undefined;
+	const proto = HostServiceClient.prototype as { requestCompileLatexFile: HostServiceClient["requestCompileLatexFile"] };
+	const originalRequestCompileLatexFile = proto.requestCompileLatexFile;
+	try {
+		proto.requestCompileLatexFile = async (request, workspaceContext) => {
+			capturedRequest = request;
+			capturedContext = workspaceContext;
+			return {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				workspace_context: workspaceContext,
+				request_id: "continuous-pi-test",
+				operation: "compile_latex_file",
+				source: sourcePath,
+				pdf: expectedPdf,
+				log: expectedLog,
+				artifact_paths: [expectedPdf],
+				clean: false,
+				cleaned_artifacts: [],
+				continuous: {
+					requested: true,
+					status: "started",
+					root_source: sourcePath,
+					session_id: workspaceContext.session_id ?? "",
+					subscriber_count: 1,
+					pid: 12345,
+				},
+			};
+		};
+
+		const result = await tool.execute(
+			"compile-latex-file-continuous",
+			{ latex_file_path: sourcePath, continuous: true },
+			undefined,
+			undefined,
+			createSessionContext(root, "pi-continuous-session"),
+		);
+		assert.equal(capturedRequest?.continuous, true);
+		assert.equal(capturedContext?.session_id, "pi-continuous-session");
+		assert.match(result.content[0].text, /Continuous: started subscribers=1 pid=12345/);
+		assert.equal((result.details as { continuous?: { status?: string } }).continuous?.status, "started");
+	} finally {
+		proto.requestCompileLatexFile = originalRequestCompileLatexFile;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+
 test("compile_latex_file resolves source path with a relative path", async () => {
 	const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-compile-test-"));
 	const src = resolve(root, "nested");

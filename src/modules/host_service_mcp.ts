@@ -3,6 +3,7 @@ import { getLatexPreambleFilePath } from "./runtime_preamble.ts";
 import { writeLatexPreambleToTmpdir } from "./runtime_preamble.ts";
 import { resolveTexActionsAgentRuntimeDir } from "./agent_runtime_context.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
+import type { HostServiceContinuousCompileManager } from "./host_service_continuous_compile.ts";
 import type {
 	HostServiceCallbackTarget,
 	HostServiceCloseRequest,
@@ -42,6 +43,7 @@ interface HostServiceMcpPdfOperations {
 		callbackTargetId: string | undefined,
 		callbackTarget: HostServiceCallbackTarget | undefined,
 	) => Promise<HostServiceCallbackTarget | undefined>;
+	continuousCompileManager?: HostServiceContinuousCompileManager;
 }
 
 function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): HostServiceCompileService {
@@ -59,6 +61,7 @@ function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): Ho
 			pdfOperations.resolveManagedOpenCallback
 				? pdfOperations.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget)
 				: callbackTarget,
+		continuousCompileManager: pdfOperations.continuousCompileManager,
 	});
 }
 
@@ -327,11 +330,15 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): HostServic
 	const compiler = parseOptionalStringArg(args, "compiler");
 	const clean = parseBooleanArg(args, "clean");
 	const openPdf = parseBooleanArg(args, "open_pdf");
+	const continuous = parseBooleanArg(args, "continuous");
 	const callback = openPdf ? parseCallbackTargetArg(args) : undefined;
 	const callbackTargetId = openPdf ? parseOptionalStringArg(args, "callback_target_id") : undefined;
 	const reuseExisting = openPdf ? parseBooleanArg(args, "reuse_existing") : undefined;
 	const requirePersistentViewer = openPdf ? parseBooleanArg(args, "require_persistent_viewer") : undefined;
 	const workspaceContext = parseCompileWorkspaceContext(latexFilePath, args.workspace_context);
+	if (continuous !== undefined && !workspaceContext.session_id?.trim()) {
+		throw new Error("workspace_context.session_id is required for continuous compilation");
+	}
 	return {
 		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
 		request_id: nextHostServiceRequestId(),
@@ -343,6 +350,7 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): HostServic
 			...(compiler === undefined ? {} : { compiler }),
 			...(clean === undefined ? {} : { clean }),
 			...(openPdf === undefined ? {} : { open_pdf: openPdf }),
+			...(continuous === undefined ? {} : { continuous }),
 			...(callback === undefined ? {} : { callback }),
 			...(callbackTargetId === undefined ? {} : { callback_target_id: callbackTargetId }),
 			...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
@@ -409,6 +417,17 @@ function parseClosePdfRequest(args: Record<string, unknown>): HostServiceCloseRe
 	};
 }
 
+function formatContinuousSummary(details: unknown): string {
+	if (!isRecord(details) || !isRecord(details.continuous)) return "";
+	const continuous = details.continuous;
+	const status = typeof continuous.status === "string" ? continuous.status : "unknown";
+	const subscribers = typeof continuous.subscriber_count === "number" ? continuous.subscriber_count : "unknown";
+	const pid = typeof continuous.pid === "number" ? ` pid=${continuous.pid}` : "";
+	const root = typeof continuous.root_source === "string" ? ` root=${continuous.root_source}` : "";
+	const error = typeof continuous.error === "string" ? ` error=${continuous.error}` : "";
+	return `\nContinuous: ${status} subscribers=${subscribers}${pid}${root}${error}`;
+}
+
 function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }): string {
 	if (typeof details.warning_count !== "number" || details.warning_count <= 0 || !Array.isArray(details.warnings)) return "";
 	const lines = details.warnings
@@ -433,7 +452,7 @@ function parseToolResult(
 		const exitCode = details.compile_status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 		const log = details.log ? `\nLog: ${details.log}` : "";
 		return {
-			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${exitCode}${warningCount}${log}${formatDiagnosticSummary(details)}`.trim() }],
+			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${exitCode}${warningCount}${log}${formatContinuousSummary(details)}${formatDiagnosticSummary(details)}`.trim() }],
 			details,
 		};
 	}
@@ -649,6 +668,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 					compiler: { type: "string" },
 					clean: { type: "boolean" },
 					open_pdf: { type: "boolean" },
+					continuous: { type: "boolean" },
 					callback_target_id: { type: "string", minLength: 1 },
 					callback: {
 						type: "object",
