@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { createConnection } from "node:net";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -71,9 +72,61 @@ exit 0
 	chmodSync(compilerPath, 0o700);
 }
 
+function writeFailingLatexCompiler(binDir: string): void {
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const compilerPath = join(binDir, "lualatex");
+	writeFileSync(compilerPath, `#!/bin/sh
+set -eu
+tex_file=""
+for arg in "$@"; do
+  tex_file="$arg"
+done
+base="${"${tex_file##*/}"}"
+name="${"${base%.*}"}"
+out_dir="$(dirname "$tex_file")"
+printf 'intentional compile failure\n' > "$out_dir/$name.log"
+exit 7
+`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+}
+
+function encodeMcpFrame(jsonText: string): string {
+	return `Content-Length: ${Buffer.byteLength(jsonText, "utf8")}\r\n\r\n${jsonText}`;
+}
+
+async function sendFramedRequest(socketPath: string, payload: string): Promise<unknown> {
+	return await new Promise((resolve, reject) => {
+		const socket = createConnection({ path: socketPath });
+		let buffer = "";
+		const timer = setTimeout(() => {
+			socket.destroy();
+			reject(new Error("timed out waiting for MCP response"));
+		}, 2_000);
+		socket.once("error", (error) => {
+			clearTimeout(timer);
+			reject(error);
+		});
+		socket.on("data", (chunk) => {
+			buffer += chunk.toString("utf8");
+			const separator = buffer.indexOf("\r\n\r\n");
+			if (separator < 0) return;
+			const header = buffer.slice(0, separator);
+			const match = header.match(/Content-Length: (\d+)/i);
+			if (!match) return;
+			const length = Number(match[1]);
+			const body = buffer.slice(separator + 4);
+			if (Buffer.byteLength(body, "utf8") < length) return;
+			clearTimeout(timer);
+			socket.end();
+			resolve(JSON.parse(body.slice(0, length)) as unknown);
+		});
+		socket.write(encodeMcpFrame(payload));
+	});
+}
+
 async function withCompileServer<T>(
 	fixture: ReturnType<typeof makeFakeContinuousManager>,
-	fn: (client: HostServiceClient, baseDir: string, server: HostServiceServer) => Promise<T>,
+	fn: (client: HostServiceClient, baseDir: string, server: HostServiceServer, socketPath: string) => Promise<T>,
 	options: { leaseTtlMs?: number; nowNs?: () => number; viewerBackend?: FakeViewerBackend; managedViewerRecords?: HostServicePdfIdRegistry } = {},
 ): Promise<T> {
 	const baseDir = temporaryDir("host-service-continuous-compile-");
@@ -95,7 +148,7 @@ async function withCompileServer<T>(
 	await server.start();
 	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
 	try {
-		return await fn(client, baseDir, server);
+		return await fn(client, baseDir, server, socketPath);
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
@@ -187,6 +240,97 @@ test("host service rejects invalid continuous requests but keeps one-shot compat
 		);
 	});
 });
+
+test("MCP-origin continuous subscriptions refresh session leases for expiry cleanup", async () => {
+	let nowNs = 1_000_000_000;
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir, _server, socketPath) => {
+		const payload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 75,
+			method: "tools/call",
+			params: {
+				name: "compile_latex_file",
+				arguments: {
+					latex_file_path: "paper.tex",
+					compiler: "lualatex",
+					continuous: true,
+					workspace_context: { cwd: baseDir, session_id: "mcp-session-A" },
+				},
+			},
+		});
+		const response = (await sendFramedRequest(socketPath, payload)) as { result: { isError?: boolean; details?: { continuous?: { status?: string } } } };
+		assert.equal(response.result.isError, undefined);
+		assert.equal(response.result.details?.continuous?.status, "started");
+		assert.equal(fixture.manager.activeRootCount(), 1);
+
+		nowNs += 2_000_000;
+		await client.requestStatus({ cwd: baseDir });
+		assert.equal(fixture.manager.activeRootCount(), 0);
+		assert.equal(fixture.processes[0]?.killed, true);
+	}, { leaseTtlMs: 1, nowNs: () => nowNs });
+});
+
+
+test("continuous=false unsubscribes even when immediate compile fails", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		assert.equal(fixture.manager.activeRootCount(), 1);
+
+		writeFailingLatexCompiler(join(baseDir, "bin"));
+		rmSync(join(baseDir, "paper.pdf"), { force: true });
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile(
+				{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: false },
+				{ cwd: baseDir, session_id: "session-A" },
+			);
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /LaTeX compile failed/);
+		const details = (observed as { statusDetails?: { continuous?: { status?: string; subscriber_count?: number } } }).statusDetails;
+		assert.equal(details?.continuous?.status, "stopped");
+		assert.equal(details?.continuous?.subscriber_count, 0);
+		assert.equal(fixture.manager.activeRootCount(), 0);
+		assert.equal(fixture.processes[0]?.killed, true);
+	});
+});
+
+
+test("continuous=false unsubscribes even when open_pdf fails", async () => {
+	const fixture = makeFakeContinuousManager();
+	const viewerBackend = new FakeViewerBackend();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		viewerBackend.setAvailable(false);
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile(
+				{ latex_file_path: "paper.tex", compiler: "lualatex", open_pdf: true, continuous: false },
+				{ cwd: baseDir, session_id: "session-A" },
+			);
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /backend unavailable|backend_unavailable/);
+		const details = (observed as { statusDetails?: { continuous?: { status?: string; subscriber_count?: number } } }).statusDetails;
+		assert.equal(details?.continuous?.status, "stopped");
+		assert.equal(details?.continuous?.subscriber_count, 0);
+		assert.equal(fixture.manager.activeRootCount(), 0);
+		assert.equal(fixture.processes[0]?.killed, true);
+	}, { viewerBackend });
+});
+
 
 test("continuous startup reports missing latexmk without regressing immediate compile dependency", async () => {
 	const fixture = makeFakeContinuousManager({ commandExists: false });

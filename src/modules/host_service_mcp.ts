@@ -44,6 +44,7 @@ interface HostServiceMcpPdfOperations {
 		callbackTarget: HostServiceCallbackTarget | undefined,
 	) => Promise<HostServiceCallbackTarget | undefined>;
 	continuousCompileManager?: HostServiceContinuousCompileManager;
+	refreshSessionLease?: (workspaceContext: HostServiceWorkspaceContext) => void | Promise<void>;
 }
 
 function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): HostServiceCompileService {
@@ -807,7 +808,7 @@ async function handleShowLatexTool(
 async function handleCompileLatexFileTool(
 	requestId: ParsedMcpRequestId,
 	args: Record<string, unknown>,
-	_pdfOperations: HostServiceMcpPdfOperations,
+	pdfOperations: HostServiceMcpPdfOperations,
 	mcpCompileService: HostServiceCompileService,
 ): Promise<McpResponsePayload> {
 	let compileRequest: HostServiceCompileRequest;
@@ -821,6 +822,9 @@ async function handleCompileLatexFileTool(
 		);
 	}
 	try {
+		if (compileRequest.details.continuous !== undefined) {
+			await pdfOperations.refreshSessionLease?.(compileRequest.workspace_context);
+		}
 		const compileResponse = await mcpCompileService.compileLatexFileRequest(compileRequest);
 		return buildSuccess(requestId, parseToolResult(compileResponse, "ok:"));
 	} catch (error) {

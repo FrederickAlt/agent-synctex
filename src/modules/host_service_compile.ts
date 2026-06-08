@@ -132,7 +132,10 @@ export class HostServiceCompileService {
 					open_status: openResponse.status,
 					error: openResponse.error,
 				});
-				return openResponse;
+				const continuous = this.applyContinuousUnsubscribeAfterFailure(request, result.source);
+				return continuous === undefined
+					? openResponse
+					: { ...openResponse, status_details: { ...openResponse.status_details, continuous } };
 			}
 			const continuous = this.applyContinuousCompileRequest(request, result.source);
 			const continuousError = continuous && ["unavailable", "error"].includes(continuous.status) ? continuous : undefined;
@@ -188,6 +191,7 @@ export class HostServiceCompileService {
 				error,
 			});
 			const nowNs = this.nowNs();
+			const continuous = this.applyContinuousUnsubscribeAfterFailure(request, normalizedPath);
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -210,6 +214,7 @@ export class HostServiceCompileService {
 					...compileErrorDiagnosticsDetails(error),
 					error_code: extractCompileErrorCode(error),
 					artifact_paths: getExistingArtifacts(errorPdf, log),
+					...(continuous === undefined ? {} : { continuous }),
 				},
 			};
 		}
@@ -358,6 +363,15 @@ export class HostServiceCompileService {
 				},
 			};
 		}
+	}
+
+	private applyContinuousUnsubscribeAfterFailure(
+		request: HostServiceCompileRequest,
+		rootSource: string,
+	): HostServiceContinuousCompileDetails | undefined {
+		return request.details.continuous === false
+			? this.applyContinuousCompileRequest(request, rootSource)
+			: undefined;
 	}
 
 	private applyContinuousCompileRequest(

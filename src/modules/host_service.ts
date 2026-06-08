@@ -1169,6 +1169,9 @@ export class HostServiceServer {
 				resolveManagedOpenCallback: (workspaceContext, callbackTargetId, callbackTarget) =>
 					this.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget),
 				continuousCompileManager: this.continuousCompileManager,
+				refreshSessionLease: (workspaceContext) => {
+					this.sessionLeases.heartbeat(workspaceContext);
+				},
 			});
 			if (response === null) {
 				return;
