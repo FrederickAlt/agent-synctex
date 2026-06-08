@@ -656,8 +656,19 @@ function resolveWorkspacePreambleFile(workspaceRoot: string): string | null {
 	return null;
 }
 
+function expandHomePath(rawPath: string): string {
+	if (rawPath === "~") {
+		return process.env.HOME || rawPath;
+	}
+	if (rawPath.startsWith("~/")) {
+		return process.env.HOME ? resolve(process.env.HOME, rawPath.slice(2)) : rawPath;
+	}
+	return rawPath;
+}
+
 function normalizeLatexSourcePath(rawSourcePath: string, workspaceCwd: string): string {
-	const resolved = isAbsolute(rawSourcePath) ? rawSourcePath : resolve(workspaceCwd, rawSourcePath);
+	const expandedPath = expandHomePath(rawSourcePath);
+	const resolved = isAbsolute(expandedPath) ? expandedPath : resolve(workspaceCwd, expandedPath);
 	if (extname(resolved) === ".tex") {
 		return resolved;
 	}

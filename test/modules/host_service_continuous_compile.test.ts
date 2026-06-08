@@ -272,33 +272,47 @@ test("MCP-origin continuous subscriptions refresh session leases for expiry clea
 });
 
 
-test("continuous=false unsubscribes even when immediate compile fails", async () => {
+test("continuous=false unsubscribes even when immediate compile fails for a tilde-expanded source", async () => {
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
-		await client.requestCompileLatexFile(
-			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
-			{ cwd: baseDir, session_id: "session-A" },
-		);
-		assert.equal(fixture.manager.activeRootCount(), 1);
-
-		writeFailingLatexCompiler(join(baseDir, "bin"));
-		rmSync(join(baseDir, "paper.pdf"), { force: true });
-		let observed: unknown;
+		const originalHome = process.env.HOME;
+		const homeDir = join(baseDir, "home");
+		mkdirSync(homeDir, { recursive: true });
+		writeFileSync(join(homeDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}home\\end{document}\n");
+		process.env.HOME = homeDir;
 		try {
 			await client.requestCompileLatexFile(
-				{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: false },
+				{ latex_file_path: "~/paper.tex", compiler: "lualatex", continuous: true },
 				{ cwd: baseDir, session_id: "session-A" },
 			);
-		} catch (error) {
-			observed = error;
+			assert.equal(fixture.manager.activeRootCount(), 1);
+
+			writeFailingLatexCompiler(join(baseDir, "bin"));
+			rmSync(join(homeDir, "paper.pdf"), { force: true });
+			let observed: unknown;
+			try {
+				await client.requestCompileLatexFile(
+					{ latex_file_path: "~/paper.tex", compiler: "lualatex", continuous: false },
+					{ cwd: baseDir, session_id: "session-A" },
+				);
+			} catch (error) {
+				observed = error;
+			}
+			assert.ok(observed instanceof Error);
+			assert.match(observed.message, /LaTeX compile failed/);
+			const details = (observed as { statusDetails?: { continuous?: { status?: string; subscriber_count?: number; root_source?: string } } }).statusDetails;
+			assert.equal(details?.continuous?.status, "stopped");
+			assert.equal(details?.continuous?.subscriber_count, 0);
+			assert.equal(details?.continuous?.root_source, join(homeDir, "paper.tex"));
+			assert.equal(fixture.manager.activeRootCount(), 0);
+			assert.equal(fixture.processes[0]?.killed, true);
+		} finally {
+			if (originalHome === undefined) {
+				delete process.env.HOME;
+			} else {
+				process.env.HOME = originalHome;
+			}
 		}
-		assert.ok(observed instanceof Error);
-		assert.match(observed.message, /LaTeX compile failed/);
-		const details = (observed as { statusDetails?: { continuous?: { status?: string; subscriber_count?: number } } }).statusDetails;
-		assert.equal(details?.continuous?.status, "stopped");
-		assert.equal(details?.continuous?.subscriber_count, 0);
-		assert.equal(fixture.manager.activeRootCount(), 0);
-		assert.equal(fixture.processes[0]?.killed, true);
 	});
 });
 
