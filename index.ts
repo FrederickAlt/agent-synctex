@@ -5,9 +5,13 @@ import { registerPdfTools } from "./src/modules/pi_extension/pdf_tools.ts";
 import { registerShowLatexTool } from "./src/modules/pi_extension/show_latex_tool.ts";
 import { registerSetLatexPreambleTool } from "./src/modules/pi_extension/set_latex_preamble_tool.ts";
 import { registerLifecycleHandlers } from "./src/modules/pi_extension/lifecycle.ts";
+import { createLogger } from "./src/modules/logging.ts";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+const logger = createLogger("pi-extension.index");
+
 export default function (pi: ExtensionAPI): void {
+	logger.info("extension.load");
 	initializeLatexPreambleFile();
 	const callbackManager = createSynctexCallbackManager();
 

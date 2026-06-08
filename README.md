@@ -123,6 +123,9 @@ npm run tex-actionsctl -- doctor
 If your project has `pdf-preview-servicectl`, it should target `show-latex.service` for host-service maintenance
 commands (`sync`, `restart`, `status`, and `logs`).
 
+Diagnostic JSONL logs are disabled unless configured. When enabled, logs are written under `${XDG_STATE_HOME:-~/.local/state}/pi-pdf-preview/logs`.
+Both the Pi extension and host-service daemon read the shared config file `~/.config/pi-pdf-preview/config.json`; see
+[docs/logging.md](docs/logging.md) for local `debug` logging and overrides.
 Artifact and status logs are written under `${XDG_RUNTIME_DIR}/tex-actions`; keep an eye on `npm run host-service:status` and
 `journalctl --user -u show-latex.service` when open/close/jump requests fail unexpectedly.
 Before first start, `npm run host-service:status` may return ENOENT when the service runtime directory has not been created yet; this is expected.

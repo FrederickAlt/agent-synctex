@@ -78,6 +78,11 @@ import {
 	MCP_ERROR_PARSE_ERROR,
 } from "./host_service_mcp.ts";
 import type { ViewerBackendAdapter } from "./host_service_viewer_protocol.ts";
+import { createLogger } from "./logging.ts";
+
+const clientLogger = createLogger("host-service.client");
+const serverLogger = createLogger("host-service.server");
+
 export { FakeViewerBackend, ZathuraViewerBackend };
 export type {
 	FakeViewerBackendOptions,
@@ -762,6 +767,14 @@ export class HostServiceClient {
 		signal: AbortSignal | undefined,
 		requestTimeoutMs: number,
 	): Promise<HostServiceResponseEnvelope> {
+		const startedAt = Date.now();
+		clientLogger.info("request.begin", {
+			operation: request.operation,
+			request_id: request.request_id,
+			socket_path: this.socketPath,
+			cwd: request.workspace_context.cwd,
+			timeout_ms: requestTimeoutMs,
+		});
 		if (!isValidWorkspaceContext(request.workspace_context)) {
 			throw new Error("host service request requires valid workspace_context.cwd");
 		}
@@ -871,12 +884,28 @@ export class HostServiceClient {
 			};
 		});
 
-		const response = await requestPromise.finally(() => {
-			if (signal && abortUnsub) {
-				signal.removeEventListener("abort", abortUnsub);
-			}
-		});
-		return response;
+		try {
+			const response = await requestPromise.finally(() => {
+				if (signal && abortUnsub) {
+					signal.removeEventListener("abort", abortUnsub);
+				}
+			});
+			clientLogger.info("request.end", {
+				operation: request.operation,
+				request_id: request.request_id,
+				status: response.status,
+				duration_ms: Date.now() - startedAt,
+			});
+			return response;
+		} catch (error) {
+			clientLogger.warn("request.error", {
+				operation: request.operation,
+				request_id: request.request_id,
+				duration_ms: Date.now() - startedAt,
+				error,
+			});
+			throw error;
+		}
 	}
 }
 
@@ -918,33 +947,40 @@ export class HostServiceServer {
 		if (this.server) {
 			return;
 		}
+		serverLogger.info("start.begin", { socket_path: this.socketPath, service_name: this.serviceName });
 		this.socketOwnedByServer = false;
-		await this.prepareSocketPath();
-		this.startedAtNs = Date.now() * 1_000_000;
-		const server = createServer((socket) => {
-			this.handleConnection(socket);
-		});
-		this.server = server;
-
-		await new Promise<void>((resolve, reject) => {
-			const finalizeError = (error: Error) => {
-				if (this.server === server) {
-					this.server = null;
-				}
-				reject(error);
-			};
-			server.once("error", finalizeError);
-			server.listen(this.socketPath, () => {
-				try {
-					chmodSync(this.socketPath, REQUIRED_SOCKET_MODE);
-					this.socketOwnedByServer = true;
-					resolve();
-				} catch (error) {
-					this.server = null;
-					finalizeError(error instanceof Error ? error : new Error(String(error)));
-				}
+		try {
+			await this.prepareSocketPath();
+			this.startedAtNs = Date.now() * 1_000_000;
+			const server = createServer((socket) => {
+				this.handleConnection(socket);
 			});
-		});
+			this.server = server;
+
+			await new Promise<void>((resolve, reject) => {
+				const finalizeError = (error: Error) => {
+					if (this.server === server) {
+						this.server = null;
+					}
+					reject(error);
+				};
+				server.once("error", finalizeError);
+				server.listen(this.socketPath, () => {
+					try {
+						chmodSync(this.socketPath, REQUIRED_SOCKET_MODE);
+						this.socketOwnedByServer = true;
+						resolve();
+					} catch (error) {
+						this.server = null;
+						finalizeError(error instanceof Error ? error : new Error(String(error)));
+					}
+				});
+			});
+			serverLogger.info("start.end", { socket_path: this.socketPath, service_name: this.serviceName, service_instance_id: this.serviceInstanceId });
+		} catch (error) {
+			serverLogger.error("start.error", { socket_path: this.socketPath, service_name: this.serviceName, error });
+			throw error;
+		}
 	}
 
 	private async closeViewerBackendSessions(): Promise<void> {
@@ -960,6 +996,7 @@ export class HostServiceServer {
 	}
 
 	async stop(): Promise<void> {
+		serverLogger.info("stop.begin", { socket_path: this.socketPath, service_name: this.serviceName, active_connections: this.activeConnections.size });
 		await this.closeViewerBackendSessions();
 		const server = this.server;
 		this.server = null;
@@ -970,6 +1007,7 @@ export class HostServiceServer {
 			this.callbackTargets.clear();
 			this.managedViewerRecords.clear();
 			this.removeSocketPath();
+			serverLogger.info("stop.end", { socket_path: this.socketPath, service_name: this.serviceName, server_was_running: false });
 			return;
 		}
 
@@ -985,6 +1023,7 @@ export class HostServiceServer {
 		this.callbackTargets.clear();
 		this.managedViewerRecords.clear();
 		this.removeSocketPath();
+		serverLogger.info("stop.end", { socket_path: this.socketPath, service_name: this.serviceName });
 	}
 
 	private handleConnection(socket: Socket): void {
@@ -1052,7 +1091,8 @@ export class HostServiceServer {
 				return;
 			}
 			socket.write(response);
-		})().catch(() => {
+		})().catch((error) => {
+			serverLogger.error("mcp_request.internal_error", { error });
 			socket.destroy();
 		});
 	}
@@ -1066,6 +1106,11 @@ export class HostServiceServer {
 				request = validateHostServiceRequest(requestPayload);
 			} catch (error) {
 				const requestId = getRequestIdFromPayload(requestPayload);
+				serverLogger.warn("request.invalid", {
+					request_id: requestId,
+					operation: getOperationFromPayload(requestPayload),
+					error,
+				});
 				const requestOperation = getOperationFromPayload(requestPayload);
 				if (requestOperation === "compile_latex_file" || requestOperation === "compile_latex_snippet") {
 					const requestWorkspaceContext = getWorkspaceContextFromPayload(requestPayload);
@@ -1121,6 +1166,11 @@ export class HostServiceServer {
 				));
 				return;
 			}
+			serverLogger.info("request.received", {
+				operation: request.operation,
+				request_id: request.request_id,
+				cwd: request.workspace_context.cwd,
+			});
 			switch (request.operation) {
 				case "status": {
 					this.totalRequests += 1;
@@ -1295,7 +1345,8 @@ export class HostServiceServer {
 					return;
 				}
 			}
-		})().catch(() => {
+		})().catch((error) => {
+			serverLogger.error("request.internal_error", { error });
 			socket.end(buildErrorResponse(
 				this.protocolVersion,
 				this.socketPath,

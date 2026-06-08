@@ -24,6 +24,9 @@ import type {
 	HostServiceOpenResponseEnvelope,
 	HostServiceWorkspaceContext,
 } from "./host_service_protocol.ts";
+import { createLogger } from "./logging.ts";
+
+const logger = createLogger("host-service.compile");
 
 const REQUIRED_DIRECTORY_MODE = 0o700;
 const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "tex-actions");
@@ -77,11 +80,19 @@ export class HostServiceCompileService {
 	}
 
 	async compileLatexFileRequest(request: HostServiceCompileRequest): Promise<HostServiceCompileResponseEnvelope> {
+		const startedAt = Date.now();
 		const requestedPath = request.details.latex_file_path;
 		const normalizedPath = normalizeLatexSourcePath(requestedPath, request.workspace_context.cwd);
 		const shouldClean = request.details.clean === true;
 		const cleanArtifacts: string[] = [];
 		const resolvedLogPath = inferLatexLogPath(normalizedPath);
+		logger.info("compile_file.begin", {
+			request_id: request.request_id,
+			source_path: normalizedPath,
+			compiler: request.details.compiler,
+			clean: shouldClean,
+			open_pdf: request.details.open_pdf === true,
+		});
 
 		try {
 			const compileRequest: LatexFileCompileRequest = {
@@ -108,8 +119,28 @@ export class HostServiceCompileService {
 				nowNs,
 			);
 			if (openResponse !== undefined && openResponse.operation !== "open_pdf") {
+				logger.warn("compile_file.open_error", {
+					request_id: request.request_id,
+					duration_ms: Date.now() - startedAt,
+					compile_status: result.compileStatus,
+					pdf_path: result.pdfPath,
+					log_path: resultLogPath,
+					open_status: openResponse.status,
+					error: openResponse.error,
+				});
 				return openResponse;
 			}
+			logger.info("compile_file.end", {
+				request_id: request.request_id,
+				duration_ms: Date.now() - startedAt,
+				compile_status: result.compileStatus,
+				compiler_exit_code: result.compilerExitCode,
+				warning_count: result.warningCount,
+				source_path: result.source,
+				pdf_path: result.pdfPath,
+				log_path: resultLogPath,
+				pdf_id: openResponse?.status_details.pdf_id,
+			});
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -138,6 +169,15 @@ export class HostServiceCompileService {
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			const log = error instanceof LoggedToolError ? error.logPath : resolvedLogPath;
 			const errorPdf = error instanceof LoggedToolError && error.pdfPath ? error.pdfPath : "";
+			logger.error("compile_file.error", {
+				request_id: request.request_id,
+				duration_ms: Date.now() - startedAt,
+				source_path: normalizedPath,
+				pdf_path: errorPdf,
+				log_path: log,
+				error_code: extractCompileErrorCode(error),
+				error,
+			});
 			const nowNs = this.nowNs();
 			return {
 				protocol_version: this.protocolVersion,
@@ -167,9 +207,18 @@ export class HostServiceCompileService {
 	}
 
 	async compileLatexSnippetRequest(request: HostServiceCompileSnippetRequest): Promise<HostServiceCompileSnippetResponseEnvelope> {
+		const startedAt = Date.now();
 		const shouldClean = false;
 		const cleanArtifacts: string[] = [];
 		let sourcePath = "";
+		logger.info("compile_snippet.begin", {
+			request_id: request.request_id,
+			compiler: request.details.compiler,
+			open_pdf: request.details.open_pdf === true,
+			fixed_preview: request.details.fixed_preview === true,
+			crop_to_content: request.details.crop_to_content === true,
+			suppress_page_numbers: request.details.suppress_page_numbers === true,
+		});
 
 		try {
 			sourcePath = buildSnippetLatexSourcePath(request.workspace_context);
@@ -210,8 +259,30 @@ export class HostServiceCompileService {
 				nowNs,
 			);
 			if (openResponse !== undefined && openResponse.operation !== "open_pdf") {
+				logger.warn("compile_snippet.open_error", {
+					request_id: request.request_id,
+					duration_ms: Date.now() - startedAt,
+					compile_status: result.compileStatus,
+					pdf_path: previewPdfPath,
+					operation_pdf_path: operationPdfPath,
+					log_path: logPath,
+					open_status: openResponse.status,
+					error: openResponse.error,
+				});
 				return openResponse;
 			}
+			logger.info("compile_snippet.end", {
+				request_id: request.request_id,
+				duration_ms: Date.now() - startedAt,
+				compile_status: result.compileStatus,
+				compiler_exit_code: result.compilerExitCode,
+				warning_count: result.warningCount,
+				source_path: result.source,
+				pdf_path: previewPdfPath,
+				operation_pdf_path: operationPdfPath,
+				log_path: logPath,
+				pdf_id: openResponse?.status_details.pdf_id,
+			});
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -243,6 +314,15 @@ export class HostServiceCompileService {
 			const source = sourcePath;
 			const log = error instanceof LoggedToolError ? error.logPath : (source ? inferLatexLogPath(source) : "");
 			const errorPdf = error instanceof LoggedToolError && error.pdfPath ? error.pdfPath : "";
+			logger.error("compile_snippet.error", {
+				request_id: request.request_id,
+				duration_ms: Date.now() - startedAt,
+				source_path: source,
+				pdf_path: errorPdf,
+				log_path: log,
+				error_code: extractCompileErrorCode(error),
+				error,
+			});
 			const nowNs = this.nowNs();
 			return {
 				protocol_version: this.protocolVersion,

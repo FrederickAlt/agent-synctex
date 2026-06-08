@@ -2,6 +2,9 @@ import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, read
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { createLogger } from "../logging.ts";
+
+const logger = createLogger("latex.compiler");
 
 export const DEFAULT_LATEX_COMPILER = "lualatex" as const;
 export const LATEX_COMPILERS = [DEFAULT_LATEX_COMPILER, "pdflatex", "xelatex", "latexmk"] as const;
@@ -485,6 +488,7 @@ function latexCommandForFile(latexFilePath: string, compiler?: LatexCompiler): L
 
 function runLatexCommand(spec: LatexCommandSpec, cwd: string, signal?: AbortSignal): Promise<LatexCommandResult> {
 	return new Promise((resolvePromise, reject) => {
+		const startedAt = Date.now();
 		if (signal?.aborted) {
 			resolvePromise({ exitCode: null, signal: null, output: "", timedOut: false, aborted: true });
 			return;
@@ -495,6 +499,7 @@ function runLatexCommand(spec: LatexCommandSpec, cwd: string, signal?: AbortSign
 		let aborted = false;
 		let settled = false;
 
+		logger.debug("process.spawn", { command: spec.command, args: spec.args, cwd });
 		const child = spawn(spec.command, spec.args, {
 			cwd,
 			env: {
@@ -532,10 +537,20 @@ function runLatexCommand(spec: LatexCommandSpec, cwd: string, signal?: AbortSign
 		};
 
 		child.on("error", (error) => {
+			logger.error("process.error", { command: spec.command, cwd, duration_ms: Date.now() - startedAt, error });
 			finish(() => reject(error));
 		});
 
 		child.on("close", (exitCode, closeSignal) => {
+			logger.debug("process.close", {
+				command: spec.command,
+				cwd,
+				duration_ms: Date.now() - startedAt,
+				exit_code: exitCode,
+				signal: closeSignal,
+				timed_out: timedOut,
+				aborted,
+			});
 			finish(() => resolvePromise({
 				exitCode,
 				signal: closeSignal,
@@ -608,6 +623,16 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 	const spec = latexCommandForFile(latexFilePath, compiler);
 	const beforePdfStatus = outputPdfStat(outputPdfPath);
 	const compileStartMs = Date.now();
+	logger.info("compile.begin", {
+		source_path: latexFilePath,
+		pdf_path: outputPdfPath,
+		log_path: logPath,
+		compiler: spec.displayName,
+		command: spec.command,
+		cwd: dirname(latexFilePath),
+		clean,
+		cleaned_artifact_count: cleanedArtifacts.length,
+	});
 
 	let result: LatexCommandResult;
 	try {
@@ -665,6 +690,20 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 		: warningExtraction.total > 0
 			? "ok_with_warnings"
 			: "ok";
+
+	logger.info("compile.end", {
+		source_path: latexFilePath,
+		pdf_path: outputPdfPath,
+		log_path: logPath,
+		duration_ms: Date.now() - compileStartMs,
+		compile_status: compileStatus,
+		compiler_exit_code: result.exitCode,
+		compiler_signal: result.signal,
+		warning_count: warningExtraction.total,
+		pdf_exists: pdfExists,
+		pdf_updated: pdfUpdated,
+		output_written: outputWritten,
+	});
 
 	return {
 		source: latexFilePath,
