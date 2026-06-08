@@ -62,9 +62,11 @@ async function waitForProcessExit(pid: number, timeoutMs = 1200): Promise<void> 
 	throw new Error(`timed out waiting for process ${pid} to exit`);
 }
 
-function writeFakeLatexCompiler(binDir: string, options: { exitCode?: number; withLog?: boolean } = {}): string {
+function writeFakeLatexCompiler(binDir: string, options: { exitCode?: number; withLog?: boolean; logText?: string; stdoutText?: string } = {}): string {
 	const exitCode = options.exitCode ?? 0;
 	const withLog = options.withLog ?? true;
+	const logText = options.logText ?? "fake compiler output";
+	const stdoutText = options.stdoutText ?? "";
 	mkdirSync(binDir, { mode: 0o700, recursive: true });
 	const compilerPath = join(binDir, "lualatex");
 	writeFileSync(compilerPath, `#!/bin/sh
@@ -84,9 +86,14 @@ name="\${base%.*}"
 out_dir="\${out_dir:-$(pwd)}"
 mkdir -p "$out_dir"${withLog ? `
 if [ ! -z "$out_dir" ]; then
-  echo "fake compiler output" > "$out_dir/$name.log"
+  cat > "$out_dir/$name.log" <<'LOGTEXT'
+${logText}
+LOGTEXT
 fi` : ""}
-printf '%s' '%PDF-1.4\n' > "$out_dir/$name.pdf"
+${stdoutText ? `cat <<'STDOUTTEXT'
+${stdoutText}
+STDOUTTEXT
+` : ""}printf '%s' '%PDF-1.4\n' > "$out_dir/$name.pdf"
 exit ${exitCode}
 `, { mode: 0o700 });
 	chmodSync(compilerPath, 0o700);
@@ -881,6 +888,123 @@ test("host service compile_latex_file operation surfaces compiler failures", asy
 		assert.ok(observed instanceof Error);
 		assert.match(observed.message, /LaTeX compile failed/);
 		assert.match(observed.message, /code=compile_failed/);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service compile_latex_file reports warning-only compiles without failing", async () => {
+	const baseDir = temporaryDir("host-service-compile-warnings-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"), {
+		logText: "LaTeX Warning: Reference `foo' undefined on input line 3.\nOverfull \\hbox (12.0pt too wide) in paragraph at lines 4--5\nOutput written on paper.pdf (1 page, 123 bytes).",
+	});
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-warnings" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		const result = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		assert.equal(result.compile_status, "ok_with_warnings");
+		assert.equal(result.warning_count, 2);
+		assert.equal(result.warnings?.some((warning) => /Reference `foo'/.test(warning.message)), true);
+		assert.equal(result.warnings?.some((warning) => /Overfull/.test(warning.message)), true);
+		assert.equal(result.log, join(baseDir, "paper.log"));
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service compile_latex_file accepts nonzero compiler status when PDF was freshly written", async () => {
+	const baseDir = temporaryDir("host-service-compile-nonzero-pdf-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"), {
+		exitCode: 9,
+		logText: "LaTeX Warning: Reference `foo' undefined on input line 3.\nOutput written on paper.pdf (1 page, 123 bytes).",
+	});
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-nonzero-pdf" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		const result = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		assert.equal(result.compile_status, "nonzero_but_pdf_updated");
+		assert.equal(result.compiler_exit_code, 9);
+		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(result.warning_count, 1);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service compile_latex_file treats nonzero fatal diagnostics as failure even when PDF was written", async () => {
+	const baseDir = temporaryDir("host-service-compile-nonzero-fatal-pdf-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeLatexCompiler(join(baseDir, "bin"), {
+		exitCode: 9,
+		logText: "! Undefined control sequence.\nl.4 \\badmacro\nOutput written on paper.pdf (1 page, 123 bytes).",
+	});
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\n\\badmacro\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-nonzero-fatal-pdf" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /code=compile_failed/);
+		assert.match(observed.message, /Undefined control sequence/);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service compile_latex_file reports stale existing PDFs as compile failures", async () => {
+	const baseDir = temporaryDir("host-service-compile-stale-pdf-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	mkdirSync(join(baseDir, "bin"), { mode: 0o700, recursive: true });
+	const compilerPath = join(baseDir, "bin", "lualatex");
+	writeFileSync(compilerPath, `#!/bin/sh\nset -eu\ntex_file=""\nfor arg in "$@"; do tex_file="$arg"; done\nbase="\${tex_file##*/}"\nname="\${base%.*}"\necho "! Undefined control sequence." > "$name.log"\nexit 1\n`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\n\\badmacro\\end{document}\n");
+	writeFileSync(join(baseDir, "paper.pdf"), "%PDF-1.4\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-stale-pdf" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /code=failed_stale_pdf_exists/);
+		assert.match(observed.message, /Undefined control sequence/);
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();

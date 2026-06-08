@@ -10,6 +10,7 @@ import {
 	DEFAULT_LATEX_COMPILER,
 	LATEX_COMPILERS,
 	type LatexCompiler,
+	type LatexDiagnosticSummary,
 } from "../latex/latex_file_compiler.ts";
 import {
 	type HostServiceCompileResponseDetails,
@@ -81,6 +82,21 @@ function stringsOrEmpty(value: unknown): string[] {
 	return value.every((entry) => typeof entry === "string") ? value : [];
 }
 
+function warningSummary(warnings: LatexDiagnosticSummary[] | undefined, count: number | undefined, truncated: boolean | undefined): string {
+	if (!count || !warnings?.length) return "";
+	const lines = warnings.slice(0, 5).map((warning) => `- ${warning.message}`);
+	const suffix = truncated ? "\n- ... more warnings omitted" : "";
+	return `\nWarnings:\n${lines.join("\n")}${suffix}`;
+}
+
+function compileSuccessText(details: HostServiceCompileResponseDetails): string {
+	const status = details.compile_status ?? "ok";
+	const warningCount = details.warning_count ? ` warnings=${details.warning_count}` : "";
+	const exitCode = status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
+	const prefix = status === "ok" ? "ok" : status;
+	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated)}`;
+}
+
 function describeCompileFailureContext(
 	requestedPath: string,
 	compileResult: { source: string; pdf: string; clean: boolean; cleaned_artifacts: string[] } | undefined,
@@ -101,7 +117,8 @@ function describeCompileFailureContext(
 
 function isOpenFailureFromCompileError(error: unknown): boolean {
 	const details = hostServiceCompileErrorDetails(error);
-	return typeof details?.pdf === "string" && details.pdf.length > 0 && details.error_code !== "compile_failed";
+	const compileErrorCodes = new Set(["compile_failed", "failed_no_pdf", "failed_stale_pdf_exists", "compile_timeout", "compile_aborted", "compiler_start_failed"]);
+	return typeof details?.pdf === "string" && details.pdf.length > 0 && !compileErrorCodes.has(String(details.error_code ?? ""));
 }
 
 function resolveLatexFilePath(latexFilePath: string, cwd = process.cwd()): string {
@@ -112,7 +129,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 	const compileLatexFileToolFacade = createUniversalToolFacade({
 		"compile_latex_file": async (_toolCallId, params, signal, _onUpdate, ctx) => {
 			let requestedPath = "";
-			let compileResult: { source: string; pdf: string; clean: boolean; cleaned_artifacts: string[] } | undefined;
+			let compileResult: HostServiceCompileResponseDetails | undefined;
 
 			let compiler: LatexCompiler | undefined;
 			let shouldOpenPdf = false;
@@ -154,21 +171,23 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 					signal,
 					HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS,
 				);
-				compileResult = {
-					source: compileResponse.source,
-					pdf: compileResponse.pdf,
-					clean: compileResponse.clean,
-					cleaned_artifacts: compileResponse.cleaned_artifacts,
-				};
+				compileResult = compileResponse;
 
 				if (!shouldOpenPdf) {
 					return {
-						content: [{ type: "text", text: `ok: ${compileResult.pdf}` }],
+						content: [{ type: "text", text: compileSuccessText(compileResult) }],
 						details: {
 							source: compileResult.source,
 							pdf: compileResult.pdf,
+							log: compileResult.log,
 							clean: compileResult.clean,
 							cleaned_artifacts: compileResult.cleaned_artifacts,
+							compile_status: compileResult.compile_status,
+							compiler_exit_code: compileResult.compiler_exit_code,
+							compiler_signal: compileResult.compiler_signal,
+							warning_count: compileResult.warning_count,
+							warnings: compileResult.warnings,
+							warnings_truncated: compileResult.warnings_truncated,
 						},
 					};
 				}
@@ -182,8 +201,10 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				}
 				const managedRecord = compileResponse.managed_record;
 				const pidText = managedRecord?.pid === undefined ? "" : ` pid=${managedRecord.pid}`;
+				const status = compileResponse.compile_status ?? "ok";
+				const warningCount = compileResponse.warning_count ? ` warnings=${compileResponse.warning_count}` : "";
 				return {
-					content: [{ type: "text", text: `ok: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}` }],
+					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated)}` }],
 					details: {
 						source: compileResponse.source,
 						pdf: compileResponse.pdf,
@@ -196,6 +217,13 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 						managed_record: managedRecord,
 						clean: compileResponse.clean,
 						cleaned_artifacts: compileResponse.cleaned_artifacts,
+						log: compileResponse.log,
+						compile_status: compileResponse.compile_status,
+						compiler_exit_code: compileResponse.compiler_exit_code,
+						compiler_signal: compileResponse.compiler_signal,
+						warning_count: compileResponse.warning_count,
+						warnings: compileResponse.warnings,
+						warnings_truncated: compileResponse.warnings_truncated,
 					},
 				};
 			} catch (error) {

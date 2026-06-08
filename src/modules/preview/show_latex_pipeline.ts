@@ -1,5 +1,5 @@
 import { type HostServiceManagedViewerRecord } from "../host_service_protocol.ts";
-import type { LatexCompiler } from "../latex/latex_file_compiler.ts";
+import type { LatexCompiler, LatexCompileStatus, LatexDiagnosticSummary } from "../latex/latex_file_compiler.ts";
 import { mergeInlinePreviewArtifacts, rasterizePdfPages, type InlinePreviewArtifact } from "./inline_preview.ts";
 import { buildInlinePreviewToolPayload, type InlinePreviewToolPayload } from "./inline_preview_payload.ts";
 import { type InlinePreviewRenderState } from "./inline_preview_metadata.ts";
@@ -13,6 +13,13 @@ export interface ParsedShowLatexInput {
 export interface ShowLatexPreviewResult {
 	text: string;
 	pdfPath: string;
+	logPath?: string;
+	compileStatus?: LatexCompileStatus;
+	compilerExitCode?: number | null;
+	compilerSignal?: string | null;
+	warningCount?: number;
+	warnings?: LatexDiagnosticSummary[];
+	warningsTruncated?: boolean;
 	sourcePath?: string;
 	operationPdfPath?: string;
 	targetPdfId?: number;
@@ -61,6 +68,13 @@ export interface ShowLatexPipelineDependencies {
 		previewPdfPath: string,
 		previewId: string,
 		artifacts: InlinePreviewArtifact[],
+		diagnostics?: {
+			compileStatus?: LatexCompileStatus;
+			logPath?: string;
+			warningCount?: number;
+			warnings?: LatexDiagnosticSummary[];
+			warningsTruncated?: boolean;
+		},
 	) => InlinePreviewToolPayload;
 }
 
@@ -86,6 +100,13 @@ export interface ShowLatexCompiledPreview {
 	text: string;
 	previewPdfPath: string;
 	inline: boolean;
+	logPath?: string;
+	compileStatus?: LatexCompileStatus;
+	compilerExitCode?: number | null;
+	compilerSignal?: string | null;
+	warningCount?: number;
+	warnings?: LatexDiagnosticSummary[];
+	warningsTruncated?: boolean;
 	sourcePath?: string;
 	operationPdfPath?: string;
 	targetPdfId?: number;
@@ -215,6 +236,13 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 		return {
 			text: preview.text,
 			previewPdfPath: preview.pdfPath,
+			logPath: preview.logPath,
+			compileStatus: preview.compileStatus,
+			compilerExitCode: preview.compilerExitCode,
+			compilerSignal: preview.compilerSignal,
+			warningCount: preview.warningCount,
+			warnings: preview.warnings,
+			warningsTruncated: preview.warningsTruncated,
 			sourcePath: preview.sourcePath,
 			operationPdfPath: preview.operationPdfPath,
 			targetPdfId: preview.targetPdfId,
@@ -244,7 +272,13 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 			inline: true,
 			text: compiledPreview.text,
 			previewPdfPath: compiledPreview.previewPdfPath,
-			payload: dependencies.buildInlinePreviewToolPayload(compiledPreview.previewPdfPath, previewId, artifacts),
+			payload: dependencies.buildInlinePreviewToolPayload(compiledPreview.previewPdfPath, previewId, artifacts, {
+				compileStatus: compiledPreview.compileStatus,
+				logPath: compiledPreview.logPath,
+				warningCount: compiledPreview.warningCount,
+				warnings: compiledPreview.warnings,
+				warningsTruncated: compiledPreview.warningsTruncated,
+			}),
 		};
 	}
 

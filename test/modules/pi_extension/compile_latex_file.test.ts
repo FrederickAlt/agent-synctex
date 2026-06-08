@@ -507,17 +507,50 @@ test("compile_latex_file compiles without opening by default", async () => {
 			const details = result.details as {
 				source: string;
 				pdf: string;
+				log: string;
 				clean: boolean;
 				cleaned_artifacts: unknown[];
 				viewer_handle?: unknown;
 			};
 			assert.equal(result.content.length, 1);
-			assert.equal(result.content[0].text, `ok: ${expectedPdf}`);
+			assert.equal(result.content[0].text.startsWith(`ok: ${expectedPdf}\nLog: `), true);
 			assert.equal(details.source, sourcePath);
 			assert.equal(details.pdf, expectedPdf);
+			assert.equal(details.log, resolve(root, "paper.log"));
 			assert.equal(details.clean, false);
 			assert.deepEqual(details.cleaned_artifacts, []);
 			assert.equal(details.viewer_handle, undefined);
+		});
+	} finally {
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("compile_latex_file returns warning summaries from successful compiles", async () => {
+	const tool = await captureCompileTool();
+	const root = mkdtempSync(join(tmpdir(), "pdf-preview-compile-warnings-"));
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	const sourcePath = resolve(root, "paper.tex");
+	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nSee \\ref{foo}.\\end{document}\n");
+	const originalPath = process.env.PATH ?? "";
+	writeFakeCompiler(binDir, {
+		logContents: "LaTeX Warning: Reference `foo' undefined on input line 3.\nOverfull \\hbox (5.0pt too wide) in paragraph at lines 4--5\n",
+	});
+	process.env.PATH = `${binDir}:${originalPath}`;
+
+	try {
+		await withHostServiceDefault(async () => {
+			const result = await tool.execute("compile-latex-file-warnings", { latex_file_path: sourcePath }, undefined, undefined, undefined);
+			const details = result.details as { compile_status?: string; warning_count?: number; warnings?: Array<{ message: string }>; log?: string };
+			assert.match(result.content[0].text, /^ok_with_warnings:/);
+			assert.match(result.content[0].text, /warnings=2/);
+			assert.match(result.content[0].text, /Reference `foo'/);
+			assert.equal(details.compile_status, "ok_with_warnings");
+			assert.equal(details.warning_count, 2);
+			assert.equal(details.warnings?.some((warning) => /Overfull/.test(warning.message)), true);
+			assert.equal(details.log, resolve(root, "paper.log"));
 		});
 	} finally {
 		process.env.PATH = originalPath;

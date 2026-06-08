@@ -8,6 +8,8 @@ import {
 import {
 	createLatexFileCompileToolSupport,
 	LoggedToolError,
+	type LatexCompileStatus,
+	type LatexDiagnosticSummary,
 	type LatexFileCompileRequest,
 } from "./latex/latex_file_compiler.ts";
 import { resolveFixedPreviewPdfPath } from "./host_service_fixed_preview_pdf_path.ts";
@@ -38,6 +40,17 @@ interface HostServiceManagedViewerServiceLike {
 }
 
 type CompileRequest = HostServiceCompileRequest | HostServiceCompileSnippetRequest;
+
+interface CompileDiagnosticsDetails {
+	compile_status?: LatexCompileStatus;
+	compiler_exit_code?: number | null;
+	compiler_signal?: string | null;
+	warning_count?: number;
+	warnings?: LatexDiagnosticSummary[];
+	warnings_truncated?: boolean;
+	error_summary?: string;
+	diagnostics?: LatexDiagnosticSummary[];
+}
 
 export interface HostServiceCompileServiceOptions {
 	protocolVersion: number;
@@ -116,6 +129,7 @@ export class HostServiceCompileService {
 					clean: shouldClean,
 					cleaned_artifacts: cleanArtifacts,
 					artifact_paths: artifactPaths,
+					...compileDiagnosticsDetails(result),
 					pdf_id: openResponse?.status_details.pdf_id,
 					managed_record: openResponse?.status_details.managed_record,
 				},
@@ -123,6 +137,7 @@ export class HostServiceCompileService {
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			const log = error instanceof LoggedToolError ? error.logPath : resolvedLogPath;
+			const errorPdf = error instanceof LoggedToolError && error.pdfPath ? error.pdfPath : "";
 			const nowNs = this.nowNs();
 			return {
 				protocol_version: this.protocolVersion,
@@ -139,12 +154,13 @@ export class HostServiceCompileService {
 					request_id: request.request_id,
 					operation: request.operation,
 					source: normalizedPath,
-					pdf: "",
+					pdf: errorPdf,
 					log,
 					clean: shouldClean,
 					cleaned_artifacts: cleanArtifacts,
+					...compileErrorDiagnosticsDetails(error),
 					error_code: extractCompileErrorCode(error),
-					artifact_paths: getExistingArtifacts(log),
+					artifact_paths: getExistingArtifacts(errorPdf, log),
 				},
 			};
 		}
@@ -216,6 +232,7 @@ export class HostServiceCompileService {
 					clean: shouldClean,
 					cleaned_artifacts: cleanArtifacts,
 					artifact_paths: artifactPaths,
+					...compileDiagnosticsDetails(result),
 					operation_artifact_paths: operationArtifactPaths,
 					pdf_id: openResponse?.status_details.pdf_id,
 					managed_record: openResponse?.status_details.managed_record,
@@ -225,6 +242,7 @@ export class HostServiceCompileService {
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			const source = sourcePath;
 			const log = error instanceof LoggedToolError ? error.logPath : (source ? inferLatexLogPath(source) : "");
+			const errorPdf = error instanceof LoggedToolError && error.pdfPath ? error.pdfPath : "";
 			const nowNs = this.nowNs();
 			return {
 				protocol_version: this.protocolVersion,
@@ -241,12 +259,13 @@ export class HostServiceCompileService {
 					request_id: request.request_id,
 					operation: request.operation,
 					source,
-					pdf: "",
+					pdf: errorPdf,
 					log,
 					clean: shouldClean,
 					cleaned_artifacts: cleanArtifacts,
+					...compileErrorDiagnosticsDetails(error),
 					error_code: extractCompileErrorCode(error),
-					artifact_paths: getExistingArtifacts(log),
+					artifact_paths: getExistingArtifacts(errorPdf, log),
 				},
 			};
 		}
@@ -568,9 +587,35 @@ function assertDirectorySafe(path: string, options: { enforceMode?: boolean } = 
 	}
 }
 
+function compileDiagnosticsDetails(result: {
+	compileStatus: LatexCompileStatus;
+	compilerExitCode: number | null;
+	compilerSignal: string | null;
+	warningCount: number;
+	warnings: LatexDiagnosticSummary[];
+	warningsTruncated: boolean;
+}): CompileDiagnosticsDetails {
+	return {
+		compile_status: result.compileStatus,
+		compiler_exit_code: result.compilerExitCode,
+		compiler_signal: result.compilerSignal,
+		warning_count: result.warningCount,
+		warnings: result.warnings,
+		warnings_truncated: result.warningsTruncated,
+	};
+}
+
+function compileErrorDiagnosticsDetails(error: unknown): CompileDiagnosticsDetails {
+	if (!(error instanceof LoggedToolError)) return {};
+	return {
+		error_summary: error.diagnosticSummary,
+		diagnostics: error.diagnostics,
+	};
+}
+
 function extractCompileErrorCode(error: unknown): string {
 	if (error instanceof LoggedToolError) {
-		return "compile_failed";
+		return error.errorCode;
 	}
 	if (error instanceof Error && /compiler/.test(error.message)) {
 		return "compile_failed";

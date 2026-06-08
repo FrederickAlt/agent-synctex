@@ -1275,7 +1275,8 @@ test("daemon renders show_latex through compile flow", async () => {
 		})) as { result: { isError?: boolean; content: Array<{ text: string }> } };
 		assert.equal(response.result.isError, undefined);
 		const resultText = response.result.content[0].text;
-		assert.match(resultText, /\.pdf$/);
+		assert.match(resultText, /\.pdf/);
+		assert.match(resultText, /Log: .*\.log/);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });

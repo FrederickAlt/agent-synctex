@@ -295,6 +295,23 @@ fs.writeFileSync(pdf, "%PDF-1.7\\n");
 	return compilerPath;
 }
 
+function writeFakeCompilerWithWarnings(binDir: string): string {
+	const compilerPath = resolve(binDir, "lualatex");
+	const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const source = process.argv[process.argv.length - 1];
+if (!source) process.exit(1);
+const pdf = path.resolve(process.cwd(), source.replace(/\\.tex$/, ".pdf"));
+const log = path.resolve(process.cwd(), source.replace(/\\.tex$/, ".log"));
+fs.writeFileSync(pdf, "%PDF-1.7\\n");
+fs.writeFileSync(log, "LaTeX Warning: Reference \`foo' undefined on input line 4.\\nOverfull \\\\hbox (5.0pt too wide) in paragraph at lines 5--6\\n");
+`;
+	writeFileSync(compilerPath, script, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+	return compilerPath;
+}
+
 function writeFakeMutool(binDir: string): string {
 	const mutoolPath = resolve(binDir, "mutool");
 	const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/h2MAAAAASUVORK5CYII=";
@@ -643,7 +660,8 @@ test("show_latex external flow opens through host service", async () => {
 			assert.equal(details.operation_pdf === MCP_FIXED_PREVIEW_PDF_PATH, false);
 			assert.equal(existsSync(MCP_FIXED_PREVIEW_PDF_PATH), true);
 			assert.equal(typeof details.pdf_id, "number");
-			assert.equal(result.content[0].text, "ok");
+			assert.match(result.content[0].text, /^ok: pdf_id=\d+ pdf=/);
+			assert.match(result.content[0].text, /Log: .*\.log/);
 
 			assert.equal(backend.openRequests.length, 1);
 			const request = backend.openRequests[0];
@@ -1020,6 +1038,36 @@ test("show_latex inline flow routes through host service rasterization", async (
 		assert.equal(trace.counters.compileLatexFile, 0);
 	} finally {
 		trace.restore();
+		await runSessionShutdown(context);
+		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("show_latex inline flow returns warning summaries from successful compiles", async () => {
+	const { root, sourceContent } = withTemporaryProject();
+	const tool = await captureShowLatexTool();
+	const originalPath = process.env.PATH ?? "";
+	const binDir = resolve(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	writeFakeCompilerWithWarnings(binDir);
+	writeFakeMutool(binDir);
+	process.env.PATH = `${binDir}:${originalPath}`;
+	const context = createSessionContext(root);
+
+	try {
+		await withHostService("ok", async () => {
+			const result = await tool.execute("show-latex-inline-warnings", { source: sourceContent, inline: true }, undefined, undefined, context);
+			const details = result.details as { compile_status?: string; warning_count?: number; warnings?: Array<{ message: string }>; log?: string };
+			assert.match(result.content[0].text, /status=ok_with_warnings warnings=2/);
+			assert.match(result.content[0].text, /Reference `foo'/);
+			assert.match(result.content[0].text, /log=.*\.log/);
+			assert.equal(details.compile_status, "ok_with_warnings");
+			assert.equal(details.warning_count, 2);
+			assert.equal(details.warnings?.some((warning) => /Overfull/.test(warning.message)), true);
+			assert.match(details.log ?? "", /snippet\.log$/);
+		});
+	} finally {
 		await runSessionShutdown(context);
 		process.env.PATH = originalPath;
 		rmSync(root, { recursive: true, force: true });

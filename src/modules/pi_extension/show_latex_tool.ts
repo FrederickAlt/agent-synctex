@@ -73,9 +73,23 @@ const showLatexPreviewPipeline = createShowLatexPreviewPipeline({
 			signal,
 			HOST_SERVICE_COMPILE_REQUEST_TIMEOUT_MS,
 		);
+		const status = compileResult.compile_status ?? "ok";
+		const warningCount = compileResult.warning_count ? ` warnings=${compileResult.warning_count}` : "";
+		const warningSummary = compileResult.warnings?.length
+			? `\nWarnings:\n${compileResult.warnings.slice(0, 5).map((warning) => `- ${warning.message}`).join("\n")}${compileResult.warnings_truncated ? "\n- ... more warnings omitted" : ""}`
+			: "";
+		const pdfId = compileResult.pdf_id === undefined ? "" : ` pdf_id=${compileResult.pdf_id}`;
+		const pdf = compileResult.pdf ? ` pdf=${compileResult.pdf}` : "";
 		return {
-			text: "ok",
+			text: `${status}:${pdfId}${pdf}${warningCount}\nLog: ${compileResult.log}${warningSummary}`,
 			pdfPath: compileResult.pdf,
+			logPath: compileResult.log,
+			compileStatus: compileResult.compile_status,
+			compilerExitCode: compileResult.compiler_exit_code,
+			compilerSignal: compileResult.compiler_signal,
+			warningCount: compileResult.warning_count,
+			warnings: compileResult.warnings,
+			warningsTruncated: compileResult.warnings_truncated,
 			sourcePath: compileResult.source,
 			operationPdfPath: compileResult.operation_pdf,
 			targetPdfId: compileResult.pdf_id,
@@ -194,7 +208,7 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 						/host service request timed out/i.test(errorText)
 						|| /host service managed viewer request timed out/i.test(errorText)
 						|| /viewer backend request timed out/i.test(errorText)
-						|| (errorCode !== undefined && errorCode !== "compile_failed")
+						|| (errorCode !== undefined && !["compile_failed", "failed_no_pdf", "failed_stale_pdf_exists", "compile_timeout", "compile_aborted", "compiler_start_failed"].includes(errorCode))
 					)
 				) {
 					throw latexToolFailure("show-latex", describeShowLatexHostServiceOpenFailure(error), {
@@ -241,6 +255,13 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 						viewer_owned: managedRecord?.viewerOwned,
 						viewer_capabilities: managedRecord?.capabilities,
 						operation_pdf: preview.operationPdfPath ?? previewPdfPath,
+						log: preview.logPath,
+						compile_status: preview.compileStatus,
+						compiler_exit_code: preview.compilerExitCode,
+						compiler_signal: preview.compilerSignal,
+						warning_count: preview.warningCount,
+						warnings: preview.warnings,
+						warnings_truncated: preview.warningsTruncated,
 						inline: false,
 					},
 				};

@@ -3,6 +3,7 @@ import type {
 	HostServiceViewerBackendCapabilities,
 } from "./host_service_viewer_protocol.ts";
 import type { InlinePreviewArtifact } from "./preview/inline_preview.ts";
+import type { LatexCompileStatus, LatexDiagnosticSummary } from "./latex/latex_file_compiler.ts";
 
 export type { HostServiceCallbackTarget, HostServiceViewerBackendCapabilities };
 
@@ -213,6 +214,14 @@ export interface HostServiceCompileResponseDetails {
 	artifact_paths: string[];
 	clean: boolean;
 	cleaned_artifacts: string[];
+	compile_status?: LatexCompileStatus;
+	compiler_exit_code?: number | null;
+	compiler_signal?: string | null;
+	warning_count?: number;
+	warnings?: LatexDiagnosticSummary[];
+	warnings_truncated?: boolean;
+	error_summary?: string;
+	diagnostics?: LatexDiagnosticSummary[];
 	pdf_id?: number;
 	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
@@ -231,6 +240,14 @@ export interface HostServiceCompileSnippetResponseDetails {
 	artifact_paths: string[];
 	clean: boolean;
 	cleaned_artifacts: string[];
+	compile_status?: LatexCompileStatus;
+	compiler_exit_code?: number | null;
+	compiler_signal?: string | null;
+	warning_count?: number;
+	warnings?: LatexDiagnosticSummary[];
+	warnings_truncated?: boolean;
+	error_summary?: string;
+	diagnostics?: LatexDiagnosticSummary[];
 	operation_pdf?: string;
 	operation_artifact_paths?: string[];
 	pdf_id?: number;

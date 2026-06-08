@@ -409,24 +409,40 @@ function parseClosePdfRequest(args: Record<string, unknown>): HostServiceCloseRe
 	};
 }
 
+function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }): string {
+	if (typeof details.warning_count !== "number" || details.warning_count <= 0 || !Array.isArray(details.warnings)) return "";
+	const lines = details.warnings
+		.slice(0, 5)
+		.map((warning) => isRecord(warning) && typeof warning.message === "string" ? `- ${warning.message}` : "")
+		.filter((line) => line.length > 0);
+	if (!lines.length) return "";
+	return `\nWarnings:\n${lines.join("\n")}${details.warnings_truncated === true ? "\n- ... more warnings omitted" : ""}`;
+}
+
 function parseToolResult(
 	response: HostServiceCompileResponseEnvelope | HostServiceCompileSnippetResponseEnvelope,
 	successText: string,
 ): McpToolResult {
 	const details = response.status_details;
 	if (response.status === "ok") {
+		const status = details.compile_status ?? (successText.replace(/:$/, "") || "ok");
 		const pdfId = details.pdf_id === undefined ? "" : ` pdf_id=${details.pdf_id}`;
 		const pdf = details.pdf ? ` pdf=${details.pdf}` : "";
 		const compileOnlyPdf = !pdfId && details.pdf ? ` ${details.pdf}` : "";
+		const warningCount = details.warning_count ? ` warnings=${details.warning_count}` : "";
+		const exitCode = details.compile_status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
+		const log = details.log ? `\nLog: ${details.log}` : "";
 		return {
-			content: [{ type: "text", text: `${successText}${pdfId}${pdfId ? pdf : compileOnlyPdf}`.trim() }],
+			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${exitCode}${warningCount}${log}${formatDiagnosticSummary(details)}`.trim() }],
 			details,
 		};
 	}
 	const errorCode = typeof details.error_code === "string" ? ` (code=${details.error_code})` : "";
+	const summary = typeof details.error_summary === "string" && details.error_summary ? `\n${details.error_summary}` : "";
+	const log = details.log ? `\nLog: ${details.log}` : "";
 	return {
 		isError: true,
-		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}` }],
+		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}` }],
 		details,
 	};
 }

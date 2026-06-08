@@ -1460,6 +1460,14 @@ function isStringRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
+function isValidLatexDiagnostic(value: unknown): boolean {
+	if (!isStringRecord(value)) return false;
+	if (typeof value.kind !== "string" || typeof value.message !== "string") return false;
+	if (value.line !== undefined && (typeof value.line !== "number" || !Number.isInteger(value.line))) return false;
+	if (value.source !== undefined && typeof value.source !== "string") return false;
+	return true;
+}
+
 function parseRequest(raw: string): unknown {
 	try {
 		return JSON.parse(raw);
@@ -2136,6 +2144,30 @@ function isValidCompileResponseLike(
 		return false;
 	}
 	if (!Array.isArray(details.artifact_paths) || !details.artifact_paths.every((entry) => typeof entry === "string")) {
+		return false;
+	}
+	if (details.compile_status !== undefined && !["ok", "ok_with_warnings", "nonzero_but_pdf_updated"].includes(String(details.compile_status))) {
+		return false;
+	}
+	if (details.compiler_exit_code !== undefined && details.compiler_exit_code !== null && typeof details.compiler_exit_code !== "number") {
+		return false;
+	}
+	if (details.compiler_signal !== undefined && details.compiler_signal !== null && typeof details.compiler_signal !== "string") {
+		return false;
+	}
+	if (details.warning_count !== undefined && (typeof details.warning_count !== "number" || !Number.isInteger(details.warning_count) || details.warning_count < 0)) {
+		return false;
+	}
+	if (details.warnings !== undefined && (!Array.isArray(details.warnings) || !details.warnings.every(isValidLatexDiagnostic))) {
+		return false;
+	}
+	if (details.warnings_truncated !== undefined && typeof details.warnings_truncated !== "boolean") {
+		return false;
+	}
+	if (details.error_summary !== undefined && typeof details.error_summary !== "string") {
+		return false;
+	}
+	if (details.diagnostics !== undefined && (!Array.isArray(details.diagnostics) || !details.diagnostics.every(isValidLatexDiagnostic))) {
 		return false;
 	}
 	if (details.pdf_id !== undefined && (typeof details.pdf_id !== "number" || !Number.isInteger(details.pdf_id) || details.pdf_id <= 0)) {
