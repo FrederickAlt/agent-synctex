@@ -4,8 +4,9 @@ import type {
 } from "./host_service_viewer_protocol.ts";
 import type { InlinePreviewArtifact } from "./preview/inline_preview.ts";
 import type { LatexCompileStatus, LatexDiagnosticSummary } from "./latex/latex_file_compiler.ts";
+import type { HostServicePendingNotification } from "./host_service_session_leases.ts";
 
-export type { HostServiceCallbackTarget, HostServiceViewerBackendCapabilities };
+export type { HostServiceCallbackTarget, HostServiceViewerBackendCapabilities, HostServicePendingNotification };
 
 
 export interface HostServiceWorkspaceContext {
@@ -18,6 +19,22 @@ export interface HostServiceStatusRequest {
 	protocol_version: number;
 	request_id: string;
 	operation: "status";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+}
+
+export interface HostServiceSessionHeartbeatRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "session_heartbeat";
+	created_at_ns: number;
+	workspace_context: HostServiceWorkspaceContext;
+}
+
+export interface HostServiceGetPendingNotificationsRequest {
+	protocol_version: number;
+	request_id: string;
+	operation: "get_pending_notifications";
 	created_at_ns: number;
 	workspace_context: HostServiceWorkspaceContext;
 }
@@ -160,6 +177,8 @@ export interface HostServiceJumpRequest {
 
 export type HostServiceRequest =
 	| HostServiceStatusRequest
+	| HostServiceSessionHeartbeatRequest
+	| HostServiceGetPendingNotificationsRequest
 	| HostServiceCompileRequest
 	| HostServiceCompileSnippetRequest
 	| HostServiceRasterizeRequest
@@ -172,6 +191,8 @@ export type HostServiceRequest =
 
 export type HostServiceOperation =
 	| "status"
+	| "session_heartbeat"
+	| "get_pending_notifications"
 	| "compile_latex_file"
 	| "compile_latex_snippet"
 	| "rasterize"
@@ -199,6 +220,47 @@ export interface HostServiceStatusResponseDetails {
 	viewer_backend_name?: string;
 	viewer_backend_available?: boolean;
 	viewer_backend_capabilities?: HostServiceViewerBackendCapabilities;
+	live_session_count?: number;
+}
+
+export interface HostServiceSessionHeartbeatResponseDetails {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	service_name: string;
+	socket_path: string;
+	service_instance_started_ns: number;
+	service_instance_id: string;
+	workspace_context: HostServiceWorkspaceContext;
+	request_id: string;
+	operation: "session_heartbeat";
+	session_id?: string;
+	last_seen_at_ns?: number;
+	lease_expires_at_ns?: number;
+	live_session_count?: number;
+	uptime_ns: number;
+	total_requests: number;
+	error_code?: string;
+}
+
+export interface HostServiceGetPendingNotificationsResponseDetails {
+	protocol_version: number;
+	supported: boolean;
+	service_available: boolean;
+	service_name: string;
+	socket_path: string;
+	service_instance_started_ns: number;
+	service_instance_id: string;
+	workspace_context: HostServiceWorkspaceContext;
+	request_id: string;
+	operation: "get_pending_notifications";
+	session_id?: string;
+	notifications: HostServicePendingNotification[];
+	delivered_count: number;
+	live_session_count?: number;
+	uptime_ns: number;
+	total_requests: number;
+	error_code?: string;
 }
 
 export interface HostServiceCompileResponseDetails {
@@ -385,6 +447,26 @@ export interface HostServiceStatusResponseEnvelope {
 	status_details: HostServiceStatusResponseDetails;
 }
 
+export interface HostServiceSessionHeartbeatResponseEnvelope {
+	protocol_version: number;
+	request_id: string;
+	operation: "session_heartbeat";
+	status: "ok" | "error";
+	generated_at_ns: number;
+	error?: string;
+	status_details: HostServiceSessionHeartbeatResponseDetails;
+}
+
+export interface HostServiceGetPendingNotificationsResponseEnvelope {
+	protocol_version: number;
+	request_id: string;
+	operation: "get_pending_notifications";
+	status: "ok" | "error";
+	generated_at_ns: number;
+	error?: string;
+	status_details: HostServiceGetPendingNotificationsResponseDetails;
+}
+
 export interface HostServiceCompileResponseEnvelope {
 	protocol_version: number;
 	request_id: string;
@@ -478,6 +560,8 @@ export interface HostServiceResolveCallbackTargetResponseEnvelope {
 
 export type HostServiceResponseEnvelope =
 	| HostServiceStatusResponseEnvelope
+	| HostServiceSessionHeartbeatResponseEnvelope
+	| HostServiceGetPendingNotificationsResponseEnvelope
 	| HostServiceCompileResponseEnvelope
 	| HostServiceCompileSnippetResponseEnvelope
 	| HostServiceRasterizeResponseEnvelope
@@ -490,6 +574,8 @@ export type HostServiceResponseEnvelope =
 
 export type HostServiceAnyResponseDetails =
 	| HostServiceStatusResponseDetails
+	| HostServiceSessionHeartbeatResponseDetails
+	| HostServiceGetPendingNotificationsResponseDetails
 	| HostServiceCompileResponseDetails
 	| HostServiceCompileSnippetResponseDetails
 	| HostServiceRasterizeResponseDetails

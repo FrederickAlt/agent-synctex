@@ -7,8 +7,17 @@ import { spawn } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { HOST_SERVICE_TOOL_NAMES, HostServiceMcpFrameReader } from "../../../src/modules/host_service_mcp.ts";
-import { HOST_SERVICE_SOCKET_PATH_ENV_VAR } from "../../../src/modules/host_service.ts";
+import {
+	FakeViewerBackend,
+	HOST_SERVICE_SOCKET_PATH_ENV_VAR,
+	HostServiceClient,
+	HostServiceServer,
+} from "../../../src/modules/host_service.ts";
 import { CodexMcpDaemonRelay } from "../../../src/modules/codex_mcp/codex_mcp_server.ts";
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function encodeFrame(payload: string): string {
 	return `Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n${payload}`;
@@ -422,6 +431,50 @@ test("Relay reads socket path override from TEX_ACTIONS_HOST_SERVICE_SOCKET_PATH
 			process.env[overrideKey] = previousOverride;
 		}
 		await daemon.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Relay heartbeats with injected workspace context while active", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-heartbeat-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const previousMcpTmpdir = process.env.MCP_TMPDIR;
+	const previousAgentId = process.env.TEX_ACTIONS_AGENT_ID;
+	process.env.MCP_TMPDIR = join(baseDir, "runtime");
+	process.env.TEX_ACTIONS_AGENT_ID = "codex-heartbeat-agent";
+	const server = new HostServiceServer({
+		socketPath,
+		serviceName: "codex-heartbeat-test",
+		viewerBackend: new FakeViewerBackend(),
+	});
+	await server.start();
+	const relay = await startRelayFixture(socketPath);
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		let liveSessionCount = 0;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const status = await client.requestStatus({ cwd: process.cwd() });
+			liveSessionCount = status.live_session_count ?? 0;
+			if (liveSessionCount > 0) {
+				break;
+			}
+			await sleep(25);
+		}
+		assert.equal(liveSessionCount, 1);
+	} finally {
+		relay.stop();
+		await server.stop();
+		if (previousMcpTmpdir === undefined) {
+			delete process.env.MCP_TMPDIR;
+		} else {
+			process.env.MCP_TMPDIR = previousMcpTmpdir;
+		}
+		if (previousAgentId === undefined) {
+			delete process.env.TEX_ACTIONS_AGENT_ID;
+		} else {
+			process.env.TEX_ACTIONS_AGENT_ID = previousAgentId;
+		}
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });

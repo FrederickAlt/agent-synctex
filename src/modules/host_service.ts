@@ -17,6 +17,7 @@ import {
 	executeRasterizePdfRequest,
 	normalizeWorkspaceContextForRasterize,
 } from "./host_service_rasterization.ts";
+import { HostServiceSessionLeaseService, requireSessionId } from "./host_service_session_leases.ts";
 import { safeInlinePreviewPngPath } from "./preview/inline_preview_metadata.ts";
 import {
 	FakeViewerBackend,
@@ -56,6 +57,12 @@ import type {
 	HostServiceRegisterCallbackTargetResponseDetails,
 	HostServiceRegisterCallbackTargetResponseEnvelope,
 	HostServiceRequest,
+	HostServiceSessionHeartbeatRequest,
+	HostServiceSessionHeartbeatResponseDetails,
+	HostServiceSessionHeartbeatResponseEnvelope,
+	HostServiceGetPendingNotificationsRequest,
+	HostServiceGetPendingNotificationsResponseDetails,
+	HostServiceGetPendingNotificationsResponseEnvelope,
 	HostServiceResolveCallbackTargetRequest,
 	HostServiceResolveCallbackTargetResponseDetails,
 	HostServiceResolveCallbackTargetResponseEnvelope,
@@ -83,7 +90,7 @@ import { createLogger } from "./logging.ts";
 const clientLogger = createLogger("host-service.client");
 const serverLogger = createLogger("host-service.server");
 
-export { FakeViewerBackend, ZathuraViewerBackend };
+export { FakeViewerBackend, HostServiceSessionLeaseService, ZathuraViewerBackend };
 export type {
 	FakeViewerBackendOptions,
 	HostServiceAnyResponseDetails,
@@ -115,6 +122,12 @@ export type {
 	HostServiceRegisterCallbackTargetResponseDetails,
 	HostServiceRegisterCallbackTargetResponseEnvelope,
 	HostServiceRequest,
+	HostServiceSessionHeartbeatRequest,
+	HostServiceSessionHeartbeatResponseDetails,
+	HostServiceSessionHeartbeatResponseEnvelope,
+	HostServiceGetPendingNotificationsRequest,
+	HostServiceGetPendingNotificationsResponseDetails,
+	HostServiceGetPendingNotificationsResponseEnvelope,
 	HostServiceResolveCallbackTargetRequest,
 	HostServiceResolveCallbackTargetResponseDetails,
 	HostServiceResolveCallbackTargetResponseEnvelope,
@@ -150,6 +163,7 @@ export interface HostServiceServerOptions {
 	serviceInstanceId?: string;
 	viewerBackend?: ViewerBackendAdapter;
 	managedViewerRecords?: HostServicePdfIdRegistry;
+	sessionLeases?: HostServiceSessionLeaseService;
 }
 
 const PROTOCOL_VERSION = 1;
@@ -388,6 +402,62 @@ export class HostServiceClient {
 		);
 		if (!isValidStatusResponse(response, requestId)) {
 			throw new Error(`Malformed host service status response payload: ${JSON.stringify(response)}`);
+		}
+		if (response.status === "error") {
+			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
+			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+		}
+		return response.status_details;
+	}
+
+	async requestSessionHeartbeat(
+		workspaceContext: HostServiceWorkspaceContext,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceSessionHeartbeatResponseDetails> {
+		const context = normalizeWorkspaceContext(workspaceContext);
+		const requestId = this.makeRequestId();
+		const response = await this.request(
+			{
+				protocol_version: PROTOCOL_VERSION,
+				request_id: requestId,
+				operation: "session_heartbeat",
+				created_at_ns: Date.now() * 1_000_000,
+				workspace_context: context,
+			},
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (!isValidSessionHeartbeatResponse(response, requestId)) {
+			throw new Error(`Malformed host service session_heartbeat response payload: ${JSON.stringify(response)}`);
+		}
+		if (response.status === "error") {
+			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
+			throw new Error(`${response.error || "host service returned error status"}${suffix}`);
+		}
+		return response.status_details;
+	}
+
+	async requestPendingNotifications(
+		workspaceContext: HostServiceWorkspaceContext,
+		signal?: AbortSignal,
+		requestTimeoutMs?: number,
+	): Promise<HostServiceGetPendingNotificationsResponseDetails> {
+		const context = normalizeWorkspaceContext(workspaceContext);
+		const requestId = this.makeRequestId();
+		const response = await this.request(
+			{
+				protocol_version: PROTOCOL_VERSION,
+				request_id: requestId,
+				operation: "get_pending_notifications",
+				created_at_ns: Date.now() * 1_000_000,
+				workspace_context: context,
+			},
+			signal,
+			requestTimeoutMs ?? this.requestTimeoutMs,
+		);
+		if (!isValidGetPendingNotificationsResponse(response, requestId)) {
+			throw new Error(`Malformed host service get_pending_notifications response payload: ${JSON.stringify(response)}`);
 		}
 		if (response.status === "error") {
 			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
@@ -917,6 +987,7 @@ export class HostServiceServer {
 	private readonly managedViewerRecords: HostServicePdfIdRegistry;
 	private readonly managedViewerService: HostServiceManagedViewerService;
 	private readonly compileService: HostServiceCompileService;
+	private readonly sessionLeases: HostServiceSessionLeaseService;
 	private server: Server | null = null;
 	private startedAtNs = 0;
 	private serviceInstanceId: string;
@@ -941,6 +1012,7 @@ export class HostServiceServer {
 			managedViewerService: this.managedViewerService,
 			resolveManagedOpenCallback: this.resolveManagedOpenCallback.bind(this),
 		});
+		this.sessionLeases = options.sessionLeases ?? new HostServiceSessionLeaseService();
 	}
 
 	async start(): Promise<void> {
@@ -1005,6 +1077,7 @@ export class HostServiceServer {
 		}
 		if (!server) {
 			this.callbackTargets.clear();
+			this.sessionLeases.clear();
 			this.managedViewerRecords.clear();
 			this.removeSocketPath();
 			serverLogger.info("stop.end", { socket_path: this.socketPath, service_name: this.serviceName, server_was_running: false });
@@ -1021,6 +1094,7 @@ export class HostServiceServer {
 			});
 		});
 		this.callbackTargets.clear();
+		this.sessionLeases.clear();
 		this.managedViewerRecords.clear();
 		this.removeSocketPath();
 		serverLogger.info("stop.end", { socket_path: this.socketPath, service_name: this.serviceName });
@@ -1173,6 +1247,7 @@ export class HostServiceServer {
 			});
 			switch (request.operation) {
 				case "status": {
+					this.sessionLeases.pruneExpired();
 					this.totalRequests += 1;
 					const nowNs = Date.now() * 1_000_000;
 					const viewerBackendAvailable = this.viewerBackend.isAvailable();
@@ -1198,8 +1273,21 @@ export class HostServiceServer {
 							viewer_backend_name: this.viewerBackend.name,
 							viewer_backend_available: viewerBackendAvailable,
 							viewer_backend_capabilities: this.viewerBackend.capabilities,
+							live_session_count: this.sessionLeases.liveSessionCount,
 						},
 					};
+					socket.end(`${JSON.stringify(response)}\n`);
+					return;
+				}
+				case "session_heartbeat": {
+					this.totalRequests += 1;
+					const response = this.sessionHeartbeatRequest(request);
+					socket.end(`${JSON.stringify(response)}\n`);
+					return;
+				}
+				case "get_pending_notifications": {
+					this.totalRequests += 1;
+					const response = this.getPendingNotificationsRequest(request);
 					socket.end(`${JSON.stringify(response)}\n`);
 					return;
 				}
@@ -1396,6 +1484,68 @@ export class HostServiceServer {
 		return callbackTarget;
 	}
 
+	private sessionHeartbeatRequest(request: HostServiceSessionHeartbeatRequest): HostServiceSessionHeartbeatResponseEnvelope {
+		const lease = this.sessionLeases.heartbeat(request.workspace_context);
+		const nowNs = Date.now() * 1_000_000;
+		return {
+			protocol_version: this.protocolVersion,
+			request_id: request.request_id,
+			operation: request.operation,
+			status: "ok",
+			generated_at_ns: nowNs,
+			status_details: {
+				...this.commonSessionStatusDetails(request, nowNs),
+				operation: request.operation,
+				session_id: lease.session_id,
+				last_seen_at_ns: lease.last_seen_at_ns,
+				lease_expires_at_ns: lease.expires_at_ns,
+				live_session_count: this.sessionLeases.liveSessionCount,
+			},
+		};
+	}
+
+	private getPendingNotificationsRequest(
+		request: HostServiceGetPendingNotificationsRequest,
+	): HostServiceGetPendingNotificationsResponseEnvelope {
+		const sessionId = requireSessionId(request.workspace_context);
+		const notifications = this.sessionLeases.retrievePendingNotifications(request.workspace_context);
+		const nowNs = Date.now() * 1_000_000;
+		return {
+			protocol_version: this.protocolVersion,
+			request_id: request.request_id,
+			operation: request.operation,
+			status: "ok",
+			generated_at_ns: nowNs,
+			status_details: {
+				...this.commonSessionStatusDetails(request, nowNs),
+				operation: request.operation,
+				session_id: sessionId,
+				notifications,
+				delivered_count: notifications.length,
+				live_session_count: this.sessionLeases.liveSessionCount,
+			},
+		};
+	}
+
+	private commonSessionStatusDetails(
+		request: HostServiceSessionHeartbeatRequest | HostServiceGetPendingNotificationsRequest,
+		nowNs: number,
+	) {
+		return {
+			protocol_version: this.protocolVersion,
+			supported: true,
+			service_available: true,
+			service_name: this.serviceName,
+			socket_path: this.socketPath,
+			service_instance_started_ns: this.startedAtNs,
+			service_instance_id: this.serviceInstanceId,
+			workspace_context: request.workspace_context,
+			request_id: request.request_id,
+			uptime_ns: nowNs - this.startedAtNs,
+			total_requests: this.totalRequests,
+		};
+	}
+
 	private async rasterizePdfRequest(request: HostServiceRasterizeRequest): Promise<HostServiceRasterizeResponseEnvelope> {
 		return executeRasterizePdfRequest(this.protocolVersion, request);
 	}
@@ -1467,6 +1617,14 @@ function normalizeWorkspaceContext(context: HostServiceWorkspaceContext): HostSe
 		cwd: context.cwd,
 		workspace_root: context.workspace_root,
 		session_id: context.session_id,
+	};
+}
+
+function normalizeWorkspaceContextWithSession(context: HostServiceWorkspaceContext): HostServiceWorkspaceContext {
+	const workspaceContext = normalizeWorkspaceContext(context);
+	return {
+		...workspaceContext,
+		session_id: requireSessionId(workspaceContext),
 	};
 }
 
@@ -1549,6 +1707,8 @@ function getOperationFromPayload(payload: unknown): HostServiceOperation {
 		const operation = payload.operation;
 		if (
 			operation === "status"
+			|| operation === "session_heartbeat"
+			|| operation === "get_pending_notifications"
 			|| operation === "compile_latex_file"
 			|| operation === "compile_latex_snippet"
 			|| operation === "rasterize"
@@ -1634,6 +1794,24 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				operation: "status",
 				created_at_ns: value.created_at_ns,
 				workspace_context: value.workspace_context,
+			};
+		}
+		case "session_heartbeat": {
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "session_heartbeat",
+				created_at_ns: value.created_at_ns,
+				workspace_context: normalizeWorkspaceContextWithSession(value.workspace_context),
+			};
+		}
+		case "get_pending_notifications": {
+			return {
+				protocol_version: PROTOCOL_VERSION,
+				request_id: value.request_id,
+				operation: "get_pending_notifications",
+				created_at_ns: value.created_at_ns,
+				workspace_context: normalizeWorkspaceContextWithSession(value.workspace_context),
 			};
 		}
 		case "compile_latex_file": {
@@ -1946,6 +2124,12 @@ function isValidHostServiceResponse(
 	if (value.operation === "status") {
 		return isValidStatusResponse(value, expectedRequestId);
 	}
+	if (value.operation === "session_heartbeat") {
+		return isValidSessionHeartbeatResponse(value, expectedRequestId);
+	}
+	if (value.operation === "get_pending_notifications") {
+		return isValidGetPendingNotificationsResponse(value, expectedRequestId);
+	}
 	if (value.operation === "compile_latex_file") {
 		return isValidCompileResponse(value, expectedRequestId);
 	}
@@ -2006,6 +2190,59 @@ function isValidStatusResponse(value: unknown, expectedRequestId: string): value
 	}
 	if (value.operation !== "status") {
 		return false;
+	}
+	return true;
+}
+
+function isValidSessionHeartbeatResponse(value: unknown, expectedRequestId: string): value is HostServiceSessionHeartbeatResponseEnvelope {
+	if (!isValidCommonHostServiceResponse(value, expectedRequestId, "session_heartbeat")) {
+		return false;
+	}
+	const details = value.status_details;
+	if (details.operation !== "session_heartbeat") {
+		return false;
+	}
+	if (details.session_id !== undefined && (typeof details.session_id !== "string" || !details.session_id)) {
+		return false;
+	}
+	if (details.last_seen_at_ns !== undefined && typeof details.last_seen_at_ns !== "number") {
+		return false;
+	}
+	if (details.lease_expires_at_ns !== undefined && typeof details.lease_expires_at_ns !== "number") {
+		return false;
+	}
+	if (value.status === "ok") {
+		return typeof details.session_id === "string"
+			&& typeof details.last_seen_at_ns === "number"
+			&& typeof details.lease_expires_at_ns === "number";
+	}
+	return true;
+}
+
+function isValidGetPendingNotificationsResponse(
+	value: unknown,
+	expectedRequestId: string,
+): value is HostServiceGetPendingNotificationsResponseEnvelope {
+	if (!isValidCommonHostServiceResponse(value, expectedRequestId, "get_pending_notifications")) {
+		return false;
+	}
+	const details = value.status_details;
+	if (details.operation !== "get_pending_notifications") {
+		return false;
+	}
+	if (details.session_id !== undefined && (typeof details.session_id !== "string" || !details.session_id)) {
+		return false;
+	}
+	if (details.notifications !== undefined && !Array.isArray(details.notifications)) {
+		return false;
+	}
+	if (details.delivered_count !== undefined && (typeof details.delivered_count !== "number" || !Number.isInteger(details.delivered_count) || details.delivered_count < 0)) {
+		return false;
+	}
+	if (value.status === "ok") {
+		return typeof details.session_id === "string"
+			&& Array.isArray(details.notifications)
+			&& typeof details.delivered_count === "number";
 	}
 	return true;
 }
@@ -2279,6 +2516,9 @@ function isValidCommonHostServiceResponseDetails(
 	if (details.error_code !== undefined && typeof details.error_code !== "string") {
 		return false;
 	}
+	if (details.live_session_count !== undefined && (typeof details.live_session_count !== "number" || !Number.isInteger(details.live_session_count) || details.live_session_count < 0)) {
+		return false;
+	}
 	return true;
 }
 
@@ -2476,7 +2716,7 @@ function isValidCommonHostServiceResponse(
 	expectedRequestId: string,
 	operation: Extract<
 		HostServiceOperation,
-		"status" | "compile_latex_file" | "compile_latex_snippet" | "register_callback_target" | "unregister_callback_target" | "resolve_callback_target"
+		"status" | "session_heartbeat" | "get_pending_notifications" | "compile_latex_file" | "compile_latex_snippet" | "register_callback_target" | "unregister_callback_target" | "resolve_callback_target"
 	>,
 ): response is HostServiceResponseEnvelope {
 	if (!isStringRecord(response)) {

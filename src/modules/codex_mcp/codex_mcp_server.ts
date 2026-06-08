@@ -12,7 +12,7 @@ import {
 	mcpFramedResponse,
 } from "../host_service_mcp.ts";
 import { resolveAgentWorkspaceContext } from "../agent_runtime_context.ts";
-import { resolveHostServiceSocketPath } from "../host_service.ts";
+import { HostServiceClient, resolveHostServiceSocketPath } from "../host_service.ts";
 import { initializeLatexPreambleFile } from "../pi_extension/latex_preamble_manager.ts";
 
 export interface CodexMcpDaemonRelayOptions {
@@ -22,10 +22,12 @@ export interface CodexMcpDaemonRelayOptions {
 	stderr?: Writable;
 	requestTimeoutMs?: number;
 	maxPayloadBytes?: number;
+	heartbeatIntervalMs?: number;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_FRAME_SIZE_BYTES = 16_384;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 type ClientFrameProtocol = HostServiceDaemonFrame["protocol"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -192,7 +194,9 @@ export class CodexMcpDaemonRelay {
 	private readonly stderr: Writable;
 	private readonly requestTimeoutMs: number;
 	private readonly maxPayloadBytes: number;
+	private readonly heartbeatIntervalMs: number;
 	private readonly frameReader: HostServiceMcpFrameReader;
+	private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	private task: Promise<void> = Promise.resolve();
 	private closed = false;
 
@@ -203,6 +207,7 @@ export class CodexMcpDaemonRelay {
 		this.stderr = options.stderr ?? processStderr;
 		this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 		this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_FRAME_SIZE_BYTES;
+		this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
 		this.frameReader = new HostServiceMcpFrameReader({ maxPayloadBytes: this.maxPayloadBytes });
 	}
 
@@ -215,6 +220,7 @@ export class CodexMcpDaemonRelay {
 		}
 		this.stdin.on("data", this.handleData);
 		this.stdin.once("close", this.close);
+		this.startHeartbeat();
 	}
 
 	readonly close = (): void => {
@@ -224,7 +230,28 @@ export class CodexMcpDaemonRelay {
 		this.closed = true;
 		this.stdin.off("data", this.handleData);
 		this.stdin.off("close", this.close);
+		if (this.heartbeatTimer) {
+			clearInterval(this.heartbeatTimer);
+			this.heartbeatTimer = undefined;
+		}
 	};
+
+	private startHeartbeat(): void {
+		if (this.heartbeatIntervalMs <= 0 || this.heartbeatTimer) {
+			return;
+		}
+		void this.sendHeartbeat();
+		this.heartbeatTimer = setInterval(() => {
+			void this.sendHeartbeat();
+		}, this.heartbeatIntervalMs);
+		this.heartbeatTimer.unref?.();
+	}
+
+	private async sendHeartbeat(): Promise<void> {
+		const workspaceContext = resolveAgentWorkspaceContext();
+		const client = new HostServiceClient({ socketPath: this.socketPath, requestTimeoutMs: this.requestTimeoutMs });
+		await client.requestSessionHeartbeat(workspaceContext).catch(() => undefined);
+	}
 
 	private readonly handleData = (chunk: string | Buffer): void => {
 		if (this.closed) {

@@ -355,6 +355,8 @@ test("session startup registers host service callback target and shutdown unregi
 		const expectedTargetId = `pi:${contextSessionKey(context as never)}`;
 		const workspaceContext = resolveAgentWorkspaceContext(context as never);
 		await withHostServiceClient(socketPath, async (client) => {
+			const status = await client.requestStatus(workspaceContext);
+			assert.equal(status.live_session_count, 1);
 			const resolve = await client.requestResolveCallbackTarget(workspaceContext, expectedTargetId);
 			assert.equal(resolve.callback_available, true);
 			assert.equal(resolve.target?.kind, "pi-synctex-callback-v1");
