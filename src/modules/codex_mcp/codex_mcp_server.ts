@@ -298,7 +298,6 @@ export class CodexMcpDaemonRelay {
 		try {
 			await this.flushPendingSystemInfo(frame.protocol);
 			await this.forwardToDaemon(frame.payload, expectsResponse, frame.protocol);
-			await this.flushPendingSystemInfo(frame.protocol);
 		} catch (error) {
 			if (!expectsResponse) {
 				return;

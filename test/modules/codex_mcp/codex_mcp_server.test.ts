@@ -65,6 +65,20 @@ type StreamDataSource = {
 	off: (event: "data", handler: (chunk: string | Buffer) => void) => void;
 };
 
+function collectRawForDuration(stream: StreamDataSource, durationMs = 100): Promise<string> {
+	return new Promise((resolve) => {
+		let raw = "";
+		const onData = (chunk: string | Buffer) => {
+			raw += String(chunk);
+		};
+		stream.on("data", onData);
+		setTimeout(() => {
+			stream.off("data", onData);
+			resolve(raw);
+		}, durationMs).unref?.();
+	});
+}
+
 function collectFrames(stream: StreamDataSource, expectedFrames: number, timeoutMs = 1_000): Promise<string> {
 	return new Promise((resolve, reject) => {
 		let raw = "";
@@ -522,6 +536,102 @@ test("Codex relay surfaces pending continuous compile notifications at request b
 	} finally {
 		relay.stop();
 		await server.stop();
+		if (previousMcpTmpdir === undefined) {
+			delete process.env.MCP_TMPDIR;
+		} else {
+			process.env.MCP_TMPDIR = previousMcpTmpdir;
+		}
+		if (previousAgentId === undefined) {
+			delete process.env.TEX_ACTIONS_AGENT_ID;
+		} else {
+			process.env.TEX_ACTIONS_AGENT_ID = previousAgentId;
+		}
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Codex relay defers notifications created by a request until the next inbound boundary", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-deferred-system-info-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const previousMcpTmpdir = process.env.MCP_TMPDIR;
+	const previousAgentId = process.env.TEX_ACTIONS_AGENT_ID;
+	process.env.MCP_TMPDIR = join(baseDir, "runtime");
+	process.env.TEX_ACTIONS_AGENT_ID = "codex-deferred-agent";
+	let pending: Array<{ id: string; created_at_ns: number; root_source: string; message: string }> = [];
+	const server = createServer((connection) => {
+		let raw = "";
+		connection.setEncoding("utf8");
+		connection.on("data", (chunk) => {
+			raw += chunk;
+			if (raw.startsWith("Content-Length:")) {
+				const frames = parseFrames(raw) as Array<{ id?: number; method?: string }>;
+				if (frames.length === 0) return;
+				const request = frames[0] ?? {};
+				if (request.method === "tools/call") {
+					pending = [{ id: "deferred", created_at_ns: 1, root_source: join(baseDir, "paper.tex"), message: "[system info] deferred compile failure" }];
+				}
+				connection.end(encodeFrame(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { content: [{ type: "text", text: "ok" }] } })));
+				return;
+			}
+			const newline = raw.indexOf("\n");
+			if (newline < 0) return;
+			const request = JSON.parse(raw.slice(0, newline)) as { request_id?: string; operation?: string; workspace_context?: { session_id?: string } };
+			if (request.operation !== "get_pending_notifications") {
+				connection.end(`${JSON.stringify({ protocol_version: 1, request_id: request.request_id ?? "", operation: request.operation, status: "error", generated_at_ns: 1, error: "unsupported", status_details: { protocol_version: 1, supported: false, service_available: false, service_name: "mixed", socket_path: socketPath, service_instance_started_ns: 1, service_instance_id: "mixed", workspace_context: request.workspace_context ?? { cwd: baseDir }, request_id: request.request_id ?? "", operation: request.operation, uptime_ns: 1, total_requests: 1, error_code: "invalid_request" } })}\n`);
+				return;
+			}
+			const delivered = pending;
+			pending = [];
+			connection.end(`${JSON.stringify({
+				protocol_version: 1,
+				request_id: request.request_id ?? "",
+				operation: "get_pending_notifications",
+				status: "ok",
+				generated_at_ns: 1,
+				status_details: {
+					protocol_version: 1,
+					supported: true,
+					service_available: true,
+					service_name: "mixed",
+					socket_path: socketPath,
+					service_instance_started_ns: 1,
+					service_instance_id: "mixed",
+					workspace_context: request.workspace_context ?? { cwd: baseDir, session_id: "codex-deferred-agent" },
+					request_id: request.request_id ?? "",
+					operation: "get_pending_notifications",
+					session_id: request.workspace_context?.session_id ?? "codex-deferred-agent",
+					notifications: delivered,
+					delivered_count: delivered.length,
+					uptime_ns: 1,
+					total_requests: 1,
+				},
+			})}\n`);
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(socketPath, () => resolve());
+	});
+	const relay = await startRelayFixture(socketPath, { heartbeatIntervalMs: 0 });
+
+	try {
+		const firstRawPromise = collectRawForDuration(relay.relayOutput, 150);
+		relay.relayInput.write(encodeFrame(JSON.stringify({ jsonrpc: "2.0", id: 80, method: "tools/call", params: { name: "compile_latex_file", arguments: {} } })));
+		const firstFrames = parseFrames(await firstRawPromise) as Array<{ method?: string; id?: number }>;
+		assert.equal(firstFrames.length, 1);
+		assert.equal(firstFrames[0]?.id, 80);
+		assert.notEqual(firstFrames[0]?.method, "notifications/message");
+
+		const secondRawPromise = collectRawForDuration(relay.relayOutput, 150);
+		relay.relayInput.write(encodeFrame(JSON.stringify({ jsonrpc: "2.0", id: 81, method: "tools/call", params: { name: "compile_latex_file", arguments: {} } })));
+		const secondFrames = parseFrames(await secondRawPromise) as Array<{ method?: string; id?: number; params?: { data?: string } }>;
+		assert.equal(secondFrames.length, 2);
+		assert.equal(secondFrames[0]?.method, "notifications/message");
+		assert.match(secondFrames[0]?.params?.data ?? "", /\[system info\] deferred compile failure/);
+		assert.equal(secondFrames[1]?.id, 81);
+	} finally {
+		relay.stop();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
 		if (previousMcpTmpdir === undefined) {
 			delete process.env.MCP_TMPDIR;
 		} else {

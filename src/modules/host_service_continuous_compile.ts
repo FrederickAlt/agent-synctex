@@ -346,16 +346,17 @@ export class HostServiceContinuousCompileManager {
 		if (latestPdfSnapshot !== undefined && !samePdfSnapshot(record.lastPdfSnapshot, latestPdfSnapshot)) {
 			record.lastPdfSnapshot = latestPdfSnapshot;
 			record.lastFailureFingerprint = undefined;
+			record.recentOutput = "";
 			sink.clearPendingNotificationsForRoot(record.rootSource);
 			return;
 		}
 
+		if (!looksLikeCompileFailure(record.recentOutput)) {
+			return;
+		}
 		const logPath = logPathForRoot(record.rootSource);
 		const logTail = readTail(logPath);
 		const combinedOutput = [logTail, record.recentOutput].filter((entry) => entry.trim()).join("\n");
-		if (!looksLikeCompileFailure(combinedOutput)) {
-			return;
-		}
 		const diagnosticSource = logTail.trim() ? logTail : combinedOutput;
 		const diagnostics = extractLatexFatalDiagnostics(diagnosticSource).slice(0, MAX_NOTIFICATION_DIAGNOSTICS);
 		const errorSummary = summarizeFailure(diagnostics, diagnosticSource);

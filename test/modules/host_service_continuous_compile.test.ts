@@ -296,6 +296,9 @@ test("successful background PDF update clears pending continuous compile failure
 		writeFileSync(pdf, "%PDF-1.7\nupdated\n");
 		fixture.processes[0]?.stdout.write("Latexmk: All targets are up-to-date\n");
 		assert.deepEqual(leases.retrievePendingNotifications({ cwd: baseDir, session_id: "session-A" }), []);
+
+		fixture.processes[0]?.stdout.write("Latexmk: Nothing to do for 'paper.tex'\n");
+		assert.deepEqual(leases.retrievePendingNotifications({ cwd: baseDir, session_id: "session-A" }), []);
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
