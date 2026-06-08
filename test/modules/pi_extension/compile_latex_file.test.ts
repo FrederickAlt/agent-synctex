@@ -602,6 +602,29 @@ test("compile_latex_file requests compilation with extended timeout", async () =
 	}
 });
 
+test("Pi tool descriptions document continuous lifecycle boundaries", async () => {
+	const { compileTool, closePdfTool } = await captureTools();
+	const closeTool = closePdfTool as unknown as { description?: string; promptGuidelines?: string[] };
+	const closeText = [closeTool.description, ...(closeTool.promptGuidelines ?? [])].join("\n");
+	assert.match(closeText, /does not stop continuous compilation/);
+	assert.match(closeText, /continuous=false/);
+
+	const tool = compileTool as unknown as {
+		description?: string;
+		promptGuidelines?: string[];
+		parameters?: { properties?: { continuous?: { schema?: { options?: { description?: string } } } } };
+	};
+	const text = [tool.description, ...(tool.promptGuidelines ?? []), tool.parameters?.properties?.continuous?.schema?.options?.description].join("\n");
+	assert.match(text, /continuous=true/);
+	assert.match(text, /continuous=false/);
+	assert.match(text, /omit continuous/);
+	assert.match(text, /close_pdf does not stop continuous compilation/);
+	assert.match(text, /latexmk/);
+	assert.match(text, /multi-file dependency tracking/);
+	assert.match(text, /heartbeat/);
+	assert.match(text, /\[system info\]/);
+});
+
 test("compile_latex_file passes continuous flag through and renders continuous metadata", async () => {
 	const { root, sourcePath } = withTemporaryProject();
 	const tool = await captureCompileTool();

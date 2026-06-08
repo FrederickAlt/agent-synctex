@@ -249,6 +249,20 @@ viewer state changes, so the tool remains useful as a compile/check operation. W
 the tool sends a host-service open request for the PDF after a successful compile and returns both `pdf` and `pdf_id` in its
 details. If compile succeeds but open fails, re-check service status/logs for `open`/`jump`-style viewer failures.
 
+`compile_latex_file` also accepts an optional tri-state `continuous` flag:
+
+- `continuous=true` performs the immediate compile, then subscribes the current `workspace_context.session_id` to one shared Host Service `latexmk -pvc` process for the normalized root file.
+- `continuous=false` performs the immediate compile, then removes only the current session's subscription. If it was the last subscriber, the Host Service stops the background compiler.
+- Omitting `continuous` preserves ordinary one-shot behavior and does not start, stop, or refresh continuous compilation state.
+
+Continuous mode requires `latexmk`; direct one-shot compiles with `lualatex`, `pdflatex`, or `xelatex` do not. If `continuous=true` reports that `latexmk` is unavailable, install MacTeX or TeX Live and ensure `latexmk` is on `PATH`; BasicTeX users may need to install `latexmk` separately (for example with `tlmgr`) and restart the Host Service so it sees the updated `PATH`.
+
+Continuous compilation uses `latexmk -pvc -view=none` with recorder/dependency-friendly behavior, SyncTeX enabled, and the same no-shell-escape posture as one-shot compiles. The Host Service owns viewer lifecycle, so `open_pdf` controls whether a PDF viewer is opened and `close_pdf` only closes a tracked viewer; `close_pdf` does not stop continuous compilation. Use `continuous=false`, heartbeat expiry, or Host Service shutdown to stop the background compiler.
+
+Subscriptions are session-scoped and kept alive by automatic session heartbeats. If a session heartbeat expires, the Host Service removes that session from all continuous compile subscriptions and stops compilers with no remaining live subscribers. Background failures are stored as pending `[system info]` notifications for subscribed sessions; a later successful rebuild clears stale failures before delivery, and retrieval at agent boundaries clears delivered notifications.
+
+For multi-file projects, compile the root document. The Host Service intentionally does not implement recursive project watching; `latexmk` handles LaTeX-aware dependency tracking for `\input`, `\include`, graphics, bibliography files, and other dependencies it discovers.
+
 Both `show_latex` and `compile_latex_file` report only a short error on failure and write diagnostic
 details to `${XDG_RUNTIME_DIR}/tex-actions/*.log`.
 

@@ -191,6 +191,48 @@ test("continuous compile manager enforces singleton processes and subscriber lif
 	assert.equal(fixture.processes[0]?.killed, true);
 });
 
+test("continuous latexmk invocation uses preview-continuous, no-viewer, recorder, SyncTeX, and safe engine flags", () => {
+	const expectedEngineArgs: Record<string, string[]> = {
+		lualatex: ["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"],
+		latexmk: ["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"],
+		pdflatex: ["-pdf", "-pdflatex=pdflatex -no-shell-escape %O %S"],
+		xelatex: ["-pdfxe", "-xelatex=xelatex -no-shell-escape %O %S"],
+	};
+
+	for (const [compiler, engineArgs] of Object.entries(expectedEngineArgs)) {
+		const fixture = makeFakeContinuousManager();
+		const root = `/tmp/project/${compiler}.tex`;
+		fixture.manager.ensureSubscription(root, `session-${compiler}`, compiler);
+		assert.equal(fixture.spawns.length, 1);
+		const spawn = fixture.spawns[0];
+		assert.equal(spawn?.command, "latexmk");
+		assert.equal(spawn?.options.cwd, "/tmp/project");
+		assert.deepEqual(spawn?.args, [
+			"-pvc",
+			"-view=none",
+			"-recorder",
+			"-synctex=1",
+			"-interaction=nonstopmode",
+			"-halt-on-error",
+			"-file-line-error",
+			...engineArgs,
+			`${compiler}.tex`,
+		]);
+		assert.equal(spawn?.args.some((arg) => /(?:^|\s)-shell-escape(?:\s|$)/.test(arg)), false);
+	}
+});
+
+test("missing latexmk guidance is actionable for MacTeX, TeX Live, and BasicTeX users", () => {
+	const fixture = makeFakeContinuousManager({ commandExists: false });
+	const details = fixture.manager.ensureSubscription("/tmp/project/main.tex", "session-A", "lualatex");
+	assert.equal(details.status, "unavailable");
+	assert.equal(details.error_code, "continuous_compiler_unavailable");
+	assert.match(details.error ?? "", /MacTeX/);
+	assert.match(details.error ?? "", /TeX Live/);
+	assert.match(details.error ?? "", /BasicTeX/);
+	assert.match(details.error ?? "", /PATH/);
+});
+
 test("background continuous compile failure queues session-scoped system-info notifications and delivery clears them", () => {
 	const baseDir = temporaryDir("continuous-failure-notify-");
 	try {

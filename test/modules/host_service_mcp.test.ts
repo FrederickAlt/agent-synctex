@@ -350,16 +350,18 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.deepEqual(pingResponse.result, {});
 
 		const toolsListPayload = JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" });
-		const toolsListResponse = (await sendFramedRequest(socketPath, toolsListPayload)) as { jsonrpc: "2.0"; id: 3; result: { tools: Array<{ name: string; inputSchema: { properties: Record<string, { type?: string }> } }> } };
+		const toolsListResponse = (await sendFramedRequest(socketPath, toolsListPayload)) as { jsonrpc: "2.0"; id: 3; result: { tools: Array<{ name: string; description?: string; inputSchema: { properties: Record<string, { type?: string; description?: string }> } }> } };
 		const names = toolsListResponse.result.tools.map((tool) => tool.name);
 		assert.deepEqual(names, HOST_TOOL_NAMES);
 
 		const byName = new Map(toolsListResponse.result.tools.map((tool) => [tool.name, tool]));
 		const showLatexTool = byName.get("show_latex");
 		const compileFileTool = byName.get("compile_latex_file");
+		const closePdfTool = byName.get("close_pdf");
 		const setPreambleTool = byName.get("set_latex_preamble");
 		assert.ok(showLatexTool);
 		assert.ok(compileFileTool);
+		assert.ok(closePdfTool);
 		assert.ok(setPreambleTool);
 		assert.equal(typeof showLatexTool.inputSchema.properties.workspace_context, "object");
 		assert.equal(typeof compileFileTool.inputSchema.properties.workspace_context, "object");
@@ -368,7 +370,15 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.ok(compileFileTool.inputSchema.properties.callback);
 		assert.ok(compileFileTool.inputSchema.properties.reuse_existing);
 		assert.ok(compileFileTool.inputSchema.properties.require_persistent_viewer);
-		assert.deepEqual(compileFileTool.inputSchema.properties.continuous, { type: "boolean" });
+		assert.equal(compileFileTool.inputSchema.properties.continuous?.type, "boolean");
+		assert.match(compileFileTool.description ?? "", /continuous=true/);
+		assert.match(compileFileTool.description ?? "", /continuous=false/);
+		assert.match(compileFileTool.description ?? "", /omitting continuous/);
+		assert.match(compileFileTool.description ?? "", /close_pdf does not stop continuous compilation/);
+		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /latexmk -pvc/);
+		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /no latexmk-owned viewer/);
+		assert.match(closePdfTool.description ?? "", /does not stop continuous compilation/);
+		assert.match(closePdfTool.description ?? "", /continuous=false/);
 		assert.deepEqual((showLatexTool.inputSchema.properties as { callback?: { required?: string[] } }).callback?.required, ["kind", "transport", "socket_path", "token"]);
 		assert.equal(showLatexTool.inputSchema.properties.fixed_preview_pdf_path, undefined);
 		assert.ok(showLatexTool.inputSchema.properties.fixed_preview);

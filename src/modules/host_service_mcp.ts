@@ -661,7 +661,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "compile_latex_file",
-			description: "Compile a LaTeX source file and optionally register a host-service PDF.",
+			description: "Compile a LaTeX source file and optionally register a host-service PDF. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc background recompilation; set continuous=false to compile once and unsubscribe this session; omitting continuous leaves existing continuous state unchanged. Use continuous=false, not close_pdf, to stop continuous compilation because close_pdf does not stop continuous compilation.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -669,7 +669,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 					compiler: { type: "string" },
 					clean: { type: "boolean" },
 					open_pdf: { type: "boolean" },
-					continuous: { type: "boolean" },
+					continuous: { type: "boolean", description: "When true, immediately compile then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file. latexmk runs with preview-continuous behavior, recorder/SyncTeX-friendly flags, no shell escape, and no latexmk-owned viewer (-view=none). When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit to leave continuous compilation unchanged." },
 					callback_target_id: { type: "string", minLength: 1 },
 					callback: {
 						type: "object",
@@ -733,7 +733,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "close_pdf",
-			description: "Close a tracked PDF by id.",
+			description: "Close a tracked PDF by id. This only affects viewer lifecycle; it does not stop continuous compilation. Use compile_latex_file with continuous=false for the root source to stop a continuous subscription.",
 			inputSchema: {
 				type: "object",
 				properties: {

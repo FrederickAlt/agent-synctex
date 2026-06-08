@@ -127,11 +127,12 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 	pi.registerTool({
 		name: "close_pdf",
 		label: "Close PDF",
-		description: "Request the host service to close a daemon-managed PDF by pdf_id. Service-managed windows are closed through private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The active PDF ID is then removed from the daemon registry when close succeeds.",
+		description: "Request the host service to close a daemon-managed PDF by pdf_id. Service-managed windows are closed through private handle metadata. Unowned/reused handles are acknowledged as not closed to avoid killing user-owned processes. The active PDF ID is then removed from the daemon registry when close succeeds. close_pdf only affects viewer lifecycle; it does not stop continuous compilation.",
 		promptSnippet: "Close a tracked PDF via host service",
 		promptGuidelines: [
 			"Use close_pdf when the user asks to close a PDF previously opened and managed by the host service.",
 			"Pass the numeric pdf_id returned by open_pdf or compile_latex_file(..., open_pdf=true).",
+			"Do not use close_pdf to stop continuous compilation; call compile_latex_file with continuous=false for the root source instead.",
 		],
 		parameters: ClosePdfParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

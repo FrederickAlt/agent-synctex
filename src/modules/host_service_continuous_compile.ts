@@ -73,7 +73,7 @@ const MAX_RECENT_OUTPUT_LENGTH = 16_384;
 const MAX_NOTIFICATION_OUTPUT_LENGTH = 4_000;
 const MAX_NOTIFICATION_DIAGNOSTICS = 8;
 const LATEX_ERROR_TAIL_LINES = 20;
-const LATEXMK_MISSING_MESSAGE = "continuous compilation requires latexmk; install MacTeX or TeX Live so the latexmk command is available on PATH";
+const LATEXMK_MISSING_MESSAGE = "continuous compilation requires latexmk. Install MacTeX or TeX Live so the latexmk command is available on PATH; BasicTeX users may need to install latexmk separately (for example with tlmgr) and then restart the Host Service so it sees the updated PATH.";
 
 function defaultCommandExists(command: string): boolean {
 	const result = spawnSync(command, ["-version"], { stdio: "ignore" });
@@ -108,6 +108,7 @@ function latexmkContinuousArgs(rootSource: string, compiler: LatexCompiler | unk
 	return [
 		"-pvc",
 		"-view=none",
+		"-recorder",
 		"-synctex=1",
 		"-interaction=nonstopmode",
 		"-halt-on-error",
