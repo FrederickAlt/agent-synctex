@@ -3250,6 +3250,50 @@ test("zathura backend closes previous owned session on replacement and replaceme
 	}
 });
 
+test("zathura backend reports not_running before forward-searching a dead tracked session", async () => {
+	const baseDir = temporaryDir("host-service-zathura-forward-not-running-");
+	const binDir = join(baseDir, "bin");
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const zathuraPath = join(binDir, "zathura");
+	writeFakeZathuraViewerBinary(zathuraPath);
+	const pdfPath = join(baseDir, "sample.pdf");
+	const sourcePath = join(baseDir, "sample.tex");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	writeFileSync(sourcePath, "alpha\n");
+	const backend = new ZathuraViewerBackend({ executablePath: zathuraPath, nodePath: process.execPath });
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+
+	try {
+		const openResult = await backend.open("open", { pdf_path: pdfPath, callback, reuse_existing: true });
+		assert.equal(openResult.status, "ok");
+		const openDetails = openResult.status_details as { handle?: string; pid?: number };
+		if (typeof openDetails.handle !== "string" || typeof openDetails.pid !== "number") {
+			throw new Error(`open response missing handle or pid: ${JSON.stringify(openDetails)}`);
+		}
+		process.kill(openDetails.pid, "SIGTERM");
+		await waitForProcessExit(openDetails.pid);
+
+		const forwardResult = await backend.forwardSearch("jump", {
+			handle: openDetails.handle,
+			backend: backend.name,
+			source_file: sourcePath,
+			line: 1,
+			synctex_pid: openDetails.pid,
+		});
+		assert.equal(forwardResult.status, "error");
+		assert.equal((forwardResult.status_details as { error_code?: string }).error_code, "not_running");
+		assert.equal((forwardResult.status_details as { reason?: string }).reason, "not_running");
+	} finally {
+		await backend.closeAll();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("zathura backend ignores pre-existing matching viewer process", async () => {
 	const baseDir = temporaryDir("host-service-zathura-preexisting-");
 	const binDir = join(baseDir, "bin");
@@ -4165,15 +4209,56 @@ test("host service jump_pdf rejects invalid line/source inputs", async () => {
 	}
 });
 
-test("host service jump_pdf handles unknown, stale, and closed pdf_ids", async () => {
+test("host service jump_pdf reports missing retained PDF before reopening", async () => {
+	const baseDir = temporaryDir("host-service-jump-missing-retained-pdf-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	const sourcePath = join(baseDir, "sample.tex");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	writeFileSync(sourcePath, "alpha\n");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeForwardSearchTracker() });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		const openResponse = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: "sample.pdf", callback, reuse_existing: true },
+		);
+		if (openResponse.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const pdfId = openResponse.pdf_id;
+		await client.requestClosePdf({ cwd: baseDir }, pdfId);
+		rmSync(pdfPath);
+		await assert.rejects(
+			() => client.requestJumpPdf({ cwd: baseDir }, { pdf_id: pdfId, line: 1 }),
+			/Cannot stat PDF file/,
+		);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("host service jump_pdf reopens known stale and closed pdf_ids while rejecting unknown ids", async () => {
 	const baseDir = temporaryDir("host-service-jump-id-classification-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const pdfPath = join(baseDir, "sample.pdf");
+	const sourcePath = join(baseDir, "sample.tex");
 	writeFileSync(pdfPath, "%PDF-1.4\n");
+	writeFileSync(sourcePath, "alpha\nbeta\n");
 	const registry = new HostServicePdfIdRegistry();
+	const backend = new FakeForwardSearchTracker();
 	const server = new HostServiceServer({
 		socketPath,
-		viewerBackend: new FakeForwardSearchTracker(),
+		viewerBackend: backend,
 		managedViewerRecords: registry,
 	});
 	await server.start();
@@ -4200,24 +4285,29 @@ test("host service jump_pdf handles unknown, stale, and closed pdf_ids", async (
 		}
 		const staleId = openResponse.pdf_id;
 		registry.markRecordStale(staleId);
-		await assert.rejects(
-			() => client.requestJumpPdf({ cwd: baseDir }, { pdf_id: staleId, line: 1 }),
-			/Stale pdf_id=/,
-		);
+		const staleJump = await client.requestJumpPdf({ cwd: baseDir }, { pdf_id: staleId, line: 2 });
+		assert.equal(staleJump.pdf_id, staleId);
+		assert.equal(staleJump.reopened, true);
+		assert.equal(staleJump.source_file, sourcePath);
+		assert.equal(staleJump.source_line, "beta");
+		assert.equal(registry.getActiveRecord(staleId).id, staleId);
 
 		const reopenable = await client.requestOpenPdf(
 			{ cwd: baseDir },
-			{ pdf_path: "sample.pdf", callback, reuse_existing: true },
+			{ pdf_path: "sample.pdf", callback, reuse_existing: false },
 		);
 		if (reopenable.pdf_id === undefined) {
 			throw new Error("host service open response did not include pdf_id");
 		}
 		const reopenablePdfId = reopenable.pdf_id;
 		await client.requestClosePdf({ cwd: baseDir }, reopenablePdfId);
-		await assert.rejects(
-			() => client.requestJumpPdf({ cwd: baseDir }, { pdf_id: reopenablePdfId, line: 1 }),
-			/Closed pdf_id=/,
-		);
+		const closedJump = await client.requestJumpPdf({ cwd: baseDir }, { pdf_id: reopenablePdfId, line: 1 });
+		assert.equal(closedJump.pdf_id, reopenablePdfId);
+		assert.equal(closedJump.reopened, true);
+		assert.equal(closedJump.source_file, sourcePath);
+		assert.equal(closedJump.source_line, "alpha");
+		assert.equal(registry.getActiveRecord(reopenablePdfId).id, reopenablePdfId);
+		assert.equal(backend.forwardSearchCalls.at(-1)?.line, 1);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -4285,6 +4375,64 @@ test("host service jump_pdf recovers from stale forward-search handles", async (
 	}
 });
 
+test("host service jump_pdf reopens when backend reports viewer process not running", async () => {
+	const baseDir = temporaryDir("host-service-jump-not-running-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(baseDir, "sample.pdf");
+	const sourcePath = join(baseDir, "sample.tex");
+	writeFileSync(pdfPath, "%PDF-1.4\n");
+	writeFileSync(sourcePath, "line one\nline two\n");
+	const callback = {
+		kind: "pi-synctex-callback-v1" as const,
+		transport: "unix" as const,
+		socket_path: join(baseDir, "callback.sock"),
+		token: "alpha-token",
+	};
+	const backend = new FakeForwardSearchTracker();
+	backend.setForwardSearchResponses([
+		{
+			status: "error",
+			error: "viewer process is not running",
+			handled: false,
+			error_code: "not_running",
+			reason: "not_running",
+			service_available: true,
+			backend_identity_ok: true,
+		},
+		{
+			status: "ok",
+			handled: true,
+			reason: "handled after not-running reopen",
+		},
+	]);
+	const server = new HostServiceServer({ socketPath, viewerBackend: backend });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 1_000 });
+
+	try {
+		const openResponse = await client.requestOpenPdf(
+			{ cwd: baseDir },
+			{ pdf_path: "sample.pdf", callback, reuse_existing: true },
+		);
+		if (openResponse.pdf_id === undefined) {
+			throw new Error("host service open response did not include pdf_id");
+		}
+		const jumpResponse = await client.requestJumpPdf(
+			{ cwd: baseDir },
+			{ pdf_id: openResponse.pdf_id, line: 2 },
+		);
+		assert.equal(jumpResponse.pdf_id, openResponse.pdf_id);
+		assert.equal(jumpResponse.reopened, true);
+		assert.equal(jumpResponse.handled, true);
+		assert.equal(backend.forwardSearchCalls.length, 2);
+		assert.equal(backend.forwardSearchCalls[0]?.source_file, sourcePath);
+		assert.equal(backend.forwardSearchCalls[1]?.source_file, sourcePath);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("host service jump_pdf surfaces handle-not-found reopen failures", async () => {
 	const baseDir = temporaryDir("host-service-jump-stale-handle-fail-");
 	const socketPath = join(baseDir, "host-service.sock");
@@ -4331,7 +4479,7 @@ test("host service jump_pdf surfaces handle-not-found reopen failures", async ()
 	}
 });
 
-	test("host service supports callback target register, replace, and unregister", async () => {
+test("host service supports callback target register, replace, and unregister", async () => {
 	const baseDir = temporaryDir("host-service-callback-register-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-callback" });

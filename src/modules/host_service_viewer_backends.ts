@@ -1410,6 +1410,17 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 				},
 			};
 		}
+		if (!isPidAlive(session.pid) || !isProcessIdentityMatch(session.pid, session, ["comm", "start_time", "exe", "cmdline"])) {
+			this.removeSession(session.pdfPath);
+			return {
+				status: "error",
+				error: "viewer process is not running",
+				status_details: {
+					...forwardStatusDetails({ handled: false, errorCode: "not_running", reason: "not_running", backendIdentityOk: true, handle }),
+					backend: this.name,
+				},
+			};
+		}
 		const sourceValidation = openAndValidateSource(details.source_file as string);
 		if (sourceValidation.error) {
 			return {

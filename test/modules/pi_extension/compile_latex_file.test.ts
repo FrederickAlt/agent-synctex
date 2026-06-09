@@ -1234,7 +1234,7 @@ test("open_pdf closes host-viewer when tracking fails after host open", async ()
 	assert.equal(/Cannot stat PDF file/.test(openMessage), true);
 });
 
-test("jump_pdf and close_pdf surface errors for unknown or closed host-service IDs", async () => {
+test("jump_pdf reopens closed host-service IDs while close_pdf still errors for closed or unknown IDs", async () => {
 	const { root, sourcePath } = withTemporaryProject();
 	const tools = await captureTools();
 	const context = createSessionContext(root);
@@ -1259,22 +1259,24 @@ test("jump_pdf and close_pdf surface errors for unknown or closed host-service I
 				const hostServiceClient = new HostServiceClient({ socketPath: process.env[HOST_SERVICE_SOCKET_PATH_ENV_VAR] });
 				await hostServiceClient.requestClosePdf({ cwd: root }, openDetails.pdf_id);
 
-				let staleJumpError: unknown;
-				try {
-					await tools.jumpPdfTool.execute(
-						"jump-pdf-tool-stale",
-						{ pdf_id: openDetails.pdf_id, line: 1, source_file: sourcePath },
-						undefined,
-						undefined,
-						context,
-					);
-					assert.fail("jump_pdf should reject for closed tracked id");
-				} catch (error) {
-					staleJumpError = error;
-				}
-				const staleJumpText = staleJumpError instanceof Error ? staleJumpError.message : String(staleJumpError);
-				assert.equal(/Closed pdf_id=/.test(staleJumpText), true);
+				const reopenedJumpResult = await tools.jumpPdfTool.execute(
+					"jump-pdf-tool-stale",
+					{ pdf_id: openDetails.pdf_id, line: 1, source_file: sourcePath },
+					undefined,
+					undefined,
+					context,
+				);
+				const reopenedJumpDetails = reopenedJumpResult.details as { pdf_id: number; reopened: boolean };
+				assert.equal(reopenedJumpDetails.pdf_id, openDetails.pdf_id);
+				assert.equal(reopenedJumpDetails.reopened, true);
 
+				await tools.closePdfTool.execute(
+					"close-pdf-tool-reclosed",
+					{ pdf_id: openDetails.pdf_id },
+					undefined,
+					undefined,
+					context,
+				);
 				let staleCloseError: unknown;
 				try {
 					await tools.closePdfTool.execute(

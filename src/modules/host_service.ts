@@ -45,6 +45,8 @@ import type {
 	HostServiceJumpResponseEnvelope,
 	HostServiceManagedViewerRecord,
 	HostServiceManagedViewerRecordInput,
+	HostServicePdfIdKnownRecord,
+	HostServicePdfIdRecordState,
 	HostServiceOpenRequest,
 	HostServiceOpenResponseDetails,
 	HostServiceOpenResponseEnvelope,
@@ -111,6 +113,8 @@ export type {
 	HostServiceJumpResponseEnvelope,
 	HostServiceManagedViewerRecord,
 	HostServiceManagedViewerRecordInput,
+	HostServicePdfIdKnownRecord,
+	HostServicePdfIdRecordState,
 	HostServiceOpenRequest,
 	HostServiceOpenResponseDetails,
 	HostServiceOpenResponseEnvelope,
@@ -290,15 +294,28 @@ export class HostServicePdfIdRegistry {
 	}
 
 	getActiveRecord(pdfId: number): HostServiceManagedViewerRecord {
-		const activeRecord = this.activeRecords.get(pdfId);
-		if (activeRecord) {
-			return activeRecord;
+		const knownRecord = this.getKnownRecord(pdfId);
+		if (knownRecord.state === "active") {
+			return knownRecord.record;
 		}
-		if (this.staleRecords.has(pdfId)) {
+		if (knownRecord.state === "stale") {
 			throw new Error(`Stale pdf_id=${pdfId}: reopen this PDF record before retrying`);
 		}
-		if (this.closedRecords.has(pdfId)) {
-			throw new Error(`Closed pdf_id=${pdfId}: this record has been removed and is no longer active`);
+		throw new Error(`Closed pdf_id=${pdfId}: this record has been removed and is no longer active`);
+	}
+
+	getKnownRecord(pdfId: number): HostServicePdfIdKnownRecord {
+		const activeRecord = this.activeRecords.get(pdfId);
+		if (activeRecord) {
+			return { state: "active", record: activeRecord };
+		}
+		const staleRecord = this.staleRecords.get(pdfId);
+		if (staleRecord) {
+			return { state: "stale", record: staleRecord };
+		}
+		const closedRecord = this.closedRecords.get(pdfId);
+		if (closedRecord) {
+			return { state: "closed", record: closedRecord };
 		}
 		throw new Error(`Unknown pdf_id=${pdfId}: no active pdf record found`);
 	}
@@ -337,6 +354,17 @@ export class HostServicePdfIdRegistry {
 			throw new Error(`Closed pdf_id=${pdfId}: this record has been removed and is no longer active`);
 		}
 		throw new Error(`Unknown pdf_id=${pdfId}: no active pdf record found`);
+	}
+
+	reviveRecord(pdfId: number): HostServiceManagedViewerRecord {
+		const knownRecord = this.getKnownRecord(pdfId);
+		if (knownRecord.state === "active") {
+			return knownRecord.record;
+		}
+		this.staleRecords.delete(pdfId);
+		this.closedRecords.delete(pdfId);
+		this.activeRecords.set(pdfId, knownRecord.record);
+		return knownRecord.record;
 	}
 
 	closeRecord(pdfId: number): HostServiceManagedViewerRecord {

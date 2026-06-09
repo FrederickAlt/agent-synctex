@@ -628,9 +628,18 @@ export interface HostServiceManagedViewerRecordInput {
 	metadata?: Record<string, unknown>;
 }
 
+export type HostServicePdfIdRecordState = "active" | "stale" | "closed";
+
+export interface HostServicePdfIdKnownRecord {
+	state: HostServicePdfIdRecordState;
+	record: HostServiceManagedViewerRecord;
+}
+
 export interface HostServicePdfIdRegistryLike {
 	findActiveRecord(predicate: (record: HostServiceManagedViewerRecord) => boolean): HostServiceManagedViewerRecord | undefined;
 	getActiveRecord(pdfId: number): HostServiceManagedViewerRecord;
+	getKnownRecord(pdfId: number): HostServicePdfIdKnownRecord;
 	trackRecord(record: HostServiceManagedViewerRecordInput): HostServiceManagedViewerRecord;
+	reviveRecord(pdfId: number): HostServiceManagedViewerRecord;
 	closeRecord(pdfId: number): HostServiceManagedViewerRecord;
 }

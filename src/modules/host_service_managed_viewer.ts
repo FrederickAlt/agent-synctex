@@ -486,8 +486,11 @@ export class HostServiceManagedViewerService {
 
 	async jumpViewer(request: HostServiceJumpRequest): Promise<HostServiceJumpResponseEnvelope> {
 		let managedRecord: HostServiceManagedViewerRecord;
+		let managedRecordState: "active" | "stale" | "closed";
 		try {
-			managedRecord = this.managedViewerRecords.getActiveRecord(request.pdf_id);
+			const knownRecord = this.managedViewerRecords.getKnownRecord(request.pdf_id);
+			managedRecord = knownRecord.record;
+			managedRecordState = knownRecord.state;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			const nowNs = Date.now() * 1_000_000;
@@ -620,6 +623,43 @@ export class HostServiceManagedViewerService {
 			};
 		}
 
+		try {
+			assertReadablePdfFile(managedRecord.pdfPath);
+		} catch (error) {
+			const nowNs = Date.now() * 1_000_000;
+			const reason = error instanceof Error ? error.message : String(error);
+			return {
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "error",
+				generated_at_ns: nowNs,
+				error: reason,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path:
+						typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+							? managedRecord.backendPath
+							: this.viewerBackend.name,
+					handled: false,
+					reopened: false,
+					error_code: reason.includes("must point to a PDF file") ? "invalid_pdf" : "invalid_request",
+					pdf_id: request.pdf_id,
+					pdf: managedRecord.pdfPath,
+					source_file: resolvedSourceFile,
+					line: request.line,
+					source_line: readSourceLine(resolvedSourceFile, request.line, request.workspace_context.cwd),
+					reason,
+				},
+			};
+		}
+
 		const managedBackendPath =
 			typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
 				? managedRecord.backendPath
@@ -682,41 +722,48 @@ export class HostServiceManagedViewerService {
 			},
 		});
 
-		const initialAttempt = await jumpBackend(managedRecord.pid, resolvedSourceFile);
-		const initialDetails = initialAttempt.status_details as Record<string, unknown>;
-		const initialDiagnostics = Array.isArray(initialDetails.diagnostics) ? initialDetails.diagnostics : undefined;
-		const initialHandled =
-			typeof initialDetails.handled === "boolean" ? initialDetails.handled : false;
-		const backendIdentityOk =
-			typeof initialDetails.backend_identity_ok === "boolean" ? initialDetails.backend_identity_ok : false;
-		const backendAvailable =
-			typeof initialDetails.service_available === "boolean" ? initialDetails.service_available : true;
-		const initialErrorCode =
-			typeof initialDetails.error_code === "string" ? initialDetails.error_code : "backend_unavailable";
-		const initialReason =
-			typeof initialDetails.reason === "string" && initialDetails.reason.trim()
-				? initialDetails.reason
-				: initialAttempt.error;
+		const reopenableErrorCodes = new Set(["handle_not_found", "not_running", "stale_handle"]);
+		let initialDiagnostics: Array<Record<string, unknown>> | undefined;
+		let initialReason: string | undefined;
+		if (managedRecordState === "active") {
+			const initialAttempt = await jumpBackend(managedRecord.pid, resolvedSourceFile);
+			const initialDetails = initialAttempt.status_details as Record<string, unknown>;
+			initialDiagnostics = Array.isArray(initialDetails.diagnostics) ? initialDetails.diagnostics : undefined;
+			const initialHandled =
+				typeof initialDetails.handled === "boolean" ? initialDetails.handled : false;
+			const backendIdentityOk =
+				typeof initialDetails.backend_identity_ok === "boolean" ? initialDetails.backend_identity_ok : false;
+			const backendAvailable =
+				typeof initialDetails.service_available === "boolean" ? initialDetails.service_available : true;
+			const initialErrorCode =
+				typeof initialDetails.error_code === "string" ? initialDetails.error_code : "backend_unavailable";
+			initialReason =
+				typeof initialDetails.reason === "string" && initialDetails.reason.trim()
+					? initialDetails.reason
+					: initialAttempt.error;
 
-		if (initialAttempt.status === "ok") {
-			return makeSuccessResponse(
-				initialHandled,
-				false,
-				undefined,
-				initialReason,
-				backendIdentityOk,
-				backendAvailable,
-				initialDiagnostics,
-			);
-		}
-		if (initialErrorCode !== "handle_not_found") {
-			return makeSuccessResponse(false, false, initialErrorCode, initialReason, backendIdentityOk, backendAvailable, initialDiagnostics);
+			if (initialAttempt.status === "ok") {
+				return makeSuccessResponse(
+					initialHandled,
+					false,
+					undefined,
+					initialReason,
+					backendIdentityOk,
+					backendAvailable,
+					initialDiagnostics,
+				);
+			}
+			if (!reopenableErrorCodes.has(initialErrorCode)) {
+				return makeSuccessResponse(false, false, initialErrorCode, initialReason, backendIdentityOk, backendAvailable, initialDiagnostics);
+			}
+		} else {
+			initialReason = `${managedRecordState} pdf_id=${request.pdf_id} requires viewer reopen`;
 		}
 
 		if (!managedRecord.callback) {
 			const nowNs = Date.now() * 1_000_000;
 			const reason =
-				`Tracked pdf_id=${request.pdf_id} is not managed by a callback target; cannot reopen for stale forward-search.`;
+				`Tracked pdf_id=${request.pdf_id} is not managed by a callback target; cannot reopen for jump_pdf.`;
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -786,6 +833,7 @@ export class HostServiceManagedViewerService {
 			managedRecord.backendPath = reopenBackendPath;
 			managedRecord.defaultSourcePath =
 				managedRecord.defaultSourcePath ?? inferDefaultSourceFileForPdf(managedRecord.pdfPath);
+			this.managedViewerRecords.reviveRecord(request.pdf_id);
 
 			const retryAttempt = await jumpBackend(reopenPid, resolvedSourceFile);
 			const retryDetails = retryAttempt.status_details as Record<string, unknown>;
@@ -858,6 +906,7 @@ export class HostServiceManagedViewerService {
 		const firstReason = initialReason ? `${initialReason}` : "closed or unavailable";
 		const secondReason =
 			typeof reopenDetails.error === "string" ? reopenDetails.error : "reopen failed";
+		const reopenFailureReason = `${firstReason} ${secondReason}`.trim();
 		return {
 			protocol_version: this.protocolVersion,
 			request_id: request.request_id,
@@ -865,7 +914,7 @@ export class HostServiceManagedViewerService {
 			status: "error",
 			generated_at_ns: Date.now() * 1_000_000,
 			error:
-				`Tracked PDF pdf_id=${request.pdf_id} is not available, and had a stale forward_search handle ${managedRecord.viewerHandle} at ${managedRecord.pdfPath}: ${firstReason} ${secondReason}`,
+				`Tracked PDF pdf_id=${request.pdf_id} is not available, and reopen failed for handle ${managedRecord.viewerHandle} at ${managedRecord.pdfPath}: ${reopenFailureReason}`,
 			status_details: {
 				protocol_version: this.protocolVersion,
 				supported: false,
@@ -888,7 +937,7 @@ export class HostServiceManagedViewerService {
 							? reopenDetails.error_code
 							: "backend_unavailable"
 						: "backend_unavailable",
-					reason: firstReason,
+					reason: reopenFailureReason,
 					handle: managedRecord.viewerHandle,
 					diagnostics: initialDiagnostics,
 					managed_record: managedRecord,
