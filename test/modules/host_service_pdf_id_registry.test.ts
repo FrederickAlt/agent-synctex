@@ -69,6 +69,34 @@ test("host service PDF ID registry classifies stale/closed/unknown lifecycle sta
 	assert.equal(closedRegistry.activeCount, 0);
 });
 
+test("host service PDF ID registry exposes and revives known stale and closed records", () => {
+	const generatedIds = [1, 2];
+	let generatedIndex = 0;
+	const registry = new HostServicePdfIdRegistry({
+		minPdfId: 1,
+		maxPdfId: 2,
+		makePdfId: () => generatedIds[generatedIndex++] ?? 2,
+	});
+	const staleRecord = registry.trackRecord(recordTemplate({ pdfPath: "/tmp/stale.pdf" }));
+	registry.markRecordStale(staleRecord.id);
+	const knownStale = registry.getKnownRecord(staleRecord.id);
+	assert.equal(knownStale.state, "stale");
+	assert.equal(knownStale.record.pdfPath, "/tmp/stale.pdf");
+	const revivedStale = registry.reviveRecord(staleRecord.id);
+	assert.equal(revivedStale.id, staleRecord.id);
+	assert.equal(registry.getActiveRecord(staleRecord.id).id, staleRecord.id);
+
+	const closedRecord = registry.trackRecord(recordTemplate({ pdfPath: "/tmp/closed.pdf" }));
+	registry.closeRecord(closedRecord.id);
+	const knownClosed = registry.getKnownRecord(closedRecord.id);
+	assert.equal(knownClosed.state, "closed");
+	assert.equal(knownClosed.record.pdfPath, "/tmp/closed.pdf");
+	const revivedClosed = registry.reviveRecord(closedRecord.id);
+	assert.equal(revivedClosed.id, closedRecord.id);
+	assert.equal(registry.getActiveRecord(closedRecord.id).id, closedRecord.id);
+	assert.throws(() => registry.getKnownRecord(123), /Unknown pdf_id=123:/);
+});
+
 test("host service PDF ID registry does not reuse closed ids within service lifetime", () => {
 	const registry = new HostServicePdfIdRegistry({
 		minPdfId: 1,
@@ -84,7 +112,7 @@ test("host service PDF ID registry does not reuse closed ids within service life
 	);
 });
 
-test("host service PDF ID registry clear() retains closed id tombstones within service lifetime", () => {
+test("host service PDF ID registry clear() resets closed id tombstones for a new service lifetime", () => {
 	const registry = new HostServicePdfIdRegistry({
 		minPdfId: 1,
 		maxPdfId: 1,
@@ -94,10 +122,9 @@ test("host service PDF ID registry clear() retains closed id tombstones within s
 	const first = registry.trackRecord(recordTemplate({ pdfPath: "/tmp/first.pdf" }));
 	registry.closeRecord(first.id);
 	registry.clear();
-	assert.throws(
-		() => registry.trackRecord(recordTemplate({ pdfPath: "/tmp/second.pdf" })),
-		/Unable to allocate unique active pdf_id after 1 attempts/,
-	);
+	const second = registry.trackRecord(recordTemplate({ pdfPath: "/tmp/second.pdf" }));
+	assert.equal(second.id, first.id);
+	assert.equal(second.pdfPath, "/tmp/second.pdf");
 });
 
 test("host service PDF ID registry handles collision exhaustion deterministically", () => {
