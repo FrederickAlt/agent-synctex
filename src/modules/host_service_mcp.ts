@@ -664,7 +664,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "compile_latex_file",
-			description: "Compile a LaTeX source file and optionally register a host-service PDF. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc background recompilation; set continuous=false to compile once and unsubscribe this session; omitting continuous leaves existing continuous state unchanged. Use continuous=false, not close_pdf, to stop continuous compilation because close_pdf does not stop continuous compilation.",
+			description: "Compile a LaTeX source file with latexmk and optionally register a host-service PDF. The compiler option selects the TeX engine latexmk should run. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc background recompilation; set continuous=false to compile once and unsubscribe this session; omitting continuous performs a latexmk-backed one-shot compile and leaves existing continuous state unchanged. Use continuous=false, not close_pdf, to stop continuous compilation because close_pdf does not stop continuous compilation.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -672,7 +672,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 					compiler: { type: "string" },
 					clean: { type: "boolean" },
 					open_pdf: { type: "boolean" },
-					continuous: { type: "boolean", description: "When true, immediately compile then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file. Continuous latexmk runs with -norc, -view=none, recorder/SyncTeX-friendly flags, and -no-shell-escape engine commands so project latexmkrc files cannot override the default commands; this provides no latexmk-owned viewer launch. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit to leave continuous compilation unchanged." },
+					continuous: { type: "boolean", description: "When true, immediately compile with latexmk using the selected engine, then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file. latexmk runs with -norc, -view=none, recorder/SyncTeX-friendly flags, selected-engine configuration, and -no-shell-escape engine commands so project latexmkrc files cannot override the default commands; this provides no latexmk-owned viewer launch. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit for a latexmk-backed one-shot compile that leaves continuous compilation unchanged." },
 					callback_target_id: { type: "string", minLength: 1 },
 					callback: {
 						type: "object",
