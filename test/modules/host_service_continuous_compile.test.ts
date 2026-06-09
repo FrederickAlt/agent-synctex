@@ -21,22 +21,48 @@ class FakeContinuousProcess extends EventEmitter {
 	readonly pid: number;
 	readonly stdout = new PassThrough();
 	readonly stderr = new PassThrough();
+	readonly killSignals: Array<NodeJS.Signals | number | undefined> = [];
+	private readonly autoExitSignals: Set<NodeJS.Signals | number | undefined>;
 	killed = false;
 	killSignal: NodeJS.Signals | number | undefined;
 
-	constructor(pid: number) {
+	constructor(pid: number, autoExitSignals = new Set<NodeJS.Signals | number | undefined>()) {
 		super();
 		this.pid = pid;
+		this.autoExitSignals = autoExitSignals;
 	}
 
 	kill(signal?: NodeJS.Signals | number): boolean {
 		this.killed = true;
 		this.killSignal = signal;
+		this.killSignals.push(signal);
+		if (this.autoExitSignals.has(signal)) {
+			queueMicrotask(() => this.emit("exit", null, typeof signal === "string" ? signal : null));
+		}
 		return true;
 	}
 }
 
-function makeFakeContinuousManager(options: { commandExists?: boolean; notificationSink?: ContinuousCompileNotificationSink } = {}) {
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class CountingSessionLeaseService extends HostServiceSessionLeaseService {
+	pruneCount = 0;
+
+	override pruneExpired(): string[] {
+		this.pruneCount += 1;
+		return super.pruneExpired();
+	}
+}
+
+function makeFakeContinuousManager(options: {
+	commandExists?: boolean;
+	notificationSink?: ContinuousCompileNotificationSink;
+	shutdownGraceMs?: number;
+	shutdownForceMs?: number;
+	autoExitSignals?: Array<NodeJS.Signals | number | undefined>;
+} = {}) {
 	let nextPid = 20_000;
 	const processes: FakeContinuousProcess[] = [];
 	const spawns: Array<{ command: string; args: string[]; options: ContinuousCompileSpawnOptions }> = [];
@@ -44,7 +70,7 @@ function makeFakeContinuousManager(options: { commandExists?: boolean; notificat
 		...options,
 		commandExists: () => options.commandExists ?? true,
 		spawnProcess(command, args, spawnOptions) {
-			const child = new FakeContinuousProcess(nextPid++);
+			const child = new FakeContinuousProcess(nextPid++, new Set(options.autoExitSignals ?? ["SIGTERM"]));
 			processes.push(child);
 			spawns.push({ command, args: [...args], options: spawnOptions });
 			return child;
@@ -131,7 +157,7 @@ async function sendFramedRequest(socketPath: string, payload: string): Promise<u
 async function withCompileServer<T>(
 	fixture: ReturnType<typeof makeFakeContinuousManager>,
 	fn: (client: HostServiceClient, baseDir: string, server: HostServiceServer, socketPath: string) => Promise<T>,
-	options: { leaseTtlMs?: number; nowNs?: () => number; viewerBackend?: FakeViewerBackend; managedViewerRecords?: HostServicePdfIdRegistry } = {},
+	options: { leaseTtlMs?: number; nowNs?: () => number; viewerBackend?: FakeViewerBackend; managedViewerRecords?: HostServicePdfIdRegistry; sessionPruneIntervalMs?: number; sessionLeases?: HostServiceSessionLeaseService } = {},
 ): Promise<T> {
 	const baseDir = temporaryDir("host-service-continuous-compile-");
 	const socketPath = join(baseDir, "host-service.sock");
@@ -144,10 +170,11 @@ async function withCompileServer<T>(
 		socketPath,
 		viewerBackend: options.viewerBackend ?? new FakeViewerBackend(),
 		managedViewerRecords: options.managedViewerRecords,
-		sessionLeases: options.leaseTtlMs === undefined && options.nowNs === undefined
+		sessionLeases: options.sessionLeases ?? (options.leaseTtlMs === undefined && options.nowNs === undefined
 			? undefined
-			: new HostServiceSessionLeaseService({ leaseTtlMs: options.leaseTtlMs, nowNs: options.nowNs }),
+			: new HostServiceSessionLeaseService({ leaseTtlMs: options.leaseTtlMs, nowNs: options.nowNs })),
 		continuousCompileManager: fixture.manager,
+		sessionPruneIntervalMs: options.sessionPruneIntervalMs,
 	});
 	await server.start();
 	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
@@ -221,6 +248,26 @@ test("continuous latexmk invocation uses preview-continuous, no-viewer, recorder
 		]);
 		assert.equal(spawn?.args.some((arg) => /(?:^|\s)-shell-escape(?:\s|$)/.test(arg)), false);
 	}
+});
+
+test("continuous latexmk invocation protects option-looking root filenames", () => {
+	const fixture = makeFakeContinuousManager();
+	fixture.manager.ensureSubscription("/tmp/project/-paper.tex", "session-option", "lualatex");
+
+	assert.equal(fixture.spawns.length, 1);
+	const spawn = fixture.spawns[0];
+	assert.equal(spawn?.options.cwd, "/tmp/project");
+	assert.equal(spawn?.args.at(-1), "./-paper.tex");
+	assert.deepEqual(spawn?.args.slice(0, 8), [
+		"-pvc",
+		"-norc",
+		"-view=none",
+		"-recorder",
+		"-synctex=1",
+		"-interaction=nonstopmode",
+		"-halt-on-error",
+		"-file-line-error",
+	]);
 });
 
 test("missing latexmk guidance is actionable for MacTeX, TeX Live, and BasicTeX users", () => {
@@ -364,6 +411,78 @@ test("host service continuous pending notification retrieval is session scoped a
 		const deliveredB = await client.requestPendingNotifications({ cwd: baseDir, session_id: "session-B" });
 		assert.equal(deliveredB.delivered_count, 1);
 	});
+});
+
+test("successful immediate compile clears stale pending continuous failure for the same session and root", async () => {
+	const leases = new HostServiceSessionLeaseService();
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		rmSync(join(baseDir, "paper.pdf"), { force: true });
+		writeFileSync(join(baseDir, "paper.log"), "! Undefined control sequence.\nl.2 \\bad\n");
+		fixture.processes[0]?.stderr.write("Latexmk: Errors, so I did not complete making targets\n! Undefined control sequence.\nl.2 \\bad\n");
+		assert.equal(leases.pendingNotificationCount("session-A"), 1);
+
+		const oneShot = await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex" },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		assert.equal(oneShot.continuous, undefined);
+		const delivered = await client.requestPendingNotifications({ cwd: baseDir, session_id: "session-A" });
+		assert.equal(delivered.delivered_count, 0);
+	}, { sessionLeases: leases });
+});
+
+test("continuous=false clears stale pending continuous failure notifications when unsubscribing", async () => {
+	const leases = new HostServiceSessionLeaseService();
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		rmSync(join(baseDir, "paper.pdf"), { force: true });
+		writeFileSync(join(baseDir, "paper.log"), "! Undefined control sequence.\nl.2 \\bad\n");
+		fixture.processes[0]?.stderr.write("Latexmk: Errors, so I did not complete making targets\n! Undefined control sequence.\nl.2 \\bad\n");
+		assert.equal(leases.pendingNotificationCount("session-A"), 1);
+
+		const stopped = await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: false },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		assert.equal(stopped.continuous?.status, "stopped");
+		const delivered = await client.requestPendingNotifications({ cwd: baseDir, session_id: "session-A" });
+		assert.equal(delivered.delivered_count, 0);
+	}, { sessionLeases: leases });
+});
+
+test("continuous=true starts compiler and reports metadata when open_pdf fails after immediate compile succeeds", async () => {
+	const fixture = makeFakeContinuousManager();
+	const viewerBackend = new FakeViewerBackend();
+	viewerBackend.setAvailable(false);
+	await withCompileServer(fixture, async (client, baseDir) => {
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile(
+				{ latex_file_path: "paper.tex", compiler: "lualatex", open_pdf: true, continuous: true },
+				{ cwd: baseDir, session_id: "session-A" },
+			);
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /backend unavailable|backend_unavailable/);
+		const details = (observed as { statusDetails?: { continuous?: { status?: string; subscriber_count?: number; pid?: number }; pdf?: string } }).statusDetails;
+		assert.equal(details?.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(details?.continuous?.status, "started");
+		assert.equal(details?.continuous?.subscriber_count, 1);
+		assert.equal(details?.continuous?.pid, fixture.processes[0]?.pid);
+		assert.equal(fixture.manager.activeRootCount(), 1);
+		assert.equal(fixture.processes[0]?.killed, false);
+	}, { viewerBackend });
 });
 
 test("host service continuous=true/false performs immediate compile and manages shared subscriptions", async () => {
@@ -562,6 +681,61 @@ test("close_pdf leaves continuous compiler running", async () => {
 		assert.equal(fixture.manager.activeRootCount(), 1);
 		assert.equal(fixture.processes[0]?.killed, false);
 	}, { viewerBackend, managedViewerRecords: new HostServicePdfIdRegistry({ minPdfId: 75, maxPdfId: 75, makePdfId: () => 75 }) });
+});
+
+test("host service autonomously prunes expired continuous subscriptions without a subsequent request", async () => {
+	let nowNs = 1_000_000_000;
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		assert.equal(fixture.manager.activeRootCount(), 1);
+
+		nowNs += 2_000_000;
+		await sleep(40);
+		assert.equal(fixture.manager.activeRootCount(), 0);
+		assert.equal(fixture.processes[0]?.killed, true);
+	}, { leaseTtlMs: 1, nowNs: () => nowNs, sessionPruneIntervalMs: 5 });
+});
+
+test("host service stops session prune timer on shutdown", async () => {
+	const leases = new CountingSessionLeaseService();
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (_client, _baseDir, server) => {
+		await sleep(20);
+		assert.ok(leases.pruneCount > 0);
+		await server.stop();
+		const countAfterStop = leases.pruneCount;
+		await sleep(20);
+		assert.equal(leases.pruneCount, countAfterStop);
+	}, { sessionLeases: leases, sessionPruneIntervalMs: 5 });
+});
+
+test("continuous compiler shutdown waits for graceful process exit", async () => {
+	const fixture = makeFakeContinuousManager({ shutdownGraceMs: 50, shutdownForceMs: 5, autoExitSignals: [] });
+	fixture.manager.ensureSubscription("/tmp/project/main.tex", "session-A", "lualatex");
+	let resolved = false;
+	const stopPromise = fixture.manager.stopAll().then(() => {
+		resolved = true;
+	});
+	await sleep(0);
+	assert.equal(fixture.processes[0]?.killSignals[0], "SIGTERM");
+	assert.equal(resolved, false);
+	fixture.processes[0]?.emit("exit", 0, null);
+	await stopPromise;
+	assert.equal(resolved, true);
+	assert.equal(fixture.processes[0]?.killSignals.includes("SIGKILL"), false);
+	assert.equal(fixture.manager.activeRootCount(), 0);
+});
+
+test("continuous compiler shutdown escalates when graceful exit times out", async () => {
+	const fixture = makeFakeContinuousManager({ shutdownGraceMs: 5, shutdownForceMs: 50, autoExitSignals: ["SIGKILL"] });
+	fixture.manager.ensureSubscription("/tmp/project/main.tex", "session-A", "lualatex");
+	await fixture.manager.stopAll();
+	assert.deepEqual(fixture.processes[0]?.killSignals, ["SIGTERM", "SIGKILL"]);
+	assert.equal(fixture.manager.activeRootCount(), 0);
 });
 
 test("heartbeat expiry and daemon shutdown stop continuous compilers", async () => {

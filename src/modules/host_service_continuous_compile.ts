@@ -43,6 +43,7 @@ export interface ContinuousCompileNotificationSink {
 	isSessionLive(sessionId: string): boolean;
 	queuePendingNotification(sessionId: string, notification: HostServicePendingNotification): void;
 	clearPendingNotificationsForRoot(rootSource: string): void;
+	clearPendingNotificationsForSessionRoot?(sessionId: string, rootSource: string): void;
 	nowNs?: () => number;
 }
 
@@ -51,6 +52,8 @@ export interface ContinuousCompileManagerOptions {
 	commandExists?: (command: string) => boolean;
 	env?: NodeJS.ProcessEnv;
 	notificationSink?: ContinuousCompileNotificationSink;
+	shutdownGraceMs?: number;
+	shutdownForceMs?: number;
 }
 
 interface PdfSnapshot {
@@ -70,6 +73,8 @@ interface ContinuousCompileRecord {
 }
 
 const MAX_RECENT_OUTPUT_LENGTH = 16_384;
+const DEFAULT_SHUTDOWN_GRACE_MS = 500;
+const DEFAULT_SHUTDOWN_FORCE_MS = 500;
 const MAX_NOTIFICATION_OUTPUT_LENGTH = 4_000;
 const MAX_NOTIFICATION_DIAGNOSTICS = 8;
 const LATEX_ERROR_TAIL_LINES = 20;
@@ -104,6 +109,11 @@ function latexmkEngineArgs(compiler: unknown): string[] {
 	}
 }
 
+function latexmkSourceOperand(rootSource: string): string {
+	const sourceName = basename(rootSource);
+	return sourceName.startsWith("-") ? `./${sourceName}` : sourceName;
+}
+
 function latexmkContinuousArgs(rootSource: string, compiler: LatexCompiler | unknown): string[] {
 	return [
 		"-pvc",
@@ -115,7 +125,7 @@ function latexmkContinuousArgs(rootSource: string, compiler: LatexCompiler | unk
 		"-halt-on-error",
 		"-file-line-error",
 		...latexmkEngineArgs(compiler),
-		basename(rootSource),
+		latexmkSourceOperand(rootSource),
 	];
 }
 
@@ -199,6 +209,8 @@ export class HostServiceContinuousCompileManager {
 	private readonly spawnProcess: (command: string, args: string[], options: ContinuousCompileSpawnOptions) => ContinuousCompileProcess;
 	private readonly commandExists: (command: string) => boolean;
 	private readonly env: NodeJS.ProcessEnv;
+	private readonly shutdownGraceMs: number;
+	private readonly shutdownForceMs: number;
 	private readonly recordsByRootSource = new Map<string, ContinuousCompileRecord>();
 	private notificationSink: ContinuousCompileNotificationSink | undefined;
 
@@ -207,6 +219,8 @@ export class HostServiceContinuousCompileManager {
 		this.commandExists = options.commandExists ?? defaultCommandExists;
 		this.env = options.env ?? process.env;
 		this.notificationSink = options.notificationSink;
+		this.shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
+		this.shutdownForceMs = options.shutdownForceMs ?? DEFAULT_SHUTDOWN_FORCE_MS;
 	}
 
 	setNotificationSink(notificationSink: ContinuousCompileNotificationSink): void {
@@ -276,6 +290,7 @@ export class HostServiceContinuousCompileManager {
 	}
 
 	removeSubscription(rootSource: string, sessionId: string): HostServiceContinuousCompileDetails {
+		this.clearPendingNotificationsForSessionRoot(sessionId, rootSource);
 		const record = this.recordsByRootSource.get(rootSource);
 		if (!record) {
 			return {
@@ -316,10 +331,8 @@ export class HostServiceContinuousCompileManager {
 		}
 	}
 
-	stopAll(): void {
-		for (const [rootSource, record] of this.recordsByRootSource) {
-			this.stopRecord(rootSource, record);
-		}
+	async stopAll(): Promise<void> {
+		await Promise.all([...this.recordsByRootSource].map(([rootSource, record]) => this.stopRecordAndWait(rootSource, record)));
 	}
 
 	activeRootCount(): number {
@@ -328,6 +341,10 @@ export class HostServiceContinuousCompileManager {
 
 	subscriberCount(rootSource: string): number {
 		return this.recordsByRootSource.get(rootSource)?.subscribers.size ?? 0;
+	}
+
+	clearPendingNotificationsForSessionRoot(sessionId: string, rootSource: string): void {
+		this.notificationSink?.clearPendingNotificationsForSessionRoot?.(sessionId, rootSource);
 	}
 
 	private recordOutputChunk(rootSource: string, record: ContinuousCompileRecord, chunk: string): void {
@@ -426,5 +443,47 @@ export class HostServiceContinuousCompileManager {
 		this.recordsByRootSource.delete(rootSource);
 		record.subscribers.clear();
 		record.process.kill("SIGTERM");
+	}
+
+	private async stopRecordAndWait(rootSource: string, record: ContinuousCompileRecord): Promise<void> {
+		this.recordsByRootSource.delete(rootSource);
+		record.subscribers.clear();
+		const exited = this.waitForProcessExit(record.process);
+		record.process.kill("SIGTERM");
+		if (await this.waitForBoundedExit(exited, this.shutdownGraceMs)) {
+			return;
+		}
+		record.process.kill("SIGKILL");
+		await this.waitForBoundedExit(exited, this.shutdownForceMs);
+	}
+
+	private waitForProcessExit(process: ContinuousCompileProcess): Promise<void> {
+		return new Promise((resolve) => {
+			let settled = false;
+			const settle = () => {
+				if (!settled) {
+					settled = true;
+					resolve();
+				}
+			};
+			process.on("exit", settle);
+			process.on("error", settle);
+		});
+	}
+
+	private async waitForBoundedExit(exited: Promise<void>, timeoutMs: number): Promise<boolean> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				exited.then(() => true),
+				new Promise<boolean>((resolve) => {
+					timer = setTimeout(() => resolve(false), timeoutMs);
+				}),
+			]);
+		} finally {
+			if (timer) {
+				clearTimeout(timer);
+			}
+		}
 	}
 }

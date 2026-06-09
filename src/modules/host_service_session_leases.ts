@@ -106,12 +106,19 @@ export class HostServiceSessionLeaseService {
 
 	clearPendingNotificationsForRoot(rootSource: string): void {
 		for (const [sessionId, notifications] of this.pendingNotificationsBySessionId) {
-			const retained = notifications.filter((notification) => notification.root_source !== rootSource);
-			if (retained.length === 0) {
-				this.pendingNotificationsBySessionId.delete(sessionId);
-			} else if (retained.length !== notifications.length) {
-				this.pendingNotificationsBySessionId.set(sessionId, retained);
-			}
+			this.clearPendingNotificationsForSessionRoot(sessionId, rootSource, notifications);
+		}
+	}
+
+	clearPendingNotificationsForSessionRoot(sessionId: string, rootSource: string, notifications = this.pendingNotificationsBySessionId.get(sessionId)): void {
+		if (!notifications) {
+			return;
+		}
+		const retained = notifications.filter((notification) => notification.root_source !== rootSource);
+		if (retained.length === 0) {
+			this.pendingNotificationsBySessionId.delete(sessionId);
+		} else if (retained.length !== notifications.length) {
+			this.pendingNotificationsBySessionId.set(sessionId, retained);
 		}
 	}
 

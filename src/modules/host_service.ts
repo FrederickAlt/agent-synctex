@@ -166,6 +166,7 @@ export interface HostServiceServerOptions {
 	managedViewerRecords?: HostServicePdfIdRegistry;
 	sessionLeases?: HostServiceSessionLeaseService;
 	continuousCompileManager?: HostServiceContinuousCompileManager;
+	sessionPruneIntervalMs?: number;
 }
 
 const PROTOCOL_VERSION = 1;
@@ -179,6 +180,7 @@ const REQUIRED_SOCKET_MODE = 0o600;
 const MAX_PAYLOAD_BYTES = 16_384;
 const STARTUP_SOCKET_CHECK_TIMEOUT_MS = 250;
 const ACTIVE_CONNECTION_TIMEOUT_MS = 10_000;
+const DEFAULT_SESSION_PRUNE_INTERVAL_MS = 1_000;
 const FALLBACK_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
 export const MIN_ACTIVE_PDF_ID = 1;
 export const MAX_ACTIVE_PDF_ID = 99_999_999;
@@ -992,6 +994,8 @@ export class HostServiceServer {
 	private readonly compileService: HostServiceCompileService;
 	private readonly sessionLeases: HostServiceSessionLeaseService;
 	private readonly continuousCompileManager: HostServiceContinuousCompileManager;
+	private readonly sessionPruneIntervalMs: number;
+	private sessionPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private server: Server | null = null;
 	private startedAtNs = 0;
 	private serviceInstanceId: string;
@@ -1013,10 +1017,12 @@ export class HostServiceServer {
 		});
 		this.sessionLeases = options.sessionLeases ?? new HostServiceSessionLeaseService();
 		this.continuousCompileManager = options.continuousCompileManager ?? new HostServiceContinuousCompileManager();
+		this.sessionPruneIntervalMs = options.sessionPruneIntervalMs ?? DEFAULT_SESSION_PRUNE_INTERVAL_MS;
 		this.continuousCompileManager.setNotificationSink({
 			isSessionLive: (sessionId) => this.sessionLeases.isLive(sessionId),
 			queuePendingNotification: (sessionId, notification) => this.sessionLeases.queuePendingNotification(sessionId, notification),
 			clearPendingNotificationsForRoot: (rootSource) => this.sessionLeases.clearPendingNotificationsForRoot(rootSource),
+			clearPendingNotificationsForSessionRoot: (sessionId, rootSource) => this.sessionLeases.clearPendingNotificationsForSessionRoot(sessionId, rootSource),
 		});
 		this.compileService = new HostServiceCompileService({
 			protocolVersion: this.protocolVersion,
@@ -1060,6 +1066,7 @@ export class HostServiceServer {
 					}
 				});
 			});
+			this.startSessionPruneLoop();
 			serverLogger.info("start.end", { socket_path: this.socketPath, service_name: this.serviceName, service_instance_id: this.serviceInstanceId });
 		} catch (error) {
 			serverLogger.error("start.error", { socket_path: this.socketPath, service_name: this.serviceName, error });
@@ -1081,7 +1088,8 @@ export class HostServiceServer {
 
 	async stop(): Promise<void> {
 		serverLogger.info("stop.begin", { socket_path: this.socketPath, service_name: this.serviceName, active_connections: this.activeConnections.size });
-		this.continuousCompileManager.stopAll();
+		this.stopSessionPruneLoop();
+		await this.continuousCompileManager.stopAll();
 		await this.closeViewerBackendSessions();
 		const server = this.server;
 		this.server = null;
@@ -1111,6 +1119,21 @@ export class HostServiceServer {
 		this.managedViewerRecords.clear();
 		this.removeSocketPath();
 		serverLogger.info("stop.end", { socket_path: this.socketPath, service_name: this.serviceName });
+	}
+
+	private startSessionPruneLoop(): void {
+		this.stopSessionPruneLoop();
+		this.sessionPruneTimer = setInterval(() => {
+			this.sessionLeases.pruneExpired();
+		}, this.sessionPruneIntervalMs);
+		this.sessionPruneTimer.unref?.();
+	}
+
+	private stopSessionPruneLoop(): void {
+		if (this.sessionPruneTimer) {
+			clearInterval(this.sessionPruneTimer);
+			this.sessionPruneTimer = null;
+		}
 	}
 
 	private handleConnection(socket: Socket): void {

@@ -112,6 +112,9 @@ export class HostServiceCompileService {
 				cleanArtifacts.push(cleaned);
 			}
 			const artifactPaths = getExistingArtifacts(result.pdfPath, resultLogPath);
+			this.clearSuccessfulImmediateCompileNotification(request, result.source);
+			const continuous = this.applyContinuousCompileRequest(request, result.source);
+			const continuousError = continuous && ["unavailable", "error"].includes(continuous.status) ? continuous : undefined;
 			const openResponse = await this.openCompiledPdfThroughManagedViewerAfterCompile(
 				request,
 				result.source,
@@ -132,13 +135,10 @@ export class HostServiceCompileService {
 					open_status: openResponse.status,
 					error: openResponse.error,
 				});
-				const continuous = this.applyContinuousUnsubscribeAfterFailure(request, result.source);
 				return continuous === undefined
 					? openResponse
 					: { ...openResponse, status_details: { ...openResponse.status_details, continuous } };
 			}
-			const continuous = this.applyContinuousCompileRequest(request, result.source);
-			const continuousError = continuous && ["unavailable", "error"].includes(continuous.status) ? continuous : undefined;
 			logger.info("compile_file.end", {
 				request_id: request.request_id,
 				duration_ms: Date.now() - startedAt,
@@ -372,6 +372,13 @@ export class HostServiceCompileService {
 		return request.details.continuous === false
 			? this.applyContinuousCompileRequest(request, rootSource)
 			: undefined;
+	}
+
+	private clearSuccessfulImmediateCompileNotification(request: HostServiceCompileRequest, rootSource: string): void {
+		const sessionId = request.workspace_context.session_id?.trim();
+		if (sessionId) {
+			this.continuousCompileManager.clearPendingNotificationsForSessionRoot(sessionId, rootSource);
+		}
 	}
 
 	private applyContinuousCompileRequest(
