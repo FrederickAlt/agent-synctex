@@ -69,7 +69,7 @@ function writeFakeLatexCompiler(binDir: string, options: { exitCode?: number; wi
 	const stdoutText = options.stdoutText ?? "";
 	const afterPdfScript = options.afterPdfScript ?? "";
 	mkdirSync(binDir, { mode: 0o700, recursive: true });
-	const compilerPath = join(binDir, "lualatex");
+	const compilerPath = join(binDir, "latexmk");
 	writeFileSync(compilerPath, `#!/bin/sh
 set -eu
 tex_file=""
@@ -1027,7 +1027,7 @@ test("host service compile_latex_file reports stale existing PDFs as compile fai
 	const socketPath = join(baseDir, "host-service.sock");
 	const originalPath = process.env.PATH ?? "";
 	mkdirSync(join(baseDir, "bin"), { mode: 0o700, recursive: true });
-	const compilerPath = join(baseDir, "bin", "lualatex");
+	const compilerPath = join(baseDir, "bin", "latexmk");
 	writeFileSync(compilerPath, `#!/bin/sh\nset -eu\ntex_file=""\nfor arg in "$@"; do tex_file="$arg"; done\nbase="\${tex_file##*/}"\nname="\${base%.*}"\necho "! Undefined control sequence." > "$name.log"\nexit 1\n`, { mode: 0o700 });
 	chmodSync(compilerPath, 0o700);
 	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;

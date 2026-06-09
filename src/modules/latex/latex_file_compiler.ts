@@ -67,6 +67,7 @@ interface LatexCommandSpec {
 	displayName: string;
 	command: string;
 	args: string[];
+	acceptUnchangedPdfWhenOutputWritten?: boolean;
 }
 
 interface LatexCommandResult {
@@ -124,6 +125,7 @@ const MAX_REPORTED_DIAGNOSTICS = 10;
 const MAX_SUMMARY_DIAGNOSTICS = 5;
 const MAX_DIAGNOSTIC_MESSAGE_CHARS = 500;
 const PDF_FRESHNESS_TOLERANCE_MS = 1000;
+const LATEXMK_MISSING_MESSAGE = "latexmk is required for this compile mode. Install MacTeX or TeX Live so the latexmk command is available on PATH; BasicTeX users may need to install latexmk separately (for example with tlmgr) and then restart the Host Service so it sees the updated PATH.";
 const LATEX_FILE_ARTIFACT_EXTENSIONS = [
 	".aux",
 	".bbl",
@@ -355,10 +357,21 @@ export function extractLatexFatalDiagnostics(text: string): LatexDiagnosticSumma
 	return dedupeDiagnostics(diagnostics).slice(0, MAX_REPORTED_DIAGNOSTICS);
 }
 
+function escapedBasename(path: string): string {
+	return basename(path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function latexLogSaysOutputWritten(text: string, pdfPath: string): boolean {
-	const pdfName = basename(pdfPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	return new RegExp(`Output written on .*${pdfName}`, "i").test(text)
-		|| /Output written on .*\.pdf/i.test(text);
+	const pdfName = escapedBasename(pdfPath);
+	return new RegExp(`Output written on .*${pdfName}(?:\\s|\\(|$)`, "i").test(text);
+}
+
+function latexmkOutputSaysTargetUpToDate(text: string, latexFilePath: string, pdfPath: string): boolean {
+	const sourceName = escapedBasename(latexFilePath);
+	const pdfName = escapedBasename(pdfPath);
+	return new RegExp(`Latexmk: .*Nothing to do for ['\"]?${sourceName}['\"]?\\.?`, "i").test(text)
+		|| new RegExp(`Latexmk: .*All targets \\([^)]*${pdfName}[^)]*\\) are up-to-date`, "i").test(text)
+		|| new RegExp(`Latexmk: .*${pdfName}.*up-to-date`, "i").test(text);
 }
 
 function outputPdfStat(pdfPath: string): Stats | undefined {
@@ -370,12 +383,16 @@ function outputPdfStat(pdfPath: string): Stats | undefined {
 	}
 }
 
-function pdfWasUpdated(before: Stats | undefined, after: Stats | undefined, compileStartMs: number): boolean {
+function fileWasUpdated(before: Stats | undefined, after: Stats | undefined, compileStartMs: number): boolean {
 	if (after === undefined) return false;
 	if (before === undefined) return after.mtimeMs >= compileStartMs - PDF_FRESHNESS_TOLERANCE_MS;
 	if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) return true;
 	return before.mtimeMs < compileStartMs - PDF_FRESHNESS_TOLERANCE_MS
 		&& after.mtimeMs >= compileStartMs - PDF_FRESHNESS_TOLERANCE_MS;
+}
+
+function pdfWasUpdated(before: Stats | undefined, after: Stats | undefined, compileStartMs: number): boolean {
+	return fileWasUpdated(before, after, compileStartMs);
 }
 
 function combinedLatexLog(latexFilePath: string, compilerOutput: string): string {
@@ -452,37 +469,54 @@ function latexCompileFailure(
 	}
 }
 
+export function latexmkEngineArgs(compiler: LatexCompiler | undefined): string[] {
+	switch (compiler) {
+		case "pdflatex":
+			return ["-pdf", "-pdflatex=pdflatex -no-shell-escape %O %S"];
+		case "xelatex":
+			return ["-pdfxe", "-xelatex=xelatex -no-shell-escape %O %S"];
+		case "latexmk":
+		case undefined:
+		case "lualatex":
+			return ["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"];
+	}
+}
+
+export function latexmkEngineIdentity(compiler: LatexCompiler | undefined): string {
+	return latexmkEngineArgs(compiler).join("\u0000");
+}
+
+export function latexmkSourceOperand(rootSource: string): string {
+	const sourceName = basename(rootSource);
+	return sourceName.startsWith("-") ? `./${sourceName}` : sourceName;
+}
+
+function latexmkCompileArgs(latexFilePath: string, compiler: LatexCompiler | undefined, continuous: boolean): string[] {
+	return [
+		...(continuous ? ["-pvc"] : []),
+		"-norc",
+		"-view=none",
+		"-recorder",
+		"-synctex=1",
+		"-interaction=nonstopmode",
+		"-halt-on-error",
+		"-file-line-error",
+		...latexmkEngineArgs(compiler),
+		latexmkSourceOperand(latexFilePath),
+	];
+}
+
+export function latexmkContinuousArgs(rootSource: string, compiler: LatexCompiler | undefined): string[] {
+	return latexmkCompileArgs(rootSource, compiler, true);
+}
+
 function latexCommandForFile(latexFilePath: string, compiler?: LatexCompiler): LatexCommandSpec {
 	const requested = compiler ?? DEFAULT_LATEX_COMPILER;
-	const fileName = basename(latexFilePath);
-	if (requested === "latexmk") {
-		return {
-			displayName: "latexmk(lualatex)",
-			command: "latexmk",
-			args: [
-				"-pdf",
-				"-lualatex",
-				"-synctex=1",
-				"-interaction=nonstopmode",
-				"-halt-on-error",
-				"-file-line-error",
-				"-pdflualatex=lualatex -no-shell-escape %O %S",
-				fileName,
-			],
-		};
-	}
-
 	return {
-		displayName: requested,
-		command: requested,
-		args: [
-			"-synctex=1",
-			"-interaction=nonstopmode",
-			"-halt-on-error",
-			"-file-line-error",
-			"-no-shell-escape",
-			fileName,
-		],
+		displayName: requested === "latexmk" ? "latexmk(lualatex)" : `latexmk(${requested})`,
+		command: "latexmk",
+		args: latexmkCompileArgs(latexFilePath, requested, false),
+		acceptUnchangedPdfWhenOutputWritten: true,
 	};
 }
 
@@ -622,6 +656,7 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 	const logPath = latexLogPath(latexFilePath);
 	const spec = latexCommandForFile(latexFilePath, compiler);
 	const beforePdfStatus = outputPdfStat(outputPdfPath);
+	const beforeLogStatus = outputPdfStat(logPath);
 	const compileStartMs = Date.now();
 	logger.info("compile.begin", {
 		source_path: latexFilePath,
@@ -639,16 +674,24 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 		result = await runLatexCommand(spec, dirname(latexFilePath), signal);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		throw latexCompileFailure(latexFilePath, spec, `failed to start compiler: ${message}`, "", "compiler_start_failed", []);
+		const reason = spec.command === "latexmk"
+			? `failed to start compiler: ${message}. ${LATEXMK_MISSING_MESSAGE}`
+			: `failed to start compiler: ${message}`;
+		throw latexCompileFailure(latexFilePath, spec, reason, "", "compiler_start_failed", []);
 	}
 
-	const combinedLog = combinedLatexLog(latexFilePath, result.output);
+	const projectLog = readTextTail(logPath);
+	const combinedLog = [projectLog, result.output].filter((entry) => entry.trim()).join("\n");
 	const fatalDiagnostics = extractLatexFatalDiagnostics(combinedLog);
 	const warningExtraction = extractLatexWarnings(combinedLog);
 	const afterPdfStatus = outputPdfStat(outputPdfPath);
+	const afterLogStatus = outputPdfStat(logPath);
 	const pdfExists = afterPdfStatus !== undefined;
 	const pdfUpdated = pdfWasUpdated(beforePdfStatus, afterPdfStatus, compileStartMs);
-	const outputWritten = latexLogSaysOutputWritten(combinedLog, outputPdfPath);
+	const logUpdated = fileWasUpdated(beforeLogStatus, afterLogStatus, compileStartMs);
+	const outputWritten = latexLogSaysOutputWritten(result.output, outputPdfPath)
+		|| (logUpdated && latexLogSaysOutputWritten(projectLog, outputPdfPath));
+	const targetUpToDate = latexmkOutputSaysTargetUpToDate(result.output, latexFilePath, outputPdfPath);
 
 	if (result.aborted) {
 		throw latexCompileFailure(latexFilePath, spec, "compilation aborted", result.output, "compile_aborted", fatalDiagnostics, pdfExists ? outputPdfPath : undefined);
@@ -659,7 +702,11 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 	if (!pdfExists) {
 		throw latexCompileFailure(latexFilePath, spec, "PDF was not created", result.output, "failed_no_pdf", fatalDiagnostics);
 	}
-	if (!pdfUpdated) {
+	const acceptsUnchangedLatexmkPdf = spec.acceptUnchangedPdfWhenOutputWritten === true
+		&& (outputWritten || targetUpToDate)
+		&& result.exitCode === 0
+		&& fatalDiagnostics.length === 0;
+	if (!pdfUpdated && !acceptsUnchangedLatexmkPdf) {
 		throw latexCompileFailure(latexFilePath, spec, `PDF exists but was not updated at ${outputPdfPath}`, result.output, "failed_stale_pdf_exists", fatalDiagnostics, outputPdfPath);
 	}
 	if (result.exitCode !== 0 && fatalDiagnostics.length > 0) {
@@ -703,6 +750,8 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 		pdf_exists: pdfExists,
 		pdf_updated: pdfUpdated,
 		output_written: outputWritten,
+		target_up_to_date: targetUpToDate,
+		log_updated: logUpdated,
 	});
 
 	return {

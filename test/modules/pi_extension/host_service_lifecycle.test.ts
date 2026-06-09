@@ -265,7 +265,7 @@ async function captureExtensionHandlersAndTools(): Promise<ExtensionSuite> {
 }
 
 function writeFakeCompiler(binDir: string, exitCode = 0): string {
-	const scriptPath = resolve(binDir, "lualatex");
+	const scriptPath = resolve(binDir, "latexmk");
 	const scriptSource = [
 		"#!/usr/bin/env node",
 		"const fs = require('node:fs');",

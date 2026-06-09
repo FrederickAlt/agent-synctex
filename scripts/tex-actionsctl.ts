@@ -712,11 +712,14 @@ async function runDoctor(context: CliRunContext): Promise<DoctorReport> {
 		report.remediation.push(REMEDIATION_COMMAND_RESTART_SERVICE);
 	}
 
-	if (!report.compilerAvailability[DEFAULT_LATEX_COMPILER]) {
-		report.errors.push(`Required LaTeX compiler missing from PATH: ${DEFAULT_LATEX_COMPILER}`);
+	const requiredCompilers = new Set([DEFAULT_LATEX_COMPILER, "latexmk"]);
+	for (const compiler of requiredCompilers) {
+		if (!report.compilerAvailability[compiler]) {
+			report.errors.push(`Required LaTeX compiler missing from PATH: ${compiler}`);
+		}
 	}
 	for (const [compiler, available] of Object.entries(report.compilerAvailability)) {
-		if (compiler === DEFAULT_LATEX_COMPILER) {
+		if (requiredCompilers.has(compiler)) {
 			continue;
 		}
 		if (!available) {

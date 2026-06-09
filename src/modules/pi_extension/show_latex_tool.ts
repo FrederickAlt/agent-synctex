@@ -28,7 +28,7 @@ const latexFileCompileToolSupport = createLatexFileCompileToolSupport();
 const LatexCompilerParam = Type.Optional(Type.Union(
 	LATEX_COMPILERS.map((compiler) => Type.Literal(compiler)),
 	{
-		description: `Optional LaTeX compiler. Defaults to ${DEFAULT_LATEX_COMPILER}.`,
+		description: `Optional TeX engine for latexmk. Defaults to ${DEFAULT_LATEX_COMPILER}; latexmk uses the hardened default LuaLaTeX-backed mode.`,
 		default: DEFAULT_LATEX_COMPILER,
 	},
 ));

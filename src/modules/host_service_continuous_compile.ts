@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, statSync, type Stats } from "node:fs";
 import { dirname, basename, extname, resolve } from "node:path";
 import type { LatexCompiler, LatexDiagnosticSummary } from "./latex/latex_file_compiler.ts";
-import { extractLatexFatalDiagnostics } from "./latex/latex_file_compiler.ts";
+import { extractLatexFatalDiagnostics, latexmkContinuousArgs, latexmkEngineIdentity } from "./latex/latex_file_compiler.ts";
 import type { HostServicePendingNotification } from "./host_service_session_leases.ts";
 
 export type ContinuousCompileStatus =
@@ -67,6 +67,7 @@ interface ContinuousCompileRecord {
 	rootSource: string;
 	process: ContinuousCompileProcess;
 	subscribers: Set<string>;
+	engineIdentity: string;
 	recentOutput: string;
 	lastPdfSnapshot?: PdfSnapshot;
 	lastFailureFingerprint?: string;
@@ -93,42 +94,6 @@ function defaultSpawnProcess(command: string, args: string[], options: Continuou
 		env: options.env,
 		stdio: ["ignore", "pipe", "pipe"],
 	});
-}
-
-function latexmkEngineArgs(compiler: unknown): string[] {
-	switch (compiler) {
-		case "pdflatex":
-			return ["-pdf", "-pdflatex=pdflatex -no-shell-escape %O %S"];
-		case "xelatex":
-			return ["-pdfxe", "-xelatex=xelatex -no-shell-escape %O %S"];
-		case "latexmk":
-		case undefined:
-		case null:
-		case "lualatex":
-			return ["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"];
-		default:
-			return ["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"];
-	}
-}
-
-function latexmkSourceOperand(rootSource: string): string {
-	const sourceName = basename(rootSource);
-	return sourceName.startsWith("-") ? `./${sourceName}` : sourceName;
-}
-
-function latexmkContinuousArgs(rootSource: string, compiler: LatexCompiler | unknown): string[] {
-	return [
-		"-pvc",
-		"-norc",
-		"-view=none",
-		"-recorder",
-		"-synctex=1",
-		"-interaction=nonstopmode",
-		"-halt-on-error",
-		"-file-line-error",
-		...latexmkEngineArgs(compiler),
-		latexmkSourceOperand(rootSource),
-	];
 }
 
 function appendBounded(current: string, chunk: string): string {
@@ -246,6 +211,8 @@ export class HostServiceContinuousCompileManager {
 				error_code: "host_service_stopping",
 			};
 		}
+		const requestedCompiler = compiler as LatexCompiler | undefined;
+		const requestedEngineIdentity = latexmkEngineIdentity(requestedCompiler);
 		const existing = this.recordsByRootSource.get(rootSource);
 		if (existing) {
 			if (existing.stopping) {
@@ -258,6 +225,18 @@ export class HostServiceContinuousCompileManager {
 					pid: existing.process.pid,
 					error: "continuous compilation is stopping",
 					error_code: "continuous_compiler_stopping",
+				};
+			}
+			if (existing.engineIdentity !== requestedEngineIdentity) {
+				return {
+					requested: true,
+					status: "error",
+					root_source: rootSource,
+					session_id: sessionId,
+					subscriber_count: existing.subscribers.size,
+					pid: existing.process.pid,
+					error: "continuous compilation is already active for this root with a different latexmk engine configuration; stop the existing subscription before switching compiler",
+					error_code: "continuous_compiler_engine_mismatch",
 				};
 			}
 			existing.subscribers.add(sessionId);
@@ -277,7 +256,7 @@ export class HostServiceContinuousCompileManager {
 		}
 
 		try {
-			const child = this.spawnProcess("latexmk", latexmkContinuousArgs(rootSource, compiler), {
+			const child = this.spawnProcess("latexmk", latexmkContinuousArgs(rootSource, requestedCompiler), {
 				cwd: dirname(rootSource),
 				env: this.env,
 			});
@@ -285,6 +264,7 @@ export class HostServiceContinuousCompileManager {
 				rootSource,
 				process: child,
 				subscribers: new Set([sessionId]),
+				engineIdentity: requestedEngineIdentity,
 				recentOutput: "",
 				lastPdfSnapshot: pdfSnapshot(pdfPathForRoot(rootSource)),
 			};

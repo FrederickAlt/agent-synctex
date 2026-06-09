@@ -234,7 +234,7 @@ Also keep `viewer_guardrails.test.ts` in mind: it is the explicit regression gua
 
 `show_latex` and `compile_latex_file` both accept an optional `compiler` parameter. The default is `lualatex`.
 `show_latex` also accepts `inline` (default `true`). Use `inline=false` when you specifically want the external host-service preview workflow.
-Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk`. For file compilation, `latexmk` is the required backend; the selected compiler configures which TeX engine latexmk runs.
+Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk`. For file compilation, `latexmk` is the required backend; the selected compiler configures which TeX engine latexmk runs (`latexmk` uses the Host Service's hardened default latexmk-backed behavior).
 
 Prefer `compile_latex_file` over invoking a bare compiler directly when you already have a `.tex` file to build.
 It can compile without requesting external viewer state: leave `open_pdf` unset/false for a build/check only run.
@@ -257,7 +257,7 @@ details. If compile succeeds but open fails, re-check service status/logs for `o
 
 File compilation requires `latexmk` for both one-shot and continuous modes. If `compile_latex_file` reports that `latexmk` is unavailable, install MacTeX or TeX Live and ensure `latexmk` is on `PATH`; BasicTeX users may need to install `latexmk` separately (for example with `tlmgr`) and restart the Host Service so it sees the updated `PATH`.
 
-File compilation uses `latexmk -norc -view=none` with recorder/dependency-friendly behavior, SyncTeX enabled, and `-no-shell-escape` engine commands. Continuous compilation adds `-pvc` for background monitoring. `-norc` is intentional: continuous mode does not load user or project `.latexmkrc` files, so those files cannot override the Host Service's default compiler commands or launch a latexmk-owned viewer. The Host Service owns viewer lifecycle, so `open_pdf` controls whether a PDF viewer is opened and `close_pdf` only closes a tracked viewer; `close_pdf` does not stop continuous compilation. Use `continuous=false`, heartbeat expiry, or Host Service shutdown to stop the background compiler.
+File compilation uses `latexmk -norc -view=none` with recorder/dependency-friendly behavior, SyncTeX enabled, and `-no-shell-escape` engine commands. Continuous compilation adds `-pvc` for background monitoring. `-norc` is intentional: file compilation does not load user or project `.latexmkrc` files, so those files cannot override the Host Service's default compiler commands or launch a latexmk-owned viewer. The Host Service owns viewer lifecycle, so `open_pdf` controls whether a PDF viewer is opened and `close_pdf` only closes a tracked viewer; `close_pdf` does not stop continuous compilation. Use `continuous=false`, heartbeat expiry, or Host Service shutdown to stop the background compiler.
 
 Subscriptions are session-scoped and kept alive by automatic session heartbeats. If a session heartbeat expires, the Host Service removes that session from all continuous compile subscriptions and stops compilers with no remaining live subscribers. Background failures are stored as pending `[system info]` notifications for subscribed sessions; a later successful rebuild clears stale failures before delivery, and retrieval at agent boundaries clears delivered notifications.
 

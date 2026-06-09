@@ -30,7 +30,7 @@ const latexFileCompileToolSupport = createLatexFileCompileToolSupport();
 const LatexCompilerParam = Type.Optional(Type.Union(
 	LATEX_COMPILERS.map((compiler) => Type.Literal(compiler)),
 	{
-		description: `Optional LaTeX compiler. Defaults to ${DEFAULT_LATEX_COMPILER}.`,
+		description: `Optional TeX engine for latexmk. Defaults to ${DEFAULT_LATEX_COMPILER}; latexmk uses the hardened default LuaLaTeX-backed mode.`,
 		default: DEFAULT_LATEX_COMPILER,
 	},
 ));
@@ -51,7 +51,7 @@ const CompileLatexFileParams = Type.Object(
 			default: false,
 		})),
 		continuous: Type.Optional(Type.Boolean({
-			description: "When true, immediately compile then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file; latexmk handles multi-file dependency tracking with -norc, recorder/SyncTeX-friendly flags, no shell escape, and no latexmk-owned viewer. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit continuous to leave continuous compilation unchanged.",
+			description: "All file compiles use latexmk. When true, immediately compile with non-continuous latexmk then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file; latexmk handles multi-file dependency tracking with -norc, recorder/SyncTeX-friendly flags, no shell escape, and no latexmk-owned viewer. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit continuous to leave continuous compilation unchanged.",
 		})),
 	},
 	{ additionalProperties: false },

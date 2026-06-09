@@ -273,7 +273,7 @@ async function captureShowLatexTool(): Promise<ShowLatexTool> {
 	return (await captureTools()).showLatex;
 }
 function writeFakeCompiler(binDir: string, shouldFail = false): string {
-	const compilerPath = resolve(binDir, "lualatex");
+	const compilerPath = resolve(binDir, "latexmk");
 	const script = shouldFail
 		? `#!/usr/bin/env node
 const fs = require(\"node:fs\");
@@ -296,7 +296,7 @@ fs.writeFileSync(pdf, "%PDF-1.7\\n");
 }
 
 function writeFakeCompilerWithWarnings(binDir: string): string {
-	const compilerPath = resolve(binDir, "lualatex");
+	const compilerPath = resolve(binDir, "latexmk");
 	const script = `#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
@@ -339,7 +339,7 @@ process.exit(1);
 }
 
 function writeFakeCompilerWithSourceCapture(binDir: string, captureFile: string): string {
-	const compilerPath = resolve(binDir, "lualatex");
+	const compilerPath = resolve(binDir, "latexmk");
 	const capturedFile = JSON.stringify(captureFile);
 	const script = `#!/usr/bin/env node
 const fs = require(\"node:fs\");
@@ -357,7 +357,7 @@ fs.writeFileSync(${capturedFile}, sourceText);
 }
 
 function writeFakeCompilerWithSynctexArtifacts(binDir: string): string {
-	const compilerPath = resolve(binDir, "lualatex");
+	const compilerPath = resolve(binDir, "latexmk");
 	const script = `#!/usr/bin/env node
 const fs = require(\"node:fs\");
 const path = require(\"node:path\");
