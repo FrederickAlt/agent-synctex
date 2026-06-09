@@ -70,6 +70,8 @@ interface ContinuousCompileRecord {
 	recentOutput: string;
 	lastPdfSnapshot?: PdfSnapshot;
 	lastFailureFingerprint?: string;
+	stopping?: boolean;
+	stopPromise?: Promise<void>;
 }
 
 const MAX_RECENT_OUTPUT_LENGTH = 16_384;
@@ -246,6 +248,18 @@ export class HostServiceContinuousCompileManager {
 		}
 		const existing = this.recordsByRootSource.get(rootSource);
 		if (existing) {
+			if (existing.stopping) {
+				return {
+					requested: true,
+					status: "error",
+					root_source: rootSource,
+					session_id: sessionId,
+					subscriber_count: existing.subscribers.size,
+					pid: existing.process.pid,
+					error: "continuous compilation is stopping",
+					error_code: "continuous_compiler_stopping",
+				};
+			}
 			existing.subscribers.add(sessionId);
 			return this.details("already_active", existing, sessionId);
 		}
@@ -305,7 +319,7 @@ export class HostServiceContinuousCompileManager {
 		}
 	}
 
-	removeSubscription(rootSource: string, sessionId: string): HostServiceContinuousCompileDetails {
+	async removeSubscription(rootSource: string, sessionId: string): Promise<HostServiceContinuousCompileDetails> {
 		this.clearPendingNotificationsForSessionRoot(sessionId, rootSource);
 		const record = this.recordsByRootSource.get(rootSource);
 		if (!record) {
@@ -321,7 +335,7 @@ export class HostServiceContinuousCompileManager {
 		if (record.subscribers.size > 0) {
 			return this.details("still_active_for_other_subscribers", record, sessionId);
 		}
-		this.stopRecord(rootSource, record);
+		await this.stopRecordAndWait(rootSource, record);
 		return {
 			requested: true,
 			status: "stopped",
@@ -338,11 +352,14 @@ export class HostServiceContinuousCompileManager {
 			return;
 		}
 		for (const [rootSource, record] of this.recordsByRootSource) {
+			if (record.stopping) {
+				continue;
+			}
 			for (const sessionId of expired) {
 				record.subscribers.delete(sessionId);
 			}
 			if (record.subscribers.size === 0) {
-				this.stopRecord(rootSource, record);
+				void this.stopRecordAndWait(rootSource, record);
 			}
 		}
 	}
@@ -455,22 +472,24 @@ export class HostServiceContinuousCompileManager {
 		};
 	}
 
-	private stopRecord(rootSource: string, record: ContinuousCompileRecord): void {
-		this.recordsByRootSource.delete(rootSource);
-		record.subscribers.clear();
-		record.process.kill("SIGTERM");
-	}
-
-	private async stopRecordAndWait(rootSource: string, record: ContinuousCompileRecord): Promise<void> {
-		this.recordsByRootSource.delete(rootSource);
-		record.subscribers.clear();
-		const exited = this.waitForProcessExit(record.process);
-		record.process.kill("SIGTERM");
-		if (await this.waitForBoundedExit(exited, this.shutdownGraceMs)) {
-			return;
+	private stopRecordAndWait(rootSource: string, record: ContinuousCompileRecord): Promise<void> {
+		if (record.stopPromise) {
+			return record.stopPromise;
 		}
-		record.process.kill("SIGKILL");
-		await this.waitForBoundedExit(exited, this.shutdownForceMs);
+		record.stopping = true;
+		record.subscribers.clear();
+		record.stopPromise = (async () => {
+			const exited = this.waitForProcessExit(record.process);
+			record.process.kill("SIGTERM");
+			if (!(await this.waitForBoundedExit(exited, this.shutdownGraceMs))) {
+				record.process.kill("SIGKILL");
+				await this.waitForBoundedExit(exited, this.shutdownForceMs);
+			}
+			if (this.recordsByRootSource.get(rootSource) === record) {
+				this.recordsByRootSource.delete(rootSource);
+			}
+		})();
+		return record.stopPromise;
 	}
 
 	private waitForProcessExit(process: ContinuousCompileProcess): Promise<void> {

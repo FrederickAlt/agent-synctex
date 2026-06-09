@@ -198,7 +198,7 @@ async function withCompileServer<T>(
 	}
 }
 
-test("continuous compile manager enforces singleton processes and subscriber lifecycle", () => {
+test("continuous compile manager enforces singleton processes and subscriber lifecycle", async () => {
 	const fixture = makeFakeContinuousManager();
 	const root = "/tmp/project/main.tex";
 
@@ -218,12 +218,12 @@ test("continuous compile manager enforces singleton processes and subscriber lif
 	assert.equal(secondSession.subscriber_count, 2);
 	assert.equal(fixture.spawns.length, 1);
 
-	const removedOne = fixture.manager.removeSubscription(root, "session-A");
+	const removedOne = await fixture.manager.removeSubscription(root, "session-A");
 	assert.equal(removedOne.status, "still_active_for_other_subscribers");
 	assert.equal(removedOne.subscriber_count, 1);
 	assert.equal(fixture.processes[0]?.killed, false);
 
-	const removedLast = fixture.manager.removeSubscription(root, "session-B");
+	const removedLast = await fixture.manager.removeSubscription(root, "session-B");
 	assert.equal(removedLast.status, "stopped");
 	assert.equal(removedLast.subscriber_count, 0);
 	assert.equal(fixture.processes[0]?.killed, true);
@@ -785,6 +785,47 @@ test("host service stops session prune timer on shutdown", async () => {
 		await sleep(20);
 		assert.equal(leases.pruneCount, countAfterStop);
 	}, { sessionLeases: leases, sessionPruneIntervalMs: 5 });
+});
+
+test("final unsubscribe waits for process exit before dropping tracking", async () => {
+	const fixture = makeFakeContinuousManager({ shutdownGraceMs: 50, shutdownForceMs: 5, autoExitSignals: [] });
+	const root = "/tmp/project/main.tex";
+	fixture.manager.ensureSubscription(root, "session-A", "lualatex");
+	let resolved = false;
+	const unsubscribePromise = fixture.manager.removeSubscription(root, "session-A").then((details) => {
+		resolved = true;
+		return details;
+	});
+	await sleep(0);
+	assert.equal(fixture.processes[0]?.killSignals[0], "SIGTERM");
+	assert.equal(resolved, false);
+	assert.equal(fixture.manager.activeRootCount(), 1);
+
+	fixture.processes[0]?.emit("exit", 0, null);
+	const details = await unsubscribePromise;
+	assert.equal(details.status, "stopped");
+	assert.equal(fixture.manager.activeRootCount(), 0);
+	assert.equal(fixture.processes[0]?.killSignals.includes("SIGKILL"), false);
+});
+
+test("final unsubscribe escalates when process ignores graceful shutdown", async () => {
+	const fixture = makeFakeContinuousManager({ shutdownGraceMs: 5, shutdownForceMs: 50, autoExitSignals: ["SIGKILL"] });
+	const root = "/tmp/project/main.tex";
+	fixture.manager.ensureSubscription(root, "session-A", "lualatex");
+	const details = await fixture.manager.removeSubscription(root, "session-A");
+	assert.equal(details.status, "stopped");
+	assert.deepEqual(fixture.processes[0]?.killSignals, ["SIGTERM", "SIGKILL"]);
+	assert.equal(fixture.manager.activeRootCount(), 0);
+});
+
+test("expiry-driven stop keeps tracking until stubborn process is escalated", async () => {
+	const fixture = makeFakeContinuousManager({ shutdownGraceMs: 5, shutdownForceMs: 50, autoExitSignals: ["SIGKILL"] });
+	fixture.manager.ensureSubscription("/tmp/project/main.tex", "session-A", "lualatex");
+	fixture.manager.removeSessions(["session-A"]);
+	assert.equal(fixture.processes[0]?.killSignals[0], "SIGTERM");
+	assert.equal(fixture.manager.activeRootCount(), 1);
+	await waitUntil(() => fixture.manager.activeRootCount() === 0);
+	assert.deepEqual(fixture.processes[0]?.killSignals, ["SIGTERM", "SIGKILL"]);
 });
 
 test("continuous compiler shutdown waits for graceful process exit", async () => {

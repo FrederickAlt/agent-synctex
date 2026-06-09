@@ -116,7 +116,7 @@ export class HostServiceCompileService {
 			}
 			const artifactPaths = getExistingArtifacts(result.pdfPath, resultLogPath);
 			this.clearSuccessfulImmediateCompileNotification(request, result.source);
-			const continuous = this.applyContinuousCompileRequest(request, result.source);
+			const continuous = await this.applyContinuousCompileRequest(request, result.source);
 			const continuousError = continuous && ["unavailable", "error"].includes(continuous.status) ? continuous : undefined;
 			const openResponse = await this.openCompiledPdfThroughManagedViewerAfterCompile(
 				request,
@@ -194,7 +194,7 @@ export class HostServiceCompileService {
 				error,
 			});
 			const nowNs = this.nowNs();
-			const continuous = this.applyContinuousUnsubscribeAfterFailure(request, normalizedPath);
+			const continuous = await this.applyContinuousUnsubscribeAfterFailure(request, normalizedPath);
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -368,12 +368,12 @@ export class HostServiceCompileService {
 		}
 	}
 
-	private applyContinuousUnsubscribeAfterFailure(
+	private async applyContinuousUnsubscribeAfterFailure(
 		request: HostServiceCompileRequest,
 		rootSource: string,
-	): HostServiceContinuousCompileDetails | undefined {
+	): Promise<HostServiceContinuousCompileDetails | undefined> {
 		return request.details.continuous === false
-			? this.applyContinuousCompileRequest(request, rootSource)
+			? await this.applyContinuousCompileRequest(request, rootSource)
 			: undefined;
 	}
 
@@ -384,10 +384,10 @@ export class HostServiceCompileService {
 		}
 	}
 
-	private applyContinuousCompileRequest(
+	private async applyContinuousCompileRequest(
 		request: HostServiceCompileRequest,
 		rootSource: string,
-	): HostServiceContinuousCompileDetails | undefined {
+	): Promise<HostServiceContinuousCompileDetails | undefined> {
 		if (request.details.continuous === undefined) {
 			return undefined;
 		}
