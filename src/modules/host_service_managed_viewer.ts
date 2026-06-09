@@ -50,8 +50,11 @@ function isValidViewerBackendCapabilities(value: unknown): value is HostServiceV
 }
 
 const MANAGED_VIEWER_OPEN_TIMEOUT_MS = 2_000;
+const VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DEADLINE_MS = 1_500;
+const VIEWER_REOPEN_FORWARD_SEARCH_ATTEMPT_TIMEOUT_MS = 500;
 const VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DELAYS_MS = [50, 100, 200, 400] as const;
 const VIEWER_BACKEND_TIMEOUT_ERROR_TEXT = "viewer backend request timed out while opening preview";
+const VIEWER_FORWARD_SEARCH_TIMEOUT_ERROR_TEXT = "viewer backend request timed out while forwarding search";
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -61,12 +64,13 @@ function withTimeout<T>(
 	operation: () => Promise<T>,
 	timeoutMs: number,
 	onLateSuccess?: (value: T) => void | Promise<void>,
+	timeoutErrorText = VIEWER_BACKEND_TIMEOUT_ERROR_TEXT,
 ): Promise<T> {
 	return new Promise<T>((resolve, reject) => {
 		let timedOut = false;
 		const timer = setTimeout(() => {
 			timedOut = true;
-			reject(new Error(VIEWER_BACKEND_TIMEOUT_ERROR_TEXT));
+			reject(new Error(timeoutErrorText));
 		}, timeoutMs);
 		timer.unref?.();
 
@@ -675,6 +679,7 @@ export class HostServiceManagedViewerService {
 			record: HostServiceManagedViewerRecord,
 			synctexPid: number | undefined,
 			forwardSourceFile: string,
+			forwardSearchTimeoutMs?: number,
 		): ReturnType<ViewerBackendAdapter["forwardSearch"]> => {
 			const backendDetails: Record<string, unknown> = {
 				handle: record.viewerHandle,
@@ -684,6 +689,32 @@ export class HostServiceManagedViewerService {
 			};
 			if (synctexPid !== undefined) {
 				backendDetails.synctex_pid = synctexPid;
+			}
+			if (forwardSearchTimeoutMs !== undefined) {
+				backendDetails.forward_search_timeout_ms = forwardSearchTimeoutMs;
+				try {
+					return await withTimeout(
+						() => this.viewerBackend.forwardSearch(request.request_id, backendDetails),
+						forwardSearchTimeoutMs,
+						undefined,
+						VIEWER_FORWARD_SEARCH_TIMEOUT_ERROR_TEXT,
+					);
+				} catch (error) {
+					const errorText = error instanceof Error ? error.message : String(error);
+					return {
+						status: "error",
+						error: errorText,
+						status_details: {
+							handled: false,
+							service_available: false,
+							backend_identity_ok: false,
+							error_code: "service_timeout",
+							reason: errorText,
+							handle: record.viewerHandle,
+							diagnostics: [{ error: errorText }],
+						},
+					};
+				}
 			}
 			return this.viewerBackend.forwardSearch(request.request_id, backendDetails);
 		};
@@ -732,21 +763,48 @@ export class HostServiceManagedViewerService {
 		});
 
 		const reopenableErrorCodes = new Set(["handle_not_found", "not_running", "stale_handle"]);
-		const transientReopenedForwardSearchErrorCodes = new Set([
-			"backend_unavailable",
+		const immediatelyTransientReopenedForwardSearchErrorCodes = new Set([
 			"handle_not_found",
 			"not_ready",
 			"not_running",
-			"service_timeout",
 			"stale_handle",
 		]);
+		const hasZathuraReadinessSignature = (
+			attempt: Awaited<ReturnType<ViewerBackendAdapter["forwardSearch"]>>,
+		): boolean => {
+			const details = attempt.status_details as Record<string, unknown>;
+			const diagnostics = Array.isArray(details.diagnostics) ? details.diagnostics : [];
+			if (diagnostics.some((diagnostic) =>
+				typeof diagnostic === "object"
+				&& diagnostic !== null
+				&& (diagnostic as Record<string, unknown>).returncode === 255
+			)) {
+				return true;
+			}
+			const textParts: string[] = [];
+			if (typeof attempt.error === "string") textParts.push(attempt.error);
+			for (const key of ["reason", "error"] as const) {
+				if (typeof details[key] === "string") textParts.push(details[key]);
+			}
+			for (const diagnostic of diagnostics) {
+				if (typeof diagnostic !== "object" || diagnostic === null) continue;
+				const record = diagnostic as Record<string, unknown>;
+				for (const key of ["stderr", "stdout", "error"] as const) {
+					if (typeof record[key] === "string") textParts.push(record[key]);
+				}
+			}
+			const text = textParts.join("\n");
+			return /(?:GDBus|D-Bus|DBus|ServiceUnknown|org\.freedesktop\.DBus|org\.pwmt\.zathura\.PID|not provided by any \.service files|returncode=255)/i.test(text);
+		};
 		const shouldRetryReopenedForwardSearch = (
 			attempt: Awaited<ReturnType<ViewerBackendAdapter["forwardSearch"]>>,
 		): boolean => {
 			if (attempt.status === "ok") return false;
 			const details = attempt.status_details as Record<string, unknown>;
 			const errorCode = typeof details.error_code === "string" ? details.error_code : "backend_unavailable";
-			return transientReopenedForwardSearchErrorCodes.has(errorCode);
+			if (immediatelyTransientReopenedForwardSearchErrorCodes.has(errorCode)) return true;
+			if (errorCode === "backend_unavailable") return hasZathuraReadinessSignature(attempt);
+			return false;
 		};
 		let initialDiagnostics: Array<Record<string, unknown>> | undefined;
 		let initialReason: string | undefined;
@@ -815,6 +873,43 @@ export class HostServiceManagedViewerService {
 			: managedRecord.capabilities ?? this.viewerBackend.capabilities;
 
 		if (reopenAttempt.status === "ok") {
+			const makeReopenedConflictResponse = (
+				conflictReason: string,
+				closed: boolean,
+			): HostServiceJumpResponseEnvelope => ({
+				protocol_version: this.protocolVersion,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "error",
+				generated_at_ns: Date.now() * 1_000_000,
+				error: conflictReason,
+				status_details: {
+					protocol_version: this.protocolVersion,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: managedRecord.viewerBackend,
+					backend_path:
+						typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+							? managedRecord.backendPath
+							: reopenBackendPath,
+					handled: false,
+					closed,
+					reopened: true,
+					pdf_id: request.pdf_id,
+					pdf: managedRecord.pdfPath,
+					source_file: resolvedSourceFile,
+					line: request.line,
+					source_line: sourceLine,
+					error_code: "conflict",
+					reason: conflictReason,
+					handle: managedRecord.viewerHandle,
+					diagnostics: initialDiagnostics,
+					managed_record: managedRecord,
+				},
+			});
 			const revivedRecord = this.managedViewerRecords.reviveRecordIfState(
 				request.pdf_id,
 				managedRecordState,
@@ -825,38 +920,10 @@ export class HostServiceManagedViewerService {
 					handle: reopenHandle,
 					backend: this.viewerBackend.name,
 				}).catch(() => undefined);
-				const conflictReason = `Tracked pdf_id=${request.pdf_id} changed lifecycle state while jump_pdf was reopening; aborting reopened jump.`;
-				return {
-					protocol_version: this.protocolVersion,
-					request_id: request.request_id,
-					operation: "jump_pdf",
-					status: "error",
-					generated_at_ns: Date.now() * 1_000_000,
-					error: conflictReason,
-					status_details: {
-						protocol_version: this.protocolVersion,
-						supported: false,
-						service_available: false,
-						workspace_context: request.workspace_context,
-						request_id: request.request_id,
-						operation: "jump_pdf",
-						backend: managedRecord.viewerBackend,
-						backend_path: reopenBackendPath,
-						handled: false,
-						closed: true,
-						reopened: false,
-						pdf_id: request.pdf_id,
-						pdf: managedRecord.pdfPath,
-						source_file: resolvedSourceFile,
-						line: request.line,
-						source_line: sourceLine,
-						error_code: "conflict",
-						reason: conflictReason,
-						handle: reopenHandle,
-						diagnostics: initialDiagnostics,
-						managed_record: managedRecord,
-					},
-				};
+				return makeReopenedConflictResponse(
+					`Tracked pdf_id=${request.pdf_id} changed lifecycle state while jump_pdf was reopening; aborting reopened jump.`,
+					true,
+				);
 			}
 			managedRecord = revivedRecord;
 			managedRecord.viewerHandle = reopenHandle;
@@ -869,16 +936,49 @@ export class HostServiceManagedViewerService {
 			managedRecord.defaultSourcePath =
 				managedRecord.defaultSourcePath ?? inferDefaultSourceFileForPdf(managedRecord.pdfPath);
 
+			const validateReopenedRecord = (): HostServiceJumpResponseEnvelope | undefined => {
+				try {
+					const knownRecord = this.managedViewerRecords.getKnownRecord(request.pdf_id);
+					if (
+						knownRecord.state === "active"
+						&& knownRecord.record === managedRecord
+						&& knownRecord.record.viewerHandle === reopenHandle
+						&& knownRecord.record.pid === reopenPid
+					) {
+						return undefined;
+					}
+				} catch {
+					// Report the same conflict classification for disappearing records.
+				}
+				return makeReopenedConflictResponse(
+					`Tracked pdf_id=${request.pdf_id} changed lifecycle state while jump_pdf was waiting for reopened viewer readiness; aborting reopened jump.`,
+					true,
+				);
+			};
+
 			let retryAttempt!: Awaited<ReturnType<ViewerBackendAdapter["forwardSearch"]>>;
 			let retryDetails: Record<string, unknown> = {};
 			const retryDiagnostics: Array<Record<string, unknown>> = initialDiagnostics ? [...initialDiagnostics] : [];
+			const readinessDeadlineMs = Date.now() + VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DEADLINE_MS;
 			for (let attemptIndex = 0; attemptIndex <= VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DELAYS_MS.length; attemptIndex += 1) {
-				retryAttempt = await jumpBackend(managedRecord, managedRecord.pid, resolvedSourceFile);
+				const preAttemptConflict = validateReopenedRecord();
+				if (preAttemptConflict) return preAttemptConflict;
+				const remainingMs = readinessDeadlineMs - Date.now();
+				if (remainingMs <= 0) {
+					break;
+				}
+				const attemptTimeoutMs = Math.max(
+					1,
+					Math.min(VIEWER_REOPEN_FORWARD_SEARCH_ATTEMPT_TIMEOUT_MS, remainingMs),
+				);
+				retryAttempt = await jumpBackend(managedRecord, managedRecord.pid, resolvedSourceFile, attemptTimeoutMs);
 				retryDetails = retryAttempt.status_details as Record<string, unknown>;
 				if (Array.isArray(retryDetails.diagnostics)) {
 					retryDiagnostics.push(...retryDetails.diagnostics);
 				}
 				if (retryAttempt.status === "ok") {
+					const successConflict = validateReopenedRecord();
+					if (successConflict) return successConflict;
 					const retryHandled =
 						typeof retryDetails.handled === "boolean" ? retryDetails.handled : false;
 					const retryBackendIdentityOk =
@@ -907,7 +1007,16 @@ export class HostServiceManagedViewerService {
 				) {
 					break;
 				}
-				await sleep(VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DELAYS_MS[attemptIndex]);
+				const preSleepConflict = validateReopenedRecord();
+				if (preSleepConflict) return preSleepConflict;
+				const sleepMs = Math.min(
+					VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DELAYS_MS[attemptIndex],
+					Math.max(0, readinessDeadlineMs - Date.now()),
+				);
+				if (sleepMs <= 0) {
+					break;
+				}
+				await sleep(sleepMs);
 			}
 			const retryBackendIdentityOk =
 				typeof retryDetails.backend_identity_ok === "boolean"

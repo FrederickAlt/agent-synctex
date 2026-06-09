@@ -177,6 +177,9 @@ function validateForwardRequest(details: Record<string, unknown>): string | unde
 	if (details.synctex_pid !== undefined && (!isNumber(details.synctex_pid) || !Number.isInteger(details.synctex_pid) || details.synctex_pid < 1)) {
 		return "invalid synctex_pid";
 	}
+	if (details.forward_search_timeout_ms !== undefined && (!isNumber(details.forward_search_timeout_ms) || !Number.isInteger(details.forward_search_timeout_ms) || details.forward_search_timeout_ms < 1)) {
+		return "invalid forward_search_timeout_ms";
+	}
 	return;
 }
 
@@ -959,6 +962,15 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 				stdio: ["ignore", "pipe", "pipe"],
 				timeout: timeoutMs,
 			});
+			if (completed.error !== undefined) {
+				if ((completed.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+					return { command, error: `viewer command timed out: ${completed.error.message}` };
+				}
+				if ((completed.error as NodeJS.ErrnoException).code === "ENOENT") {
+					return { command, error: "viewer backend is unavailable" };
+				}
+				return { command, error: `failed to invoke viewer command: ${completed.error.message}` };
+			}
 			return {
 				command,
 				completed: {
@@ -1450,10 +1462,11 @@ export class ZathuraViewerBackend implements ViewerBackendAdapter {
 			};
 		}
 		const requestedPid = isNumber(details.synctex_pid) ? details.synctex_pid : undefined;
+		const forwardSearchTimeoutMs = isNumber(details.forward_search_timeout_ms) ? details.forward_search_timeout_ms : 10_000;
 		const line = details.line as number;
 		const diagnostics: Array<Record<string, unknown>> = [];
 		const attempt = (pid: number | undefined, label: string) => {
-			const attemptResult = this.runForwardSearch(session.backendPath, line, sourceValidation.normalizedPath, session.pdfPath, pid, 10_000);
+			const attemptResult = this.runForwardSearch(session.backendPath, line, sourceValidation.normalizedPath, session.pdfPath, pid, forwardSearchTimeoutMs);
 			if (attemptResult.error) {
 				diagnostics.push(forwardDiagnostic(label, attemptResult.command, pid, undefined, attemptResult.error));
 				return { handled: false, reason: attemptResult.error };
