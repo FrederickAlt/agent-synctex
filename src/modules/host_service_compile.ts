@@ -64,6 +64,7 @@ export interface HostServiceCompileServiceOptions {
 		callbackTargetId: string | undefined,
 		callbackTarget: HostServiceCallbackTarget | undefined,
 	) => Promise<HostServiceCallbackTarget | undefined>;
+	refreshContinuousSessionLease?: (workspaceContext: HostServiceWorkspaceContext) => void;
 	nowNs?: () => number;
 	continuousCompileManager?: HostServiceContinuousCompileManager;
 }
@@ -72,6 +73,7 @@ export class HostServiceCompileService {
 	private readonly protocolVersion: number;
 	private readonly managedViewerService: HostServiceManagedViewerServiceLike;
 	private readonly resolveManagedOpenCallback: HostServiceCompileServiceOptions["resolveManagedOpenCallback"];
+	private readonly refreshContinuousSessionLease: HostServiceCompileServiceOptions["refreshContinuousSessionLease"];
 	private readonly nowNs: () => number;
 	private readonly continuousCompileManager: HostServiceContinuousCompileManager;
 
@@ -79,6 +81,7 @@ export class HostServiceCompileService {
 		this.protocolVersion = options.protocolVersion;
 		this.managedViewerService = options.managedViewerService;
 		this.resolveManagedOpenCallback = options.resolveManagedOpenCallback;
+		this.refreshContinuousSessionLease = options.refreshContinuousSessionLease;
 		this.nowNs = options.nowNs ?? (() => Date.now() * 1_000_000);
 		this.continuousCompileManager = options.continuousCompileManager ?? new HostServiceContinuousCompileManager();
 	}
@@ -400,6 +403,7 @@ export class HostServiceCompileService {
 				error_code: "invalid_request",
 			};
 		}
+		this.refreshContinuousSessionLease?.(request.workspace_context);
 		return request.details.continuous
 			? this.continuousCompileManager.ensureSubscription(rootSource, sessionId, request.details.compiler)
 			: this.continuousCompileManager.removeSubscription(rootSource, sessionId);

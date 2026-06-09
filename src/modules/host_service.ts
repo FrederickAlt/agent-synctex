@@ -996,6 +996,7 @@ export class HostServiceServer {
 	private readonly continuousCompileManager: HostServiceContinuousCompileManager;
 	private readonly sessionPruneIntervalMs: number;
 	private sessionPruneTimer: ReturnType<typeof setInterval> | null = null;
+	private stopping = false;
 	private server: Server | null = null;
 	private startedAtNs = 0;
 	private serviceInstanceId: string;
@@ -1028,6 +1029,11 @@ export class HostServiceServer {
 			protocolVersion: this.protocolVersion,
 			managedViewerService: this.managedViewerService,
 			resolveManagedOpenCallback: this.resolveManagedOpenCallback.bind(this),
+			refreshContinuousSessionLease: (workspaceContext) => {
+				if (!this.stopping) {
+					this.sessionLeases.heartbeat(workspaceContext);
+				}
+			},
 			continuousCompileManager: this.continuousCompileManager,
 		});
 		this.sessionLeases.onExpiredSessions((sessionIds) => this.continuousCompileManager.removeSessions(sessionIds));
@@ -1038,6 +1044,8 @@ export class HostServiceServer {
 			return;
 		}
 		serverLogger.info("start.begin", { socket_path: this.socketPath, service_name: this.serviceName });
+		this.stopping = false;
+		this.continuousCompileManager.setAcceptingSubscriptions(true);
 		this.socketOwnedByServer = false;
 		try {
 			await this.prepareSocketPath();
@@ -1088,37 +1096,32 @@ export class HostServiceServer {
 
 	async stop(): Promise<void> {
 		serverLogger.info("stop.begin", { socket_path: this.socketPath, service_name: this.serviceName, active_connections: this.activeConnections.size });
+		this.stopping = true;
+		this.continuousCompileManager.setAcceptingSubscriptions(false);
 		this.stopSessionPruneLoop();
-		await this.continuousCompileManager.stopAll();
-		await this.closeViewerBackendSessions();
 		const server = this.server;
 		this.server = null;
 		for (const socket of this.activeConnections) {
 			socket.destroy();
 		}
-		if (!server) {
-			this.callbackTargets.clear();
-			this.sessionLeases.clear();
-			this.managedViewerRecords.clear();
-			this.removeSocketPath();
-			serverLogger.info("stop.end", { socket_path: this.socketPath, service_name: this.serviceName, server_was_running: false });
-			return;
-		}
-
-		await new Promise<void>((resolve, reject) => {
-			server.close((error) => {
-				if (error) {
-					reject(error);
-					return;
-				}
-				resolve();
+		if (server) {
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => {
+					if (error) {
+						reject(error);
+						return;
+					}
+					resolve();
+				});
 			});
-		});
+		}
+		await this.continuousCompileManager.stopAll();
+		await this.closeViewerBackendSessions();
 		this.callbackTargets.clear();
 		this.sessionLeases.clear();
 		this.managedViewerRecords.clear();
 		this.removeSocketPath();
-		serverLogger.info("stop.end", { socket_path: this.socketPath, service_name: this.serviceName });
+		serverLogger.info("stop.end", { socket_path: this.socketPath, service_name: this.serviceName, server_was_running: server !== null });
 	}
 
 	private startSessionPruneLoop(): void {
@@ -1137,6 +1140,10 @@ export class HostServiceServer {
 	}
 
 	private handleConnection(socket: Socket): void {
+		if (this.stopping) {
+			socket.destroy();
+			return;
+		}
 		this.activeConnections.add(socket);
 		socket.setTimeout(ACTIVE_CONNECTION_TIMEOUT_MS, () => {
 			socket.destroy();
@@ -1198,7 +1205,9 @@ export class HostServiceServer {
 					this.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget),
 				continuousCompileManager: this.continuousCompileManager,
 				refreshSessionLease: (workspaceContext) => {
-					this.sessionLeases.heartbeat(workspaceContext);
+					if (!this.stopping) {
+						this.sessionLeases.heartbeat(workspaceContext);
+					}
 				},
 			});
 			if (response === null) {

@@ -47,6 +47,17 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitUntil(predicate: () => boolean, timeoutMs = 500, intervalMs = 10): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) {
+			return;
+		}
+		await sleep(intervalMs);
+	}
+	assert.equal(predicate(), true);
+}
+
 class CountingSessionLeaseService extends HostServiceSessionLeaseService {
 	pruneCount = 0;
 
@@ -83,12 +94,12 @@ function temporaryDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));
 }
 
-function writeFakeLatexCompiler(binDir: string): void {
+function writeFakeLatexCompiler(binDir: string, options: { delaySeconds?: string } = {}): void {
 	mkdirSync(binDir, { recursive: true, mode: 0o700 });
 	const compilerPath = join(binDir, "lualatex");
 	writeFileSync(compilerPath, `#!/bin/sh
 set -eu
-tex_file=""
+${options.delaySeconds ? `sleep ${options.delaySeconds}\n` : ""}tex_file=""
 for arg in "$@"; do
   tex_file="$arg"
 done
@@ -157,12 +168,12 @@ async function sendFramedRequest(socketPath: string, payload: string): Promise<u
 async function withCompileServer<T>(
 	fixture: ReturnType<typeof makeFakeContinuousManager>,
 	fn: (client: HostServiceClient, baseDir: string, server: HostServiceServer, socketPath: string) => Promise<T>,
-	options: { leaseTtlMs?: number; nowNs?: () => number; viewerBackend?: FakeViewerBackend; managedViewerRecords?: HostServicePdfIdRegistry; sessionPruneIntervalMs?: number; sessionLeases?: HostServiceSessionLeaseService } = {},
+	options: { leaseTtlMs?: number; nowNs?: () => number; viewerBackend?: FakeViewerBackend; managedViewerRecords?: HostServicePdfIdRegistry; sessionPruneIntervalMs?: number; sessionLeases?: HostServiceSessionLeaseService; compilerDelaySeconds?: string } = {},
 ): Promise<T> {
 	const baseDir = temporaryDir("host-service-continuous-compile-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const binDir = join(baseDir, "bin");
-	writeFakeLatexCompiler(binDir);
+	writeFakeLatexCompiler(binDir, { delaySeconds: options.compilerDelaySeconds });
 	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}hi\\end{document}\n");
 	const originalPath = process.env.PATH ?? "";
 	process.env.PATH = `${binDir}:${originalPath}`;
@@ -683,6 +694,70 @@ test("close_pdf leaves continuous compiler running", async () => {
 	}, { viewerBackend, managedViewerRecords: new HostServicePdfIdRegistry({ minPdfId: 75, maxPdfId: 75, makePdfId: () => 75 }) });
 });
 
+test("immediate success pending clear preserves other sessions and other roots", async () => {
+	const leases = new HostServiceSessionLeaseService();
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const root = join(baseDir, "paper.tex");
+		const otherRoot = join(baseDir, "other.tex");
+		leases.queuePendingNotification("session-A", { id: "a-paper", created_at_ns: 1, root_source: root, message: "paper A" });
+		leases.queuePendingNotification("session-B", { id: "b-paper", created_at_ns: 2, root_source: root, message: "paper B" });
+		leases.queuePendingNotification("session-A", { id: "a-other", created_at_ns: 3, root_source: otherRoot, message: "other A" });
+
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex" },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+
+		const deliveredA = await client.requestPendingNotifications({ cwd: baseDir, session_id: "session-A" });
+		assert.deepEqual(deliveredA.notifications.map((notification) => notification.id), ["a-other"]);
+		const deliveredB = await client.requestPendingNotifications({ cwd: baseDir, session_id: "session-B" });
+		assert.deepEqual(deliveredB.notifications.map((notification) => notification.id), ["b-paper"]);
+	}, { sessionLeases: leases });
+});
+
+test("in-flight compile cannot create a continuous compiler after host service shutdown begins", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir, server) => {
+		const compilePromise = client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
+			{ cwd: baseDir, session_id: "session-A" },
+		).catch((error: unknown) => error);
+		await sleep(20);
+
+		await server.stop();
+		await compilePromise;
+		await sleep(80);
+
+		assert.equal(fixture.spawns.length, 0);
+		assert.equal(fixture.manager.activeRootCount(), 0);
+	}, { compilerDelaySeconds: "0.05" });
+});
+
+test("long immediate compile refreshes lease before continuous subscription so autonomous pruning remains bounded", async () => {
+	let nowNs = 1_000_000_000;
+	const leases = new HostServiceSessionLeaseService({ leaseTtlMs: 1, nowNs: () => nowNs });
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const compilePromise = client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		await sleep(20);
+		nowNs += 2_000_000;
+		await waitUntil(() => !leases.isLive("session-A"));
+
+		const compiled = await compilePromise;
+		assert.equal(compiled.continuous?.status, "started");
+		assert.equal(leases.isLive("session-A"), true);
+		assert.equal(fixture.manager.activeRootCount(), 1);
+
+		nowNs += 2_000_000;
+		await waitUntil(() => fixture.manager.activeRootCount() === 0);
+		assert.equal(fixture.processes[0]?.killed, true);
+	}, { sessionLeases: leases, sessionPruneIntervalMs: 5, compilerDelaySeconds: "0.05" });
+});
+
 test("host service autonomously prunes expired continuous subscriptions without a subsequent request", async () => {
 	let nowNs = 1_000_000_000;
 	const fixture = makeFakeContinuousManager();
@@ -694,8 +769,7 @@ test("host service autonomously prunes expired continuous subscriptions without 
 		assert.equal(fixture.manager.activeRootCount(), 1);
 
 		nowNs += 2_000_000;
-		await sleep(40);
-		assert.equal(fixture.manager.activeRootCount(), 0);
+		await waitUntil(() => fixture.manager.activeRootCount() === 0);
 		assert.equal(fixture.processes[0]?.killed, true);
 	}, { leaseTtlMs: 1, nowNs: () => nowNs, sessionPruneIntervalMs: 5 });
 });
@@ -704,7 +778,7 @@ test("host service stops session prune timer on shutdown", async () => {
 	const leases = new CountingSessionLeaseService();
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (_client, _baseDir, server) => {
-		await sleep(20);
+		await waitUntil(() => leases.pruneCount > 0);
 		assert.ok(leases.pruneCount > 0);
 		await server.stop();
 		const countAfterStop = leases.pruneCount;

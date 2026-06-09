@@ -62,6 +62,9 @@ function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): Ho
 			pdfOperations.resolveManagedOpenCallback
 				? pdfOperations.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget)
 				: callbackTarget,
+		refreshContinuousSessionLease: (workspaceContext) => {
+			void pdfOperations.refreshSessionLease?.(workspaceContext);
+		},
 		continuousCompileManager: pdfOperations.continuousCompileManager,
 	});
 }

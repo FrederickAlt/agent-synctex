@@ -213,6 +213,7 @@ export class HostServiceContinuousCompileManager {
 	private readonly shutdownForceMs: number;
 	private readonly recordsByRootSource = new Map<string, ContinuousCompileRecord>();
 	private notificationSink: ContinuousCompileNotificationSink | undefined;
+	private acceptingSubscriptions = true;
 
 	constructor(options: ContinuousCompileManagerOptions = {}) {
 		this.spawnProcess = options.spawnProcess ?? defaultSpawnProcess;
@@ -227,7 +228,22 @@ export class HostServiceContinuousCompileManager {
 		this.notificationSink = notificationSink;
 	}
 
+	setAcceptingSubscriptions(acceptingSubscriptions: boolean): void {
+		this.acceptingSubscriptions = acceptingSubscriptions;
+	}
+
 	ensureSubscription(rootSource: string, sessionId: string, compiler?: LatexCompiler | unknown): HostServiceContinuousCompileDetails {
+		if (!this.acceptingSubscriptions) {
+			return {
+				requested: true,
+				status: "error",
+				root_source: rootSource,
+				session_id: sessionId,
+				subscriber_count: 0,
+				error: "continuous compilation is shutting down",
+				error_code: "host_service_stopping",
+			};
+		}
 		const existing = this.recordsByRootSource.get(rootSource);
 		if (existing) {
 			existing.subscribers.add(sessionId);
