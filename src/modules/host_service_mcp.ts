@@ -329,12 +329,13 @@ function parseJumpWorkspaceContext(rawWorkspaceContext: unknown, sourceFile?: st
 	return workspaceContext;
 }
 
-function parseCompileLatexFileRequest(args: Record<string, unknown>): HostServiceCompileRequest {
+function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileRequest: HostServiceCompileRequest; hideWarnings: boolean } {
 	const latexFilePath = parseStringArg(args, "latex_file_path");
 	const compiler = parseOptionalStringArg(args, "compiler");
 	const clean = parseBooleanArg(args, "clean");
 	const openPdf = parseBooleanArg(args, "open_pdf");
 	const continuous = parseBooleanArg(args, "continuous");
+	const hideWarnings = parseBooleanArg(args, "hide_warnings") ?? true;
 	const callback = openPdf ? parseCallbackTargetArg(args) : undefined;
 	const callbackTargetId = openPdf ? parseOptionalStringArg(args, "callback_target_id") : undefined;
 	const reuseExisting = openPdf ? parseBooleanArg(args, "reuse_existing") : undefined;
@@ -344,22 +345,25 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): HostServic
 		throw new Error("workspace_context.session_id is required for continuous compilation");
 	}
 	return {
-		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
-		request_id: nextHostServiceRequestId(),
-		operation: "compile_latex_file",
-		created_at_ns: Date.now() * 1_000_000,
-		workspace_context: workspaceContext,
-		details: {
-			latex_file_path: latexFilePath,
-			...(compiler === undefined ? {} : { compiler }),
-			...(clean === undefined ? {} : { clean }),
-			...(openPdf === undefined ? {} : { open_pdf: openPdf }),
-			...(continuous === undefined ? {} : { continuous }),
-			...(callback === undefined ? {} : { callback }),
-			...(callbackTargetId === undefined ? {} : { callback_target_id: callbackTargetId }),
-			...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
-			...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
+		compileRequest: {
+			protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
+			request_id: nextHostServiceRequestId(),
+			operation: "compile_latex_file",
+			created_at_ns: Date.now() * 1_000_000,
+			workspace_context: workspaceContext,
+			details: {
+				latex_file_path: latexFilePath,
+				...(compiler === undefined ? {} : { compiler }),
+				...(clean === undefined ? {} : { clean }),
+				...(openPdf === undefined ? {} : { open_pdf: openPdf }),
+				...(continuous === undefined ? {} : { continuous }),
+				...(callback === undefined ? {} : { callback }),
+				...(callbackTargetId === undefined ? {} : { callback_target_id: callbackTargetId }),
+				...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
+				...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
+			},
 		},
+		hideWarnings,
 	};
 }
 
@@ -432,8 +436,10 @@ function formatContinuousSummary(details: unknown): string {
 	return `\nContinuous: ${status} subscribers=${subscribers}${pid}${root}${error}`;
 }
 
-function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }): string {
-	if (typeof details.warning_count !== "number" || details.warning_count <= 0 || !Array.isArray(details.warnings)) return "";
+function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }, hideWarnings = false): string {
+	if (typeof details.warning_count !== "number" || details.warning_count <= 0) return "";
+	if (hideWarnings) return `\nWarnings: ${details.warning_count} warnings hidden by default; rerun with hide_warnings=false to show warning details.`;
+	if (!Array.isArray(details.warnings)) return "";
 	const lines = details.warnings
 		.slice(0, 5)
 		.map((warning) => isRecord(warning) && typeof warning.message === "string" ? `- ${warning.message}` : "")
@@ -442,9 +448,16 @@ function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: 
 	return `\nWarnings:\n${lines.join("\n")}${details.warnings_truncated === true ? "\n- ... more warnings omitted" : ""}`;
 }
 
+function agentFacingCompileDetails<T extends { warning_count?: unknown; warnings?: unknown }>(details: T, hideWarnings: boolean): T | (Omit<T, "warnings"> & { warnings_hidden: true }) {
+	if (!hideWarnings || typeof details.warning_count !== "number" || details.warning_count <= 0) return details;
+	const { warnings: _warnings, ...filteredDetails } = details;
+	return { ...filteredDetails, warnings_hidden: true };
+}
+
 function parseToolResult(
 	response: HostServiceCompileResponseEnvelope | HostServiceCompileSnippetResponseEnvelope,
 	successText: string,
+	options: { hideWarnings?: boolean } = {},
 ): McpToolResult {
 	const details = response.status_details;
 	if (response.status === "ok") {
@@ -456,8 +469,8 @@ function parseToolResult(
 		const exitCode = details.compile_status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 		const log = details.log ? `\nLog: ${details.log}` : "";
 		return {
-			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${exitCode}${warningCount}${log}${formatContinuousSummary(details)}${formatDiagnosticSummary(details)}`.trim() }],
-			details,
+			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${exitCode}${warningCount}${log}${formatContinuousSummary(details)}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim() }],
+			details: agentFacingCompileDetails(details, options.hideWarnings === true),
 		};
 	}
 	const errorCode = typeof details.error_code === "string" ? ` (code=${details.error_code})` : "";
@@ -664,7 +677,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "compile_latex_file",
-			description: "Compile a LaTeX source file with latexmk and optionally register a host-service PDF. The compiler option selects the TeX engine latexmk should run. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc background recompilation; set continuous=false to compile once and unsubscribe this session; omitting continuous performs a latexmk-backed one-shot compile and leaves existing continuous state unchanged. Use continuous=false, not close_pdf, to stop continuous compilation because close_pdf does not stop continuous compilation.",
+			description: "Compile a LaTeX source file with latexmk and optionally register a host-service PDF. The compiler option selects the TeX engine latexmk should run. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc background recompilation; set continuous=false to compile once and unsubscribe this session; omitting continuous performs a latexmk-backed one-shot compile and leaves existing continuous state unchanged. Use continuous=false, not close_pdf, to stop continuous compilation because close_pdf does not stop continuous compilation. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -673,6 +686,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 					clean: { type: "boolean" },
 					open_pdf: { type: "boolean" },
 					continuous: { type: "boolean", description: "When true, immediately compile with latexmk using the selected engine, then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file. latexmk runs with -norc, -view=none, recorder/SyncTeX-friendly flags, selected-engine configuration, and -no-shell-escape engine commands so project latexmkrc files cannot override the default commands; this provides no latexmk-owned viewer launch. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit for a latexmk-backed one-shot compile that leaves continuous compilation unchanged." },
+					hide_warnings: { type: "boolean", default: true, description: "Defaults to true. When true, successful compiles keep warning_count metadata but hide warning message details from text and omit details.warnings. Set hide_warnings=false to show warning summaries and details.warnings." },
 					callback_target_id: { type: "string", minLength: 1 },
 					callback: {
 						type: "object",
@@ -815,8 +829,11 @@ async function handleCompileLatexFileTool(
 	mcpCompileService: HostServiceCompileService,
 ): Promise<McpResponsePayload> {
 	let compileRequest: HostServiceCompileRequest;
+	let hideWarnings = true;
 	try {
-		compileRequest = parseCompileLatexFileRequest(args);
+		const parsed = parseCompileLatexFileRequest(args);
+		compileRequest = parsed.compileRequest;
+		hideWarnings = parsed.hideWarnings;
 	} catch (error) {
 		return buildMcpErrorResponse(
 			requestId,
@@ -829,7 +846,7 @@ async function handleCompileLatexFileTool(
 			await pdfOperations.refreshSessionLease?.(compileRequest.workspace_context);
 		}
 		const compileResponse = await mcpCompileService.compileLatexFileRequest(compileRequest);
-		return buildSuccess(requestId, parseToolResult(compileResponse, "ok:"));
+		return buildSuccess(requestId, parseToolResult(compileResponse, "ok:", { hideWarnings }));
 	} catch (error) {
 		const details = error instanceof Error ? error.message : String(error);
 		return buildSuccess(requestId, {

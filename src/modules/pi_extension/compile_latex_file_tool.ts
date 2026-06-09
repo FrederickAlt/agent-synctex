@@ -53,6 +53,10 @@ const CompileLatexFileParams = Type.Object(
 		continuous: Type.Optional(Type.Boolean({
 			description: "All file compiles use latexmk. When true, immediately compile with non-continuous latexmk then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file; latexmk handles multi-file dependency tracking with -norc, recorder/SyncTeX-friendly flags, no shell escape, and no latexmk-owned viewer. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit continuous to leave continuous compilation unchanged.",
 		})),
+		hide_warnings: Type.Optional(Type.Boolean({
+			description: "When true (the default), successful compiles with warnings keep warning_count metadata but hide warning message details from the tool text/details. Set hide_warnings=false to show warning summaries and details.warnings.",
+			default: true,
+		})),
 	},
 	{ additionalProperties: false },
 );
@@ -85,11 +89,20 @@ function stringsOrEmpty(value: unknown): string[] {
 	return value.every((entry) => typeof entry === "string") ? value : [];
 }
 
-function warningSummary(warnings: LatexDiagnosticSummary[] | undefined, count: number | undefined, truncated: boolean | undefined): string {
-	if (!count || !warnings?.length) return "";
+function warningSummary(warnings: LatexDiagnosticSummary[] | undefined, count: number | undefined, truncated: boolean | undefined, hideWarnings: boolean): string {
+	if (!count) return "";
+	if (hideWarnings) return `\nWarnings: ${count} warnings hidden by default; rerun with hide_warnings=false to show warning details.`;
+	if (!warnings?.length) return "";
 	const lines = warnings.slice(0, 5).map((warning) => `- ${warning.message}`);
 	const suffix = truncated ? "\n- ... more warnings omitted" : "";
 	return `\nWarnings:\n${lines.join("\n")}${suffix}`;
+}
+
+function agentFacingCompileDetails<T extends Record<string, unknown>>(details: T, hideWarnings: boolean): T | (Omit<T, "warnings"> & { warnings_hidden: true }) {
+	const warningCount = typeof details.warning_count === "number" ? details.warning_count : 0;
+	if (!hideWarnings || warningCount <= 0) return details;
+	const { warnings: _warnings, ...filteredDetails } = details;
+	return { ...filteredDetails, warnings_hidden: true };
 }
 
 function continuousSummary(details: HostServiceCompileResponseDetails): string {
@@ -100,12 +113,12 @@ function continuousSummary(details: HostServiceCompileResponseDetails): string {
 	return `\nContinuous: ${continuous.status} subscribers=${continuous.subscriber_count}${pid} root=${continuous.root_source}${error}`;
 }
 
-function compileSuccessText(details: HostServiceCompileResponseDetails): string {
+function compileSuccessText(details: HostServiceCompileResponseDetails, hideWarnings: boolean): string {
 	const status = details.compile_status ?? "ok";
 	const warningCount = details.warning_count ? ` warnings=${details.warning_count}` : "";
 	const exitCode = status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 	const prefix = status === "ok" ? "ok" : status;
-	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${continuousSummary(details)}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated)}`;
+	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${continuousSummary(details)}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated, hideWarnings)}`;
 }
 
 function describeCompileFailureContext(
@@ -146,6 +159,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 			let shouldOpenPdf = false;
 			let shouldClean = false;
 			let continuous: boolean | undefined;
+			let hideWarnings = true;
 			let targetId = "";
 			try {
 				requestedPath = String(params.latex_file_path ?? "");
@@ -162,6 +176,12 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 						throw new Error("continuous must be a boolean");
 					}
 					continuous = params.continuous;
+				}
+				if (params.hide_warnings !== undefined) {
+					if (typeof params.hide_warnings !== "boolean") {
+						throw new Error("hide_warnings must be a boolean");
+					}
+					hideWarnings = params.hide_warnings;
 				}
 				const workspaceContext = hostServiceWorkspaceContextForRequest(ctx);
 				const client = createHostServiceClient();
@@ -197,8 +217,8 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 
 				if (!shouldOpenPdf) {
 					return {
-						content: [{ type: "text", text: compileSuccessText(compileResult) }],
-						details: {
+						content: [{ type: "text", text: compileSuccessText(compileResult, hideWarnings) }],
+						details: agentFacingCompileDetails({
 							source: compileResult.source,
 							pdf: compileResult.pdf,
 							log: compileResult.log,
@@ -211,7 +231,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 							warning_count: compileResult.warning_count,
 							warnings: compileResult.warnings,
 							warnings_truncated: compileResult.warnings_truncated,
-						},
+						}, hideWarnings),
 					};
 				}
 
@@ -227,8 +247,8 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				const status = compileResponse.compile_status ?? "ok";
 				const warningCount = compileResponse.warning_count ? ` warnings=${compileResponse.warning_count}` : "";
 				return {
-					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${continuousSummary(compileResponse)}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated)}` }],
-					details: {
+					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${continuousSummary(compileResponse)}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated, hideWarnings)}` }],
+					details: agentFacingCompileDetails({
 						source: compileResponse.source,
 						pdf: compileResponse.pdf,
 						pdf_id: compileResponse.pdf_id,
@@ -248,7 +268,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 						warning_count: compileResponse.warning_count,
 						warnings: compileResponse.warnings,
 						warnings_truncated: compileResponse.warnings_truncated,
-					},
+					}, hideWarnings),
 				};
 			} catch (error) {
 				const failureContext = describeCompileFailureContext(requestedPath, compileResult, error);
@@ -284,13 +304,14 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 		name: "compile_latex_file",
 		label: "Compile LaTeX File",
 		description:
-			"Compile an existing local LaTeX source file from its own directory using latexmk. Defaults to lualatex; pass compiler to choose the TeX engine latexmk should run: lualatex, pdflatex, xelatex, or latexmk default behavior. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external service state. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc recompilation; set continuous=false to compile once and unsubscribe this session; omit continuous for a latexmk-backed one-shot compile that leaves continuous state unchanged.",
+			"Compile an existing local LaTeX source file from its own directory using latexmk. Defaults to lualatex; pass compiler to choose the TeX engine latexmk should run: lualatex, pdflatex, xelatex, or latexmk default behavior. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external service state. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc recompilation; set continuous=false to compile once and unsubscribe this session; omit continuous for a latexmk-backed one-shot compile that leaves continuous state unchanged. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
 		promptSnippet: "Compile a local LaTeX file as PDF",
 		promptGuidelines: [
 			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
 			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without requesting external service state; set open_pdf=true only when the user wants the compiled PDF opened/tracked by the host service immediately.",
 			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling.",
 			"Use continuous=true for iterative project editing. Omit continuous for a latexmk-backed one-shot compile that does not alter continuous state. Use continuous=false to stop only this session's subscription; close_pdf does not stop continuous compilation.",
+			"Warnings are hidden by default to keep compile output concise: warning_count remains in details and text, and warnings_hidden=true is set when warning details were omitted. Set hide_warnings=false when you need the warning summary text and details.warnings.",
 			"File compilation requires latexmk. If compile_latex_file reports latexmk is unavailable, install MacTeX or TeX Live; BasicTeX users may need to install latexmk separately and ensure it is on PATH.",
 			"latexmk starts with -norc, -view=none, recorder/SyncTeX-friendly flags, selected-engine configuration, and -no-shell-escape engine commands so project latexmkrc files cannot override default commands or launch a latexmk-owned viewer. Continuous mode adds -pvc.",
 			"Continuous subscriptions are tied to the agent session heartbeat. If the session stops heartbeating, the Host Service removes the subscription and stops unreferenced compilers; unresolved background failures are delivered later as pending [system info] messages and cleared by later success or delivery.",

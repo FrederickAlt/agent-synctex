@@ -240,6 +240,8 @@ Prefer `compile_latex_file` over invoking a bare compiler directly when you alre
 It can compile without requesting external viewer state: leave `open_pdf` unset/false for a build/check only run.
 Pass `clean=true` to remove common same-basename LaTeX artifacts before compiling, including the previous PDF and SyncTeX sidecars.
 
+`compile_latex_file` hides LaTeX warning message details by default (`hide_warnings=true`) to keep agent output concise. Warning extraction still runs: outputs preserve status such as `ok_with_warnings`, include `warning_count`, and set `warnings_hidden=true` when warning details were omitted. Rerun with `hide_warnings=false` to include the warning summary text and `details.warnings`.
+
 Snippet previews pass `-synctex=1` to the selected LaTeX command by default. File compiles are driven by latexmk with SyncTeX enabled, so generated PDFs have SyncTeX sidecars when compilation succeeds.
 
 For `compile_latex_file`, latexmk is spawned with the source file's directory as the

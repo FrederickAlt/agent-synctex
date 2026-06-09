@@ -24,12 +24,25 @@ function allocateMcpTmpDir(prefix = "host-service-mcp-runtime-") {
 	};
 }
 
-function writeFakeLatexCompiler(binDir: string): void {
+function writeFakeLatexCompiler(binDir: string, options: { logContents?: string } = {}): void {
 	const compilerPath = join(binDir, "latexmk");
+	const logContents = options.logContents ?? "fake compiler output\n";
 	mkdirSync(binDir, { mode: 0o700, recursive: true });
 	writeFileSync(
 		compilerPath,
-		"#!/bin/sh\nset -eu\ntex_file=\"\"\nfor arg in \"$@\"; do\n  tex_file=\"$arg\"\ndone\nbase=\"${tex_file##*/}\"\nname=\"${base%.*}\"\nout_dir=\"$(dirname \"$tex_file\")\"\nif [ -z \"$tex_file\" ]; then\n  exit 1\nfi\nprintf \"fake compiler output\\n\" > \"$out_dir/$name.log\"\nprintf '%s' '%PDF-1.4\\n' > \"$out_dir/$name.pdf\"\ntouch \"$out_dir/$name.aux\"\nexit 0\n",
+		`#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const texFile = process.argv[process.argv.length - 1] || "";
+if (!texFile) process.exit(1);
+const base = path.basename(texFile);
+const name = base.replace(/\\.tex$/, "");
+const outDir = path.dirname(texFile);
+fs.writeFileSync(path.join(outDir, name + ".log"), ${JSON.stringify(logContents)});
+fs.writeFileSync(path.join(outDir, name + ".pdf"), "%PDF-1.4\\n");
+fs.writeFileSync(path.join(outDir, name + ".aux"), "");
+process.exit(0);
+`,
 		{ mode: 0o700 },
 	);
 	chmodSync(compilerPath, 0o700);
@@ -371,15 +384,20 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.ok(compileFileTool.inputSchema.properties.reuse_existing);
 		assert.ok(compileFileTool.inputSchema.properties.require_persistent_viewer);
 		assert.equal(compileFileTool.inputSchema.properties.continuous?.type, "boolean");
+		assert.equal(compileFileTool.inputSchema.properties.hide_warnings?.type, "boolean");
 		assert.match(compileFileTool.description ?? "", /continuous=true/);
 		assert.match(compileFileTool.description ?? "", /continuous=false/);
 		assert.match(compileFileTool.description ?? "", /omitting continuous/);
 		assert.match(compileFileTool.description ?? "", /close_pdf does not stop continuous compilation/);
+		assert.match(compileFileTool.description ?? "", /hide_warnings=false/);
+		assert.match(compileFileTool.description ?? "", /hidden by default/i);
 		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /latexmk -pvc/);
 		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /-norc/);
 		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /latexmkrc/);
 		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /no shell escape|-no-shell-escape/);
 		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /no latexmk-owned viewer/);
+		assert.match(compileFileTool.inputSchema.properties.hide_warnings?.description ?? "", /default/i);
+		assert.match(compileFileTool.inputSchema.properties.hide_warnings?.description ?? "", /hide_warnings=false/);
 		assert.match(closePdfTool.description ?? "", /does not stop continuous compilation/);
 		assert.match(closePdfTool.description ?? "", /continuous=false/);
 		assert.deepEqual((showLatexTool.inputSchema.properties as { callback?: { required?: string[] } }).callback?.required, ["kind", "transport", "socket_path", "token"]);
@@ -623,6 +641,23 @@ test("daemon rejects compile_latex_file continuous arguments without session ide
 		const malformedResponse = (await sendFramedRequest(socketPath, malformedPayload)) as { error: { code: number; message: string } };
 		assert.equal(malformedResponse.error.code, -32602);
 		assert.equal(malformedResponse.error.message, "continuous must be a boolean");
+
+		const malformedHideWarningsPayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 77,
+			method: "tools/call",
+			params: {
+				name: "compile_latex_file",
+				arguments: {
+					latex_file_path: "paper.tex",
+					hide_warnings: "false",
+					workspace_context: { cwd: baseDir },
+				},
+			},
+		});
+		const malformedHideWarningsResponse = (await sendFramedRequest(socketPath, malformedHideWarningsPayload)) as { error: { code: number; message: string } };
+		assert.equal(malformedHideWarningsResponse.error.code, -32602);
+		assert.equal(malformedHideWarningsResponse.error.message, "hide_warnings must be a boolean");
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -1228,6 +1263,80 @@ test("daemon compiles LaTeX file with absolute path without workspace_context", 
 		runtime.restore();
 	}
 });
+
+test("daemon compile_latex_file hides warning details by default and can show them explicitly", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-compile-warnings-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-compile-warnings-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const latexPath = join(workspaceDir, "main.tex");
+	writeFileSync(latexPath, "\\documentclass{article}\\begin{document}See \\ref{foo}.\\end{document}\n");
+	const socketPath = join(baseDir, "host-service.sock");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	const fakeCompilerDir = join(baseDir, "fake-bin");
+	writeFakeLatexCompiler(fakeCompilerDir, {
+		logContents: "LaTeX Warning: Reference `foo' undefined on input line 1.\nOverfull \\hbox (5.0pt too wide) in paragraph at lines 2--3\n",
+	});
+	await server.start();
+	const defaultPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 101,
+		method: "tools/call",
+		params: {
+			name: "compile_latex_file",
+			arguments: {
+				latex_file_path: latexPath,
+			},
+		},
+	});
+	const shownPayload = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 102,
+		method: "tools/call",
+		params: {
+			name: "compile_latex_file",
+			arguments: {
+				latex_file_path: latexPath,
+				hide_warnings: false,
+			},
+		},
+	});
+	try {
+		const defaultResponse = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
+			return await sendFramedRequest(socketPath, defaultPayload);
+		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details: { compile_status?: string; warning_count?: number; warnings?: unknown; warnings_hidden?: boolean; log?: string } } };
+		assert.equal(defaultResponse.result.isError, undefined);
+		const defaultText = defaultResponse.result.content[0].text;
+		assert.match(defaultText, /^ok_with_warnings:/);
+		assert.match(defaultText, /warnings=2/);
+		assert.match(defaultText, /warnings hidden/i);
+		assert.match(defaultText, /hide_warnings=false/);
+		assert.doesNotMatch(defaultText, /Reference `foo'|Overfull/);
+		assert.equal(defaultResponse.result.details.compile_status, "ok_with_warnings");
+		assert.equal(defaultResponse.result.details.warning_count, 2);
+		assert.equal(defaultResponse.result.details.warnings_hidden, true);
+		assert.equal("warnings" in defaultResponse.result.details, false);
+
+		const shownResponse = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
+			return await sendFramedRequest(socketPath, shownPayload);
+		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details: { compile_status?: string; warning_count?: number; warnings?: Array<{ message: string }>; warnings_hidden?: boolean; log?: string } } };
+		assert.equal(shownResponse.result.isError, undefined);
+		const shownText = shownResponse.result.content[0].text;
+		assert.match(shownText, /^ok_with_warnings:/);
+		assert.match(shownText, /warnings=2/);
+		assert.match(shownText, /Reference `foo'/);
+		assert.match(shownText, /Overfull/);
+		assert.equal(shownResponse.result.details.compile_status, "ok_with_warnings");
+		assert.equal(shownResponse.result.details.warning_count, 2);
+		assert.equal(shownResponse.result.details.warnings_hidden, undefined);
+		assert.equal(shownResponse.result.details.warnings?.some((warning) => /Overfull/.test(warning.message)), true);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
+
 
 test("daemon rejects compile_latex_file absolute path with non-absolute workspace_context.cwd", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-compile-abs-rel-cwd-");

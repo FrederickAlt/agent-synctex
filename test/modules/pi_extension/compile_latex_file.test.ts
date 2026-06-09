@@ -527,7 +527,7 @@ test("compile_latex_file compiles without opening by default", async () => {
 	}
 });
 
-test("compile_latex_file returns warning summaries from successful compiles", async () => {
+test("compile_latex_file hides warning details by default and can show them explicitly", async () => {
 	const tool = await captureCompileTool();
 	const root = mkdtempSync(join(tmpdir(), "pdf-preview-compile-warnings-"));
 	const binDir = resolve(root, "bin");
@@ -542,18 +542,47 @@ test("compile_latex_file returns warning summaries from successful compiles", as
 
 	try {
 		await withHostServiceDefault(async () => {
-			const result = await tool.execute("compile-latex-file-warnings", { latex_file_path: sourcePath }, undefined, undefined, undefined);
-			const details = result.details as { compile_status?: string; warning_count?: number; warnings?: Array<{ message: string }>; log?: string };
-			assert.match(result.content[0].text, /^ok_with_warnings:/);
-			assert.match(result.content[0].text, /warnings=2/);
-			assert.match(result.content[0].text, /Reference `foo'/);
-			assert.equal(details.compile_status, "ok_with_warnings");
-			assert.equal(details.warning_count, 2);
-			assert.equal(details.warnings?.some((warning) => /Overfull/.test(warning.message)), true);
-			assert.equal(details.log, resolve(root, "paper.log"));
+			const defaultResult = await tool.execute("compile-latex-file-warnings-hidden", { latex_file_path: sourcePath }, undefined, undefined, undefined);
+			const defaultDetails = defaultResult.details as { compile_status?: string; warning_count?: number; warnings?: Array<{ message: string }>; warnings_hidden?: boolean; log?: string };
+			assert.match(defaultResult.content[0].text, /^ok_with_warnings:/);
+			assert.match(defaultResult.content[0].text, /warnings=2/);
+			assert.match(defaultResult.content[0].text, /warnings hidden/i);
+			assert.match(defaultResult.content[0].text, /hide_warnings=false/);
+			assert.doesNotMatch(defaultResult.content[0].text, /Reference `foo'|Overfull/);
+			assert.equal(defaultDetails.compile_status, "ok_with_warnings");
+			assert.equal(defaultDetails.warning_count, 2);
+			assert.equal(defaultDetails.warnings_hidden, true);
+			assert.equal("warnings" in defaultDetails, false);
+			assert.equal(defaultDetails.log, resolve(root, "paper.log"));
+
+			const shownResult = await tool.execute("compile-latex-file-warnings-shown", { latex_file_path: sourcePath, hide_warnings: false }, undefined, undefined, undefined);
+			const shownDetails = shownResult.details as { compile_status?: string; warning_count?: number; warnings?: Array<{ message: string }>; warnings_hidden?: boolean; log?: string };
+			assert.match(shownResult.content[0].text, /^ok_with_warnings:/);
+			assert.match(shownResult.content[0].text, /warnings=2/);
+			assert.match(shownResult.content[0].text, /Reference `foo'/);
+			assert.match(shownResult.content[0].text, /Overfull/);
+			assert.equal(shownDetails.compile_status, "ok_with_warnings");
+			assert.equal(shownDetails.warning_count, 2);
+			assert.equal(shownDetails.warnings_hidden, undefined);
+			assert.equal(shownDetails.warnings?.some((warning) => /Overfull/.test(warning.message)), true);
+			assert.equal(shownDetails.log, resolve(root, "paper.log"));
 		});
 	} finally {
 		process.env.PATH = originalPath;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+
+test("compile_latex_file validates hide_warnings", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	try {
+		await assert.rejects(
+			() => tool.execute("compile-latex-file-hide-warnings-validation", { latex_file_path: sourcePath, hide_warnings: "false" }, undefined, undefined, undefined),
+			/hide_warnings must be a boolean/,
+		);
+	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
@@ -612,9 +641,9 @@ test("Pi tool descriptions document continuous lifecycle boundaries", async () =
 	const tool = compileTool as unknown as {
 		description?: string;
 		promptGuidelines?: string[];
-		parameters?: { properties?: { continuous?: { schema?: { options?: { description?: string } } } } };
+		parameters?: { properties?: { continuous?: { schema?: { options?: { description?: string } } }; hide_warnings?: { schema?: { options?: { description?: string; default?: boolean } } } } };
 	};
-	const text = [tool.description, ...(tool.promptGuidelines ?? []), tool.parameters?.properties?.continuous?.schema?.options?.description].join("\n");
+	const text = [tool.description, ...(tool.promptGuidelines ?? []), tool.parameters?.properties?.continuous?.schema?.options?.description, tool.parameters?.properties?.hide_warnings?.schema?.options?.description].join("\n");
 	assert.match(text, /continuous=true/);
 	assert.match(text, /continuous=false/);
 	assert.match(text, /omit continuous/);
@@ -626,6 +655,9 @@ test("Pi tool descriptions document continuous lifecycle boundaries", async () =
 	assert.match(text, /multi-file dependency tracking/);
 	assert.match(text, /heartbeat/);
 	assert.match(text, /\[system info\]/);
+	assert.match(text, /hide_warnings=false/);
+	assert.match(text, /hidden by default/i);
+	assert.ok(tool.parameters?.properties?.hide_warnings);
 });
 
 test("compile_latex_file passes continuous flag through and renders continuous metadata", async () => {
