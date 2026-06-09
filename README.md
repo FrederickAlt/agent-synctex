@@ -234,15 +234,17 @@ Also keep `viewer_guardrails.test.ts` in mind: it is the explicit regression gua
 
 `show_latex` and `compile_latex_file` both accept an optional `compiler` parameter. The default is `lualatex`.
 `show_latex` also accepts `inline` (default `true`). Use `inline=false` when you specifically want the external host-service preview workflow.
-Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk` (which runs latexmk with LuaLaTeX).
+Supported values are `lualatex`, `pdflatex`, `xelatex`, and `latexmk`; file compilation uses `latexmk` as the driver and maps those values to its engine configuration (`latexmk` uses the hardened default LuaLaTeX-backed mode).
 
 Prefer `compile_latex_file` over invoking a bare compiler directly when you already have a `.tex` file to build.
 It can compile without requesting external viewer state: leave `open_pdf` unset/false for a build/check only run.
 Pass `clean=true` to remove common same-basename LaTeX artifacts before compiling, including the previous PDF and SyncTeX sidecars.
 
-Both snippet previews and file compiles pass `-synctex=1` to the selected LaTeX command by default, so generated PDFs have SyncTeX sidecars when the compiler succeeds.
+File compiles require `latexmk`; if it is unavailable, install MacTeX or TeX Live and ensure `latexmk` is on `PATH`; BasicTeX users may need to install `latexmk` separately (for example with `tlmgr`) and restart the Host Service so it sees the updated `PATH`.
 
-For `compile_latex_file`, the selected compiler is spawned with the source file's directory as the
+Both snippet previews and file compiles pass `-synctex=1` through latexmk by default, so generated PDFs have SyncTeX sidecars when the compiler succeeds.
+
+For `compile_latex_file`, `latexmk` is spawned with the source file's directory as the
 working directory, using the original file name as the job input. The resulting `<name>.pdf` stays
 next to the source file. By default, successful output is a single short `ok: <pdf>` line and no
 viewer state changes, so the tool remains useful as a compile/check operation. With `open_pdf=true`,
@@ -255,9 +257,7 @@ details. If compile succeeds but open fails, re-check service status/logs for `o
 - `continuous=false` performs the immediate compile, then removes only the current session's subscription. If it was the last subscriber, the Host Service stops the background compiler.
 - Omitting `continuous` preserves ordinary one-shot behavior and does not start, stop, or refresh continuous compilation state.
 
-Continuous mode requires `latexmk`; direct one-shot compiles with `lualatex`, `pdflatex`, or `xelatex` do not. If `continuous=true` reports that `latexmk` is unavailable, install MacTeX or TeX Live and ensure `latexmk` is on `PATH`; BasicTeX users may need to install `latexmk` separately (for example with `tlmgr`) and restart the Host Service so it sees the updated `PATH`.
-
-Continuous compilation uses `latexmk -pvc -norc -view=none` with recorder/dependency-friendly behavior, SyncTeX enabled, and `-no-shell-escape` engine commands. `-norc` is intentional: continuous mode does not load user or project `.latexmkrc` files, so those files cannot override the Host Service's default compiler commands or launch a latexmk-owned viewer. The Host Service owns viewer lifecycle, so `open_pdf` controls whether a PDF viewer is opened and `close_pdf` only closes a tracked viewer; `close_pdf` does not stop continuous compilation. Use `continuous=false`, heartbeat expiry, or Host Service shutdown to stop the background compiler.
+One-shot file compilation uses non-continuous `latexmk` without `-pvc`; continuous background compilation uses `latexmk -pvc`. Both use `-norc`, `-view=none`, recorder/dependency-friendly behavior, SyncTeX enabled, and `-no-shell-escape` engine commands. `-norc` is intentional: file compilation does not load user or project `.latexmkrc` files, so those files cannot override the Host Service's default compiler commands or launch a latexmk-owned viewer. The Host Service owns viewer lifecycle, so `open_pdf` controls whether a PDF viewer is opened and `close_pdf` only closes a tracked viewer; `close_pdf` does not stop continuous compilation. Use `continuous=false`, heartbeat expiry, or Host Service shutdown to stop the background compiler.
 
 Subscriptions are session-scoped and kept alive by automatic session heartbeats. If a session heartbeat expires, the Host Service removes that session from all continuous compile subscriptions and stops compilers with no remaining live subscribers. Background failures are stored as pending `[system info]` notifications for subscribed sessions; a later successful rebuild clears stale failures before delivery, and retrieval at agent boundaries clears delivered notifications.
 

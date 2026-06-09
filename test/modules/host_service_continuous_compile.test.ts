@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createConnection } from "node:net";
 import { PassThrough } from "node:stream";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -96,7 +96,7 @@ function temporaryDir(prefix: string): string {
 
 function writeFakeLatexCompiler(binDir: string, options: { delaySeconds?: string } = {}): void {
 	mkdirSync(binDir, { recursive: true, mode: 0o700 });
-	const compilerPath = join(binDir, "lualatex");
+	const compilerPath = join(binDir, "latexmk");
 	writeFileSync(compilerPath, `#!/bin/sh
 set -eu
 ${options.delaySeconds ? `sleep ${options.delaySeconds}\n` : ""}tex_file=""
@@ -115,7 +115,7 @@ exit 0
 
 function writeFailingLatexCompiler(binDir: string): void {
 	mkdirSync(binDir, { recursive: true, mode: 0o700 });
-	const compilerPath = join(binDir, "lualatex");
+	const compilerPath = join(binDir, "latexmk");
 	writeFileSync(compilerPath, `#!/bin/sh
 set -eu
 tex_file=""
@@ -127,6 +127,50 @@ name="${"${base%.*}"}"
 out_dir="$(dirname "$tex_file")"
 printf 'intentional compile failure\n' > "$out_dir/$name.log"
 exit 7
+`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+}
+
+function writeLatexmkThatLeavesExistingPdfUntouched(binDir: string): void {
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const compilerPath = join(binDir, "latexmk");
+	writeFileSync(compilerPath, `#!/bin/sh
+set -eu
+tex_file=""
+for arg in "$@"; do
+  case "$arg" in
+    -*) ;;
+    *) tex_file="$arg" ;;
+  esac
+done
+base="${"${tex_file##*/}"}"
+name="${"${base%.*}"}"
+out_dir="$(dirname "$tex_file")"
+printf 'Latexmk: applying rule lualatex\nOutput written on %s.pdf (1 page, 123 bytes).\n' "$name" > "$out_dir/$name.log"
+if [ ! -f "$out_dir/$name.pdf" ]; then
+  printf '%s' '%PDF-1.4\n' > "$out_dir/$name.pdf"
+fi
+exit 0
+`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+}
+
+function writeRecordingLatexmk(binDir: string, recordPath: string): void {
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const compilerPath = join(binDir, "latexmk");
+	writeFileSync(compilerPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(recordPath)}, JSON.stringify(args) + "\\n");
+const source = args[args.length - 1];
+if (!source) process.exit(1);
+const sourceBase = path.basename(source, ".tex");
+const outDir = path.resolve(process.cwd(), path.dirname(source));
+fs.mkdirSync(outDir, { recursive: true });
+fs.writeFileSync(path.join(outDir, sourceBase + ".log"), "Output written on " + sourceBase + ".pdf (1 page, 123 bytes).\\n");
+fs.writeFileSync(path.join(outDir, sourceBase + ".pdf"), "%PDF-1.4\\n");
+process.exit(0);
 `, { mode: 0o700 });
 	chmodSync(compilerPath, 0o700);
 }
@@ -279,6 +323,39 @@ test("continuous latexmk invocation protects option-looking root filenames", () 
 		"-halt-on-error",
 		"-file-line-error",
 	]);
+});
+
+test("one-shot compile_latex_file invokes latexmk without pvc and maps selected engines", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+
+		for (const compiler of ["lualatex", "pdflatex", "xelatex", "latexmk"] as const) {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler }, { cwd: baseDir, session_id: `session-${compiler}` });
+		}
+
+		const invocations = readFileSync(recordPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as string[]);
+		assert.equal(invocations.length, 4);
+		assert.deepEqual(invocations.map((args) => args.includes("-pvc")), [false, false, false, false]);
+		assert.deepEqual(invocations.map((args) => args.slice(0, 7)), [
+			["-norc", "-view=none", "-recorder", "-synctex=1", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error"],
+			["-norc", "-view=none", "-recorder", "-synctex=1", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error"],
+			["-norc", "-view=none", "-recorder", "-synctex=1", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error"],
+			["-norc", "-view=none", "-recorder", "-synctex=1", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error"],
+		]);
+		assert.deepEqual(invocations.map((args) => args.slice(7, -1)), [
+			["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"],
+			["-pdf", "-pdflatex=pdflatex -no-shell-escape %O %S"],
+			["-pdfxe", "-xelatex=xelatex -no-shell-escape %O %S"],
+			["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"],
+		]);
+		assert.deepEqual(invocations.map((args) => args.at(-1)), ["paper.tex", "paper.tex", "paper.tex", "paper.tex"]);
+		assert.equal(invocations.some((args) => args.some((arg) => /(?:^|\s)-shell-escape(?:\s|$)/.test(arg))), false);
+	});
 });
 
 test("missing latexmk guidance is actionable for MacTeX, TeX Live, and BasicTeX users", () => {
@@ -527,6 +604,56 @@ test("host service continuous=true/false performs immediate compile and manages 
 		assert.equal(stopped.continuous?.status, "stopped");
 		assert.equal(stopped.continuous?.subscriber_count, 0);
 		assert.equal(fixture.processes[0]?.killed, true);
+	});
+});
+
+test("compiler=latexmk repeated continuous calls succeed when latexmk reports PDF output without changing mtime", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		writeLatexmkThatLeavesExistingPdfUntouched(join(baseDir, "bin"));
+		const context = { cwd: baseDir, session_id: "session-latexmk" };
+
+		const started = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "latexmk", continuous: true }, context);
+		assert.equal(started.continuous?.status, "started");
+		assert.equal(started.compile_status, "ok");
+		assert.equal(fixture.spawns.length, 1);
+
+		const repeated = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "latexmk", continuous: true }, context);
+		assert.equal(repeated.continuous?.status, "already_active");
+		assert.equal(repeated.continuous?.subscriber_count, 1);
+		assert.equal(repeated.compile_status, "ok");
+		assert.equal(fixture.spawns.length, 1);
+
+		const stopped = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "latexmk", continuous: false }, context);
+		assert.equal(stopped.continuous?.status, "stopped");
+		assert.equal(stopped.continuous?.subscriber_count, 0);
+		assert.equal(stopped.compile_status, "ok");
+		assert.equal(fixture.processes[0]?.killed, true);
+	});
+});
+
+test("missing latexmk fails all file compile modes with install guidance", async () => {
+	const fixture = makeFakeContinuousManager({ commandExists: false });
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const binDir = join(baseDir, "bin");
+		rmSync(join(binDir, "latexmk"), { force: true });
+		process.env.PATH = binDir;
+		for (const request of [
+			{ latex_file_path: "paper.tex", compiler: "lualatex" as const },
+			{ latex_file_path: "paper.tex", compiler: "pdflatex" as const, continuous: true },
+			{ latex_file_path: "paper.tex", compiler: "xelatex" as const, continuous: false },
+		]) {
+			let observed: unknown;
+			try {
+				await client.requestCompileLatexFile(request, { cwd: baseDir, session_id: "session-missing-latexmk" });
+			} catch (error) {
+				observed = error;
+			}
+			assert.ok(observed instanceof Error);
+			assert.match(observed.message, /code=compiler_start_failed/);
+			assert.match(observed.message, /latexmk is required/);
+			assert.match(observed.message, /MacTeX|TeX Live/);
+		}
 	});
 });
 

@@ -30,7 +30,7 @@ const latexFileCompileToolSupport = createLatexFileCompileToolSupport();
 const LatexCompilerParam = Type.Optional(Type.Union(
 	LATEX_COMPILERS.map((compiler) => Type.Literal(compiler)),
 	{
-		description: `Optional LaTeX compiler. Defaults to ${DEFAULT_LATEX_COMPILER}.`,
+		description: `Optional TeX engine for latexmk. Defaults to ${DEFAULT_LATEX_COMPILER}; latexmk uses the hardened default LuaLaTeX-backed mode.`,
 		default: DEFAULT_LATEX_COMPILER,
 	},
 ));
@@ -51,7 +51,7 @@ const CompileLatexFileParams = Type.Object(
 			default: false,
 		})),
 		continuous: Type.Optional(Type.Boolean({
-			description: "When true, immediately compile then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file; latexmk handles multi-file dependency tracking with -norc, recorder/SyncTeX-friendly flags, no shell escape, and no latexmk-owned viewer. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit continuous to leave continuous compilation unchanged.",
+			description: "All file compiles use latexmk. When true, immediately compile with non-continuous latexmk then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file; latexmk handles multi-file dependency tracking with -norc, recorder/SyncTeX-friendly flags, no shell escape, and no latexmk-owned viewer. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit continuous to leave continuous compilation unchanged.",
 		})),
 	},
 	{ additionalProperties: false },
@@ -284,17 +284,17 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 		name: "compile_latex_file",
 		label: "Compile LaTeX File",
 		description:
-			"Compile an existing local LaTeX source file from its own directory. Defaults to lualatex; pass compiler to choose lualatex, pdflatex, xelatex, or latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external service state. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc recompilation; set continuous=false to compile once and unsubscribe this session; omit continuous for one-shot compiles that leave continuous state unchanged.",
+			"Compile an existing local LaTeX source file from its own directory using latexmk. Defaults to lualatex; pass compiler to choose the latexmk engine mapping: lualatex, pdflatex, xelatex, or latexmk for the hardened default LuaLaTeX-backed mode. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track for the successfully compiled PDF; leave it false (the default) to compile without requesting external service state. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc recompilation; set continuous=false to compile once and unsubscribe this session; omit continuous for one-shot compiles that leave continuous state unchanged.",
 		promptSnippet: "Compile a local LaTeX file as PDF",
 		promptGuidelines: [
 			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
 			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without requesting external service state; set open_pdf=true only when the user wants the compiled PDF opened/tracked by the host service immediately.",
 			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling.",
 			"Use continuous=true for iterative project editing. Omit continuous for ordinary one-shot compiles that do not alter continuous state. Use continuous=false to stop only this session's subscription; close_pdf does not stop continuous compilation.",
-			"Continuous compilation requires latexmk. If continuous=true reports latexmk is unavailable, install MacTeX or TeX Live; BasicTeX users may need to install latexmk separately and ensure it is on PATH.",
-			"Continuous latexmk starts with -norc, -view=none, recorder/SyncTeX-friendly flags, and -no-shell-escape engine commands so project latexmkrc files cannot override default commands or launch a latexmk-owned viewer.",
+			"File compilation requires latexmk. If any file compile reports latexmk is unavailable, install MacTeX or TeX Live; BasicTeX users may need to install latexmk separately and ensure it is on PATH.",
+			"One-shot file compiles use non-continuous latexmk without -pvc. Continuous latexmk starts with -pvc. Both use -norc, -view=none, recorder/SyncTeX-friendly flags, and -no-shell-escape engine commands so project latexmkrc files cannot override default commands or launch a latexmk-owned viewer.",
 			"Continuous subscriptions are tied to the agent session heartbeat. If the session stops heartbeating, the Host Service removes the subscription and stops unreferenced compilers; unresolved background failures are delivered later as pending [system info] messages and cleared by later success or delivery.",
-			"latexmk handles multi-file dependency tracking for continuous mode, including included files and bibliography dependencies; the Host Service intentionally does not recursively watch the project tree.",
+			"latexmk handles multi-file dependency tracking, including included files and bibliography dependencies; the Host Service intentionally does not recursively watch the project tree.",
 			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
 			"For multi-file LaTeX projects, compile the root file that produces the PDF, such as main.tex, and use open_pdf=true only when a host-service-tracked PDF is needed. The returned pdf_id identifies the running service-tracked PDF and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",
 		],

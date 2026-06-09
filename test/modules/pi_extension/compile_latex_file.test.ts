@@ -335,7 +335,7 @@ function writeFakeCompiler(binDir: string, options: FakeCompilerOptions = {}): s
 	const writeStdout = stdoutContents === undefined ? "" : `\n\tprocess.stdout.write(${JSON.stringify(stdoutContents)});`;
 	const writeStderr = stderrContents === undefined ? "" : `\n\tprocess.stderr.write(${JSON.stringify(stderrContents)});`;
 
-	const compilerPath = resolve(binDir, "lualatex");
+	const compilerPath = resolve(binDir, "latexmk");
 	writeFileSync(
 		compilerPath,
 		`#!/usr/bin/env node

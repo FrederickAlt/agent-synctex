@@ -485,6 +485,7 @@ test("tex-actionsctl doctor tolerates missing optional compilers", async () => {
 	const compileBin = join(base, "bin");
 	mkdirSync(compileBin, { recursive: true, mode: 0o700 });
 	writeExecutable(join(compileBin, "lualatex"));
+	writeExecutable(join(compileBin, "latexmk"));
 	const socketPath = resolve(texDir, "host-service.sock");
 	const server = new HostServiceServer({
 		socketPath,
@@ -524,7 +525,7 @@ test("tex-actionsctl doctor tolerates missing optional compilers", async () => {
 		assert.equal(report.errors.length, 0);
 		assert.equal(report.warnings.some((message) => message.includes("Optional LaTeX compiler missing from PATH: pdflatex")), true);
 		assert.equal(report.warnings.some((message) => message.includes("Optional LaTeX compiler missing from PATH: xelatex")), true);
-		assert.equal(report.warnings.some((message) => message.includes("Optional LaTeX compiler missing from PATH: latexmk")), true);
+		assert.equal(report.warnings.some((message) => message.includes("Optional LaTeX compiler missing from PATH: latexmk")), false);
 	} finally {
 		await server.stop();
 		rmSync(base, { recursive: true, force: true });
@@ -574,6 +575,7 @@ test("tex-actionsctl doctor fails when required compiler missing", async () => {
 		);
 		assert.equal(report.daemonReachable, true);
 		assert.equal(report.errors.some((message) => message.includes("Required LaTeX compiler missing from PATH: lualatex")), true);
+		assert.equal(report.errors.some((message) => message.includes("Required LaTeX compiler missing from PATH: latexmk")), true);
 	} finally {
 		await server.stop();
 		rmSync(base, { recursive: true, force: true });

@@ -25,7 +25,7 @@ function allocateMcpTmpDir(prefix = "host-service-mcp-runtime-") {
 }
 
 function writeFakeLatexCompiler(binDir: string): void {
-	const compilerPath = join(binDir, "lualatex");
+	const compilerPath = join(binDir, "latexmk");
 	mkdirSync(binDir, { mode: 0o700, recursive: true });
 	writeFileSync(
 		compilerPath,

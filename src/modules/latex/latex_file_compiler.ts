@@ -67,6 +67,7 @@ interface LatexCommandSpec {
 	displayName: string;
 	command: string;
 	args: string[];
+	acceptUnchangedPdfWhenOutputWritten?: boolean;
 }
 
 interface LatexCommandResult {
@@ -124,6 +125,7 @@ const MAX_REPORTED_DIAGNOSTICS = 10;
 const MAX_SUMMARY_DIAGNOSTICS = 5;
 const MAX_DIAGNOSTIC_MESSAGE_CHARS = 500;
 const PDF_FRESHNESS_TOLERANCE_MS = 1000;
+const LATEXMK_MISSING_MESSAGE = "latexmk is required for this compile mode. Install MacTeX or TeX Live so the latexmk command is available on PATH; BasicTeX users may need to install latexmk separately (for example with tlmgr) and then restart the Host Service so it sees the updated PATH.";
 const LATEX_FILE_ARTIFACT_EXTENSIONS = [
 	".aux",
 	".bbl",
@@ -452,37 +454,50 @@ function latexCompileFailure(
 	}
 }
 
+export function latexmkEngineArgs(compiler: LatexCompiler | undefined): string[] {
+	switch (compiler) {
+		case "pdflatex":
+			return ["-pdf", "-pdflatex=pdflatex -no-shell-escape %O %S"];
+		case "xelatex":
+			return ["-pdfxe", "-xelatex=xelatex -no-shell-escape %O %S"];
+		case "latexmk":
+		case undefined:
+		case "lualatex":
+			return ["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"];
+	}
+}
+
+export function latexmkSourceOperand(rootSource: string): string {
+	const sourceName = basename(rootSource);
+	return sourceName.startsWith("-") ? `./${sourceName}` : sourceName;
+}
+
+function latexmkCompileArgs(latexFilePath: string, compiler: LatexCompiler | undefined, continuous: boolean): string[] {
+	return [
+		...(continuous ? ["-pvc"] : []),
+		"-norc",
+		"-view=none",
+		"-recorder",
+		"-synctex=1",
+		"-interaction=nonstopmode",
+		"-halt-on-error",
+		"-file-line-error",
+		...latexmkEngineArgs(compiler),
+		latexmkSourceOperand(latexFilePath),
+	];
+}
+
+export function latexmkContinuousArgs(rootSource: string, compiler: LatexCompiler | undefined): string[] {
+	return latexmkCompileArgs(rootSource, compiler, true);
+}
+
 function latexCommandForFile(latexFilePath: string, compiler?: LatexCompiler): LatexCommandSpec {
 	const requested = compiler ?? DEFAULT_LATEX_COMPILER;
-	const fileName = basename(latexFilePath);
-	if (requested === "latexmk") {
-		return {
-			displayName: "latexmk(lualatex)",
-			command: "latexmk",
-			args: [
-				"-pdf",
-				"-lualatex",
-				"-synctex=1",
-				"-interaction=nonstopmode",
-				"-halt-on-error",
-				"-file-line-error",
-				"-pdflualatex=lualatex -no-shell-escape %O %S",
-				fileName,
-			],
-		};
-	}
-
 	return {
-		displayName: requested,
-		command: requested,
-		args: [
-			"-synctex=1",
-			"-interaction=nonstopmode",
-			"-halt-on-error",
-			"-file-line-error",
-			"-no-shell-escape",
-			fileName,
-		],
+		displayName: requested === "latexmk" ? "latexmk(lualatex)" : `latexmk(${requested})`,
+		command: "latexmk",
+		args: latexmkCompileArgs(latexFilePath, requested, false),
+		acceptUnchangedPdfWhenOutputWritten: true,
 	};
 }
 
@@ -639,7 +654,10 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 		result = await runLatexCommand(spec, dirname(latexFilePath), signal);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		throw latexCompileFailure(latexFilePath, spec, `failed to start compiler: ${message}`, "", "compiler_start_failed", []);
+		const reason = spec.command === "latexmk"
+			? `failed to start compiler: ${message}. ${LATEXMK_MISSING_MESSAGE}`
+			: `failed to start compiler: ${message}`;
+		throw latexCompileFailure(latexFilePath, spec, reason, "", "compiler_start_failed", []);
 	}
 
 	const combinedLog = combinedLatexLog(latexFilePath, result.output);
@@ -659,7 +677,11 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 	if (!pdfExists) {
 		throw latexCompileFailure(latexFilePath, spec, "PDF was not created", result.output, "failed_no_pdf", fatalDiagnostics);
 	}
-	if (!pdfUpdated) {
+	const acceptsUnchangedLatexmkPdf = spec.acceptUnchangedPdfWhenOutputWritten === true
+		&& outputWritten
+		&& result.exitCode === 0
+		&& fatalDiagnostics.length === 0;
+	if (!pdfUpdated && !acceptsUnchangedLatexmkPdf) {
 		throw latexCompileFailure(latexFilePath, spec, `PDF exists but was not updated at ${outputPdfPath}`, result.output, "failed_stale_pdf_exists", fatalDiagnostics, outputPdfPath);
 	}
 	if (result.exitCode !== 0 && fatalDiagnostics.length > 0) {

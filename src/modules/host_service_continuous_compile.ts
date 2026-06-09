@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, statSync, type Stats } from "node:fs";
 import { dirname, basename, extname, resolve } from "node:path";
 import type { LatexCompiler, LatexDiagnosticSummary } from "./latex/latex_file_compiler.ts";
-import { extractLatexFatalDiagnostics } from "./latex/latex_file_compiler.ts";
+import { extractLatexFatalDiagnostics, latexmkContinuousArgs } from "./latex/latex_file_compiler.ts";
 import type { HostServicePendingNotification } from "./host_service_session_leases.ts";
 
 export type ContinuousCompileStatus =
@@ -93,42 +93,6 @@ function defaultSpawnProcess(command: string, args: string[], options: Continuou
 		env: options.env,
 		stdio: ["ignore", "pipe", "pipe"],
 	});
-}
-
-function latexmkEngineArgs(compiler: unknown): string[] {
-	switch (compiler) {
-		case "pdflatex":
-			return ["-pdf", "-pdflatex=pdflatex -no-shell-escape %O %S"];
-		case "xelatex":
-			return ["-pdfxe", "-xelatex=xelatex -no-shell-escape %O %S"];
-		case "latexmk":
-		case undefined:
-		case null:
-		case "lualatex":
-			return ["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"];
-		default:
-			return ["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"];
-	}
-}
-
-function latexmkSourceOperand(rootSource: string): string {
-	const sourceName = basename(rootSource);
-	return sourceName.startsWith("-") ? `./${sourceName}` : sourceName;
-}
-
-function latexmkContinuousArgs(rootSource: string, compiler: LatexCompiler | unknown): string[] {
-	return [
-		"-pvc",
-		"-norc",
-		"-view=none",
-		"-recorder",
-		"-synctex=1",
-		"-interaction=nonstopmode",
-		"-halt-on-error",
-		"-file-line-error",
-		...latexmkEngineArgs(compiler),
-		latexmkSourceOperand(rootSource),
-	];
 }
 
 function appendBounded(current: string, chunk: string): string {
@@ -277,7 +241,7 @@ export class HostServiceContinuousCompileManager {
 		}
 
 		try {
-			const child = this.spawnProcess("latexmk", latexmkContinuousArgs(rootSource, compiler), {
+			const child = this.spawnProcess("latexmk", latexmkContinuousArgs(rootSource, compiler as LatexCompiler | undefined), {
 				cwd: dirname(rootSource),
 				env: this.env,
 			});
