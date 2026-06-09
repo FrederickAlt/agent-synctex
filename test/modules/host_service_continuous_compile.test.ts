@@ -185,6 +185,27 @@ exit 0
 	chmodSync(compilerPath, 0o700);
 }
 
+function writeUpToDateNoopLatexmk(binDir: string): void {
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const compilerPath = join(binDir, "latexmk");
+	writeFileSync(compilerPath, `#!/bin/sh
+set -eu
+tex_file=""
+for arg in "$@"; do
+  case "$arg" in
+    -*) ;;
+    *) tex_file="$arg" ;;
+  esac
+done
+base="${"${tex_file##*/}"}"
+name="${"${base%.*}"}"
+printf "Latexmk: Nothing to do for '%s'.\n" "$base"
+printf "Latexmk: All targets (%s.pdf) are up-to-date\n" "$name"
+exit 0
+`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+}
+
 function encodeMcpFrame(jsonText: string): string {
 	return `Content-Length: ${Buffer.byteLength(jsonText, "utf8")}\r\n\r\n${jsonText}`;
 }
@@ -638,6 +659,19 @@ test("stale previous log output does not bypass stale-PDF detection", async () =
 		}
 		assert.ok(observed instanceof Error);
 		assert.match(observed.message, /code=failed_stale_pdf_exists/);
+	});
+});
+
+test("latexmk target-specific up-to-date no-op succeeds with unchanged PDF and log", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		writeFileSync(join(baseDir, "paper.pdf"), "%PDF-1.4 existing\n");
+		writeFileSync(join(baseDir, "paper.log"), "old log without current output-written evidence\n");
+		writeUpToDateNoopLatexmk(join(baseDir, "bin"));
+
+		const result = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "latexmk" }, { cwd: baseDir });
+		assert.equal(result.compile_status, "ok");
+		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
 	});
 });
 

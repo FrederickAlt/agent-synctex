@@ -357,9 +357,21 @@ export function extractLatexFatalDiagnostics(text: string): LatexDiagnosticSumma
 	return dedupeDiagnostics(diagnostics).slice(0, MAX_REPORTED_DIAGNOSTICS);
 }
 
+function escapedBasename(path: string): string {
+	return basename(path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function latexLogSaysOutputWritten(text: string, pdfPath: string): boolean {
-	const pdfName = basename(pdfPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const pdfName = escapedBasename(pdfPath);
 	return new RegExp(`Output written on .*${pdfName}(?:\\s|\\(|$)`, "i").test(text);
+}
+
+function latexmkOutputSaysTargetUpToDate(text: string, latexFilePath: string, pdfPath: string): boolean {
+	const sourceName = escapedBasename(latexFilePath);
+	const pdfName = escapedBasename(pdfPath);
+	return new RegExp(`Latexmk: .*Nothing to do for ['\"]?${sourceName}['\"]?\\.?`, "i").test(text)
+		|| new RegExp(`Latexmk: .*All targets \\([^)]*${pdfName}[^)]*\\) are up-to-date`, "i").test(text)
+		|| new RegExp(`Latexmk: .*${pdfName}.*up-to-date`, "i").test(text);
 }
 
 function outputPdfStat(pdfPath: string): Stats | undefined {
@@ -679,6 +691,7 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 	const logUpdated = fileWasUpdated(beforeLogStatus, afterLogStatus, compileStartMs);
 	const outputWritten = latexLogSaysOutputWritten(result.output, outputPdfPath)
 		|| (logUpdated && latexLogSaysOutputWritten(projectLog, outputPdfPath));
+	const targetUpToDate = latexmkOutputSaysTargetUpToDate(result.output, latexFilePath, outputPdfPath);
 
 	if (result.aborted) {
 		throw latexCompileFailure(latexFilePath, spec, "compilation aborted", result.output, "compile_aborted", fatalDiagnostics, pdfExists ? outputPdfPath : undefined);
@@ -690,7 +703,7 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 		throw latexCompileFailure(latexFilePath, spec, "PDF was not created", result.output, "failed_no_pdf", fatalDiagnostics);
 	}
 	const acceptsUnchangedLatexmkPdf = spec.acceptUnchangedPdfWhenOutputWritten === true
-		&& outputWritten
+		&& (outputWritten || targetUpToDate)
 		&& result.exitCode === 0
 		&& fatalDiagnostics.length === 0;
 	if (!pdfUpdated && !acceptsUnchangedLatexmkPdf) {
@@ -737,6 +750,7 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 		pdf_exists: pdfExists,
 		pdf_updated: pdfUpdated,
 		output_written: outputWritten,
+		target_up_to_date: targetUpToDate,
 		log_updated: logUpdated,
 	});
 
