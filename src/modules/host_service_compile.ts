@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -26,6 +26,10 @@ import type {
 } from "./host_service_protocol.ts";
 import { createLogger } from "./logging.ts";
 import { HostServiceContinuousCompileManager, type HostServiceContinuousCompileDetails } from "./host_service_continuous_compile.ts";
+import {
+	HostServiceCompileCoordinationError,
+	HostServiceRootCompileCoordinator,
+} from "./host_service_root_compile_coordinator.ts";
 
 const logger = createLogger("host-service.compile");
 
@@ -67,6 +71,7 @@ export interface HostServiceCompileServiceOptions {
 	refreshContinuousSessionLease?: (workspaceContext: HostServiceWorkspaceContext) => void;
 	nowNs?: () => number;
 	continuousCompileManager?: HostServiceContinuousCompileManager;
+	rootCompileCoordinator?: HostServiceRootCompileCoordinator;
 }
 
 export class HostServiceCompileService {
@@ -76,6 +81,7 @@ export class HostServiceCompileService {
 	private readonly refreshContinuousSessionLease: HostServiceCompileServiceOptions["refreshContinuousSessionLease"];
 	private readonly nowNs: () => number;
 	private readonly continuousCompileManager: HostServiceContinuousCompileManager;
+	private readonly rootCompileCoordinator: HostServiceRootCompileCoordinator;
 
 	constructor(options: HostServiceCompileServiceOptions) {
 		this.protocolVersion = options.protocolVersion;
@@ -84,9 +90,18 @@ export class HostServiceCompileService {
 		this.refreshContinuousSessionLease = options.refreshContinuousSessionLease;
 		this.nowNs = options.nowNs ?? (() => Date.now() * 1_000_000);
 		this.continuousCompileManager = options.continuousCompileManager ?? new HostServiceContinuousCompileManager();
+		this.rootCompileCoordinator = options.rootCompileCoordinator ?? new HostServiceRootCompileCoordinator();
 	}
 
-	async compileLatexFileRequest(request: HostServiceCompileRequest): Promise<HostServiceCompileResponseEnvelope> {
+	start(): void {
+		this.rootCompileCoordinator.resume();
+	}
+
+	stop(): void {
+		this.rootCompileCoordinator.stop();
+	}
+
+	async compileLatexFileRequest(request: HostServiceCompileRequest, signal?: AbortSignal): Promise<HostServiceCompileResponseEnvelope> {
 		const startedAt = Date.now();
 		const requestedPath = request.details.latex_file_path;
 		const normalizedPath = normalizeLatexSourcePath(requestedPath, request.workspace_context.cwd);
@@ -107,8 +122,13 @@ export class HostServiceCompileService {
 				compiler: request.details.compiler,
 				clean: shouldClean,
 				cwd: request.workspace_context.cwd,
+				signal,
 			};
-			const result = await hostServiceLatexFileCompiler.compileLatexFile(compileRequest);
+			const result = await this.rootCompileCoordinator.runExclusive(
+				normalizeLatexRootKey(normalizedPath),
+				() => hostServiceLatexFileCompiler.compileLatexFile(compileRequest),
+				signal,
+			);
 			const resultLogPath = inferLatexLogPath(result.source);
 			const nowNs = this.nowNs();
 			for (const cleaned of result.cleanedArtifacts) {
@@ -686,6 +706,10 @@ function normalizeLatexSourcePath(rawSourcePath: string, workspaceCwd: string): 
 	return resolved;
 }
 
+function normalizeLatexRootKey(normalizedSourcePath: string): string {
+	return existsSync(normalizedSourcePath) ? realpathSync.native(normalizedSourcePath) : normalizedSourcePath;
+}
+
 function inferLatexLogPath(sourcePath: string): string {
 	return join(dirname(sourcePath), `${basename(sourcePath, extname(sourcePath))}.log`);
 }
@@ -764,6 +788,9 @@ function compileErrorDiagnosticsDetails(error: unknown): CompileDiagnosticsDetai
 
 function extractCompileErrorCode(error: unknown): string {
 	if (error instanceof LoggedToolError) {
+		return error.errorCode;
+	}
+	if (error instanceof HostServiceCompileCoordinationError) {
 		return error.errorCode;
 	}
 	if (error instanceof Error && /compiler/.test(error.message)) {

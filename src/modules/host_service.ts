@@ -944,7 +944,7 @@ export class HostServiceClient {
 
 			const socket = createConnection({ path: this.socketPath });
 			const timer = setTimeout(() => {
-				finish(new Error("host service request timed out; is the host service running?"));
+				finish(new Error("host service request timed out before the operation completed; the timeout includes any server-side waiting such as same-root compile queue time"));
 				socket.destroy();
 			}, requestTimeoutMs);
 			timer.unref?.();
@@ -959,7 +959,7 @@ export class HostServiceClient {
 
 			socket.setEncoding("utf8");
 			socket.setTimeout(requestTimeoutMs, () => {
-				finish(new Error("host service request timed out; is the host service running?"));
+				finish(new Error("host service request timed out before the operation completed; the timeout includes any server-side waiting such as same-root compile queue time"));
 				socket.destroy();
 			});
 
@@ -1096,6 +1096,7 @@ export class HostServiceServer {
 		}
 		serverLogger.info("start.begin", { socket_path: this.socketPath, service_name: this.serviceName });
 		this.stopping = false;
+		this.compileService.start();
 		this.continuousCompileManager.setAcceptingSubscriptions(true);
 		this.socketOwnedByServer = false;
 		try {
@@ -1149,7 +1150,9 @@ export class HostServiceServer {
 		serverLogger.info("stop.begin", { socket_path: this.socketPath, service_name: this.serviceName, active_connections: this.activeConnections.size });
 		this.stopping = true;
 		this.continuousCompileManager.setAcceptingSubscriptions(false);
+		this.compileService.stop();
 		this.stopSessionPruneLoop();
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		const server = this.server;
 		this.server = null;
 		for (const socket of this.activeConnections) {
@@ -1396,7 +1399,11 @@ export class HostServiceServer {
 					if (request.details.continuous !== undefined) {
 						this.sessionLeases.heartbeat(request.workspace_context);
 					}
-					const response = await this.compileService.compileLatexFileRequest(request);
+					const abortController = new AbortController();
+					const abortCompile = () => abortController.abort();
+					socket.once("close", abortCompile);
+					const response = await this.compileService.compileLatexFileRequest(request, abortController.signal)
+						.finally(() => socket.off("close", abortCompile));
 					socket.end(`${JSON.stringify(response)}\n`);
 					return;
 				}

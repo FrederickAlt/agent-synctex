@@ -121,6 +121,114 @@ function shellSingleQuoted(value: string): string {
 	return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
+function writeRootScopedProbeLatexmk(binDir: string, stateDir: string, options: { sleepSeconds?: string; failFirst?: boolean } = {}): string {
+	mkdirSync(binDir, { mode: 0o700, recursive: true });
+	mkdirSync(stateDir, { mode: 0o700, recursive: true });
+	const compilerPath = join(binDir, "latexmk");
+	const sleepSeconds = options.sleepSeconds ?? "0.25";
+	const failFirst = options.failFirst === true ? "1" : "0";
+	writeFileSync(compilerPath, `#!/usr/bin/env bash
+set -eu
+state_dir=${shellSingleQuoted(stateDir)}
+sleep_seconds=${shellSingleQuoted(sleepSeconds)}
+fail_first=${failFirst}
+mkdir -p "$state_dir"
+tex_file=""
+out_dir=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-output-directory" ]; then
+    out_dir="$arg"
+  fi
+  tex_file="$arg"
+  prev="$arg"
+done
+base="\${tex_file##*/}"
+name="\${base%.*}"
+out_dir="\${out_dir:-$(pwd)}"
+lock="$state_dir/$name.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  printf '%s\n' "$name overlap" >> "$state_dir/overlap.txt"
+  cat > "$out_dir/$name.log" <<'LOGTEXT'
+Runaway argument?
+File ended while scanning use of \\@newl@bel.
+LOGTEXT
+  exit 13
+fi
+trap 'rmdir "$lock" 2>/dev/null || true' EXIT INT TERM
+count_file="$state_dir/$name.count"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+printf '%s' "$((count + 1))" > "$count_file"
+printf '%s start\n' "$name" >> "$state_dir/events.txt"
+printf '%s' started > "$state_dir/$name.started"
+sleep "$sleep_seconds"
+if [ "$fail_first" = "1" ] && [ "$count" = "0" ]; then
+  cat > "$out_dir/$name.log" <<'LOGTEXT'
+! Undefined control sequence.
+LOGTEXT
+  printf '%s end-fail\n' "$name" >> "$state_dir/events.txt"
+  exit 7
+fi
+cat > "$out_dir/$name.log" <<'LOGTEXT'
+fake compiler output
+Output written on paper.pdf (1 page, 123 bytes).
+LOGTEXT
+printf '%s' '%PDF-1.4\n' > "$out_dir/$name.pdf"
+printf '%s end\n' "$name" >> "$state_dir/events.txt"
+exit 0
+`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+	return compilerPath;
+}
+
+function writeUncoordinatedAuxRaceLatexmk(binDir: string, stateDir: string): string {
+	mkdirSync(binDir, { mode: 0o700, recursive: true });
+	mkdirSync(stateDir, { mode: 0o700, recursive: true });
+	const compilerPath = join(binDir, "latexmk");
+	writeFileSync(compilerPath, `#!/usr/bin/env bash
+set -eu
+state_dir=${shellSingleQuoted(stateDir)}
+mkdir -p "$state_dir"
+tex_file=""
+for arg in "$@"; do tex_file="$arg"; done
+base="\${tex_file##*/}"
+name="\${base%.*}"
+lock="$state_dir/$name.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  cat > "$name.log" <<'LOGTEXT'
+Runaway argument?
+File ended while scanning use of \\@newl@bel.
+LOGTEXT
+  cat "$name.log"
+  exit 12
+fi
+trap 'rmdir "$lock" 2>/dev/null || true' EXIT INT TERM
+printf '%s' started > "$state_dir/first.started"
+sleep 0.25
+cat > "$name.log" <<'LOGTEXT'
+Output written on paper.pdf (1 page, 123 bytes).
+LOGTEXT
+printf '%s' '%PDF-1.4\n' > "$name.pdf"
+exit 0
+`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+	return compilerPath;
+}
+
+function runProcess(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<{ code: number | null; output: string }> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(command, args, { cwd, env });
+		let output = "";
+		child.stdout.on("data", (chunk) => { output += String(chunk); });
+		child.stderr.on("data", (chunk) => { output += String(chunk); });
+		child.on("error", reject);
+		child.on("close", (code) => resolve({ code, output }));
+	});
+}
+
 function writeFakeForkingZathuraViewerBinary(path: string, options: { childPidFile?: string } = {}): void {
 	const childPidFile = options.childPidFile ?? "";
 	const quotedChildPidFile = shellSingleQuoted(childPidFile);
@@ -1059,6 +1167,197 @@ test("host service waits for latex compiler process before reporting success", a
 		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
 		assert.equal(existsSync(finishedMarker), true, "compile returned before the compiler reached its final statement");
 		assert.ok(elapsedMs >= 300, `compile returned too quickly: ${elapsedMs}ms`);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("uncoordinated same-root latexmk processes can surface aux-read failures while another writes a PDF", async () => {
+	const baseDir = temporaryDir("host-service-uncoordinated-aux-race-");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	writeUncoordinatedAuxRaceLatexmk(join(baseDir, "bin"), stateDir);
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+	const env = { ...process.env, PATH: `${join(baseDir, "bin")}:${originalPath}` };
+
+	try {
+		const first = runProcess("latexmk", ["paper.tex"], baseDir, env);
+		await waitForFile(join(stateDir, "first.started"));
+		const second = runProcess("latexmk", ["paper.tex"], baseDir, env);
+		const results = await Promise.all([first, second]);
+		assert.equal(results.some((result) => result.code === 0), true, "one uncoordinated compile should still be able to produce a PDF");
+		assert.equal(results.some((result) => result.code !== 0 && /@newl@bel/.test(result.output)), true);
+		assert.equal(existsSync(join(baseDir, "paper.pdf")), true);
+	} finally {
+		process.env.PATH = originalPath;
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service serializes concurrent same-root compile_latex_file requests", async () => {
+	const baseDir = temporaryDir("host-service-compile-serialized-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	writeRootScopedProbeLatexmk(join(baseDir, "bin"), stateDir, { sleepSeconds: "0.25" });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-serialized" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		const [relativeResult, absoluteResult] = await Promise.all([
+			client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir }),
+			client.requestCompileLatexFile({ latex_file_path: join(baseDir, "paper.tex"), compiler: "lualatex" }, { cwd: baseDir }),
+		]);
+		assert.equal(relativeResult.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(absoluteResult.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(existsSync(join(stateDir, "overlap.txt")), false);
+		assert.deepEqual(readFileSync(join(stateDir, "events.txt"), "utf8").trim().split("\n"), [
+			"paper start",
+			"paper end",
+			"paper start",
+			"paper end",
+		]);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service keeps different-root compile_latex_file requests independent", async () => {
+	const baseDir = temporaryDir("host-service-compile-different-roots-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	writeRootScopedProbeLatexmk(join(baseDir, "bin"), stateDir, { sleepSeconds: "0.35" });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "alpha.tex"), "\\documentclass{article}\n\\begin{document}\nalpha\\end{document}\n");
+	writeFileSync(join(baseDir, "beta.tex"), "\\documentclass{article}\n\\begin{document}\nbeta\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-independent" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		const startedAt = Date.now();
+		await Promise.all([
+			client.requestCompileLatexFile({ latex_file_path: "alpha.tex", compiler: "lualatex" }, { cwd: baseDir }),
+			client.requestCompileLatexFile({ latex_file_path: "beta.tex", compiler: "lualatex" }, { cwd: baseDir }),
+		]);
+		const elapsedMs = Date.now() - startedAt;
+		const events = readFileSync(join(stateDir, "events.txt"), "utf8").trim().split("\n");
+		assert.match(events[0], / start$/);
+		assert.match(events[1], / start$/);
+		assert.ok(elapsedMs < 650, `different roots were unexpectedly serialized: ${elapsedMs}ms`);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service runs queued same-root requests after process failure", async () => {
+	const baseDir = temporaryDir("host-service-compile-failure-releases-queue-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	writeRootScopedProbeLatexmk(join(baseDir, "bin"), stateDir, { sleepSeconds: "0.15", failFirst: true });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-failure-releases" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		const results = await Promise.allSettled([
+			client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir }),
+			client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir }),
+		]);
+		assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+		assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+		assert.equal(existsSync(join(stateDir, "overlap.txt")), false);
+		assert.deepEqual(readFileSync(join(stateDir, "events.txt"), "utf8").trim().split("\n"), [
+			"paper start",
+			"paper end-fail",
+			"paper start",
+			"paper end",
+		]);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service request timeout cancels queued same-root compile work", async () => {
+	const baseDir = temporaryDir("host-service-compile-queue-timeout-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	writeRootScopedProbeLatexmk(join(baseDir, "bin"), stateDir, { sleepSeconds: "0.45" });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-queue-timeout" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		const first = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		await waitForFile(join(stateDir, "paper.started"));
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir }, undefined, 120);
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /timed out/);
+		await first;
+		await sleep(180);
+		assert.deepEqual(readFileSync(join(stateDir, "events.txt"), "utf8").trim().split("\n"), [
+			"paper start",
+			"paper end",
+		]);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service stop releases queued same-root compile requests", async () => {
+	const baseDir = temporaryDir("host-service-compile-stop-releases-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	writeRootScopedProbeLatexmk(join(baseDir, "bin"), stateDir, { sleepSeconds: "1" });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-stop-releases" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		const first = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		first.catch(() => undefined);
+		await waitForFile(join(stateDir, "paper.started"));
+		const second = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		second.catch(() => undefined);
+		await sleep(50);
+		await server.stop();
+		const results = await Promise.allSettled([first, second]);
+		assert.equal(results.every((result) => result.status === "rejected"), true);
+		assert.equal(results.some((result) => result.status === "rejected" && /host_service_stopped/.test(String(result.reason))), true);
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
