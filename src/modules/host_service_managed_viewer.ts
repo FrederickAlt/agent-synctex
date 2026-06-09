@@ -50,7 +50,12 @@ function isValidViewerBackendCapabilities(value: unknown): value is HostServiceV
 }
 
 const MANAGED_VIEWER_OPEN_TIMEOUT_MS = 2_000;
+const VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DELAYS_MS = [50, 100, 200, 400] as const;
 const VIEWER_BACKEND_TIMEOUT_ERROR_TEXT = "viewer backend request timed out while opening preview";
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function withTimeout<T>(
 	operation: () => Promise<T>,
@@ -667,12 +672,13 @@ export class HostServiceManagedViewerService {
 		const sourceLine = readSourceLine(resolvedSourceFile, request.line, request.workspace_context.cwd) ?? "";
 
 		const jumpBackend = async (
+			record: HostServiceManagedViewerRecord,
 			synctexPid: number | undefined,
 			forwardSourceFile: string,
 		): ReturnType<ViewerBackendAdapter["forwardSearch"]> => {
 			const backendDetails: Record<string, unknown> = {
-				handle: managedRecord.viewerHandle,
-				backend: managedRecord.viewerBackend,
+				handle: record.viewerHandle,
+				backend: record.viewerBackend,
 				source_file: forwardSourceFile,
 				line: request.line,
 			};
@@ -705,7 +711,10 @@ export class HostServiceManagedViewerService {
 				request_id: request.request_id,
 				operation: "jump_pdf",
 				backend: managedRecord.viewerBackend,
-				backend_path: managedBackendPath,
+				backend_path:
+					typeof managedRecord.backendPath === "string" && managedRecord.backendPath.trim()
+						? managedRecord.backendPath
+						: managedBackendPath,
 				backend_identity_ok: backendIdentityOk,
 				handled,
 				reopened,
@@ -723,10 +732,26 @@ export class HostServiceManagedViewerService {
 		});
 
 		const reopenableErrorCodes = new Set(["handle_not_found", "not_running", "stale_handle"]);
+		const transientReopenedForwardSearchErrorCodes = new Set([
+			"backend_unavailable",
+			"handle_not_found",
+			"not_ready",
+			"not_running",
+			"service_timeout",
+			"stale_handle",
+		]);
+		const shouldRetryReopenedForwardSearch = (
+			attempt: Awaited<ReturnType<ViewerBackendAdapter["forwardSearch"]>>,
+		): boolean => {
+			if (attempt.status === "ok") return false;
+			const details = attempt.status_details as Record<string, unknown>;
+			const errorCode = typeof details.error_code === "string" ? details.error_code : "backend_unavailable";
+			return transientReopenedForwardSearchErrorCodes.has(errorCode);
+		};
 		let initialDiagnostics: Array<Record<string, unknown>> | undefined;
 		let initialReason: string | undefined;
 		if (managedRecordState === "active") {
-			const initialAttempt = await jumpBackend(managedRecord.pid, resolvedSourceFile);
+			const initialAttempt = await jumpBackend(managedRecord, managedRecord.pid, resolvedSourceFile);
 			const initialDetails = initialAttempt.status_details as Record<string, unknown>;
 			initialDiagnostics = Array.isArray(initialDetails.diagnostics) ? initialDetails.diagnostics : undefined;
 			const initialHandled =
@@ -844,32 +869,50 @@ export class HostServiceManagedViewerService {
 			managedRecord.defaultSourcePath =
 				managedRecord.defaultSourcePath ?? inferDefaultSourceFileForPdf(managedRecord.pdfPath);
 
-			const retryAttempt = await jumpBackend(reopenPid, resolvedSourceFile);
-			const retryDetails = retryAttempt.status_details as Record<string, unknown>;
-			const retryHandled =
-				typeof retryDetails.handled === "boolean" ? retryDetails.handled : false;
-			const retryDiagnostics = Array.isArray(retryDetails.diagnostics) ? retryDetails.diagnostics : [];
+			let retryAttempt!: Awaited<ReturnType<ViewerBackendAdapter["forwardSearch"]>>;
+			let retryDetails: Record<string, unknown> = {};
+			const retryDiagnostics: Array<Record<string, unknown>> = initialDiagnostics ? [...initialDiagnostics] : [];
+			for (let attemptIndex = 0; attemptIndex <= VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DELAYS_MS.length; attemptIndex += 1) {
+				retryAttempt = await jumpBackend(managedRecord, managedRecord.pid, resolvedSourceFile);
+				retryDetails = retryAttempt.status_details as Record<string, unknown>;
+				if (Array.isArray(retryDetails.diagnostics)) {
+					retryDiagnostics.push(...retryDetails.diagnostics);
+				}
+				if (retryAttempt.status === "ok") {
+					const retryHandled =
+						typeof retryDetails.handled === "boolean" ? retryDetails.handled : false;
+					const retryBackendIdentityOk =
+						typeof retryDetails.backend_identity_ok === "boolean"
+							? retryDetails.backend_identity_ok
+							: false;
+					const retryServiceAvailable =
+						typeof retryDetails.service_available === "boolean" ? retryDetails.service_available : true;
+					const retryReason =
+						typeof retryDetails.reason === "string" && retryDetails.reason.trim()
+							? retryDetails.reason
+							: retryAttempt.error;
+					return makeSuccessResponse(
+						retryHandled,
+						true,
+						undefined,
+						retryReason,
+						retryBackendIdentityOk,
+						retryServiceAvailable,
+						retryDiagnostics.length > 0 ? retryDiagnostics : undefined,
+					);
+				}
+				if (
+					attemptIndex >= VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DELAYS_MS.length
+					|| !shouldRetryReopenedForwardSearch(retryAttempt)
+				) {
+					break;
+				}
+				await sleep(VIEWER_REOPEN_FORWARD_SEARCH_RETRY_DELAYS_MS[attemptIndex]);
+			}
 			const retryBackendIdentityOk =
 				typeof retryDetails.backend_identity_ok === "boolean"
 					? retryDetails.backend_identity_ok
 					: false;
-			const retryServiceAvailable =
-				typeof retryDetails.service_available === "boolean" ? retryDetails.service_available : true;
-			const retryReason =
-				typeof retryDetails.reason === "string" && retryDetails.reason.trim()
-					? retryDetails.reason
-					: retryAttempt.error;
-			if (retryAttempt.status === "ok") {
-				return makeSuccessResponse(
-					retryHandled,
-					true,
-					undefined,
-					retryReason,
-					retryBackendIdentityOk,
-					retryServiceAvailable,
-					retryDiagnostics,
-				);
-			}
 			const staleRetryReason = retryAttempt.error
 				? `${initialReason ?? ""} ${retryAttempt.error}`.trim()
 				: "recovered handle jump failed";
@@ -904,9 +947,7 @@ export class HostServiceManagedViewerService {
 							: "backend_unavailable",
 					reason: staleRetryReason,
 					handle: managedRecord.viewerHandle,
-					diagnostics: initialDiagnostics
-						? [...initialDiagnostics, ...retryDiagnostics]
-						: retryDiagnostics,
+					diagnostics: retryDiagnostics,
 					managed_record: managedRecord,
 				},
 			};
