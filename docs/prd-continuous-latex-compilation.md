@@ -1,6 +1,12 @@
 # PRD: Continuous LaTeX Compilation with Session Subscriptions
 
-Source issue: [#73 Add continuous LaTeX compilation with session subscriptions](https://github.com/FrederickAlt/agent-synctex/issues/73)
+Source issue: [#73 Add continuous LaTeX compilation with session subscriptions](https://github.com/FrederickAlt/agent-synctex/issues/73) — implemented and closed.
+
+## Status and Follow-up Coordination
+
+This PRD is retained as historical context for the implemented continuous compilation feature. For same-root compile coordination, cache reuse, one-shot requests waiting on active continuous compilation, and `clean=true` interactions with continuous compilation, see [PRD: LaTeX root compile coordination](./prd-latex-root-compile-coordination.md).
+
+The follow-up coordination PRD supersedes any wording below that implies every `compile_latex_file` call must always spawn a fresh immediate one-shot `latexmk` process. The intended follow-up behavior is that same-root one-shot requests are queued and may reuse a fresh cached result, one-shot requests should wait on a compatible active continuous compiler instead of spawning a competing `latexmk`, and `clean=true` should coordinate with continuous compilation by stopping, cleaning, restarting, and waiting for the post-clean result.
 
 ## Problem Statement
 
