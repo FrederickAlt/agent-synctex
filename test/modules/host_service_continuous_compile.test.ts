@@ -175,6 +175,16 @@ process.exit(0);
 	chmodSync(compilerPath, 0o700);
 }
 
+function writeNoopLatexmk(binDir: string): void {
+	mkdirSync(binDir, { recursive: true, mode: 0o700 });
+	const compilerPath = join(binDir, "latexmk");
+	writeFileSync(compilerPath, `#!/bin/sh
+set -eu
+exit 0
+`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+}
+
 function encodeMcpFrame(jsonText: string): string {
 	return `Content-Length: ${Buffer.byteLength(jsonText, "utf8")}\r\n\r\n${jsonText}`;
 }
@@ -255,6 +265,12 @@ test("continuous compile manager enforces singleton processes and subscriber lif
 	const repeated = fixture.manager.ensureSubscription(root, "session-A", "lualatex");
 	assert.equal(repeated.status, "already_active");
 	assert.equal(repeated.subscriber_count, 1);
+	assert.equal(fixture.spawns.length, 1);
+
+	const mismatchedEngine = fixture.manager.ensureSubscription(root, "session-pdftex", "pdflatex");
+	assert.equal(mismatchedEngine.status, "error");
+	assert.equal(mismatchedEngine.error_code, "continuous_compiler_engine_mismatch");
+	assert.equal(mismatchedEngine.subscriber_count, 1);
 	assert.equal(fixture.spawns.length, 1);
 
 	const secondSession = fixture.manager.ensureSubscription(root, "session-B", "lualatex");
@@ -607,6 +623,24 @@ test("host service continuous=true/false performs immediate compile and manages 
 	});
 });
 
+test("stale previous log output does not bypass stale-PDF detection", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		writeFileSync(join(baseDir, "paper.pdf"), "%PDF-1.4 stale\n");
+		writeFileSync(join(baseDir, "paper.log"), "Output written on paper.pdf (1 page, 123 bytes).\n");
+		writeNoopLatexmk(join(baseDir, "bin"));
+
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "latexmk" }, { cwd: baseDir });
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /code=failed_stale_pdf_exists/);
+	});
+});
+
 test("compiler=latexmk repeated continuous calls succeed when latexmk reports PDF output without changing mtime", async () => {
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
@@ -629,6 +663,45 @@ test("compiler=latexmk repeated continuous calls succeed when latexmk reports PD
 		assert.equal(stopped.continuous?.subscriber_count, 0);
 		assert.equal(stopped.compile_status, "ok");
 		assert.equal(fixture.processes[0]?.killed, true);
+	});
+});
+
+test("continuous=true rejects compiler changes for an already-active root", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const started = await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
+			{ cwd: baseDir, session_id: "session-lua" },
+		);
+		assert.equal(started.continuous?.status, "started");
+		assert.equal(fixture.spawns.length, 1);
+
+		for (const compiler of ["pdflatex", "xelatex"] as const) {
+			let observed: unknown;
+			try {
+				await client.requestCompileLatexFile(
+					{ latex_file_path: "paper.tex", compiler, continuous: true },
+					{ cwd: baseDir, session_id: `session-${compiler}` },
+				);
+			} catch (error) {
+				observed = error;
+			}
+			assert.ok(observed instanceof Error);
+			assert.match(observed.message, /continuous_compiler_engine_mismatch/);
+			const details = (observed as { statusDetails?: { continuous?: { status?: string; subscriber_count?: number; error_code?: string } } }).statusDetails;
+			assert.equal(details?.continuous?.status, "error");
+			assert.equal(details?.continuous?.error_code, "continuous_compiler_engine_mismatch");
+			assert.equal(details?.continuous?.subscriber_count, 1);
+			assert.equal(fixture.spawns.length, 1);
+		}
+
+		const repeated = await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
+			{ cwd: baseDir, session_id: "session-lua" },
+		);
+		assert.equal(repeated.continuous?.status, "already_active");
+		assert.equal(repeated.continuous?.subscriber_count, 1);
+		assert.equal(fixture.spawns.length, 1);
 	});
 });
 

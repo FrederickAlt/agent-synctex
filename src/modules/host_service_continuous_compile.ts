@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, statSync, type Stats } from "node:fs";
 import { dirname, basename, extname, resolve } from "node:path";
 import type { LatexCompiler, LatexDiagnosticSummary } from "./latex/latex_file_compiler.ts";
-import { extractLatexFatalDiagnostics, latexmkContinuousArgs } from "./latex/latex_file_compiler.ts";
+import { extractLatexFatalDiagnostics, latexmkContinuousArgs, latexmkEngineIdentity } from "./latex/latex_file_compiler.ts";
 import type { HostServicePendingNotification } from "./host_service_session_leases.ts";
 
 export type ContinuousCompileStatus =
@@ -67,6 +67,7 @@ interface ContinuousCompileRecord {
 	rootSource: string;
 	process: ContinuousCompileProcess;
 	subscribers: Set<string>;
+	engineIdentity: string;
 	recentOutput: string;
 	lastPdfSnapshot?: PdfSnapshot;
 	lastFailureFingerprint?: string;
@@ -210,6 +211,8 @@ export class HostServiceContinuousCompileManager {
 				error_code: "host_service_stopping",
 			};
 		}
+		const requestedCompiler = compiler as LatexCompiler | undefined;
+		const requestedEngineIdentity = latexmkEngineIdentity(requestedCompiler);
 		const existing = this.recordsByRootSource.get(rootSource);
 		if (existing) {
 			if (existing.stopping) {
@@ -222,6 +225,18 @@ export class HostServiceContinuousCompileManager {
 					pid: existing.process.pid,
 					error: "continuous compilation is stopping",
 					error_code: "continuous_compiler_stopping",
+				};
+			}
+			if (existing.engineIdentity !== requestedEngineIdentity) {
+				return {
+					requested: true,
+					status: "error",
+					root_source: rootSource,
+					session_id: sessionId,
+					subscriber_count: existing.subscribers.size,
+					pid: existing.process.pid,
+					error: "continuous compilation is already active for this root with a different latexmk engine configuration; stop the existing subscription before switching compiler",
+					error_code: "continuous_compiler_engine_mismatch",
 				};
 			}
 			existing.subscribers.add(sessionId);
@@ -241,7 +256,7 @@ export class HostServiceContinuousCompileManager {
 		}
 
 		try {
-			const child = this.spawnProcess("latexmk", latexmkContinuousArgs(rootSource, compiler as LatexCompiler | undefined), {
+			const child = this.spawnProcess("latexmk", latexmkContinuousArgs(rootSource, requestedCompiler), {
 				cwd: dirname(rootSource),
 				env: this.env,
 			});
@@ -249,6 +264,7 @@ export class HostServiceContinuousCompileManager {
 				rootSource,
 				process: child,
 				subscribers: new Set([sessionId]),
+				engineIdentity: requestedEngineIdentity,
 				recentOutput: "",
 				lastPdfSnapshot: pdfSnapshot(pdfPathForRoot(rootSource)),
 			};

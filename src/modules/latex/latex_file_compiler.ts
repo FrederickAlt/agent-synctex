@@ -359,8 +359,7 @@ export function extractLatexFatalDiagnostics(text: string): LatexDiagnosticSumma
 
 function latexLogSaysOutputWritten(text: string, pdfPath: string): boolean {
 	const pdfName = basename(pdfPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	return new RegExp(`Output written on .*${pdfName}`, "i").test(text)
-		|| /Output written on .*\.pdf/i.test(text);
+	return new RegExp(`Output written on .*${pdfName}(?:\\s|\\(|$)`, "i").test(text);
 }
 
 function outputPdfStat(pdfPath: string): Stats | undefined {
@@ -372,12 +371,16 @@ function outputPdfStat(pdfPath: string): Stats | undefined {
 	}
 }
 
-function pdfWasUpdated(before: Stats | undefined, after: Stats | undefined, compileStartMs: number): boolean {
+function fileWasUpdated(before: Stats | undefined, after: Stats | undefined, compileStartMs: number): boolean {
 	if (after === undefined) return false;
 	if (before === undefined) return after.mtimeMs >= compileStartMs - PDF_FRESHNESS_TOLERANCE_MS;
 	if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) return true;
 	return before.mtimeMs < compileStartMs - PDF_FRESHNESS_TOLERANCE_MS
 		&& after.mtimeMs >= compileStartMs - PDF_FRESHNESS_TOLERANCE_MS;
+}
+
+function pdfWasUpdated(before: Stats | undefined, after: Stats | undefined, compileStartMs: number): boolean {
+	return fileWasUpdated(before, after, compileStartMs);
 }
 
 function combinedLatexLog(latexFilePath: string, compilerOutput: string): string {
@@ -465,6 +468,10 @@ export function latexmkEngineArgs(compiler: LatexCompiler | undefined): string[]
 		case "lualatex":
 			return ["-pdf", "-lualatex", "-pdflualatex=lualatex -no-shell-escape %O %S"];
 	}
+}
+
+export function latexmkEngineIdentity(compiler: LatexCompiler | undefined): string {
+	return latexmkEngineArgs(compiler).join("\u0000");
 }
 
 export function latexmkSourceOperand(rootSource: string): string {
@@ -637,6 +644,7 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 	const logPath = latexLogPath(latexFilePath);
 	const spec = latexCommandForFile(latexFilePath, compiler);
 	const beforePdfStatus = outputPdfStat(outputPdfPath);
+	const beforeLogStatus = outputPdfStat(logPath);
 	const compileStartMs = Date.now();
 	logger.info("compile.begin", {
 		source_path: latexFilePath,
@@ -660,13 +668,17 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 		throw latexCompileFailure(latexFilePath, spec, reason, "", "compiler_start_failed", []);
 	}
 
-	const combinedLog = combinedLatexLog(latexFilePath, result.output);
+	const projectLog = readTextTail(logPath);
+	const combinedLog = [projectLog, result.output].filter((entry) => entry.trim()).join("\n");
 	const fatalDiagnostics = extractLatexFatalDiagnostics(combinedLog);
 	const warningExtraction = extractLatexWarnings(combinedLog);
 	const afterPdfStatus = outputPdfStat(outputPdfPath);
+	const afterLogStatus = outputPdfStat(logPath);
 	const pdfExists = afterPdfStatus !== undefined;
 	const pdfUpdated = pdfWasUpdated(beforePdfStatus, afterPdfStatus, compileStartMs);
-	const outputWritten = latexLogSaysOutputWritten(combinedLog, outputPdfPath);
+	const logUpdated = fileWasUpdated(beforeLogStatus, afterLogStatus, compileStartMs);
+	const outputWritten = latexLogSaysOutputWritten(result.output, outputPdfPath)
+		|| (logUpdated && latexLogSaysOutputWritten(projectLog, outputPdfPath));
 
 	if (result.aborted) {
 		throw latexCompileFailure(latexFilePath, spec, "compilation aborted", result.output, "compile_aborted", fatalDiagnostics, pdfExists ? outputPdfPath : undefined);
@@ -725,6 +737,7 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 		pdf_exists: pdfExists,
 		pdf_updated: pdfUpdated,
 		output_written: outputWritten,
+		log_updated: logUpdated,
 	});
 
 	return {
