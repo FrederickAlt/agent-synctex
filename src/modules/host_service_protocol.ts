@@ -641,5 +641,6 @@ export interface HostServicePdfIdRegistryLike {
 	getKnownRecord(pdfId: number): HostServicePdfIdKnownRecord;
 	trackRecord(record: HostServiceManagedViewerRecordInput): HostServiceManagedViewerRecord;
 	reviveRecord(pdfId: number): HostServiceManagedViewerRecord;
+	reviveRecordIfState(pdfId: number, expectedState: HostServicePdfIdRecordState, expectedRecord: HostServiceManagedViewerRecord): HostServiceManagedViewerRecord | undefined;
 	closeRecord(pdfId: number): HostServiceManagedViewerRecord;
 }

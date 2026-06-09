@@ -760,40 +760,6 @@ export class HostServiceManagedViewerService {
 			initialReason = `${managedRecordState} pdf_id=${request.pdf_id} requires viewer reopen`;
 		}
 
-		if (!managedRecord.callback) {
-			const nowNs = Date.now() * 1_000_000;
-			const reason =
-				`Tracked pdf_id=${request.pdf_id} is not managed by a callback target; cannot reopen for jump_pdf.`;
-			return {
-				protocol_version: this.protocolVersion,
-				request_id: request.request_id,
-				operation: "jump_pdf",
-				status: "error",
-				generated_at_ns: nowNs,
-				error: reason,
-				status_details: {
-					protocol_version: this.protocolVersion,
-					supported: false,
-					service_available: false,
-					workspace_context: request.workspace_context,
-					request_id: request.request_id,
-					operation: "jump_pdf",
-					backend: managedRecord.viewerBackend,
-					backend_path: managedBackendPath,
-					handled: false,
-					reopened: false,
-					pdf_id: request.pdf_id,
-					pdf: managedRecord.pdfPath,
-					source_file: resolvedSourceFile,
-					line: request.line,
-					source_line: sourceLine,
-					error_code: "invalid_request",
-					reason: reason,
-					diagnostics: initialDiagnostics,
-				},
-			};
-		}
-
 		const reopenAttempt = await this.viewerBackend.open(request.request_id, {
 			pdf_path: managedRecord.pdfPath,
 			callback: managedRecord.callback,
@@ -824,6 +790,50 @@ export class HostServiceManagedViewerService {
 			: managedRecord.capabilities ?? this.viewerBackend.capabilities;
 
 		if (reopenAttempt.status === "ok") {
+			const revivedRecord = this.managedViewerRecords.reviveRecordIfState(
+				request.pdf_id,
+				managedRecordState,
+				managedRecord,
+			);
+			if (!revivedRecord) {
+				await this.viewerBackend.close(request.request_id, {
+					handle: reopenHandle,
+					backend: this.viewerBackend.name,
+				}).catch(() => undefined);
+				const conflictReason = `Tracked pdf_id=${request.pdf_id} changed lifecycle state while jump_pdf was reopening; aborting reopened jump.`;
+				return {
+					protocol_version: this.protocolVersion,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					status: "error",
+					generated_at_ns: Date.now() * 1_000_000,
+					error: conflictReason,
+					status_details: {
+						protocol_version: this.protocolVersion,
+						supported: false,
+						service_available: false,
+						workspace_context: request.workspace_context,
+						request_id: request.request_id,
+						operation: "jump_pdf",
+						backend: managedRecord.viewerBackend,
+						backend_path: reopenBackendPath,
+						handled: false,
+						closed: true,
+						reopened: false,
+						pdf_id: request.pdf_id,
+						pdf: managedRecord.pdfPath,
+						source_file: resolvedSourceFile,
+						line: request.line,
+						source_line: sourceLine,
+						error_code: "conflict",
+						reason: conflictReason,
+						handle: reopenHandle,
+						diagnostics: initialDiagnostics,
+						managed_record: managedRecord,
+					},
+				};
+			}
+			managedRecord = revivedRecord;
 			managedRecord.viewerHandle = reopenHandle;
 			managedRecord.pid = reopenPid;
 			managedRecord.pidDiagnostic = reopenPidDiagnostic;
@@ -833,7 +843,6 @@ export class HostServiceManagedViewerService {
 			managedRecord.backendPath = reopenBackendPath;
 			managedRecord.defaultSourcePath =
 				managedRecord.defaultSourcePath ?? inferDefaultSourceFileForPdf(managedRecord.pdfPath);
-			this.managedViewerRecords.reviveRecord(request.pdf_id);
 
 			const retryAttempt = await jumpBackend(reopenPid, resolvedSourceFile);
 			const retryDetails = retryAttempt.status_details as Record<string, unknown>;

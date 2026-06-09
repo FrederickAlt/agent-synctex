@@ -112,7 +112,7 @@ test("host service PDF ID registry does not reuse closed ids within service life
 	);
 });
 
-test("host service PDF ID registry clear() retains closed id tombstones within service lifetime", () => {
+test("host service PDF ID registry clear() resets closed id tombstones for a new service lifetime", () => {
 	const registry = new HostServicePdfIdRegistry({
 		minPdfId: 1,
 		maxPdfId: 1,
@@ -122,10 +122,9 @@ test("host service PDF ID registry clear() retains closed id tombstones within s
 	const first = registry.trackRecord(recordTemplate({ pdfPath: "/tmp/first.pdf" }));
 	registry.closeRecord(first.id);
 	registry.clear();
-	assert.throws(
-		() => registry.trackRecord(recordTemplate({ pdfPath: "/tmp/second.pdf" })),
-		/Unable to allocate unique active pdf_id after 1 attempts/,
-	);
+	const second = registry.trackRecord(recordTemplate({ pdfPath: "/tmp/second.pdf" }));
+	assert.equal(second.id, first.id);
+	assert.equal(second.pdfPath, "/tmp/second.pdf");
 });
 
 test("host service PDF ID registry handles collision exhaustion deterministically", () => {

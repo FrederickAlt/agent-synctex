@@ -810,6 +810,27 @@ test("daemon supports MCP managed open/jump/close without callback", async () =>
 		assert.equal(closeResponse.result.isError, undefined);
 		assert.equal(closeResponse.result.details.closed, true);
 		assert.equal(closeResponse.result.details.pdf_id, pdfId);
+
+		const reopenedJumpPayload = JSON.stringify({
+			jsonrpc: "2.0",
+			id: 14,
+			method: "tools/call",
+			params: {
+				name: "jump_pdf",
+				arguments: {
+					pdf_id: pdfId,
+					line: 3,
+					source_file: sourcePath,
+				},
+			},
+		});
+		const reopenedJumpResponse = (await sendFramedRequest(socketPath, reopenedJumpPayload)) as {
+			result: { isError?: boolean; details: { handled?: boolean; reopened?: boolean; pdf_id?: number } };
+		};
+		assert.equal(reopenedJumpResponse.result.isError, undefined);
+		assert.equal(reopenedJumpResponse.result.details.pdf_id, pdfId);
+		assert.equal(reopenedJumpResponse.result.details.handled, true);
+		assert.equal(reopenedJumpResponse.result.details.reopened, true);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });

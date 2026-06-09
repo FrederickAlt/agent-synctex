@@ -367,6 +367,28 @@ export class HostServicePdfIdRegistry {
 		return knownRecord.record;
 	}
 
+	reviveRecordIfState(
+		pdfId: number,
+		expectedState: HostServicePdfIdRecordState,
+		expectedRecord: HostServiceManagedViewerRecord,
+	): HostServiceManagedViewerRecord | undefined {
+		let knownRecord: HostServicePdfIdKnownRecord;
+		try {
+			knownRecord = this.getKnownRecord(pdfId);
+		} catch {
+			return undefined;
+		}
+		if (knownRecord.state !== expectedState || knownRecord.record !== expectedRecord) {
+			return undefined;
+		}
+		if (knownRecord.state !== "active") {
+			this.staleRecords.delete(pdfId);
+			this.closedRecords.delete(pdfId);
+			this.activeRecords.set(pdfId, knownRecord.record);
+		}
+		return knownRecord.record;
+	}
+
 	closeRecord(pdfId: number): HostServiceManagedViewerRecord {
 		return this.removeRecord(pdfId);
 	}
@@ -374,6 +396,7 @@ export class HostServicePdfIdRegistry {
 	clear(): void {
 		this.activeRecords.clear();
 		this.staleRecords.clear();
+		this.closedRecords.clear();
 	}
 
 	private allocatePdfId(): number {
