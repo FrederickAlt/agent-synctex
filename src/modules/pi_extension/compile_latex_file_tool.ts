@@ -91,7 +91,7 @@ function stringsOrEmpty(value: unknown): string[] {
 
 function warningSummary(warnings: LatexDiagnosticSummary[] | undefined, count: number | undefined, truncated: boolean | undefined, hideWarnings: boolean): string {
 	if (!count) return "";
-	if (hideWarnings) return `\nWarnings: ${count} warnings hidden by default; rerun with hide_warnings=false to show warning details.`;
+	if (hideWarnings) return `\nWarnings: ${count} warnings hidden.`;
 	if (!warnings?.length) return "";
 	const lines = warnings.slice(0, 5).map((warning) => `- ${warning.message}`);
 	const suffix = truncated ? "\n- ... more warnings omitted" : "";

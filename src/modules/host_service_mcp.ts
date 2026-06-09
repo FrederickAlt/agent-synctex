@@ -438,7 +438,7 @@ function formatContinuousSummary(details: unknown): string {
 
 function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }, hideWarnings = false): string {
 	if (typeof details.warning_count !== "number" || details.warning_count <= 0) return "";
-	if (hideWarnings) return `\nWarnings: ${details.warning_count} warnings hidden by default; rerun with hide_warnings=false to show warning details.`;
+	if (hideWarnings) return `\nWarnings: ${details.warning_count} warnings hidden.`;
 	if (!Array.isArray(details.warnings)) return "";
 	const lines = details.warnings
 		.slice(0, 5)

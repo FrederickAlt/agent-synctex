@@ -546,9 +546,8 @@ test("compile_latex_file hides warning details by default and can show them expl
 			const defaultDetails = defaultResult.details as { compile_status?: string; warning_count?: number; warnings?: Array<{ message: string }>; warnings_hidden?: boolean; log?: string };
 			assert.match(defaultResult.content[0].text, /^ok_with_warnings:/);
 			assert.match(defaultResult.content[0].text, /warnings=2/);
-			assert.match(defaultResult.content[0].text, /warnings hidden/i);
-			assert.match(defaultResult.content[0].text, /hide_warnings=false/);
-			assert.doesNotMatch(defaultResult.content[0].text, /Reference `foo'|Overfull/);
+			assert.match(defaultResult.content[0].text, /Warnings: 2 warnings hidden\./);
+			assert.doesNotMatch(defaultResult.content[0].text, /hide_warnings=false|Reference `foo'|Overfull/);
 			assert.equal(defaultDetails.compile_status, "ok_with_warnings");
 			assert.equal(defaultDetails.warning_count, 2);
 			assert.equal(defaultDetails.warnings_hidden, true);

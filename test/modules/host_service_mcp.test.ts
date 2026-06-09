@@ -1329,9 +1329,8 @@ test("daemon compile_latex_file hides warning details by default and can show th
 		const defaultText = defaultResponse.result.content[0].text;
 		assert.match(defaultText, /^ok_with_warnings:/);
 		assert.match(defaultText, /warnings=2/);
-		assert.match(defaultText, /warnings hidden/i);
-		assert.match(defaultText, /hide_warnings=false/);
-		assert.doesNotMatch(defaultText, /Reference `foo'|Overfull/);
+		assert.match(defaultText, /Warnings: 2 warnings hidden\./);
+		assert.doesNotMatch(defaultText, /hide_warnings=false|Reference `foo'|Overfull/);
 		assert.equal(defaultResponse.result.details.compile_status, "ok_with_warnings");
 		assert.equal(defaultResponse.result.details.warning_count, 2);
 		assert.equal(defaultResponse.result.details.warnings_hidden, true);
