@@ -4,7 +4,7 @@ Source issue: [#73 Add continuous LaTeX compilation with session subscriptions](
 
 ## Problem Statement
 
-Agents can currently compile an existing LaTeX source file as a one-shot operation and optionally open the resulting PDF through the Host Service. This works well for isolated compile requests, but it is inefficient for iterative editing of multi-file LaTeX projects. After each edit, the agent must explicitly re-run the compile tool, and the system has no durable way to keep the PDF fresh as included files, bibliography files, or other project dependencies change.
+Agents can currently compile an existing LaTeX source file as a one-shot operation and optionally open the resulting PDF through the Host Service. File compilation should now be consistently driven by `latexmk`, with the selected compiler (`lualatex`, `pdflatex`, or `xelatex`) passed to `latexmk` as the engine configuration. One-shot latexmk-backed compilation works well for isolated compile requests, but it is inefficient for iterative editing of multi-file LaTeX projects. After each edit, the agent must explicitly re-run the compile tool, and the system has no durable way to keep the PDF fresh as included files, bibliography files, or other project dependencies change.
 
 The hard user-facing problem is tracking file changes in a LaTeX project that may span many files. A naïve recursive watcher would either miss dynamic LaTeX dependencies or watch too much of the workspace, causing noisy recompiles and implementation complexity. Users need a simple tool flag that enables continuous compilation for the root document without creating orphan compiler processes or duplicate compiler workers for the same file.
 
@@ -14,13 +14,13 @@ Continuous compilation also creates a new feedback problem: later background com
 
 Add a `continuous` flag to the existing LaTeX file compile tool. The flag controls a Host Service-owned continuous compilation subscription for the normalized root LaTeX source file.
 
-When an agent passes `continuous=true`, the Host Service compiles the document normally and then ensures a single `latexmk -pvc` process is active for that root file. If continuous compilation is already active for that file, the Host Service does not start another process; it reports that continuous compilation is already active and refreshes/adds the current agent session subscription.
+When an agent passes `continuous=true`, the Host Service first performs an immediate latexmk-backed compile using the selected compiler as latexmk engine configuration and then ensures a single `latexmk -pvc` process is active for that root file with the same engine mapping. If continuous compilation is already active for that file, the Host Service does not start another process; it reports that continuous compilation is already active and refreshes/adds the current agent session subscription.
 
-When an agent passes `continuous=false`, the Host Service compiles the document normally and then removes the current agent session's subscription. If other live sessions are still subscribed to the same root file, the shared continuous compiler remains active. If the current session was the last subscriber, the Host Service stops the `latexmk` process.
+When an agent passes `continuous=false`, the Host Service first performs an immediate latexmk-backed compile using the selected compiler as latexmk engine configuration and then removes the current agent session's subscription. If other live sessions are still subscribed to the same root file, the shared continuous compiler remains active. If the current session was the last subscriber, the Host Service stops the `latexmk` process.
 
-When the `continuous` flag is omitted, the compile tool preserves current one-shot behavior and does not alter continuous compilation state.
+When the `continuous` flag is omitted, the compile tool performs a one-shot latexmk-backed compile and does not alter continuous compilation state.
 
-Continuous compilation uses `latexmk -pvc -view=none` so that latexmk performs LaTeX-aware dependency tracking for multi-file projects while the Host Service continues to own viewer state, PDF IDs, callback routing, and lifecycle management. The Host Service must not rely on recursive project-wide file watching for this feature.
+File compilation uses `latexmk` as the single backend. One-shot compilation runs latexmk once; continuous compilation uses `latexmk -pvc -view=none` so that latexmk performs LaTeX-aware dependency tracking for multi-file projects while the Host Service continues to own viewer state, PDF IDs, callback routing, and lifecycle management. The Host Service must not rely on recursive project-wide file watching for this feature.
 
 To avoid orphan compiler processes after agent crashes, agents periodically send a heartbeat to the Host Service. Continuous compilation subscriptions are tied to `workspace_context.session_id`; if a session heartbeat expires, the Host Service removes that session from all continuous compile subscriptions and stops any continuous compiler process with no remaining live subscribers.
 
@@ -37,7 +37,7 @@ For later background compilation failures, the Host Service stores ephemeral pen
 7. As an agent, I want repeated `continuous=true` calls to tell me continuous compilation is already active, so that I understand no new compiler was started.
 8. As an agent, I want `continuous=false` to stop my subscription, so that I can explicitly deactivate continuous compilation through the same tool.
 9. As an agent, I want `continuous=false` to still compile the document once, so that changing the flag only affects continuous state and does not skip normal compile behavior.
-10. As an agent, I want omitting `continuous` to preserve existing one-shot compile behavior, so that existing tool usage remains compatible.
+10. As an agent, I want omitting `continuous` to perform a latexmk-backed one-shot compile without changing continuous state, so that existing tool usage remains compatible while using the same compile backend.
 11. As an agent, I want omitting `continuous` not to accidentally stop an active continuous session, so that a normal compile does not disrupt background compilation.
 12. As an agent, I want omitting `continuous` not to accidentally start continuous compilation, so that background processes are only created intentionally.
 13. As a second agent working on the same root file, I want to subscribe to an existing continuous compiler instead of starting a second one, so that shared work does not duplicate compiler processes.
@@ -55,9 +55,9 @@ For later background compilation failures, the Host Service stores ephemeral pen
 25. As an agent, I want the compile response to include the continuous compiler process id when available, so that diagnostics can identify the running background process.
 26. As an agent, I want the compile response to include subscriber counts or equivalent state, so that I can tell whether other sessions still keep a compiler alive.
 27. As an agent, I want continuous compile errors to preserve current diagnostic behavior for the immediate compile, so that LaTeX errors remain actionable.
-28. As an agent, I want missing `latexmk` to produce a clear error when `continuous=true`, so that I know how to install the required dependency.
+28. As an agent, I want missing `latexmk` to produce a clear error for any file compile request, so that I know how to install the required dependency.
 29. As an agent on macOS, I want the error for missing `latexmk` to make clear that it is supplied by MacTeX/TeX Live rather than the operating system, so that setup is understandable.
-30. As an agent, I want ordinary compilation with `lualatex`, `pdflatex`, or `xelatex` to continue working even if `latexmk` is missing, so that continuous mode's dependency does not regress existing behavior.
+30. As an agent, I want ordinary compilation with `lualatex`, `pdflatex`, or `xelatex` to be routed through latexmk engine configuration, so that one-shot and continuous compiles use the same backend and behavior.
 31. As an agent, I want continuous mode to use `latexmk` without opening its own viewer, so that the Host Service remains the owner of managed viewer opens and PDF IDs.
 32. As an agent, I want external PDF viewing behavior to remain controlled by `open_pdf`, so that continuous compilation does not create surprise viewer windows.
 33. As an agent, I want closing a PDF viewer to avoid stopping continuous compilation, so that viewer lifecycle and compiler subscription lifecycle are separate.
@@ -74,7 +74,7 @@ For later background compilation failures, the Host Service stores ephemeral pen
 44. As a Pi extension user, I want session shutdown to stop heartbeats and unregister subscriptions through expiry or cleanup, so that session lifecycle is respected.
 45. As an MCP-wrapper user, I want the wrapper to inject workspace context and heartbeat automatically, so that continuous compilation works without manual setup.
 46. As a Codex relay user, I want heartbeat support to be part of the relay behavior, so that the Host Service can detect whether the agent process is still alive.
-47. As a developer, I want existing one-shot compile tests to continue passing, so that continuous mode is an additive feature.
+47. As a developer, I want one-shot compile tests updated to assert latexmk-backed behavior, so that file compilation has one consistent backend.
 48. As a developer, I want MCP tool schemas to expose `continuous` accurately, so that clients can discover and use the flag.
 49. As a developer, I want Host Service request validation to reject malformed continuous values, so that protocol safety is maintained.
 50. As a developer, I want compile response validation to accept continuous metadata, so that clients can safely consume the new response shape.
@@ -84,7 +84,7 @@ For later background compilation failures, the Host Service stores ephemeral pen
 54. As a developer, I want tests proving heartbeat expiry removes subscriptions and stops orphan compilers, so that crash safety is covered.
 55. As a developer, I want tests proving Host Service shutdown stops all continuous compilers, so that lifecycle cleanup is covered.
 56. As a developer, I want tests proving missing `session_id` rejects continuous requests, so that unowned background processes cannot start.
-57. As a developer, I want tests proving missing latexmk rejects continuous startup clearly, so that dependency errors are user-friendly.
+57. As a developer, I want tests proving missing latexmk rejects file compilation clearly, so that dependency errors are user-friendly.
 58. As a developer, I want docs describing `continuous=true`, `continuous=false`, and omitted semantics, so that tool users know how to control the feature.
 59. As a developer, I want docs clarifying that `close_pdf` does not stop continuous compilation, so that users do not rely on viewer close for compiler lifecycle.
 60. As a developer, I want docs clarifying that latexmk handles multi-file dependency tracking, so that future maintainers do not add a redundant recursive watcher.
@@ -106,7 +106,7 @@ For later background compilation failures, the Host Service stores ephemeral pen
 - Add an optional `continuous` boolean to the existing file compile tool. The flag is tri-state by presence: `true` subscribes/starts, `false` unsubscribes/stops if last subscriber, and omission leaves continuous state unchanged.
 - Continuous mode requires `workspace_context.session_id`. Requests that set `continuous` to either boolean value without a non-empty session id are rejected with a clear validation error. One-shot compile requests without the flag remain compatible with existing callers.
 - Continuous compilation is a Host Service responsibility. The Host Service owns background compiler processes, session subscriptions, heartbeat state, pending background failure notifications, and cleanup behavior.
-- Use `latexmk -pvc` for continuous compilation rather than implementing recursive file watching. This delegates LaTeX-aware dependency discovery and rebuild scheduling to latexmk.
+- Use `latexmk` as the only LaTeX file compilation backend. One-shot compilation runs latexmk once; continuous compilation uses `latexmk -pvc` rather than implementing recursive file watching. This delegates LaTeX-aware dependency discovery and rebuild scheduling to latexmk.
 - Run latexmk with no viewer launch. Viewer behavior remains controlled by existing managed viewer operations and `open_pdf` semantics.
 - Keep viewer lifecycle separate from continuous compiler lifecycle. Closing a PDF does not stop continuous compilation. Continuous compilation stops through `continuous=false`, heartbeat expiry, or Host Service shutdown.
 - Implement a deep continuous compile manager module with a small interface for ensuring a session subscription, removing a session subscription, processing heartbeats/session expiry, querying state, collecting pending notifications, and stopping all processes. This module should encapsulate process spawning, singleton enforcement, subscriber bookkeeping, bounded output capture, notification state, and shutdown cleanup.
@@ -118,11 +118,11 @@ For later background compilation failures, the Host Service stores ephemeral pen
 - Agents/wrappers send automatic heartbeats while alive. The heartbeat is a Host Service protocol operation rather than a user-facing manual tool.
 - Heartbeat expiry removes the expired session from all continuous compile subscriptions and pending notification state. Any continuous compiler with zero remaining subscribers is stopped.
 - Host Service shutdown stops every continuous compiler process before completing shutdown.
-- Continuous startup checks for latexmk availability. If unavailable, continuous startup fails with a clear dependency error while ordinary one-shot compilation remains unaffected.
-- The immediate compile remains part of every compile tool call regardless of continuous flag value. The flag changes only the continuous subscription state and result metadata.
+- File compilation checks for latexmk availability. If unavailable, any `compile_latex_file` request fails with a clear dependency error and installation guidance.
+- The immediate latexmk-backed compile remains part of every compile tool call regardless of continuous flag value. The flag changes only the continuous subscription state and result metadata.
 - Compile responses gain continuous metadata describing whether the request started a process, found one already active, deactivated the current session, left a process active for other subscribers, stopped the process, or failed to change continuous state.
 - Existing compile diagnostics and artifact reporting remain authoritative for the immediate compile portion of the request.
-- The selected compiler option should be mapped into an appropriate latexmk engine configuration where applicable. If the selected compiler is `latexmk`, continuous mode can use the default latexmk-backed LuaLaTeX behavior already expected by the project.
+- The selected compiler option must be mapped into an appropriate latexmk engine configuration for both one-shot and continuous compile paths. `lualatex`, `pdflatex`, and `xelatex` select the corresponding latexmk engine behavior. If the selected compiler is `latexmk`, the Host Service uses its default hardened latexmk-backed behavior.
 - The latexmk polling interval can be tuned with latexmk startup configuration if needed, but fast edits should primarily be controlled by the singleton process guarantee and latexmk's serialized rebuild behavior.
 - Background `latexmk -pvc` output is monitored by the Host Service. When a background compile fails and does not produce or update the PDF, the Host Service records a pending system-info notification for each live subscribed session.
 - Pending background failure notifications are ephemeral and replaceable. For each session and root source, there is at most one pending failure notification. A newer unresolved failure replaces the older one.
@@ -143,8 +143,8 @@ For later background compilation failures, the Host Service stores ephemeral pen
 - The continuous compile manager should have focused unit tests with fake process spawning/time control where possible. Good tests cover singleton process creation, idempotent subscribe, unsubscribe with remaining subscribers, unsubscribe as last subscriber, heartbeat expiry pruning, process exit handling, bounded output capture, pending failure creation, success-based pending failure clearing, delivery-based clearing, and stop-all cleanup.
 - Host Service integration tests should verify that compile requests with `continuous=true` and valid session ids start or reuse a continuous compiler after the immediate compile succeeds.
 - Host Service integration tests should verify that compile requests with `continuous=false` remove only the current session subscription and stop the compiler only when no subscribers remain.
-- Host Service integration tests should verify that continuous requests without a session id are rejected while ordinary compile requests remain allowed.
-- Host Service integration tests should verify that missing latexmk produces a clear continuous-mode dependency failure.
+- Host Service integration tests should verify that continuous requests without a session id are rejected while ordinary one-shot compile requests remain allowed without a session id.
+- Host Service integration tests should verify that missing latexmk produces a clear file-compilation dependency failure for both one-shot and continuous requests.
 - Host Service lifecycle tests should verify that daemon shutdown terminates active continuous compiler processes.
 - Heartbeat tests should verify that a live heartbeat keeps subscribed compilers alive and an expired heartbeat removes subscriptions and stops unreferenced compilers.
 - Pending notification tests should verify that a background failure without a fresh PDF creates a session-scoped pending `[system info]` notification.
@@ -152,12 +152,12 @@ For later background compilation failures, the Host Service stores ephemeral pen
 - Pending notification tests should verify that retrieving pending notifications clears delivered notifications and does not redeliver duplicates.
 - Pending notification tests should verify that one session cannot retrieve another session's pending notification.
 - Pending notification tests should verify that repeated background failures for the same session/source replace the prior pending failure rather than accumulating unbounded notifications.
-- MCP tests should verify the tool schema exposes `continuous`, request parsing accepts boolean values, malformed values are rejected, and continuous metadata is passed through in successful responses.
+- MCP tests should verify the tool schema exposes `continuous`, request parsing accepts boolean values, malformed values are rejected, selected compilers are mapped through latexmk, and continuous metadata is passed through in successful responses.
 - MCP or Host Service protocol tests should verify pending notification retrieval request/response validation and session-id requirements.
 - Pi extension tests should verify the compile tool passes `continuous` through to the Host Service and renders user-facing status text for started, already-active, deactivated, and still-active-for-other-subscribers outcomes.
 - Pi lifecycle/boundary tests should verify heartbeat startup/shutdown behavior and pending notification retrieval/injection at available agent boundaries without requiring real latexmk processes.
 - MCP relay tests should verify workspace context/session id injection and heartbeat behavior for relay-managed clients. If boundary hooks exist, relay tests should also verify pending notification retrieval and surfacing.
-- Existing one-shot compile tests are prior art for fake compiler binaries, temporary Host Service instances, tool capture, managed viewer assertions, and request payload assertions.
+- One-shot compile tests should use fake latexmk binaries, temporary Host Service instances, tool capture, managed viewer assertions, and request payload assertions.
 - Existing Host Service tests are prior art for protocol validation, server lifecycle, fake viewer backends, fake compiler binaries, and shutdown cleanup.
 - Existing MCP tests are prior art for tool schema validation, argument parsing, and daemon response formatting.
 
@@ -167,7 +167,7 @@ For later background compilation failures, the Host Service stores ephemeral pen
 - Supporting continuous compilation without a session id.
 - Adding a separate user-facing stop-continuous-compilation tool.
 - Stopping continuous compilation when a PDF viewer is closed.
-- Making latexmk a required dependency for ordinary one-shot compilation.
+- Supporting LaTeX file compilation without latexmk.
 - Persisting continuous compiler sessions across Host Service restarts.
 - Supporting multiple simultaneous continuous compiler processes for the same normalized root source file.
 - Exposing heartbeat as a manual user tool for agents to call directly.
@@ -179,10 +179,10 @@ For later background compilation failures, the Host Service stores ephemeral pen
 
 ## Further Notes
 
-- `latexmk` is not provided by macOS itself, but is normally included with MacTeX or TeX Live. BasicTeX users may need to install it separately.
-- Continuous mode should produce clear installation guidance when latexmk is missing.
+- `latexmk` is a required dependency for LaTeX file compilation. It is not provided by macOS itself, but is normally included with MacTeX or TeX Live. BasicTeX users may need to install it separately.
+- All file compile requests should produce clear installation guidance when latexmk is missing.
 - `latexmk -pvc` monitors source files and dependencies at intervals. The Host Service should rely on latexmk for LaTeX dependency tracking rather than attempting to infer project structure itself.
 - The Host Service remains the primary owner of core logic, active runtime state, callback routing, viewer operations, continuous compiler lifecycle, and pending background notification state.
 - Pi and other wrappers own presentation and agent-message injection. They should ask the Host Service for pending session-scoped notifications at agent boundaries and inject unresolved failures as `[system info]`.
-- The design preserves existing user-facing compile behavior and adds continuous compilation as an explicit opt-in lifecycle controlled by the compile tool flag.
+- The design intentionally standardizes file compilation on latexmk. It preserves the compile tool interface while making continuous compilation an explicit opt-in lifecycle controlled by the compile tool flag.
 
