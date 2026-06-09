@@ -698,7 +698,7 @@ function expandHomePath(rawPath: string): string {
 }
 
 function normalizeLatexSourcePath(rawSourcePath: string, workspaceCwd: string): string {
-	const expandedPath = expandHomePath(rawSourcePath);
+	const expandedPath = expandHomePath(rawSourcePath.trim());
 	const resolved = isAbsolute(expandedPath) ? expandedPath : resolve(workspaceCwd, expandedPath);
 	if (extname(resolved) === ".tex") {
 		return resolved;
