@@ -176,7 +176,7 @@ export class HostServiceCompileService {
 			const compilerIdentity = latexmkEngineIdentity(resolvedCompiler);
 			const rootKey = normalizeLatexRootKey(normalizedPath);
 			const canReuseLastResult = !shouldClean && request.details.continuous !== true;
-			const canRouteThroughContinuous = !shouldClean && request.details.continuous !== true;
+			const canRouteThroughContinuous = !shouldClean;
 			const canRecordLastResult = request.details.continuous !== true;
 			const compileRequest: LatexFileCompileRequest = {
 				requestedPath,
@@ -325,7 +325,7 @@ export class HostServiceCompileService {
 				error,
 			});
 			const nowNs = this.nowNs();
-			const continuous = await this.applyContinuousUnsubscribeAfterFailure(request, normalizedPath);
+			const continuous = await this.applyContinuousUnsubscribeAfterFailure(request, normalizedPath, error);
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -502,9 +502,15 @@ export class HostServiceCompileService {
 	private async applyContinuousUnsubscribeAfterFailure(
 		request: HostServiceCompileRequest,
 		rootSource: string,
+		error?: unknown,
 	): Promise<HostServiceContinuousCompileDetails | undefined> {
-		return request.details.continuous === false
-			? await this.applyContinuousCompileRequest(request, rootSource)
+		if (request.details.continuous === false) {
+			return await this.applyContinuousCompileRequest(request, rootSource);
+		}
+		return request.details.continuous === true
+			&& error instanceof HostServiceCompileCoordinationError
+			&& error.errorCode === "continuous_compiler_engine_mismatch"
+			? this.applyContinuousCompileRequest(request, rootSource)
 			: undefined;
 	}
 

@@ -520,6 +520,60 @@ test("one-shot compile waits for next continuous result when inputs changed afte
 	});
 });
 
+test("continuous=true reuses active compatible continuous compiler without spawning one-shot latexmk", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+
+		let repeatedSettled = false;
+		const repeated = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" })
+			.finally(() => {
+				repeatedSettled = true;
+			});
+		const secondSubscriber = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-B" });
+		await sleep(50);
+		assert.equal(repeatedSettled, false);
+		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1);
+
+		writeContinuousRecorderArtifacts(root);
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		const repeatedResult = await repeated;
+		const secondResult = await secondSubscriber;
+
+		assert.equal(repeatedResult.continuous?.status, "already_active");
+		assert.equal(repeatedResult.continuous?.subscriber_count, 1);
+		assert.equal(secondResult.continuous?.status, "already_active");
+		assert.equal(secondResult.continuous?.subscriber_count, 2);
+		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1);
+	});
+});
+
+test("continuous=true rejects active continuous compiler mismatch without spawning one-shot latexmk", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "pdflatex", continuous: true }, { cwd: baseDir, session_id: "session-B" });
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /active.*compiler lualatex/i);
+		assert.equal((observed as { statusDetails?: { error_code?: string } }).statusDetails?.error_code, "continuous_compiler_engine_mismatch");
+		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1);
+	});
+});
+
 test("one-shot compile rejects active continuous compiler mismatch without spawning latexmk", async () => {
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
@@ -598,6 +652,49 @@ test("continuous lifecycle failure event resolves one-shot wait without freshnes
 	});
 });
 
+
+test("continuous cycle warnings reset on later clean success", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		fixture.processes[0]?.stderr.write("LaTeX Warning: Reference `old' undefined on input line 1.\n");
+		writeContinuousRecorderArtifacts(root);
+		emitContinuousEvent(fixture.processes[0]!, "warning");
+		const warned = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir, session_id: "session-A" });
+		assert.equal(warned.compile_status, "ok_with_warnings");
+		assert.equal(warned.warning_count, 1);
+
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		writeContinuousRecorderArtifacts(root, { log: "Output written on paper.pdf (1 page, 123 bytes).\n" });
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		const clean = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir, session_id: "session-A" });
+		assert.equal(clean.compile_status, "ok");
+		assert.equal(clean.warning_count, 0);
+	});
+});
+
+test("continuous cycle failure output resets on later successful cycle", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		fixture.processes[0]?.stderr.write("! Undefined control sequence.\nl.1 \\oldmacro\nLaTeX Warning: old warning on input line 1.\n");
+		writeContinuousRecorderArtifacts(root, { log: "! Undefined control sequence.\nl.1 \\oldmacro\n", pdf: false });
+		emitContinuousEvent(fixture.processes[0]!, "failure");
+
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		writeContinuousRecorderArtifacts(root, { log: "Output written on paper.pdf (1 page, 123 bytes).\n" });
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		const clean = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir, session_id: "session-A" });
+		assert.equal(clean.compile_status, "ok");
+		assert.equal(clean.warning_count, 0);
+	});
+});
 
 test("clean=true with active continuous stops, cleans, restarts subscribers, and waits for post-clean result", async () => {
 	const fixture = makeFakeContinuousManager();
@@ -989,7 +1086,11 @@ test("host service continuous pending notification retrieval is session scoped a
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
 		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
-		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-B" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		const secondSubscriber = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-B" });
+		writeContinuousRecorderArtifacts(join(baseDir, "paper.tex"));
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		await secondSubscriber;
 		rmSync(join(baseDir, "paper.pdf"), { force: true });
 		writeFileSync(join(baseDir, "paper.log"), "! Undefined control sequence.\nl.2 \\bad\n");
 		fixture.processes[0]?.stderr.write("Latexmk: Errors, so I did not complete making targets\n! Undefined control sequence.\nl.2 \\bad\n");
@@ -1096,7 +1197,11 @@ test("host service continuous=true/false performs immediate compile and manages 
 		assert.equal(started.continuous?.subscriber_count, 1);
 		assert.equal(fixture.spawns.length, 1);
 
-		const repeated = await client.requestCompileLatexFile({ latex_file_path: join(baseDir, "paper.tex"), compiler: "lualatex", continuous: true }, contextA);
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		const repeatedPromise = client.requestCompileLatexFile({ latex_file_path: join(baseDir, "paper.tex"), compiler: "lualatex", continuous: true }, contextA);
+		writeContinuousRecorderArtifacts(join(baseDir, "paper.tex"));
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		const repeated = await repeatedPromise;
 		assert.equal(repeated.continuous?.status, "already_active");
 		assert.equal(repeated.continuous?.subscriber_count, 1);
 		assert.equal(fixture.spawns.length, 1);
@@ -1105,10 +1210,6 @@ test("host service continuous=true/false performs immediate compile and manages 
 		assert.equal(shared.continuous?.status, "already_active");
 		assert.equal(shared.continuous?.subscriber_count, 2);
 		assert.equal(fixture.spawns.length, 1);
-
-		emitContinuousEvent(fixture.processes[0]!, "compiling");
-		writeContinuousRecorderArtifacts(join(baseDir, "paper.tex"));
-		emitContinuousEvent(fixture.processes[0]!, "success");
 
 		const stillActive = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: false }, contextA);
 		assert.equal(stillActive.continuous?.status, "still_active_for_other_subscribers");
@@ -1185,15 +1286,15 @@ test("compiler=latexmk repeated continuous calls succeed when latexmk reports PD
 		assert.equal(started.compile_status, "ok");
 		assert.equal(fixture.spawns.length, 1);
 
-		const repeated = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "latexmk", continuous: true }, context);
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		const repeatedPromise = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "latexmk", continuous: true }, context);
+		writeContinuousRecorderArtifacts(join(baseDir, "paper.tex"));
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		const repeated = await repeatedPromise;
 		assert.equal(repeated.continuous?.status, "already_active");
 		assert.equal(repeated.continuous?.subscriber_count, 1);
 		assert.equal(repeated.compile_status, "ok");
 		assert.equal(fixture.spawns.length, 1);
-
-		emitContinuousEvent(fixture.processes[0]!, "compiling");
-		writeContinuousRecorderArtifacts(join(baseDir, "paper.tex"));
-		emitContinuousEvent(fixture.processes[0]!, "success");
 
 		const stopped = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "latexmk", continuous: false }, context);
 		assert.equal(stopped.continuous?.status, "stopped");
@@ -1232,10 +1333,14 @@ test("continuous=true rejects compiler changes for an already-active root", asyn
 			assert.equal(fixture.spawns.length, 1);
 		}
 
-		const repeated = await client.requestCompileLatexFile(
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		const repeatedPromise = client.requestCompileLatexFile(
 			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true },
 			{ cwd: baseDir, session_id: "session-lua" },
 		);
+		writeContinuousRecorderArtifacts(join(baseDir, "paper.tex"));
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		const repeated = await repeatedPromise;
 		assert.equal(repeated.continuous?.status, "already_active");
 		assert.equal(repeated.continuous?.subscriber_count, 1);
 		assert.equal(fixture.spawns.length, 1);

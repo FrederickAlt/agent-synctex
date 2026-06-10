@@ -87,6 +87,7 @@ interface ContinuousCompileRecord {
 	engineIdentity: string;
 	compilerLabel: string;
 	recentOutput: string;
+	cycleOutput: string;
 	lifecycleBuffer: string;
 	cycleState: ContinuousCompileCycleState;
 	cycleStartedAtMs: number;
@@ -296,6 +297,7 @@ export class HostServiceContinuousCompileManager {
 				engineIdentity: requestedEngineIdentity,
 				compilerLabel: compilerLabel(requestedCompiler),
 				recentOutput: "",
+				cycleOutput: "",
 				lifecycleBuffer: "",
 				cycleState: "idle",
 				cycleStartedAtMs: Date.now(),
@@ -512,6 +514,8 @@ export class HostServiceContinuousCompileManager {
 				: undefined;
 			if (event === "compiling" || event === "success" || event === "warning" || event === "failure") {
 				this.applyLifecycleEvent(record, event);
+			} else if (record.cycleState === "compiling") {
+				record.cycleOutput = appendBounded(record.cycleOutput, `${line}\n`);
 			}
 		}
 		if (record.lifecycleBuffer.length > MAX_RECENT_OUTPUT_LENGTH) {
@@ -522,6 +526,7 @@ export class HostServiceContinuousCompileManager {
 	private applyLifecycleEvent(record: ContinuousCompileRecord, event: "compiling" | "success" | "warning" | "failure"): void {
 		if (event === "compiling") {
 			record.cycleState = "compiling";
+			record.cycleOutput = "";
 			record.cycleStartedAtMs = Date.now();
 			return;
 		}
@@ -535,7 +540,7 @@ export class HostServiceContinuousCompileManager {
 		const pdfPath = pdfPathForRoot(rootSource);
 		const logPath = logPathForRoot(rootSource);
 		const logTail = readTail(logPath);
-		const combinedOutput = [logTail, record.recentOutput].filter((entry) => entry.trim()).join("\n");
+		const combinedOutput = [logTail, record.cycleOutput].filter((entry) => entry.trim()).join("\n");
 		const compiledAfterMs = record.cycleStartedAtMs;
 		if (event !== "failure" && existsSync(pdfPath)) {
 			const warningExtraction = extractLatexWarnings(combinedOutput);
