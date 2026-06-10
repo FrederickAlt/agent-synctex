@@ -44,6 +44,7 @@ const HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES = [
 	"preamble.tex",
 	"praeamble.tex",
 ] as const;
+const UNOBSERVED_IDLE_CONTINUOUS_WAIT_MS = 500;
 
 const hostServiceLatexFileCompiler = createLatexFileCompileToolSupport();
 
@@ -178,7 +179,8 @@ export class HostServiceCompileService {
 			const rootKey = normalizeLatexRootKey(normalizedPath);
 			const canReuseLastResult = !shouldClean && request.details.continuous !== true;
 			const canRouteThroughContinuous = !shouldClean;
-			const canRecordLastResult = request.details.continuous !== true;
+			const canUseInitialContinuousCompileCache = request.details.continuous === undefined;
+			const canRecordLastResult = true;
 			const compileRequest: LatexFileCompileRequest = {
 				requestedPath,
 				compiler: request.details.compiler,
@@ -218,7 +220,27 @@ export class HostServiceCompileService {
 						}
 					}
 					if (canRouteThroughContinuous) {
-						const continuousResult = await this.continuousCompileManager.waitForFreshResult(normalizedPath, compilerIdentity, signal);
+						const continuousState = this.continuousCompileManager.rootState(normalizedPath, compilerIdentity);
+						const mayBeDormantInitialContinuous = canUseInitialContinuousCompileCache
+							&& continuousState.active
+							&& continuousState.compatible
+							&& continuousState.cycleState !== "compiling"
+							&& continuousState.hasObservedOutcome !== true;
+						if (canReuseLastResult && mayBeDormantInitialContinuous) {
+							const cached = this.rootCompileCoordinator.freshCachedResult<LatexFileCompileResult>(rootKey, normalizedPath, compilerIdentity);
+							if (cached?.status === "success") {
+								return cached.value;
+							}
+							if (cached?.status === "failure") {
+								throw cached.error;
+							}
+						}
+						const continuousResult = await this.continuousCompileManager.waitForFreshResult(
+							normalizedPath,
+							compilerIdentity,
+							signal,
+							mayBeDormantInitialContinuous ? UNOBSERVED_IDLE_CONTINUOUS_WAIT_MS : undefined,
+						);
 						if (continuousResult !== undefined) {
 							return continuousResult;
 						}

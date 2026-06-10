@@ -165,7 +165,7 @@ exit 0
 	chmodSync(compilerPath, 0o700);
 }
 
-function writeRecordingLatexmk(binDir: string, recordPath: string): void {
+function writeRecordingLatexmk(binDir: string, recordPath: string, options: { writeFls?: boolean } = {}): void {
 	mkdirSync(binDir, { recursive: true, mode: 0o700 });
 	const compilerPath = join(binDir, "latexmk");
 	writeFileSync(compilerPath, `#!/usr/bin/env node
@@ -178,8 +178,15 @@ if (!source) process.exit(1);
 const sourceBase = path.basename(source, ".tex");
 const outDir = path.resolve(process.cwd(), path.dirname(source));
 fs.mkdirSync(outDir, { recursive: true });
-fs.writeFileSync(path.join(outDir, sourceBase + ".log"), "Output written on " + sourceBase + ".pdf (1 page, 123 bytes).\\n");
-fs.writeFileSync(path.join(outDir, sourceBase + ".pdf"), "%PDF-1.4\\n");
+const sourcePath = path.resolve(process.cwd(), source);
+const logPath = path.join(outDir, sourceBase + ".log");
+const pdfPath = path.join(outDir, sourceBase + ".pdf");
+fs.writeFileSync(logPath, "Output written on " + sourceBase + ".pdf (1 page, 123 bytes).\\n");
+fs.writeFileSync(pdfPath, "%PDF-1.4\\n");
+if (${JSON.stringify(options.writeFls === true)}) {
+  const flsPath = path.join(outDir, sourceBase + ".fls");
+  fs.writeFileSync(flsPath, ["PWD " + outDir, "INPUT " + sourcePath, "OUTPUT " + logPath, "OUTPUT " + pdfPath, "OUTPUT " + flsPath, ""].join("\\n"));
+}
 process.exit(0);
 `, { mode: 0o700 });
 	chmodSync(compilerPath, 0o700);
@@ -474,6 +481,38 @@ test("one-shot compile waits for active compatible continuous cycle without spaw
 
 		const invocations = readFileSync(recordPath, "utf8").trim().split("\n");
 		assert.equal(invocations.length, 1);
+	});
+});
+
+
+test("one-shot compile reuses initial continuous compile when active continuous has emitted no lifecycle result", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath, { writeFls: true });
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true, open_pdf: false },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		assert.equal(fixture.manager.cycleState(root), "idle");
+
+		const startedAt = Date.now();
+		const oneShot = await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", open_pdf: false },
+			{ cwd: baseDir, session_id: "session-A" },
+			undefined,
+			250,
+		);
+
+		assert.equal(oneShot.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(oneShot.compile_status, "ok");
+		assert.equal(oneShot.continuous, undefined);
+		assert.equal(fixture.manager.activeRootCount(), 1);
+		assert.equal(fixture.processes[0]?.killed, false);
+		assert.equal(recordedLatexmkInvocationCount(recordPath), 1);
+		assert.ok(Date.now() - startedAt < 250, "one-shot should not wait for the caller timeout when the initial compile is still fresh");
 	});
 });
 

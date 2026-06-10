@@ -100,6 +100,14 @@ interface ContinuousCompileRecord {
 	stopPromise?: Promise<void>;
 }
 
+interface ContinuousCompileRootState {
+	active: boolean;
+	compatible: boolean;
+	cycleState?: ContinuousCompileCycleState;
+	hasObservedOutcome?: boolean;
+	compilerLabel?: string;
+}
+
 const MAX_RECENT_OUTPUT_LENGTH = 16_384;
 const DEFAULT_SHUTDOWN_GRACE_MS = 500;
 const DEFAULT_SHUTDOWN_FORCE_MS = 500;
@@ -418,6 +426,20 @@ export class HostServiceContinuousCompileManager {
 		return this.recordsByRootSource.get(rootSource)?.cycleState;
 	}
 
+	rootState(rootSource: string, compilerIdentity: string): ContinuousCompileRootState {
+		const record = this.recordsByRootSource.get(rootSource);
+		if (record === undefined) {
+			return { active: false, compatible: false };
+		}
+		return {
+			active: true,
+			compatible: record.engineIdentity === compilerIdentity,
+			cycleState: record.cycleState,
+			hasObservedOutcome: record.lastOutcome !== undefined,
+			compilerLabel: record.compilerLabel,
+		};
+	}
+
 	async cleanRestartAndWaitForFreshResult(
 		rootSource: string,
 		compilerIdentity: string,
@@ -468,7 +490,7 @@ export class HostServiceContinuousCompileManager {
 		return { result, cleanedArtifacts, continuous };
 	}
 
-	waitForFreshResult(rootSource: string, compilerIdentity: string, signal?: AbortSignal): Promise<LatexFileCompileResult | undefined> {
+	waitForFreshResult(rootSource: string, compilerIdentity: string, signal?: AbortSignal, timeoutMs?: number): Promise<LatexFileCompileResult | undefined> {
 		const record = this.recordsByRootSource.get(rootSource);
 		if (record === undefined) {
 			return Promise.resolve(undefined);
@@ -496,16 +518,44 @@ export class HostServiceContinuousCompileManager {
 			));
 		}
 		return new Promise<LatexFileCompileResult>((resolve, reject) => {
-			const waiter: ContinuousCompileWaiter = { compilerIdentity, resolve, reject, signal };
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			let settled = false;
+			const waiter: ContinuousCompileWaiter = {
+				compilerIdentity,
+				resolve: (result) => {
+					if (settled) return;
+					settled = true;
+					if (timer !== undefined) clearTimeout(timer);
+					resolve(result);
+				},
+				reject: (error) => {
+					if (settled) return;
+					settled = true;
+					if (timer !== undefined) clearTimeout(timer);
+					reject(error);
+				},
+				signal,
+			};
 			if (signal !== undefined) {
 				waiter.onAbort = () => {
 					record.waiters.delete(waiter);
-					reject(new HostServiceCompileCoordinationError(
+					waiter.reject(new HostServiceCompileCoordinationError(
 						"compile request cancelled while waiting for active continuous compilation",
 						"compile_cancelled",
 					));
 				};
 				signal.addEventListener("abort", waiter.onAbort, { once: true });
+			}
+			if (timeoutMs !== undefined) {
+				timer = setTimeout(() => {
+					record.waiters.delete(waiter);
+					this.detachWaiter(waiter);
+					waiter.reject(new HostServiceCompileCoordinationError(
+						"active continuous compilation has not reported a fresh result yet; retry after latexmk reports a compile cycle or use continuous=false to stop it before running a one-shot compile",
+						"continuous_compiler_result_unavailable",
+					));
+				}, timeoutMs);
+				timer.unref?.();
 			}
 			record.waiters.add(waiter);
 		});
