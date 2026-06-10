@@ -174,6 +174,7 @@ export class HostServiceCompileService {
 			const compilerIdentity = latexmkEngineIdentity(resolvedCompiler);
 			const rootKey = normalizeLatexRootKey(normalizedPath);
 			const canReuseLastResult = !shouldClean && request.details.continuous !== true;
+			const canRouteThroughContinuous = !shouldClean && request.details.continuous === undefined;
 			const canRecordLastResult = request.details.continuous !== true;
 			const compileRequest: LatexFileCompileRequest = {
 				requestedPath,
@@ -185,6 +186,12 @@ export class HostServiceCompileService {
 			const result = await this.rootCompileCoordinator.runExclusive(
 				rootKey,
 				async () => {
+					if (canRouteThroughContinuous) {
+						const continuousResult = await this.continuousCompileManager.waitForFreshResult(normalizedPath, compilerIdentity, signal);
+						if (continuousResult !== undefined) {
+							return continuousResult;
+						}
+					}
 					if (canReuseLastResult) {
 						const cached = this.rootCompileCoordinator.freshCachedResult<LatexFileCompileResult>(rootKey, normalizedPath, compilerIdentity);
 						if (cached?.status === "success") {

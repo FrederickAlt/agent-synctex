@@ -1,9 +1,10 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, statSync, type Stats } from "node:fs";
 import { dirname, basename, extname, resolve } from "node:path";
-import type { LatexCompiler, LatexDiagnosticSummary } from "./latex/latex_file_compiler.ts";
-import { extractLatexFatalDiagnostics, latexmkContinuousArgs, latexmkEngineIdentity } from "./latex/latex_file_compiler.ts";
+import type { LatexCompiler, LatexDiagnosticSummary, LatexFileCompileResult } from "./latex/latex_file_compiler.ts";
+import { extractLatexFatalDiagnostics, extractLatexWarnings, LATEXMK_CONTINUOUS_EVENT_PREFIX, latexmkContinuousArgs, latexmkEngineIdentity, LoggedToolError } from "./latex/latex_file_compiler.ts";
 import type { HostServicePendingNotification } from "./host_service_session_leases.ts";
+import { buildLatexmkFreshnessSnapshot, HostServiceCompileCoordinationError, isLatexmkFreshnessSnapshotFresh, type HostServiceCompileFreshnessSnapshot } from "./host_service_root_compile_coordinator.ts";
 
 export type ContinuousCompileStatus =
 	| "started"
@@ -13,6 +14,8 @@ export type ContinuousCompileStatus =
 	| "stopped"
 	| "unavailable"
 	| "error";
+
+export type ContinuousCompileCycleState = "idle" | "compiling" | "stopping" | "stopped";
 
 export interface HostServiceContinuousCompileDetails {
 	requested: boolean;
@@ -63,12 +66,31 @@ interface PdfSnapshot {
 	ctimeMs: number;
 }
 
+interface ContinuousCompileOutcome {
+	outcome: { status: "success"; value: LatexFileCompileResult } | { status: "failure"; error: unknown };
+	freshness: HostServiceCompileFreshnessSnapshot | undefined;
+}
+
+interface ContinuousCompileWaiter {
+	compilerIdentity: string;
+	resolve: (result: LatexFileCompileResult) => void;
+	reject: (error: unknown) => void;
+	signal?: AbortSignal;
+	onAbort?: () => void;
+}
+
 interface ContinuousCompileRecord {
 	rootSource: string;
 	process: ContinuousCompileProcess;
 	subscribers: Set<string>;
 	engineIdentity: string;
+	compilerLabel: string;
 	recentOutput: string;
+	lifecycleBuffer: string;
+	cycleState: ContinuousCompileCycleState;
+	cycleStartedAtMs: number;
+	lastOutcome?: ContinuousCompileOutcome;
+	waiters: Set<ContinuousCompileWaiter>;
 	lastPdfSnapshot?: PdfSnapshot;
 	lastFailureFingerprint?: string;
 	stopping?: boolean;
@@ -172,6 +194,10 @@ function failureFingerprint(rootSource: string, pdfPath: string, logPath: string
 	return JSON.stringify({ rootSource, pdfPath, logPath, summary, diagnostics });
 }
 
+function compilerLabel(compiler: LatexCompiler | undefined): string {
+	return compiler === undefined || compiler === "latexmk" ? "lualatex" : compiler;
+}
+
 export class HostServiceContinuousCompileManager {
 	private readonly spawnProcess: (command: string, args: string[], options: ContinuousCompileSpawnOptions) => ContinuousCompileProcess;
 	private readonly commandExists: (command: string) => boolean;
@@ -265,7 +291,12 @@ export class HostServiceContinuousCompileManager {
 				process: child,
 				subscribers: new Set([sessionId]),
 				engineIdentity: requestedEngineIdentity,
+				compilerLabel: compilerLabel(requestedCompiler),
 				recentOutput: "",
+				lifecycleBuffer: "",
+				cycleState: "idle",
+				cycleStartedAtMs: Date.now(),
+				waiters: new Set(),
 				lastPdfSnapshot: pdfSnapshot(pdfPathForRoot(rootSource)),
 			};
 			this.recordsByRootSource.set(rootSource, record);
@@ -276,11 +307,21 @@ export class HostServiceContinuousCompileManager {
 				this.recordOutputChunk(rootSource, record, Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
 			});
 			child.on("exit", () => {
+				this.rejectWaiters(record, new HostServiceCompileCoordinationError(
+					"continuous compiler stopped before producing a fresh result",
+					"continuous_compiler_stopped",
+				));
+				record.cycleState = "stopped";
 				if (this.recordsByRootSource.get(rootSource) === record) {
 					this.recordsByRootSource.delete(rootSource);
 				}
 			});
 			child.on("error", () => {
+				this.rejectWaiters(record, new HostServiceCompileCoordinationError(
+					"continuous compiler failed before producing a fresh result",
+					"continuous_compiler_failed",
+				));
+				record.cycleState = "stopped";
 				if (this.recordsByRootSource.get(rootSource) === record) {
 					this.recordsByRootSource.delete(rootSource);
 				}
@@ -356,6 +397,53 @@ export class HostServiceContinuousCompileManager {
 		return this.recordsByRootSource.get(rootSource)?.subscribers.size ?? 0;
 	}
 
+	cycleState(rootSource: string): ContinuousCompileCycleState | undefined {
+		return this.recordsByRootSource.get(rootSource)?.cycleState;
+	}
+
+	waitForFreshResult(rootSource: string, compilerIdentity: string, signal?: AbortSignal): Promise<LatexFileCompileResult | undefined> {
+		const record = this.recordsByRootSource.get(rootSource);
+		if (record === undefined) {
+			return Promise.resolve(undefined);
+		}
+		if (record.engineIdentity !== compilerIdentity) {
+			return Promise.reject(new HostServiceCompileCoordinationError(
+				`continuous compilation is already active for this root with compiler ${record.compilerLabel}; use the active compiler or stop continuous compilation first before requesting a different compiler`,
+				"continuous_compiler_engine_mismatch",
+			));
+		}
+		const freshOutcome = this.freshOutcome(record);
+		if (freshOutcome !== undefined) {
+			return freshOutcome.status === "success" ? Promise.resolve(freshOutcome.value) : Promise.reject(freshOutcome.error);
+		}
+		if (record.stopping) {
+			return Promise.reject(new HostServiceCompileCoordinationError(
+				"continuous compilation is stopping before producing a fresh result",
+				"continuous_compiler_stopping",
+			));
+		}
+		if (signal?.aborted) {
+			return Promise.reject(new HostServiceCompileCoordinationError(
+				"compile request cancelled while waiting for active continuous compilation",
+				"compile_cancelled",
+			));
+		}
+		return new Promise<LatexFileCompileResult>((resolve, reject) => {
+			const waiter: ContinuousCompileWaiter = { compilerIdentity, resolve, reject, signal };
+			if (signal !== undefined) {
+				waiter.onAbort = () => {
+					record.waiters.delete(waiter);
+					reject(new HostServiceCompileCoordinationError(
+						"compile request cancelled while waiting for active continuous compilation",
+						"compile_cancelled",
+					));
+				};
+				signal.addEventListener("abort", waiter.onAbort, { once: true });
+			}
+			record.waiters.add(waiter);
+		});
+	}
+
 	clearPendingNotificationsForSessionRoot(sessionId: string, rootSource: string): void {
 		this.notificationSink?.clearPendingNotificationsForSessionRoot?.(sessionId, rootSource);
 	}
@@ -365,7 +453,126 @@ export class HostServiceContinuousCompileManager {
 			return;
 		}
 		record.recentOutput = appendBounded(record.recentOutput, chunk);
+		this.observeLifecycleEvents(record, chunk);
 		this.observeBackgroundCompileOutput(record);
+	}
+
+	private observeLifecycleEvents(record: ContinuousCompileRecord, chunk: string): void {
+		record.lifecycleBuffer += chunk;
+		const lines = record.lifecycleBuffer.split(/\r?\n/u);
+		record.lifecycleBuffer = lines.pop() ?? "";
+		for (const line of lines) {
+			const event = line.trim().startsWith(LATEXMK_CONTINUOUS_EVENT_PREFIX)
+				? line.trim().slice(LATEXMK_CONTINUOUS_EVENT_PREFIX.length)
+				: undefined;
+			if (event === "compiling" || event === "success" || event === "warning" || event === "failure") {
+				this.applyLifecycleEvent(record, event);
+			}
+		}
+		if (record.lifecycleBuffer.length > MAX_RECENT_OUTPUT_LENGTH) {
+			record.lifecycleBuffer = record.lifecycleBuffer.slice(record.lifecycleBuffer.length - MAX_RECENT_OUTPUT_LENGTH);
+		}
+	}
+
+	private applyLifecycleEvent(record: ContinuousCompileRecord, event: "compiling" | "success" | "warning" | "failure"): void {
+		if (event === "compiling") {
+			record.cycleState = "compiling";
+			record.cycleStartedAtMs = Date.now();
+			return;
+		}
+		record.cycleState = "idle";
+		record.lastOutcome = this.buildCycleOutcome(record, event);
+		this.resolveFreshWaiters(record);
+	}
+
+	private buildCycleOutcome(record: ContinuousCompileRecord, event: "success" | "warning" | "failure"): ContinuousCompileOutcome {
+		const rootSource = record.rootSource;
+		const pdfPath = pdfPathForRoot(rootSource);
+		const logPath = logPathForRoot(rootSource);
+		const logTail = readTail(logPath);
+		const combinedOutput = [logTail, record.recentOutput].filter((entry) => entry.trim()).join("\n");
+		const compiledAfterMs = record.cycleStartedAtMs;
+		if (event !== "failure" && existsSync(pdfPath)) {
+			const warningExtraction = extractLatexWarnings(combinedOutput);
+			const result: LatexFileCompileResult = {
+				source: rootSource,
+				pdfPath,
+				logPath,
+				clean: false,
+				cleanedArtifacts: [],
+				compileStatus: event === "warning" || warningExtraction.total > 0 ? "ok_with_warnings" : "ok",
+				compilerExitCode: 0,
+				compilerSignal: null,
+				warningCount: warningExtraction.total,
+				warnings: warningExtraction.warnings,
+				warningsTruncated: warningExtraction.truncated,
+			};
+			return {
+				outcome: { status: "success", value: result },
+				freshness: buildLatexmkFreshnessSnapshot({ rootSource, pdfPath, logPath, compiledAfterMs, requirePdf: true }),
+			};
+		}
+
+		const diagnostics = extractLatexFatalDiagnostics(combinedOutput);
+		const summary = summarizeFailure(diagnostics, combinedOutput);
+		const errorCode = event === "failure" ? "compile_failed" : "failed_no_pdf";
+		const error = new LoggedToolError(
+			`LaTeX continuous compile failed: ${summary}`,
+			logPath,
+			notificationOutputTail(combinedOutput),
+			{
+				errorCode,
+				diagnostics,
+				diagnosticSummary: summary,
+				pdfPath: existsSync(pdfPath) ? pdfPath : undefined,
+			},
+		);
+		return {
+			outcome: { status: "failure", error },
+			freshness: buildLatexmkFreshnessSnapshot({ rootSource, logPath, compiledAfterMs, requirePdf: false }),
+		};
+	}
+
+	private freshOutcome(record: ContinuousCompileRecord): ContinuousCompileOutcome["outcome"] | undefined {
+		const outcome = record.lastOutcome;
+		if (outcome === undefined || outcome.freshness === undefined || !isLatexmkFreshnessSnapshotFresh(outcome.freshness)) {
+			return undefined;
+		}
+		return outcome.outcome;
+	}
+
+	private resolveFreshWaiters(record: ContinuousCompileRecord): void {
+		for (const waiter of [...record.waiters]) {
+			if (waiter.compilerIdentity !== record.engineIdentity) {
+				continue;
+			}
+			const outcome = this.freshOutcome(record);
+			if (outcome === undefined) {
+				continue;
+			}
+			record.waiters.delete(waiter);
+			this.detachWaiter(waiter);
+			if (outcome.status === "success") {
+				waiter.resolve(outcome.value);
+			} else {
+				waiter.reject(outcome.error);
+			}
+		}
+	}
+
+	private rejectWaiters(record: ContinuousCompileRecord, error: unknown): void {
+		for (const waiter of [...record.waiters]) {
+			record.waiters.delete(waiter);
+			this.detachWaiter(waiter);
+			waiter.reject(error);
+		}
+	}
+
+	private detachWaiter(waiter: ContinuousCompileWaiter): void {
+		if (waiter.signal !== undefined && waiter.onAbort !== undefined) {
+			waiter.signal.removeEventListener("abort", waiter.onAbort);
+			waiter.onAbort = undefined;
+		}
 	}
 
 	private observeBackgroundCompileOutput(record: ContinuousCompileRecord): void {
@@ -457,7 +664,12 @@ export class HostServiceContinuousCompileManager {
 			return record.stopPromise;
 		}
 		record.stopping = true;
+		record.cycleState = "stopping";
 		record.subscribers.clear();
+		this.rejectWaiters(record, new HostServiceCompileCoordinationError(
+			"continuous compilation is stopping before producing a fresh result",
+			"continuous_compiler_stopping",
+		));
 		record.stopPromise = (async () => {
 			const exited = this.waitForProcessExit(record.process);
 			record.process.kill("SIGTERM");

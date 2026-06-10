@@ -3,7 +3,7 @@ import { createConnection } from "node:net";
 import { PassThrough } from "node:stream";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -16,6 +16,7 @@ import {
 	HostServiceSessionLeaseService,
 } from "../../src/modules/host_service.ts";
 import type { ContinuousCompileNotificationSink, ContinuousCompileSpawnOptions } from "../../src/modules/host_service_continuous_compile.ts";
+import { LATEXMK_CONTINUOUS_EVENT_PREFIX, LATEXMK_CONTINUOUS_POLL_INTERVAL_SECONDS } from "../../src/modules/latex/latex_file_compiler.ts";
 
 class FakeContinuousProcess extends EventEmitter {
 	readonly pid: number;
@@ -206,6 +207,32 @@ exit 0
 	chmodSync(compilerPath, 0o700);
 }
 
+function writeContinuousRecorderArtifacts(root: string, options: { log?: string; pdf?: boolean } = {}): void {
+	const rootDir = dirname(root);
+	const rootName = basename(root, ".tex");
+	const logPath = join(rootDir, `${rootName}.log`);
+	const pdfPath = join(rootDir, `${rootName}.pdf`);
+	const flsPath = join(rootDir, `${rootName}.fls`);
+	writeFileSync(logPath, options.log ?? `Output written on ${rootName}.pdf (1 page, 123 bytes).\n`);
+	if (options.pdf !== false) {
+		writeFileSync(pdfPath, "%PDF-1.4\n");
+	} else {
+		rmSync(pdfPath, { force: true });
+	}
+	writeFileSync(flsPath, [
+		`PWD ${rootDir}`,
+		`INPUT ${root}`,
+		`OUTPUT ${logPath}`,
+		...(options.pdf === false ? [] : [`OUTPUT ${pdfPath}`]),
+		`OUTPUT ${flsPath}`,
+		"",
+	].join("\n"));
+}
+
+function emitContinuousEvent(process: FakeContinuousProcess, event: "compiling" | "success" | "warning" | "failure"): void {
+	process.stdout.write(`${LATEXMK_CONTINUOUS_EVENT_PREFIX}${event}\n`);
+}
+
 function encodeMcpFrame(jsonText: string): string {
 	return `Content-Length: ${Buffer.byteLength(jsonText, "utf8")}\r\n\r\n${jsonText}`;
 }
@@ -281,7 +308,8 @@ test("continuous compile manager enforces singleton processes and subscriber lif
 	assert.equal(first.status, "started");
 	assert.equal(first.subscriber_count, 1);
 	assert.equal(fixture.spawns.length, 1);
-	assert.deepEqual(fixture.spawns[0]?.args.slice(0, 3), ["-pvc", "-norc", "-view=none"]);
+	assert.deepEqual(fixture.spawns[0]?.args.slice(0, 5), ["-pvc", "-e", fixture.spawns[0]?.args[2], "-norc", "-view=none"]);
+	assert.match(fixture.spawns[0]?.args[2] ?? "", new RegExp(`\\$sleep_time = ${LATEXMK_CONTINUOUS_POLL_INTERVAL_SECONDS}`));
 
 	const repeated = fixture.manager.ensureSubscription(root, "session-A", "lualatex");
 	assert.equal(repeated.status, "already_active");
@@ -326,8 +354,12 @@ test("continuous latexmk invocation uses preview-continuous, no-viewer, recorder
 		const spawn = fixture.spawns[0];
 		assert.equal(spawn?.command, "latexmk");
 		assert.equal(spawn?.options.cwd, "/tmp/project");
-		assert.deepEqual(spawn?.args, [
-			"-pvc",
+		assert.deepEqual(spawn?.args.slice(0, 2), ["-pvc", "-e"]);
+		assert.match(spawn?.args[2] ?? "", new RegExp(`\\$sleep_time = ${LATEXMK_CONTINUOUS_POLL_INTERVAL_SECONDS}`));
+		for (const event of ["compiling", "success", "warning", "failure"] as const) {
+			assert.match(spawn?.args[2] ?? "", new RegExp(`${LATEXMK_CONTINUOUS_EVENT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}%s\\\\n' ${event}`));
+		}
+		assert.deepEqual(spawn?.args.slice(3), [
 			"-norc",
 			"-view=none",
 			"-recorder",
@@ -350,8 +382,10 @@ test("continuous latexmk invocation protects option-looking root filenames", () 
 	const spawn = fixture.spawns[0];
 	assert.equal(spawn?.options.cwd, "/tmp/project");
 	assert.equal(spawn?.args.at(-1), "./-paper.tex");
-	assert.deepEqual(spawn?.args.slice(0, 8), [
+	assert.deepEqual(spawn?.args.slice(0, 10), [
 		"-pvc",
+		"-e",
+		spawn?.args[2],
 		"-norc",
 		"-view=none",
 		"-recorder",
@@ -360,6 +394,7 @@ test("continuous latexmk invocation protects option-looking root filenames", () 
 		"-halt-on-error",
 		"-file-line-error",
 	]);
+	assert.match(spawn?.args[2] ?? "", new RegExp(`\\$sleep_time = ${LATEXMK_CONTINUOUS_POLL_INTERVAL_SECONDS}`));
 });
 
 test("one-shot compile_latex_file invokes latexmk without pvc and maps selected engines", async () => {
@@ -392,6 +427,137 @@ test("one-shot compile_latex_file invokes latexmk without pvc and maps selected 
 		]);
 		assert.deepEqual(invocations.map((args) => args.at(-1)), ["paper.tex", "paper.tex", "paper.tex", "paper.tex"]);
 		assert.equal(invocations.some((args) => args.some((arg) => /(?:^|\s)-shell-escape(?:\s|$)/.test(arg))), false);
+	});
+});
+
+test("one-shot compile waits for active compatible continuous cycle without spawning another latexmk", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		assert.equal(fixture.manager.cycleState(root), "compiling");
+
+		let settled = false;
+		const oneShot = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir, session_id: "session-A" })
+			.finally(() => {
+				settled = true;
+			});
+		await sleep(50);
+		assert.equal(settled, false);
+
+		writeContinuousRecorderArtifacts(root);
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		const result = await oneShot;
+		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(result.compile_status, "ok");
+		assert.equal(fixture.manager.cycleState(root), "idle");
+
+		const invocations = readFileSync(recordPath, "utf8").trim().split("\n");
+		assert.equal(invocations.length, 1);
+	});
+});
+
+test("one-shot compile immediately returns fresh idle continuous result", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		writeContinuousRecorderArtifacts(root, { log: "LaTeX Warning: Reference `x' undefined on input line 1.\nOutput written on paper.pdf (1 page, 123 bytes).\n" });
+		emitContinuousEvent(fixture.processes[0]!, "warning");
+
+		const result = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir, session_id: "session-A" });
+		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(result.compile_status, "ok_with_warnings");
+		assert.equal(result.warning_count, 1);
+		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1);
+	});
+});
+
+test("one-shot compile waits for next continuous result when inputs changed after idle result", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		writeContinuousRecorderArtifacts(root);
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		writeFileSync(root, "\\documentclass{article}\n\\begin{document}changed\\end{document}\n");
+
+		let settled = false;
+		const oneShot = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir, session_id: "session-A" })
+			.finally(() => {
+				settled = true;
+			});
+		await sleep(50);
+		assert.equal(settled, false);
+
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		writeContinuousRecorderArtifacts(root);
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		const result = await oneShot;
+		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1);
+	});
+});
+
+test("one-shot compile rejects active continuous compiler mismatch without spawning latexmk", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		writeContinuousRecorderArtifacts(root);
+		emitContinuousEvent(fixture.processes[0]!, "success");
+
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "pdflatex" }, { cwd: baseDir, session_id: "session-A" });
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /active.*compiler lualatex/i);
+		assert.match(observed.message, /use the active compiler or stop continuous compilation first/i);
+		assert.equal((observed as { statusDetails?: { error_code?: string } }).statusDetails?.error_code, "continuous_compiler_engine_mismatch");
+		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1);
+	});
+});
+
+test("continuous lifecycle failure event resolves one-shot wait with fresh failure diagnostics", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const root = join(baseDir, "paper.tex");
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		const oneShot = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir, session_id: "session-A" });
+
+		writeContinuousRecorderArtifacts(root, { log: "! Undefined control sequence.\nl.1 \\bad\n", pdf: false });
+		emitContinuousEvent(fixture.processes[0]!, "failure");
+
+		let observed: unknown;
+		try {
+			await oneShot;
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /Undefined control sequence|continuous compile failed/);
+		assert.equal((observed as { statusDetails?: { error_code?: string } }).statusDetails?.error_code, "compile_failed");
+		assert.equal(fixture.manager.cycleState(root), "idle");
 	});
 });
 
@@ -538,7 +704,7 @@ test("host service continuous pending notification retrieval is session scoped a
 	});
 });
 
-test("successful immediate compile clears stale pending continuous failure for the same session and root", async () => {
+test("successful one-shot routed through continuous clears stale pending continuous failure for the same session and root", async () => {
 	const leases = new HostServiceSessionLeaseService();
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
@@ -551,10 +717,14 @@ test("successful immediate compile clears stale pending continuous failure for t
 		fixture.processes[0]?.stderr.write("Latexmk: Errors, so I did not complete making targets\n! Undefined control sequence.\nl.2 \\bad\n");
 		assert.equal(leases.pendingNotificationCount("session-A"), 1);
 
-		const oneShot = await client.requestCompileLatexFile(
+		const oneShotPromise = client.requestCompileLatexFile(
 			{ latex_file_path: "paper.tex", compiler: "lualatex" },
 			{ cwd: baseDir, session_id: "session-A" },
 		);
+		await sleep(20);
+		writeContinuousRecorderArtifacts(join(baseDir, "paper.tex"));
+		emitContinuousEvent(fixture.processes[0]!, "success");
+		const oneShot = await oneShotPromise;
 		assert.equal(oneShot.continuous, undefined);
 		const delivered = await client.requestPendingNotifications({ cwd: baseDir, session_id: "session-A" });
 		assert.equal(delivered.delivered_count, 0);

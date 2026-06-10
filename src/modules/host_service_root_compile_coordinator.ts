@@ -102,7 +102,7 @@ export class HostServiceRootCompileCoordinator {
 		if (cached.compilerIdentity !== compilerIdentity) {
 			return undefined;
 		}
-		if (cached.freshness === undefined || !isFresh(cached.freshness)) {
+		if (cached.freshness === undefined || !isLatexmkFreshnessSnapshotFresh(cached.freshness)) {
 			return undefined;
 		}
 		return cached.outcome as HostServiceCachedCompileOutcome<T>;
@@ -246,7 +246,7 @@ export function buildLatexmkFreshnessSnapshot(options: {
 	return { dependencyFiles, outputFiles };
 }
 
-function isFresh(snapshot: HostServiceCompileFreshnessSnapshot): boolean {
+export function isLatexmkFreshnessSnapshotFresh(snapshot: HostServiceCompileFreshnessSnapshot): boolean {
 	return filesMatch(snapshot.dependencyFiles) && filesMatch(snapshot.outputFiles);
 }
 

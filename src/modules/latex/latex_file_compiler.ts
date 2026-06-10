@@ -491,9 +491,26 @@ export function latexmkSourceOperand(rootSource: string): string {
 	return sourceName.startsWith("-") ? `./${sourceName}` : sourceName;
 }
 
+export const LATEXMK_CONTINUOUS_EVENT_PREFIX = "agent-synctex-latexmk-event:";
+export const LATEXMK_CONTINUOUS_POLL_INTERVAL_SECONDS = 0.1;
+
+function latexmkContinuousConfig(): string[] {
+	const eventCommand = (event: string) => `printf '${LATEXMK_CONTINUOUS_EVENT_PREFIX}%s\\n' ${event}`;
+	return [
+		"-e",
+		[
+			`$sleep_time = ${LATEXMK_CONTINUOUS_POLL_INTERVAL_SECONDS};`,
+			`$compiling_cmd = q{${eventCommand("compiling")}};`,
+			`$success_cmd = q{${eventCommand("success")}};`,
+			`$warning_cmd = q{${eventCommand("warning")}};`,
+			`$failure_cmd = q{${eventCommand("failure")}};`,
+		].join(" "),
+	];
+}
+
 function latexmkCompileArgs(latexFilePath: string, compiler: LatexCompiler | undefined, continuous: boolean): string[] {
 	return [
-		...(continuous ? ["-pvc"] : []),
+		...(continuous ? ["-pvc", ...latexmkContinuousConfig()] : []),
 		"-norc",
 		"-view=none",
 		"-recorder",
