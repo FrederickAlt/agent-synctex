@@ -1,5 +1,5 @@
 import { createConnection } from "node:net";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -223,6 +223,32 @@ function eventCount(project: InstrumentedProject, event: string): number {
 	return readEvents(project).filter((entry) => entry.event === event).length;
 }
 
+function eventModificationTimes(project: InstrumentedProject, event: string): number[] {
+	return readdirSync(project.dir)
+		.filter((name) => name.startsWith(`compile-event-${event}-`) && name.endsWith(".jsonl"))
+		.map((name) => statSync(join(project.dir, name)).mtimeMs);
+}
+
+function compileWindow(project: InstrumentedProject): { startMs: number; endMs: number } {
+	const startTimes = eventModificationTimes(project, "compile-start");
+	const endTimes = eventModificationTimes(project, "compile-end");
+	assert.ok(startTimes.length > 0, `${project.label} should record at least one compile-start event`);
+	assert.ok(endTimes.length > 0, `${project.label} should record at least one compile-end event`);
+	return {
+		startMs: Math.min(...startTimes),
+		endMs: Math.max(...endTimes),
+	};
+}
+
+function assertCompileWindowsOverlap(first: InstrumentedProject, second: InstrumentedProject): void {
+	const firstWindow = compileWindow(first);
+	const secondWindow = compileWindow(second);
+	assert.ok(
+		firstWindow.startMs < secondWindow.endMs && secondWindow.startMs < firstWindow.endMs,
+		`${first.label} and ${second.label} should compile concurrently to prove coordination is per-root`,
+	);
+}
+
 function assertNoOverlapEvents(projects: InstrumentedProject[]): void {
 	for (const project of projects) {
 		assert.equal(eventCount(project, "overlap-detected"), 0, `${project.label} recorded overlapping TeX runs`);
@@ -277,7 +303,7 @@ function expectCompileSuccess(response: McpCompileResponse, label: string): Comp
 	assert.equal(response.result.isError, undefined, `${label} failed: ${response.result.content[0]?.text ?? ""}`);
 	const details = response.result.details;
 	assert.ok(details, `${label} missing details`);
-	assert.match(details.compile_status ?? "", /^ok|ok_with_warnings$/u, `${label} unexpected compile status`);
+	assert.match(details.compile_status ?? "", /^(ok|ok_with_warnings)$/u, `${label} unexpected compile status`);
 	assert.equal(details.pdf_id, undefined, `${label} unexpectedly opened a viewer-backed PDF`);
 	assert.ok(details.pdf && existsSync(details.pdf), `${label} PDF missing at ${details.pdf ?? "[missing path]"}`);
 	assert.ok(details.log && existsSync(details.log), `${label} log missing at ${details.log ?? "[missing path]"}`);
@@ -305,8 +331,8 @@ test("real latexmk Host Service MCP root coordination smoke", async (t) => {
 	const baseDir = mkdtempSync(join(tmpdir(), "host-service-real-latexmk-smoke-"));
 	const socketPath = join(baseDir, "host-service.sock");
 	const sameRoot = createInstrumentedProject(baseDir, "same-root", 0.25);
-	const otherRootA = createInstrumentedProject(baseDir, "other-root-a", 0.2);
-	const otherRootB = createInstrumentedProject(baseDir, "other-root-b", 0.2);
+	const otherRootA = createInstrumentedProject(baseDir, "other-root-a", 1.0);
+	const otherRootB = createInstrumentedProject(baseDir, "other-root-b", 1.0);
 	const continuousRoot = createInstrumentedProject(baseDir, "continuous-root", 0.2);
 	const viewerBackend = new CountingViewerBackend();
 	const server = new HostServiceServer({ socketPath, viewerBackend });
@@ -331,6 +357,7 @@ test("real latexmk Host Service MCP root coordination smoke", async (t) => {
 		differentRoots.forEach((response, index) => expectCompileSuccess(response, `different-root compile ${index}`));
 		assert.ok(eventCount(otherRootA, "compile-start") > beforeOtherAStarts, "first different root should compile");
 		assert.ok(eventCount(otherRootB, "compile-start") > beforeOtherBStarts, "second different root should compile");
+		assertCompileWindowsOverlap(otherRootA, otherRootB);
 		assertNoOverlapEvents([sameRoot, otherRootA, otherRootB]);
 
 		const firstContinuous = expectCompileSuccess(
@@ -356,11 +383,17 @@ test("real latexmk Host Service MCP root coordination smoke", async (t) => {
 			"active continuous latexmk should finish the rebuild before a fresh-result one-shot",
 			10_000,
 		);
+		const beforeOneShotThroughContinuousStarts = eventCount(continuousRoot, "compile-start");
 		const oneShotDuringContinuous = expectCompileSuccess(
 			await callCompile(socketPath, continuousRoot, {}, "continuous-A"),
 			"one-shot through active continuous compiler",
 		);
 		assert.equal(oneShotDuringContinuous.pdf, continuousRoot.pdfPath);
+		assert.equal(
+			eventCount(continuousRoot, "compile-start"),
+			beforeOneShotThroughContinuousStarts,
+			"one-shot with active compatible continuous compiler should not spawn another TeX run",
+		);
 		assertNoOverlapEvents([continuousRoot]);
 
 		const secondContinuous = expectCompileSuccess(
@@ -406,6 +439,14 @@ test("real latexmk Host Service MCP root coordination smoke", async (t) => {
 		);
 		assert.equal(unsubscribeB.continuous?.status, "stopped");
 		assert.equal(unsubscribeB.continuous?.subscriber_count, 0);
+		const beforeStoppedStarts = eventCount(continuousRoot, "compile-start");
+		appendFileSync(continuousRoot.texPath, "\n% final unsubscribe should stop continuous rebuilds\n");
+		await sleep(1_000);
+		assert.equal(
+			eventCount(continuousRoot, "compile-start"),
+			beforeStoppedStarts,
+			"unsubscribing the final session should stop continuous rebuilds",
+		);
 
 		await waitUntil(() => !existsSync(continuousRoot.lockPath), "continuous root lock marker should be cleared after successful runs");
 		assertNoOverlapEvents([sameRoot, otherRootA, otherRootB, continuousRoot]);
