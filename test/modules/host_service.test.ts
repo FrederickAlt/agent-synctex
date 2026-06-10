@@ -121,11 +121,12 @@ function shellSingleQuoted(value: string): string {
 	return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
-function writeLatexmkWithRecorderCacheProbe(binDir: string, stateDir: string, options: { dependencyPath?: string; omitRecorder?: boolean } = {}): string {
+function writeLatexmkWithRecorderCacheProbe(binDir: string, stateDir: string, options: { dependencyPath?: string; omitRecorder?: boolean; sleepSeconds?: string } = {}): string {
 	mkdirSync(binDir, { mode: 0o700, recursive: true });
 	mkdirSync(stateDir, { mode: 0o700, recursive: true });
 	const compilerPath = join(binDir, "latexmk");
 	const dependencyInput = options.dependencyPath === undefined ? "" : `printf 'INPUT %s\\n' ${shellSingleQuoted(options.dependencyPath)} >> \"$out_dir/$name.fls\"`;
+	const sleepCommand = options.sleepSeconds === undefined ? "" : `sleep ${shellSingleQuoted(options.sleepSeconds)}`;
 	const recorderOutput = options.omitRecorder === true ? "" : `cat > \"$out_dir/$name.fls\" <<FLS
 PWD $out_dir
 INPUT $out_dir/$base
@@ -153,6 +154,7 @@ if [ -f "$count_file" ]; then
   count=$(cat "$count_file")
 fi
 printf '%s' "$((count + 1))" > "$count_file"
+${sleepCommand}
 ${recorderOutput}
 if grep -q 'FAIL' "$out_dir/$base"; then
   cat > "$out_dir/$name.log" <<'LOGTEXT'
@@ -1283,12 +1285,12 @@ test("host service serializes concurrent same-root compile_latex_file requests",
 });
 
 
-test("host service reuses fresh same-root one-shot result without spawning latexmk again", async () => {
+test("host service reuses fresh queued same-root one-shot result without spawning latexmk again", async () => {
 	const baseDir = temporaryDir("host-service-compile-cache-reuse-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const originalPath = process.env.PATH ?? "";
 	const stateDir = join(baseDir, "state");
-	writeLatexmkWithRecorderCacheProbe(join(baseDir, "bin"), stateDir);
+	writeLatexmkWithRecorderCacheProbe(join(baseDir, "bin"), stateDir, { sleepSeconds: "0.2" });
 	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
 	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
 
@@ -1296,8 +1298,10 @@ test("host service reuses fresh same-root one-shot result without spawning latex
 	await server.start();
 	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
 	try {
-		const first = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
-		const second = await client.requestCompileLatexFile({ latex_file_path: join(baseDir, "paper.tex"), compiler: "lualatex" }, { cwd: baseDir });
+		const [first, second] = await Promise.all([
+			client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir }),
+			client.requestCompileLatexFile({ latex_file_path: join(baseDir, "paper.tex"), compiler: "lualatex" }, { cwd: baseDir }),
+		]);
 
 		assert.equal(first.pdf, join(baseDir, "paper.pdf"));
 		assert.equal(second.pdf, first.pdf);
