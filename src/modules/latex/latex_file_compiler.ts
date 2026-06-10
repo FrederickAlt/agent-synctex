@@ -395,20 +395,16 @@ function pdfWasUpdated(before: Stats | undefined, after: Stats | undefined, comp
 	return fileWasUpdated(before, after, compileStartMs);
 }
 
-function combinedLatexLog(latexFilePath: string, compilerOutput: string): string {
-	const projectLog = readTextTail(latexLogPath(latexFilePath));
-	return [projectLog, compilerOutput].filter((entry) => entry.trim()).join("\n");
-}
-
 function writeLatexCompileErrorLog(
 	latexFilePath: string,
 	spec: LatexCommandSpec,
 	reason: string,
 	compilerOutput: string,
 	diagnostics: LatexDiagnosticSummary[] = [],
+	currentProjectLog?: string,
 ): string {
 	const projectLogPath = latexLogPath(latexFilePath);
-	const projectLogTail = readTail(projectLogPath, MAX_TAIL_BYTES).trim();
+	const projectLogTail = (currentProjectLog ?? readTail(projectLogPath, MAX_TAIL_BYTES)).trim();
 	const outputTail = tailText(compilerOutput.trim(), MAX_TAIL_BYTES).trim();
 	const tempLogPath = latexCompileErrorLogPath();
 	const sections = [
@@ -427,8 +423,8 @@ function writeLatexCompileErrorLog(
 	return tempLogPath;
 }
 
-function latexCompileErrorTail(latexFilePath: string, reason: string, compilerOutput: string): string {
-	const projectLogTail = readTail(latexLogPath(latexFilePath), MAX_TAIL_BYTES).trim();
+function latexCompileErrorTail(latexFilePath: string, reason: string, compilerOutput: string, currentProjectLog?: string): string {
+	const projectLogTail = (currentProjectLog ?? readTail(latexLogPath(latexFilePath), MAX_TAIL_BYTES)).trim();
 	const outputTail = tailText(compilerOutput.trim(), MAX_TAIL_BYTES).trim();
 	return lastLines(projectLogTail || outputTail || reason, LATEX_ERROR_TAIL_LINES);
 }
@@ -439,8 +435,9 @@ function writeLatexCompileError(
 	reason: string,
 	compilerOutput: string,
 	diagnostics: LatexDiagnosticSummary[] = [],
+	currentProjectLog?: string,
 ): string {
-	return writeLatexCompileErrorLog(errorPath, spec, reason, compilerOutput, diagnostics);
+	return writeLatexCompileErrorLog(errorPath, spec, reason, compilerOutput, diagnostics, currentProjectLog);
 }
 
 function latexCompileFailure(
@@ -449,13 +446,14 @@ function latexCompileFailure(
 	reason: string,
 	compilerOutput: string,
 	errorCode: LatexCompileFailureCode = "compile_failed",
-	diagnostics: LatexDiagnosticSummary[] = [],
+	diagnostics?: LatexDiagnosticSummary[],
 	pdfPath?: string,
+	currentProjectLog?: string,
 ): Error {
 	try {
-		const effectiveDiagnostics = diagnostics.length ? diagnostics : extractLatexFatalDiagnostics(combinedLatexLog(latexFilePath, compilerOutput));
-		const tempLogPath = writeLatexCompileError(latexFilePath, spec, reason, compilerOutput, effectiveDiagnostics);
-		const tail = latexCompileErrorTail(latexFilePath, reason, compilerOutput);
+		const effectiveDiagnostics = diagnostics ?? extractLatexFatalDiagnostics([currentProjectLog ?? readTextTail(latexLogPath(latexFilePath)), compilerOutput].filter((entry) => entry.trim()).join("\n"));
+		const tempLogPath = writeLatexCompileError(latexFilePath, spec, reason, compilerOutput, effectiveDiagnostics, currentProjectLog);
+		const tail = latexCompileErrorTail(latexFilePath, reason, compilerOutput, currentProjectLog);
 		const summary = diagnosticSummary(effectiveDiagnostics, "Error summary");
 		return new LoggedToolError(
 			shortFailureMessage(`LaTeX compile failed: ${errorCode}`, tempLogPath, tail, effectiveDiagnostics),
@@ -694,37 +692,37 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 		const reason = spec.command === "latexmk"
 			? `failed to start compiler: ${message}. ${LATEXMK_MISSING_MESSAGE}`
 			: `failed to start compiler: ${message}`;
-		throw latexCompileFailure(latexFilePath, spec, reason, "", "compiler_start_failed", []);
+		throw latexCompileFailure(latexFilePath, spec, reason, "", "compiler_start_failed", [], undefined, "");
 	}
 
-	const projectLog = readTextTail(logPath);
-	const combinedLog = [projectLog, result.output].filter((entry) => entry.trim()).join("\n");
-	const fatalDiagnostics = extractLatexFatalDiagnostics(combinedLog);
-	const warningExtraction = extractLatexWarnings(combinedLog);
 	const afterPdfStatus = outputPdfStat(outputPdfPath);
 	const afterLogStatus = outputPdfStat(logPath);
 	const pdfExists = afterPdfStatus !== undefined;
 	const pdfUpdated = pdfWasUpdated(beforePdfStatus, afterPdfStatus, compileStartMs);
 	const logUpdated = fileWasUpdated(beforeLogStatus, afterLogStatus, compileStartMs);
+	const projectLog = logUpdated ? readTextTail(logPath) : "";
+	const combinedLog = [projectLog, result.output].filter((entry) => entry.trim()).join("\n");
+	const fatalDiagnostics = extractLatexFatalDiagnostics(combinedLog);
+	const warningExtraction = extractLatexWarnings(combinedLog);
 	const outputWritten = latexLogSaysOutputWritten(result.output, outputPdfPath)
 		|| (logUpdated && latexLogSaysOutputWritten(projectLog, outputPdfPath));
 	const targetUpToDate = latexmkOutputSaysTargetUpToDate(result.output, latexFilePath, outputPdfPath);
 
 	if (result.aborted) {
-		throw latexCompileFailure(latexFilePath, spec, "compilation aborted", result.output, "compile_aborted", fatalDiagnostics, pdfExists ? outputPdfPath : undefined);
+		throw latexCompileFailure(latexFilePath, spec, "compilation aborted", result.output, "compile_aborted", fatalDiagnostics, pdfExists ? outputPdfPath : undefined, projectLog);
 	}
 	if (result.timedOut) {
-		throw latexCompileFailure(latexFilePath, spec, `compiler timed out after ${REQUEST_TIMEOUT_MS / 1000}s`, result.output, "compile_timeout", fatalDiagnostics, pdfExists ? outputPdfPath : undefined);
+		throw latexCompileFailure(latexFilePath, spec, `compiler timed out after ${REQUEST_TIMEOUT_MS / 1000}s`, result.output, "compile_timeout", fatalDiagnostics, pdfExists ? outputPdfPath : undefined, projectLog);
 	}
 	if (!pdfExists) {
-		throw latexCompileFailure(latexFilePath, spec, "PDF was not created", result.output, "failed_no_pdf", fatalDiagnostics);
+		throw latexCompileFailure(latexFilePath, spec, "PDF was not created", result.output, "failed_no_pdf", fatalDiagnostics, undefined, projectLog);
 	}
 	const acceptsUnchangedLatexmkPdf = spec.acceptUnchangedPdfWhenOutputWritten === true
 		&& (outputWritten || targetUpToDate)
 		&& result.exitCode === 0
 		&& fatalDiagnostics.length === 0;
 	if (!pdfUpdated && !acceptsUnchangedLatexmkPdf) {
-		throw latexCompileFailure(latexFilePath, spec, `PDF exists but was not updated at ${outputPdfPath}`, result.output, "failed_stale_pdf_exists", fatalDiagnostics, outputPdfPath);
+		throw latexCompileFailure(latexFilePath, spec, `PDF exists but was not updated at ${outputPdfPath}`, result.output, "failed_stale_pdf_exists", fatalDiagnostics, outputPdfPath, projectLog);
 	}
 	if (result.exitCode !== 0 && fatalDiagnostics.length > 0) {
 		throw latexCompileFailure(
@@ -735,6 +733,7 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 			"compile_failed",
 			fatalDiagnostics,
 			outputPdfPath,
+			projectLog,
 		);
 	}
 	if (result.exitCode !== 0 && !outputWritten) {
@@ -746,6 +745,7 @@ async function compileLatexFile(request: LatexFileCompileRequest): Promise<Latex
 			"compile_failed",
 			fatalDiagnostics,
 			outputPdfPath,
+			projectLog,
 		);
 	}
 

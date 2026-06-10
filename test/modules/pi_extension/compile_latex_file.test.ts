@@ -213,6 +213,9 @@ async function loadCompiledShowLatexModule(): Promise<CompiledShowLatexModule> {
 }
 
 type ToolInvocation = {
+	description?: string;
+	promptGuidelines?: string[];
+	parameters?: { properties?: Record<string, unknown> };
 	execute: (
 		_toolCallId: string,
 		params: Record<string, unknown>,
@@ -280,6 +283,24 @@ async function captureTools(): Promise<CapturedTools> {
 async function captureCompileTool(): Promise<ToolInvocation> {
 	return (await captureTools()).compileTool;
 }
+
+test("compile_latex_file Pi tool docs describe coordinated same-root behavior without changing arguments", async () => {
+	const tool = await captureCompileTool();
+	const text = [tool.description, ...(tool.promptGuidelines ?? [])].join("\n");
+
+	assert.match(text, /same-root/i);
+	assert.match(text, /wait/i);
+	assert.match(text, /cached|reuse/i);
+	assert.match(text, /clean=true.*restart/i);
+	assert.deepEqual(Object.keys(tool.parameters?.properties ?? {}).sort(), [
+		"clean",
+		"compiler",
+		"continuous",
+		"hide_warnings",
+		"latex_file_path",
+		"open_pdf",
+	]);
+});
 
 type FakeCompilerOptions = {
 	exitCode?: number;

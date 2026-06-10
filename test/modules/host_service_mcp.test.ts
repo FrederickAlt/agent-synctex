@@ -391,6 +391,10 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.match(compileFileTool.description ?? "", /close_pdf does not stop continuous compilation/);
 		assert.match(compileFileTool.description ?? "", /hide_warnings=false/);
 		assert.match(compileFileTool.description ?? "", /hidden by default/i);
+		assert.match(compileFileTool.description ?? "", /same-root/i);
+		assert.match(compileFileTool.description ?? "", /wait/i);
+		assert.match(compileFileTool.description ?? "", /cached|reuse/i);
+		assert.match(compileFileTool.description ?? "", /clean=true.*restart/i);
 		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /latexmk -pvc/);
 		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /-norc/);
 		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /latexmkrc/);

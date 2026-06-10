@@ -18,6 +18,15 @@ import {
 import type { ContinuousCompileNotificationSink, ContinuousCompileSpawnOptions } from "../../src/modules/host_service_continuous_compile.ts";
 import { LATEXMK_CONTINUOUS_EVENT_PREFIX, LATEXMK_CONTINUOUS_POLL_INTERVAL_SECONDS } from "../../src/modules/latex/latex_file_compiler.ts";
 
+class CoherentPdfOpenBackend extends FakeViewerBackend {
+	readonly openedPdfContents: string[] = [];
+
+	async open(requestId: string, details: Record<string, unknown>) {
+		this.openedPdfContents.push(readFileSync(String(details.pdf_path), "utf8"));
+		return super.open(requestId, details);
+	}
+}
+
 class FakeContinuousProcess extends EventEmitter {
 	readonly pid: number;
 	readonly stdout = new PassThrough();
@@ -537,6 +546,31 @@ test("one-shot compile rejects active continuous compiler mismatch without spawn
 	});
 });
 
+test("MCP compile_latex_file mismatch response preserves agent-facing guidance and details", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir, _server, socketPath) => {
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		const response = await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 91,
+			method: "tools/call",
+			params: {
+				name: "compile_latex_file",
+				arguments: {
+					latex_file_path: "paper.tex",
+					compiler: "pdflatex",
+					workspace_context: { cwd: baseDir, session_id: "session-A" },
+				},
+			},
+		})) as { result?: { isError?: boolean; content: Array<{ text: string }>; details?: { error_code?: string } } };
+
+		assert.equal(response.result?.isError, true);
+		assert.match(response.result?.content[0]?.text ?? "", /active.*compiler lualatex/i);
+		assert.match(response.result?.content[0]?.text ?? "", /use the active compiler or stop continuous compilation first/i);
+		assert.equal(response.result?.details?.error_code, "continuous_compiler_engine_mismatch");
+	});
+});
+
 test("continuous lifecycle failure event resolves one-shot wait without freshness metadata", async () => {
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
@@ -612,6 +646,34 @@ test("clean=true with active continuous stops, cleans, restarts subscribers, and
 	});
 });
 
+test("clean=true open_pdf waits for continuous restart result before managed viewer open", async () => {
+	const fixture = makeFakeContinuousManager();
+	const backend = new CoherentPdfOpenBackend();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const root = join(baseDir, "paper.tex");
+		const pdf = join(baseDir, "paper.pdf");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		writeFileSync(pdf, "%PDF-1.4 old pdf\n");
+
+		const cleanAndOpen = client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", clean: true, open_pdf: true },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		await waitUntil(() => fixture.processes.length === 2);
+		assert.deepEqual(backend.openedPdfContents, [], "managed viewer should not open while clean/restart coordination is still pending");
+		assert.equal(existsSync(pdf), false, "old PDF should be removed before the restarted compiler result");
+
+		writeContinuousRecorderArtifacts(root);
+		writeFileSync(pdf, "%PDF-1.4 post-clean coherent pdf\n");
+		emitContinuousEvent(fixture.processes[1]!, "success");
+		const result = await cleanAndOpen;
+
+		assert.equal(Number.isInteger(result.pdf_id ?? 0) && (result.pdf_id ?? 0) > 0, true);
+		assert.deepEqual(backend.openedPdfContents, ["%PDF-1.4 post-clean coherent pdf\n"]);
+	}, { viewerBackend: backend });
+});
+
 test("clean=true active continuous timeout leaves restarted subscribers active", async () => {
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
@@ -635,6 +697,8 @@ test("clean=true active continuous timeout leaves restarted subscribers active",
 		}
 		assert.ok(observed instanceof Error);
 		assert.match(observed.message, /timed out/);
+		assert.match(observed.message, /cleaning\/restarting continuous compilation|clean\/restart/i);
+		assert.match(observed.message, /waiting on active continuous compilation|continuous/i);
 		assert.equal(fixture.processes[0]?.killed, true);
 		assert.equal(fixture.processes[1]?.killed, false);
 		assert.equal(fixture.manager.activeRootCount(), 1);
@@ -671,6 +735,7 @@ test("clean=true active continuous timeout during stop preserves artifacts and r
 		}
 		assert.ok(observed instanceof Error);
 		assert.match(observed.message, /timed out/);
+		assert.match(observed.message, /cleaning\/restarting continuous compilation|clean\/restart/i);
 		await waitUntil(() => fixture.manager.cycleState(root) === "idle" && fixture.manager.subscriberCount(root) === 2);
 		await sleep(250);
 
@@ -1072,6 +1137,27 @@ test("stale previous log output does not bypass stale-PDF detection", async () =
 		}
 		assert.ok(observed instanceof Error);
 		assert.match(observed.message, /code=failed_stale_pdf_exists/);
+	});
+});
+
+test("failed one-shot compile does not report stale project log diagnostics as current failure", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		writeFileSync(join(baseDir, "paper.log"), "! Undefined control sequence.\nl.2 \\oldmacro\n");
+		writeNoopLatexmk(join(baseDir, "bin"));
+
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "latexmk" }, { cwd: baseDir });
+		} catch (error) {
+			observed = error;
+		}
+
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /code=failed_no_pdf/);
+		assert.doesNotMatch(observed.message, /Undefined control sequence|oldmacro/);
+		assert.deepEqual((observed as { statusDetails?: { diagnostics?: unknown[]; error_summary?: string } }).statusDetails?.diagnostics, []);
+		assert.doesNotMatch((observed as { statusDetails?: { error_summary?: string } }).statusDetails?.error_summary ?? "", /Undefined control sequence|oldmacro/);
 	});
 });
 

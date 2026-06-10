@@ -928,6 +928,7 @@ export class HostServiceClient {
 		}
 
 		let abortUnsub: (() => void) | undefined;
+		const timeoutErrorText = this.timeoutErrorText(request);
 		const requestPromise = new Promise<HostServiceResponseEnvelope>((resolve, reject) => {
 			let settled = false;
 			let raw = "";
@@ -944,7 +945,7 @@ export class HostServiceClient {
 
 			const socket = createConnection({ path: this.socketPath });
 			const timer = setTimeout(() => {
-				finish(new Error("host service request timed out before the operation completed; the timeout includes any server-side waiting such as same-root compile queue time"));
+				finish(new Error(timeoutErrorText));
 				socket.destroy();
 			}, requestTimeoutMs);
 			timer.unref?.();
@@ -959,7 +960,7 @@ export class HostServiceClient {
 
 			socket.setEncoding("utf8");
 			socket.setTimeout(requestTimeoutMs, () => {
-				finish(new Error("host service request timed out before the operation completed; the timeout includes any server-side waiting such as same-root compile queue time"));
+				finish(new Error(timeoutErrorText));
 				socket.destroy();
 			});
 
@@ -1032,6 +1033,24 @@ export class HostServiceClient {
 			});
 			throw error;
 		}
+	}
+
+	private timeoutErrorText(request: HostServiceRequest): string {
+		if (request.operation !== "compile_latex_file") {
+			return "host service request timed out before the operation completed";
+		}
+		const phases = [
+			"queued behind an active same-root compile",
+			"waiting on active same-root continuous compilation",
+			"running latexmk",
+		];
+		if (request.details.clean === true) {
+			phases.splice(2, 0, "cleaning/restarting continuous compilation");
+		}
+		if (request.details.open_pdf === true) {
+			phases.push("opening the coherent compiled PDF in the managed viewer after compile coordination");
+		}
+		return `compile_latex_file timed out before the operation completed; the timeout budget includes server-side coordination and may have expired while ${phases.join(", ")}`;
 	}
 }
 

@@ -240,6 +240,10 @@ Prefer `compile_latex_file` over invoking a bare compiler directly when you alre
 It can compile without requesting external viewer state: leave `open_pdf` unset/false for a build/check only run.
 Pass `clean=true` to remove common same-basename LaTeX artifacts before compiling, including the previous PDF and SyncTeX sidecars.
 
+The Host Service coordinates file compilation per normalized root source. Same-root one-shot requests do not run competing latexmk processes: a request may wait behind an active same-root compile, wait for a compatible active continuous compiler to produce a fresh result, or reuse a fresh cached result. If a continuous compiler is already active with a different engine, retry with the active compiler named in the error or stop continuous compilation first.
+
+When `clean=true` is requested while same-root continuous compilation is active, the Host Service stops the continuous compiler, removes artifacts including the PDF, restarts continuous compilation for existing subscribers with the same compiler configuration, waits for the first post-clean result, and only then returns. With `open_pdf=true`, managed viewer open happens after this compile coordination succeeds, so the viewer is opened only for the coherent returned PDF.
+
 `compile_latex_file` hides LaTeX warning message details by default (`hide_warnings=true`) to keep agent output concise. Warning extraction still runs: outputs preserve status such as `ok_with_warnings`, include `warning_count`, and set `warnings_hidden=true` when warning details were omitted. Rerun with `hide_warnings=false` to include the warning summary text and `details.warnings`.
 
 Snippet previews pass `-synctex=1` to the selected LaTeX command by default. File compiles are driven by latexmk with SyncTeX enabled, so generated PDFs have SyncTeX sidecars when compilation succeeds.
@@ -255,7 +259,7 @@ details. If compile succeeds but open fails, re-check service status/logs for `o
 
 - `continuous=true` performs the immediate compile, then subscribes the current `workspace_context.session_id` to one shared Host Service `latexmk -pvc` process for the normalized root file.
 - `continuous=false` performs the immediate compile, then removes only the current session's subscription. If it was the last subscriber, the Host Service stops the background compiler.
-- Omitting `continuous` performs a latexmk-backed one-shot compile and does not start, stop, or refresh continuous compilation state.
+- Omitting `continuous` performs a coordinated latexmk-backed one-shot compile and does not start, stop, or refresh continuous compilation state; it may wait for same-root work already in progress or return a fresh cached result.
 
 File compilation requires `latexmk` for both one-shot and continuous modes. If `compile_latex_file` reports that `latexmk` is unavailable, install MacTeX or TeX Live and ensure `latexmk` is on `PATH`; BasicTeX users may need to install `latexmk` separately (for example with `tlmgr`) and restart the Host Service so it sees the updated `PATH`.
 
