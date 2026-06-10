@@ -7,10 +7,12 @@ import {
 } from "./latex/latex_preamble.ts";
 import {
 	createLatexFileCompileToolSupport,
+	latexmkEngineIdentity,
 	LoggedToolError,
 	type LatexCompileStatus,
 	type LatexDiagnosticSummary,
 	type LatexFileCompileRequest,
+	type LatexFileCompileResult,
 } from "./latex/latex_file_compiler.ts";
 import { resolveFixedPreviewPdfPath } from "./host_service_fixed_preview_pdf_path.ts";
 import { getMcpFixedPreviewPdfPath } from "./runtime_paths.ts";
@@ -27,6 +29,7 @@ import type {
 import { createLogger } from "./logging.ts";
 import { HostServiceContinuousCompileManager, type HostServiceContinuousCompileDetails } from "./host_service_continuous_compile.ts";
 import {
+	buildLatexmkFreshnessSnapshot,
 	HostServiceCompileCoordinationError,
 	HostServiceRootCompileCoordinator,
 } from "./host_service_root_compile_coordinator.ts";
@@ -101,6 +104,56 @@ export class HostServiceCompileService {
 		this.rootCompileCoordinator.stop();
 	}
 
+	private recordLastCompileSuccess(
+		rootKey: string,
+		rootSource: string,
+		compilerIdentity: string,
+		result: LatexFileCompileResult,
+		compiledAfterMs: number,
+		canRecord: boolean,
+	): void {
+		if (!canRecord) {
+			return;
+		}
+		this.rootCompileCoordinator.recordLastResult(rootKey, {
+			rootSource,
+			compilerIdentity,
+			outcome: { status: "success", value: result },
+			freshness: buildLatexmkFreshnessSnapshot({
+				rootSource,
+				pdfPath: result.pdfPath,
+				logPath: result.logPath,
+				compiledAfterMs,
+				requirePdf: true,
+			}),
+		});
+	}
+
+	private recordLastCompileFailure(
+		rootKey: string,
+		rootSource: string,
+		compilerIdentity: string,
+		error: unknown,
+		compiledAfterMs: number,
+		canRecord: boolean,
+	): void {
+		if (!canRecord) {
+			return;
+		}
+		const logPath = error instanceof LoggedToolError ? error.logPath : inferLatexLogPath(rootSource);
+		this.rootCompileCoordinator.recordLastResult(rootKey, {
+			rootSource,
+			compilerIdentity,
+			outcome: { status: "failure", error },
+			freshness: buildLatexmkFreshnessSnapshot({
+				rootSource,
+				logPath,
+				compiledAfterMs,
+				requirePdf: false,
+			}),
+		});
+	}
+
 	async compileLatexFileRequest(request: HostServiceCompileRequest, signal?: AbortSignal): Promise<HostServiceCompileResponseEnvelope> {
 		const startedAt = Date.now();
 		const requestedPath = request.details.latex_file_path;
@@ -117,6 +170,11 @@ export class HostServiceCompileService {
 		});
 
 		try {
+			const resolvedCompiler = hostServiceLatexFileCompiler.resolveLatexCompiler(request.details.compiler);
+			const compilerIdentity = latexmkEngineIdentity(resolvedCompiler);
+			const rootKey = normalizeLatexRootKey(normalizedPath);
+			const canReuseLastResult = !shouldClean && request.details.continuous !== true;
+			const canRecordLastResult = request.details.continuous !== true;
 			const compileRequest: LatexFileCompileRequest = {
 				requestedPath,
 				compiler: request.details.compiler,
@@ -125,8 +183,28 @@ export class HostServiceCompileService {
 				signal,
 			};
 			const result = await this.rootCompileCoordinator.runExclusive(
-				normalizeLatexRootKey(normalizedPath),
-				() => hostServiceLatexFileCompiler.compileLatexFile(compileRequest),
+				rootKey,
+				async () => {
+					if (canReuseLastResult) {
+						const cached = this.rootCompileCoordinator.freshCachedResult<LatexFileCompileResult>(rootKey, normalizedPath, compilerIdentity);
+						if (cached?.status === "success") {
+							return cached.value;
+						}
+						if (cached?.status === "failure") {
+							throw cached.error;
+						}
+					}
+
+					const compiledAfterMs = Date.now();
+					try {
+						const freshResult = await hostServiceLatexFileCompiler.compileLatexFile(compileRequest);
+						this.recordLastCompileSuccess(rootKey, normalizedPath, compilerIdentity, freshResult, compiledAfterMs, canRecordLastResult);
+						return freshResult;
+					} catch (compileError) {
+						this.recordLastCompileFailure(rootKey, normalizedPath, compilerIdentity, compileError, compiledAfterMs, canRecordLastResult);
+						throw compileError;
+					}
+				},
 				signal,
 			);
 			const resultLogPath = inferLatexLogPath(result.source);

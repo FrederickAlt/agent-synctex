@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { basename, dirname, extname, isAbsolute, normalize, resolve } from "node:path";
+
 export class HostServiceCompileCoordinationError extends Error {
 	readonly errorCode: string;
 
@@ -6,6 +10,29 @@ export class HostServiceCompileCoordinationError extends Error {
 		this.name = "HostServiceCompileCoordinationError";
 		this.errorCode = errorCode;
 	}
+}
+
+export type HostServiceCachedCompileOutcome<T> =
+	| { status: "success"; value: T }
+	| { status: "failure"; error: unknown };
+
+export interface HostServiceRootCompileCacheRecord<T> {
+	rootSource: string;
+	compilerIdentity: string;
+	outcome: HostServiceCachedCompileOutcome<T>;
+	freshness: HostServiceCompileFreshnessSnapshot | undefined;
+}
+
+export interface HostServiceCompileFreshnessSnapshot {
+	dependencyFiles: HostServiceFileSnapshot[];
+	outputFiles: HostServiceFileSnapshot[];
+}
+
+interface HostServiceFileSnapshot {
+	path: string;
+	size: number;
+	mtimeMs: number;
+	digest: string;
 }
 
 interface RootCompileQueueItem {
@@ -24,6 +51,7 @@ interface RootCompileQueue {
 
 export class HostServiceRootCompileCoordinator {
 	private readonly queues = new Map<string, RootCompileQueue>();
+	private readonly lastCompileResults = new Map<string, HostServiceRootCompileCacheRecord<unknown>>();
 	private stoppedError: HostServiceCompileCoordinationError | undefined;
 
 	runExclusive<T>(rootKey: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -66,6 +94,28 @@ export class HostServiceRootCompileCoordinator {
 		});
 	}
 
+	freshCachedResult<T>(rootKey: string, _rootSource: string, compilerIdentity: string): HostServiceCachedCompileOutcome<T> | undefined {
+		const cached = this.lastCompileResults.get(rootKey);
+		if (cached === undefined) {
+			return undefined;
+		}
+		if (cached.compilerIdentity !== compilerIdentity) {
+			return undefined;
+		}
+		if (cached.freshness === undefined || !isFresh(cached.freshness)) {
+			return undefined;
+		}
+		return cached.outcome as HostServiceCachedCompileOutcome<T>;
+	}
+
+	recordLastResult<T>(rootKey: string, record: HostServiceRootCompileCacheRecord<T>): void {
+		this.lastCompileResults.set(rootKey, record as HostServiceRootCompileCacheRecord<unknown>);
+	}
+
+	clearLastResult(rootKey: string): void {
+		this.lastCompileResults.delete(rootKey);
+	}
+
 	resume(): void {
 		this.stoppedError = undefined;
 	}
@@ -75,6 +125,7 @@ export class HostServiceRootCompileCoordinator {
 		"host_service_stopped",
 	)): void {
 		this.stoppedError = error;
+		this.lastCompileResults.clear();
 		for (const [rootKey, queue] of this.queues) {
 			const pending = queue.items.filter((item) => !item.started);
 			queue.items = queue.items.filter((item) => item.started);
@@ -149,4 +200,153 @@ export class HostServiceRootCompileCoordinator {
 			item.onAbort = undefined;
 		}
 	}
+}
+
+export function buildLatexmkFreshnessSnapshot(options: {
+	rootSource: string;
+	pdfPath?: string;
+	logPath: string;
+	compiledAfterMs: number;
+	requirePdf: boolean;
+}): HostServiceCompileFreshnessSnapshot | undefined {
+	const flsPath = latexmkArtifactPath(options.rootSource, ".fls");
+	const recorder = readLatexmkRecorderRecords(flsPath, dirname(options.rootSource));
+	if (recorder === undefined) {
+		return undefined;
+	}
+	const outputPathSet = new Set(recorder.outputs.map((path) => normalize(path)));
+	const dependencyPaths = recorder.inputs.filter((path) => !outputPathSet.has(normalize(path)));
+	if (dependencyPaths.length === 0) {
+		return undefined;
+	}
+	const normalizedRootSource = normalize(options.rootSource);
+	if (!dependencyPaths.some((path) => normalize(path) === normalizedRootSource)) {
+		return undefined;
+	}
+
+	const dependencyFiles = snapshotFiles(dependencyPaths);
+	if (dependencyFiles === undefined) {
+		return undefined;
+	}
+	if (dependencyFiles.some((snapshot) => snapshot.mtimeMs > options.compiledAfterMs)) {
+		return undefined;
+	}
+
+	const outputPaths = [
+		...(options.requirePdf && options.pdfPath !== undefined ? [options.pdfPath] : []),
+		options.logPath,
+		flsPath,
+		...recorder.outputs,
+		...existingLatexmkDatabaseArtifacts(options.rootSource),
+	];
+	const outputFiles = snapshotFiles(outputPaths);
+	if (outputFiles === undefined) {
+		return undefined;
+	}
+	return { dependencyFiles, outputFiles };
+}
+
+function isFresh(snapshot: HostServiceCompileFreshnessSnapshot): boolean {
+	return filesMatch(snapshot.dependencyFiles) && filesMatch(snapshot.outputFiles);
+}
+
+function filesMatch(snapshots: HostServiceFileSnapshot[]): boolean {
+	for (const snapshot of snapshots) {
+		const current = snapshotFile(snapshot.path);
+		if (current === undefined) {
+			return false;
+		}
+		if (current.size !== snapshot.size || current.mtimeMs !== snapshot.mtimeMs || current.digest !== snapshot.digest) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function snapshotFiles(paths: string[]): HostServiceFileSnapshot[] | undefined {
+	const uniquePaths = Array.from(new Set(paths.map((path) => normalize(path))));
+	const snapshots: HostServiceFileSnapshot[] = [];
+	for (const path of uniquePaths) {
+		const snapshot = snapshotFile(path);
+		if (snapshot === undefined) {
+			return undefined;
+		}
+		snapshots.push(snapshot);
+	}
+	return snapshots;
+}
+
+function snapshotFile(path: string): HostServiceFileSnapshot | undefined {
+	try {
+		const stat = lstatSync(path);
+		if (!stat.isFile()) {
+			return undefined;
+		}
+		return {
+			path,
+			size: stat.size,
+			mtimeMs: stat.mtimeMs,
+			digest: createHash("sha256").update(readFileSync(path)).digest("hex"),
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function readLatexmkRecorderRecords(flsPath: string, fallbackDirectory: string): { inputs: string[]; outputs: string[] } | undefined {
+	if (!existsSync(flsPath)) {
+		return undefined;
+	}
+	let text: string;
+	try {
+		text = readFileSync(flsPath, "utf8");
+	} catch {
+		return undefined;
+	}
+	let currentDirectory = fallbackDirectory;
+	const inputs: string[] = [];
+	const outputs: string[] = [];
+	for (const rawLine of text.split(/\r?\n/u)) {
+		const line = rawLine.trim();
+		if (line.startsWith("PWD ")) {
+			const nextDirectory = line.slice(4).trim();
+			if (nextDirectory) {
+				currentDirectory = resolveRecordedPath(nextDirectory, currentDirectory);
+			}
+			continue;
+		}
+		if (line.startsWith("INPUT ")) {
+			const inputPath = line.slice(6).trim();
+			if (!inputPath) {
+				return undefined;
+			}
+			inputs.push(resolveRecordedPath(inputPath, currentDirectory));
+			continue;
+		}
+		if (line.startsWith("OUTPUT ")) {
+			const outputPath = line.slice(7).trim();
+			if (!outputPath) {
+				return undefined;
+			}
+			outputs.push(resolveRecordedPath(outputPath, currentDirectory));
+		}
+	}
+	return {
+		inputs: Array.from(new Set(inputs)),
+		outputs: Array.from(new Set(outputs)),
+	};
+}
+
+function resolveRecordedPath(path: string, currentDirectory: string): string {
+	const unquoted = path.replace(/^"(.*)"$/u, "$1");
+	return normalize(isAbsolute(unquoted) ? unquoted : resolve(currentDirectory, unquoted));
+}
+
+function latexmkArtifactPath(rootSource: string, extension: string): string {
+	return resolve(dirname(rootSource), `${basename(rootSource, extname(rootSource))}${extension}`);
+}
+
+function existingLatexmkDatabaseArtifacts(rootSource: string): string[] {
+	const path = latexmkArtifactPath(rootSource, ".fdb_latexmk");
+	return existsSync(path) ? [path] : [];
 }

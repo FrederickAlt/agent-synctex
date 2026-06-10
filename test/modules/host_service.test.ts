@@ -121,6 +121,57 @@ function shellSingleQuoted(value: string): string {
 	return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
+function writeLatexmkWithRecorderCacheProbe(binDir: string, stateDir: string, options: { dependencyPath?: string; omitRecorder?: boolean } = {}): string {
+	mkdirSync(binDir, { mode: 0o700, recursive: true });
+	mkdirSync(stateDir, { mode: 0o700, recursive: true });
+	const compilerPath = join(binDir, "latexmk");
+	const dependencyInput = options.dependencyPath === undefined ? "" : `printf 'INPUT %s\\n' ${shellSingleQuoted(options.dependencyPath)} >> \"$out_dir/$name.fls\"`;
+	const recorderOutput = options.omitRecorder === true ? "" : `cat > \"$out_dir/$name.fls\" <<FLS
+PWD $out_dir
+INPUT $out_dir/$base
+FLS
+${dependencyInput}`;
+	writeFileSync(compilerPath, `#!/usr/bin/env bash
+set -eu
+state_dir=${shellSingleQuoted(stateDir)}
+mkdir -p "$state_dir"
+tex_file=""
+out_dir="$(pwd)"
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-output-directory" ]; then
+    out_dir="$arg"
+  fi
+  tex_file="$arg"
+  prev="$arg"
+done
+base="\${tex_file##*/}"
+name="\${base%.*}"
+count_file="$state_dir/$name.count"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+printf '%s' "$((count + 1))" > "$count_file"
+${recorderOutput}
+if grep -q 'FAIL' "$out_dir/$base"; then
+  cat > "$out_dir/$name.log" <<'LOGTEXT'
+! Undefined control sequence.
+l.2 \\bad
+LOGTEXT
+  exit 7
+fi
+cat > "$out_dir/$name.log" <<'LOGTEXT'
+LaTeX Warning: Reference \`missing' on page 1 undefined on input line 3.
+Output written on paper.pdf (1 page, 123 bytes).
+LOGTEXT
+printf '%s' '%PDF-1.4\\n' > "$out_dir/$name.pdf"
+exit 0
+`, { mode: 0o700 });
+	chmodSync(compilerPath, 0o700);
+	return compilerPath;
+}
+
 function writeRootScopedProbeLatexmk(binDir: string, stateDir: string, options: { sleepSeconds?: string; failFirst?: boolean } = {}): string {
 	mkdirSync(binDir, { mode: 0o700, recursive: true });
 	mkdirSync(stateDir, { mode: 0o700, recursive: true });
@@ -1224,6 +1275,142 @@ test("host service serializes concurrent same-root compile_latex_file requests",
 			"paper start",
 			"paper end",
 		]);
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service reuses fresh same-root one-shot result without spawning latexmk again", async () => {
+	const baseDir = temporaryDir("host-service-compile-cache-reuse-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	writeLatexmkWithRecorderCacheProbe(join(baseDir, "bin"), stateDir);
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-cache-reuse" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		const first = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		const second = await client.requestCompileLatexFile({ latex_file_path: join(baseDir, "paper.tex"), compiler: "lualatex" }, { cwd: baseDir });
+
+		assert.equal(first.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(second.pdf, first.pdf);
+		assert.equal(second.log, first.log);
+		assert.deepEqual(second.artifact_paths, first.artifact_paths);
+		assert.equal(second.compile_status, "ok_with_warnings");
+		assert.equal(second.compiler_exit_code, 0);
+		assert.equal(second.compiler_signal, null);
+		assert.equal(second.warning_count, 1);
+		assert.deepEqual(second.warnings, first.warnings);
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "1");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "pdflatex" }, { cwd: baseDir });
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "2");
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service invalidates cached success when a known latexmk dependency changes", async () => {
+	const baseDir = temporaryDir("host-service-compile-cache-stale-dep-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	const dependencyPath = join(baseDir, "chapter.tex");
+	writeLatexmkWithRecorderCacheProbe(join(baseDir, "bin"), stateDir, { dependencyPath });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\n\\input{chapter}\n\\end{document}\n");
+	writeFileSync(dependencyPath, "chapter one\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-cache-stale-dep" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		writeFileSync(dependencyPath, "chapter two\n");
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "2");
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service preserves cached fatal diagnostics and replaces stale failures after a fix", async () => {
+	const baseDir = temporaryDir("host-service-compile-cache-failure-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	writeLatexmkWithRecorderCacheProbe(join(baseDir, "bin"), stateDir);
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	const sourcePath = join(baseDir, "paper.tex");
+	writeFileSync(sourcePath, "\\documentclass{article}\nFAIL\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-cache-failure" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		let firstFailure: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		} catch (error) {
+			firstFailure = error;
+		}
+		let cachedFailure: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		} catch (error) {
+			cachedFailure = error;
+		}
+
+		assert.ok(firstFailure instanceof Error && "statusDetails" in firstFailure);
+		assert.ok(cachedFailure instanceof Error && "statusDetails" in cachedFailure);
+		const firstDetails = firstFailure.statusDetails as Record<string, unknown>;
+		const cachedDetails = cachedFailure.statusDetails as Record<string, unknown>;
+		assert.equal(cachedDetails.error_code, firstDetails.error_code);
+		assert.deepEqual(cachedDetails.diagnostics, firstDetails.diagnostics);
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "1");
+
+		writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nfixed\\end{document}\n");
+		const success = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		assert.equal(success.compile_status, "ok_with_warnings");
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "2");
+	} finally {
+		process.env.PATH = originalPath;
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("host service recompiles when latexmk dependency freshness is unavailable", async () => {
+	const baseDir = temporaryDir("host-service-compile-cache-conservative-");
+	const socketPath = join(baseDir, "host-service.sock");
+	const originalPath = process.env.PATH ?? "";
+	const stateDir = join(baseDir, "state");
+	writeLatexmkWithRecorderCacheProbe(join(baseDir, "bin"), stateDir, { omitRecorder: true });
+	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
+	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\nhi\\end{document}\n");
+
+	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-cache-conservative" });
+	await server.start();
+	const client = new HostServiceClient({ socketPath, requestTimeoutMs: 2_000 });
+	try {
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "2");
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
