@@ -516,6 +516,43 @@ test("one-shot compile reuses initial continuous compile when active continuous 
 	});
 });
 
+test("one-shot compile reports bounded error when idle continuous has no fresh result", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true, open_pdf: false },
+			{ cwd: baseDir, session_id: "session-A" },
+		);
+		assert.equal(fixture.manager.cycleState(root), "idle");
+
+		const startedAt = Date.now();
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile(
+				{ latex_file_path: "paper.tex", compiler: "lualatex", open_pdf: false },
+				{ cwd: baseDir, session_id: "session-A" },
+				undefined,
+				1_500,
+			);
+		} catch (error) {
+			observed = error;
+		}
+
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /fresh result yet/);
+		assert.equal((observed as { statusDetails?: { error_code?: string } }).statusDetails?.error_code, "continuous_compiler_result_unavailable");
+		assert.equal(fixture.manager.waiterCount(root), 0);
+		assert.equal(fixture.manager.activeRootCount(), 1);
+		assert.equal(fixture.processes[0]?.killed, false);
+		assert.equal(recordedLatexmkInvocationCount(recordPath), 1);
+		assert.ok(Date.now() - startedAt < 1_500, "one-shot should return the bounded continuous-result error before the caller timeout");
+	});
+});
+
 test("one-shot compile immediately returns fresh idle continuous result", async () => {
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
