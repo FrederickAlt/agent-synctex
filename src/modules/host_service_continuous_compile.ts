@@ -83,6 +83,7 @@ interface ContinuousCompileRecord {
 	rootSource: string;
 	process: ContinuousCompileProcess;
 	subscribers: Set<string>;
+	compiler: LatexCompiler | undefined;
 	engineIdentity: string;
 	compilerLabel: string;
 	recentOutput: string;
@@ -290,6 +291,7 @@ export class HostServiceContinuousCompileManager {
 				rootSource,
 				process: child,
 				subscribers: new Set([sessionId]),
+				compiler: requestedCompiler,
 				engineIdentity: requestedEngineIdentity,
 				compilerLabel: compilerLabel(requestedCompiler),
 				recentOutput: "",
@@ -399,6 +401,62 @@ export class HostServiceContinuousCompileManager {
 
 	cycleState(rootSource: string): ContinuousCompileCycleState | undefined {
 		return this.recordsByRootSource.get(rootSource)?.cycleState;
+	}
+
+	async cleanRestartAndWaitForFreshResult(
+		rootSource: string,
+		compilerIdentity: string,
+		cleanArtifacts: () => string[],
+		signal?: AbortSignal,
+	): Promise<{ result: LatexFileCompileResult; cleanedArtifacts: string[]; continuous: HostServiceContinuousCompileDetails } | undefined> {
+		const record = this.recordsByRootSource.get(rootSource);
+		if (record === undefined) {
+			return undefined;
+		}
+		if (record.engineIdentity !== compilerIdentity) {
+			throw new HostServiceCompileCoordinationError(
+				`continuous compilation is already active for this root with compiler ${record.compilerLabel}; use the active compiler or stop continuous compilation first before requesting a different compiler`,
+				"continuous_compiler_engine_mismatch",
+			);
+		}
+		const subscribers = Array.from(record.subscribers);
+		const compiler = record.compiler;
+		const sessionId = subscribers[0];
+		if (sessionId === undefined) {
+			throw new HostServiceCompileCoordinationError(
+				"cannot restart continuous compilation after clean because the active compiler has no subscribers",
+				"continuous_compiler_restart_failed",
+			);
+		}
+
+		await this.stopRecordAndWait(rootSource, record);
+		const cleanedArtifacts = cleanArtifacts();
+		const start = this.ensureSubscription(rootSource, sessionId, compiler);
+		if (start.status === "error" || start.status === "unavailable") {
+			throw new HostServiceCompileCoordinationError(
+				`failed to restart continuous compilation after clean: ${start.error ?? start.status}`,
+				"continuous_compiler_restart_failed",
+			);
+		}
+		for (const subscriber of subscribers.slice(1)) {
+			const added = this.ensureSubscription(rootSource, subscriber, compiler);
+			if (added.status === "error" || added.status === "unavailable") {
+				throw new HostServiceCompileCoordinationError(
+					`failed to restore continuous subscriber after clean: ${added.error ?? added.status}`,
+					"continuous_compiler_restart_failed",
+				);
+			}
+		}
+		const restartedRecord = this.recordsByRootSource.get(rootSource);
+		const continuous = restartedRecord === undefined ? start : this.details("started", restartedRecord, sessionId);
+		const result = await this.waitForFreshResult(rootSource, compilerIdentity, signal);
+		if (result === undefined) {
+			throw new HostServiceCompileCoordinationError(
+				"continuous compiler was not active after clean restart",
+				"continuous_compiler_restart_failed",
+			);
+		}
+		return { result, cleanedArtifacts, continuous };
 	}
 
 	waitForFreshResult(rootSource: string, compilerIdentity: string, signal?: AbortSignal): Promise<LatexFileCompileResult | undefined> {

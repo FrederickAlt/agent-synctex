@@ -2794,6 +2794,7 @@ test("host service compile_latex_file keeps clean=true artifacts in report", asy
 	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\\n\\begin{document}\\nclean\\end{document}\\n");
 	writeFileSync(join(baseDir, "paper.aux"), "old aux");
 	writeFileSync(join(baseDir, "paper.log"), "old log");
+	writeFileSync(join(baseDir, "paper.pdf"), "old pdf");
 
 	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-clean" });
 	await server.start();
@@ -2812,6 +2813,7 @@ test("host service compile_latex_file keeps clean=true artifacts in report", asy
 		assert.equal(result.clean, true);
 		assert.equal(result.cleaned_artifacts.includes(join(baseDir, "paper.aux")), true);
 		assert.equal(result.cleaned_artifacts.includes(join(baseDir, "paper.log")), true);
+		assert.equal(result.cleaned_artifacts.includes(join(baseDir, "paper.pdf")), true);
 		assert.equal(result.artifact_paths.includes(join(baseDir, "paper.pdf")), true);
 		assert.equal(result.artifact_paths.includes(join(baseDir, "paper.log")), true);
 		assert.equal(result.artifact_paths.includes(join(baseDir, "paper.aux")), false);

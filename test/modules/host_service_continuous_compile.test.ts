@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createConnection } from "node:net";
 import { PassThrough } from "node:stream";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import assert from "node:assert/strict";
@@ -564,6 +564,138 @@ test("continuous lifecycle failure event resolves one-shot wait without freshnes
 	});
 });
 
+
+test("clean=true with active continuous stops, cleans, restarts subscribers, and waits for post-clean result", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+		const root = join(baseDir, "paper.tex");
+		const pdf = join(baseDir, "paper.pdf");
+		const log = join(baseDir, "paper.log");
+		const aux = join(baseDir, "paper.aux");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "pdflatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		fixture.manager.ensureSubscription(root, "session-B", "pdflatex");
+		writeFileSync(pdf, "old pdf");
+		writeFileSync(log, "old log");
+		writeFileSync(aux, "old aux");
+
+		const clean = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "pdflatex", clean: true }, { cwd: baseDir, session_id: "session-A" });
+		await waitUntil(() => fixture.processes.length === 2);
+
+		assert.equal(fixture.processes[0]?.killed, true);
+		assert.equal(existsSync(pdf), false, "PDF should be deleted before the restarted continuous compiler reports a result");
+		assert.equal(existsSync(log), false);
+		assert.equal(existsSync(aux), false);
+		assert.deepEqual(fixture.spawns[1]?.args.slice(10, -1), ["-pdf", "-pdflatex=pdflatex -no-shell-escape %O %S"]);
+
+		writeContinuousRecorderArtifacts(root, { log: "LaTeX Warning: Reference `after-clean' undefined on input line 1.\nOutput written on paper.pdf (1 page, 123 bytes).\n" });
+		emitContinuousEvent(fixture.processes[1]!, "warning");
+		const result = await clean;
+
+		assert.equal(result.clean, true);
+		assert.equal(result.cleaned_artifacts.includes(pdf), true);
+		assert.equal(result.cleaned_artifacts.includes(log), true);
+		assert.equal(result.cleaned_artifacts.includes(aux), true);
+		assert.equal(result.compile_status, "ok_with_warnings");
+		assert.equal(result.warning_count, 1);
+		assert.equal(result.continuous?.status, "started");
+		assert.equal(result.continuous?.subscriber_count, 2);
+		assert.equal(fixture.manager.subscriberCount(root), 2);
+		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1, "clean restart should not spawn a one-shot latexmk compile");
+
+		const removedA = await fixture.manager.removeSubscription(root, "session-A");
+		assert.equal(removedA.status, "still_active_for_other_subscribers");
+		const removedB = await fixture.manager.removeSubscription(root, "session-B");
+		assert.equal(removedB.status, "stopped");
+	});
+});
+
+test("clean=true active continuous timeout leaves restarted subscribers active", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const root = join(baseDir, "paper.tex");
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		writeFileSync(join(baseDir, "paper.pdf"), "old pdf");
+
+		const clean = client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", clean: true },
+			{ cwd: baseDir, session_id: "session-A" },
+			undefined,
+			80,
+		);
+		await waitUntil(() => fixture.processes.length === 2);
+
+		let observed: unknown;
+		try {
+			await clean;
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /timed out/);
+		assert.equal(fixture.processes[0]?.killed, true);
+		assert.equal(fixture.processes[1]?.killed, false);
+		assert.equal(fixture.manager.activeRootCount(), 1);
+		assert.equal(fixture.manager.subscriberCount(root), 1);
+	});
+});
+
+test("clean=true active continuous reports post-clean compile failures with diagnostics", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const root = join(baseDir, "paper.tex");
+		const pdf = join(baseDir, "paper.pdf");
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		writeFileSync(pdf, "old pdf");
+
+		const clean = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", clean: true }, { cwd: baseDir, session_id: "session-A" });
+		await waitUntil(() => fixture.processes.length === 2);
+		writeFileSync(join(baseDir, "paper.log"), "! Undefined control sequence.\nl.1 \\bad\n");
+		rmSync(join(baseDir, "paper.fls"), { force: true });
+		emitContinuousEvent(fixture.processes[1]!, "failure");
+
+		let observed: unknown;
+		try {
+			await clean;
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /Undefined control sequence|continuous compile failed/);
+		const details = (observed as { statusDetails?: { error_code?: string; cleaned_artifacts?: string[]; diagnostics?: unknown[] } }).statusDetails;
+		assert.equal(details?.error_code, "compile_failed");
+		assert.equal(details?.cleaned_artifacts?.includes(pdf), true);
+		assert.ok((details?.diagnostics?.length ?? 0) > 0);
+		assert.equal(fixture.manager.activeRootCount(), 1);
+	});
+});
+
+test("clean=true active continuous reports restart failures clearly", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const root = join(baseDir, "paper.tex");
+		const pdf = join(baseDir, "paper.pdf");
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		writeFileSync(pdf, "old pdf");
+		fixture.manager.setAcceptingSubscriptions(false);
+
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", clean: true }, { cwd: baseDir, session_id: "session-A" });
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /failed to restart continuous compilation after clean/);
+		const details = (observed as { statusDetails?: { error_code?: string; cleaned_artifacts?: string[] } }).statusDetails;
+		assert.equal(details?.error_code, "continuous_compiler_restart_failed");
+		assert.equal(details?.cleaned_artifacts?.includes(pdf), true);
+		assert.equal(fixture.manager.activeRootCount(), 0);
+		assert.equal(fixture.manager.subscriberCount(root), 0);
+	});
+});
 
 test("continuous=false compatible active compile uses continuous result and unsubscribes without spawning another latexmk", async () => {
 	const fixture = makeFakeContinuousManager();

@@ -619,7 +619,7 @@ function latexFileArtifactPaths(latexFilePath: string): string[] {
 	return LATEX_FILE_ARTIFACT_EXTENSIONS.map((extension) => join(dir, `${base}${extension}`));
 }
 
-function cleanLatexFileArtifacts(latexFilePath: string): string[] {
+export function cleanLatexFileArtifacts(latexFilePath: string): string[] {
 	const removed: string[] = [];
 	for (const artifactPath of latexFileArtifactPaths(latexFilePath)) {
 		if (!existsSync(artifactPath)) continue;

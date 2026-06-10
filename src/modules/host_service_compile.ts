@@ -6,6 +6,7 @@ import {
 	DEFAULT_SNIPPET_PREAMBLE,
 } from "./latex/latex_preamble.ts";
 import {
+	cleanLatexFileArtifacts,
 	createLatexFileCompileToolSupport,
 	latexmkEngineIdentity,
 	LoggedToolError,
@@ -170,6 +171,7 @@ export class HostServiceCompileService {
 		});
 
 		try {
+			let cleanRestartContinuous: HostServiceContinuousCompileDetails | undefined;
 			const resolvedCompiler = hostServiceLatexFileCompiler.resolveLatexCompiler(request.details.compiler);
 			const compilerIdentity = latexmkEngineIdentity(resolvedCompiler);
 			const rootKey = normalizeLatexRootKey(normalizedPath);
@@ -186,6 +188,27 @@ export class HostServiceCompileService {
 			const result = await this.rootCompileCoordinator.runExclusive(
 				rootKey,
 				async () => {
+					if (shouldClean) {
+						const continuousClean = await this.continuousCompileManager.cleanRestartAndWaitForFreshResult(
+							normalizedPath,
+							compilerIdentity,
+							() => {
+								this.rootCompileCoordinator.clearLastResult(rootKey);
+								const removed = cleanLatexFileArtifacts(normalizedPath);
+								cleanArtifacts.push(...removed);
+								return removed;
+							},
+							signal,
+						);
+						if (continuousClean !== undefined) {
+							cleanRestartContinuous = continuousClean.continuous;
+							return {
+								...continuousClean.result,
+								clean: true,
+								cleanedArtifacts: continuousClean.cleanedArtifacts,
+							};
+						}
+					}
 					if (canRouteThroughContinuous) {
 						const continuousResult = await this.continuousCompileManager.waitForFreshResult(normalizedPath, compilerIdentity, signal);
 						if (continuousResult !== undefined) {
@@ -217,11 +240,14 @@ export class HostServiceCompileService {
 			const resultLogPath = inferLatexLogPath(result.source);
 			const nowNs = this.nowNs();
 			for (const cleaned of result.cleanedArtifacts) {
-				cleanArtifacts.push(cleaned);
+				if (!cleanArtifacts.includes(cleaned)) {
+					cleanArtifacts.push(cleaned);
+				}
 			}
 			const artifactPaths = getExistingArtifacts(result.pdfPath, resultLogPath);
 			this.clearSuccessfulImmediateCompileNotification(request, result.source);
-			const continuous = await this.applyContinuousCompileRequest(request, result.source);
+			const requestedContinuous = await this.applyContinuousCompileRequest(request, result.source);
+			const continuous = requestedContinuous ?? cleanRestartContinuous;
 			const continuousError = continuous && ["unavailable", "error"].includes(continuous.status) ? continuous : undefined;
 			const openResponse = await this.openCompiledPdfThroughManagedViewerAfterCompile(
 				request,
