@@ -289,6 +289,7 @@ export interface HostServiceCompileResponseDetails {
 	pdf_id?: number;
 	managed_record?: HostServiceManagedViewerRecord;
 	continuous?: HostServiceContinuousCompileDetails;
+	continuous_active_notice?: string;
 	error_code?: string;
 }
 

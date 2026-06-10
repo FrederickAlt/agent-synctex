@@ -113,12 +113,16 @@ function continuousSummary(details: HostServiceCompileResponseDetails): string {
 	return `\nContinuous: ${continuous.status} subscribers=${continuous.subscriber_count}${pid} root=${continuous.root_source}${error}`;
 }
 
+function continuousActiveNotice(details: HostServiceCompileResponseDetails): string {
+	return details.continuous_active_notice ? `\n${details.continuous_active_notice}` : "";
+}
+
 function compileSuccessText(details: HostServiceCompileResponseDetails, hideWarnings: boolean): string {
 	const status = details.compile_status ?? "ok";
 	const warningCount = details.warning_count ? ` warnings=${details.warning_count}` : "";
 	const exitCode = status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 	const prefix = status === "ok" ? "ok" : status;
-	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${continuousSummary(details)}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated, hideWarnings)}`;
+	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${continuousSummary(details)}${continuousActiveNotice(details)}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated, hideWarnings)}`;
 }
 
 function describeCompileFailureContext(
@@ -223,6 +227,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 							pdf: compileResult.pdf,
 							log: compileResult.log,
 							continuous: compileResult.continuous,
+							continuous_active_notice: compileResult.continuous_active_notice,
 							clean: compileResult.clean,
 							cleaned_artifacts: compileResult.cleaned_artifacts,
 							compile_status: compileResult.compile_status,
@@ -247,12 +252,13 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				const status = compileResponse.compile_status ?? "ok";
 				const warningCount = compileResponse.warning_count ? ` warnings=${compileResponse.warning_count}` : "";
 				return {
-					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${continuousSummary(compileResponse)}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated, hideWarnings)}` }],
+					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${continuousSummary(compileResponse)}${continuousActiveNotice(compileResponse)}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated, hideWarnings)}` }],
 					details: agentFacingCompileDetails({
 						source: compileResponse.source,
 						pdf: compileResponse.pdf,
 						pdf_id: compileResponse.pdf_id,
 						continuous: compileResponse.continuous,
+						continuous_active_notice: compileResponse.continuous_active_notice,
 						pid: managedRecord?.pid,
 						viewer_handle: managedRecord?.viewerHandle,
 						viewer_backend: managedRecord?.viewerBackend,

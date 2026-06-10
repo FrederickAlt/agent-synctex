@@ -556,7 +556,8 @@ export class HostServiceClient {
 		}
 		if (response.status === "error") {
 			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
-			const error = new Error(`${response.error || "host service returned error status"}${suffix}`) as HostServiceResponseError;
+			const continuousActiveNotice = response.status_details.continuous_active_notice ? `\n${response.status_details.continuous_active_notice}` : "";
+			const error = new Error(`${response.error || "host service returned error status"}${suffix}${continuousActiveNotice}`) as HostServiceResponseError;
 			error.statusDetails = response.status_details;
 			error.errorCode = response.status_details.error_code;
 			error.requestId = response.request_id;
@@ -2645,6 +2646,9 @@ function isValidCompileResponseLike(
 		return false;
 	}
 	if (details.continuous !== undefined && !isValidContinuousCompileDetails(details.continuous)) {
+		return false;
+	}
+	if (details.continuous_active_notice !== undefined && typeof details.continuous_active_notice !== "string") {
 		return false;
 	}
 	if (typeof details.error_code !== "undefined" && typeof details.error_code !== "string") {

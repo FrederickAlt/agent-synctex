@@ -680,6 +680,96 @@ test("Pi tool descriptions document continuous lifecycle boundaries", async () =
 	assert.ok(tool.parameters?.properties?.hide_warnings);
 });
 
+test("compile_latex_file renders redundant active-continuous notice for omitted one-shot results", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	const expectedPdf = resolve(root, "paper.pdf");
+	const expectedLog = resolve(root, "paper.log");
+	const notice = "Continuous: active for this root. You usually do not need to call compile_latex_file while continuous compilation is running; it already rebuilds after changes and compile errors are delivered to you as pending system-info notifications. Use continuous=false to stop continuous compilation. Last continuous result: ok_with_warnings, warnings=2.";
+	const proto = HostServiceClient.prototype as { requestCompileLatexFile: HostServiceClient["requestCompileLatexFile"] };
+	const originalRequestCompileLatexFile = proto.requestCompileLatexFile;
+	try {
+		proto.requestCompileLatexFile = async (_request, workspaceContext) => ({
+			protocol_version: 1,
+			supported: true,
+			service_available: true,
+			workspace_context: workspaceContext,
+			request_id: "redundant-continuous-pi-test",
+			operation: "compile_latex_file",
+			source: sourcePath,
+			pdf: expectedPdf,
+			log: expectedLog,
+			artifact_paths: [expectedPdf],
+			clean: false,
+			cleaned_artifacts: [],
+			compile_status: "ok_with_warnings",
+			warning_count: 2,
+			warnings: [],
+			warnings_truncated: false,
+			continuous_active_notice: notice,
+		});
+
+		const result = await tool.execute(
+			"compile-latex-file-redundant-continuous",
+			{ latex_file_path: sourcePath },
+			undefined,
+			undefined,
+			createSessionContext(root, "pi-continuous-session"),
+		);
+		assert.match(result.content[0].text, /Continuous: active for this root/);
+		assert.match(result.content[0].text, /pending system-info notifications/);
+		assert.match(result.content[0].text, /continuous=false/);
+		assert.match(result.content[0].text, /Last continuous result: ok_with_warnings, warnings=2\./);
+		assert.equal((result.details as { continuous_active_notice?: string }).continuous_active_notice, notice);
+	} finally {
+		proto.requestCompileLatexFile = originalRequestCompileLatexFile;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("compile_latex_file omits active-continuous notice for ordinary one-shot results", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	const expectedPdf = resolve(root, "paper.pdf");
+	const expectedLog = resolve(root, "paper.log");
+	const proto = HostServiceClient.prototype as { requestCompileLatexFile: HostServiceClient["requestCompileLatexFile"] };
+	const originalRequestCompileLatexFile = proto.requestCompileLatexFile;
+	try {
+		proto.requestCompileLatexFile = async (_request, workspaceContext) => ({
+			protocol_version: 1,
+			supported: true,
+			service_available: true,
+			workspace_context: workspaceContext,
+			request_id: "ordinary-pi-test",
+			operation: "compile_latex_file",
+			source: sourcePath,
+			pdf: expectedPdf,
+			log: expectedLog,
+			artifact_paths: [expectedPdf],
+			clean: false,
+			cleaned_artifacts: [],
+			compile_status: "ok",
+			warning_count: 0,
+			warnings: [],
+			warnings_truncated: false,
+		});
+
+		const result = await tool.execute(
+			"compile-latex-file-ordinary-one-shot",
+			{ latex_file_path: sourcePath },
+			undefined,
+			undefined,
+			createSessionContext(root, "pi-ordinary-session"),
+		);
+		assert.doesNotMatch(result.content[0].text, /Continuous: active for this root/);
+		assert.doesNotMatch(result.content[0].text, /pending system-info notifications/);
+		assert.equal((result.details as { continuous_active_notice?: string }).continuous_active_notice, undefined);
+	} finally {
+		proto.requestCompileLatexFile = originalRequestCompileLatexFile;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("compile_latex_file passes continuous flag through and renders continuous metadata", async () => {
 	const { root, sourcePath } = withTemporaryProject();
 	const tool = await captureCompileTool();

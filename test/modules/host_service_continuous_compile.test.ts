@@ -427,7 +427,8 @@ test("one-shot compile_latex_file invokes latexmk without pvc and maps selected 
 		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
 
 		for (const compiler of ["lualatex", "pdflatex", "xelatex", "latexmk"] as const) {
-			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler }, { cwd: baseDir, session_id: `session-${compiler}` });
+			const result = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler }, { cwd: baseDir, session_id: `session-${compiler}` });
+			assert.equal(result.continuous_active_notice, undefined);
 		}
 
 		const invocations = readFileSync(recordPath, "utf8")
@@ -477,6 +478,8 @@ test("one-shot compile waits for active compatible continuous cycle without spaw
 		const result = await oneShot;
 		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
 		assert.equal(result.compile_status, "ok");
+		assert.match(result.continuous_active_notice ?? "", /Continuous: active for this root/);
+		assert.match(result.continuous_active_notice ?? "", /Last continuous result: ok\./);
 		assert.equal(fixture.manager.cycleState(root), "idle");
 
 		const invocations = readFileSync(recordPath, "utf8").trim().split("\n");
@@ -569,7 +572,36 @@ test("one-shot compile immediately returns fresh idle continuous result", async 
 		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
 		assert.equal(result.compile_status, "ok_with_warnings");
 		assert.equal(result.warning_count, 1);
+		assert.match(result.continuous_active_notice ?? "", /Continuous: active for this root/);
+		assert.match(result.continuous_active_notice ?? "", /usually do not need to call compile_latex_file/);
+		assert.match(result.continuous_active_notice ?? "", /pending system-info notifications/);
+		assert.match(result.continuous_active_notice ?? "", /continuous=false/);
+		assert.match(result.continuous_active_notice ?? "", /Last continuous result: ok_with_warnings, warnings=1\./);
 		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1);
+	});
+});
+
+test("one-shot compile through active continuous failure reports failed last result notice", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		writeRecordingLatexmk(join(baseDir, "bin"), join(baseDir, "latexmk-args.jsonl"));
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+		writeContinuousRecorderArtifacts(root, { log: "! Undefined control sequence.\nl.1 \\bad\n", pdf: false });
+		emitContinuousEvent(fixture.processes[0]!, "failure");
+
+		let observed: unknown;
+		try {
+			await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir, session_id: "session-A" });
+		} catch (error) {
+			observed = error;
+		}
+
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /Last continuous result: failed\./);
+		assert.match((observed as { statusDetails?: { continuous_active_notice?: string } }).statusDetails?.continuous_active_notice ?? "", /Last continuous result: failed\./);
 	});
 });
 

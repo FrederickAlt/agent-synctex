@@ -440,6 +440,11 @@ function formatContinuousSummary(details: unknown): string {
 	return `\nContinuous: ${status} subscribers=${subscribers}${pid}${root}${error}`;
 }
 
+function formatContinuousActiveNotice(details: unknown): string {
+	if (!isRecord(details) || typeof details.continuous_active_notice !== "string" || !details.continuous_active_notice) return "";
+	return `\n${details.continuous_active_notice}`;
+}
+
 function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }, hideWarnings = false): string {
 	if (typeof details.warning_count !== "number" || details.warning_count <= 0) return "";
 	if (hideWarnings) return `\nWarnings: ${details.warning_count} warnings hidden.`;
@@ -473,7 +478,7 @@ function parseToolResult(
 		const exitCode = details.compile_status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 		const log = details.log ? `\nLog: ${details.log}` : "";
 		return {
-			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${exitCode}${warningCount}${log}${formatContinuousSummary(details)}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim() }],
+			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${exitCode}${warningCount}${log}${formatContinuousSummary(details)}${formatContinuousActiveNotice(details)}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim() }],
 			details: agentFacingCompileDetails(details, options.hideWarnings === true),
 		};
 	}
@@ -482,7 +487,7 @@ function parseToolResult(
 	const log = details.log ? `\nLog: ${details.log}` : "";
 	return {
 		isError: true,
-		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}` }],
+		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}${formatContinuousActiveNotice(details)}` }],
 		details,
 	};
 }
