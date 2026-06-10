@@ -174,7 +174,7 @@ export class HostServiceCompileService {
 			const compilerIdentity = latexmkEngineIdentity(resolvedCompiler);
 			const rootKey = normalizeLatexRootKey(normalizedPath);
 			const canReuseLastResult = !shouldClean && request.details.continuous !== true;
-			const canRouteThroughContinuous = !shouldClean && request.details.continuous === undefined;
+			const canRouteThroughContinuous = !shouldClean && request.details.continuous !== true;
 			const canRecordLastResult = request.details.continuous !== true;
 			const compileRequest: LatexFileCompileRequest = {
 				requestedPath,

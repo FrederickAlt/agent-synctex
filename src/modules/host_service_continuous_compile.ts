@@ -482,7 +482,7 @@ export class HostServiceContinuousCompileManager {
 		}
 		record.cycleState = "idle";
 		record.lastOutcome = this.buildCycleOutcome(record, event);
-		this.resolveFreshWaiters(record);
+		this.resolveObservedCycleWaiters(record, record.lastOutcome);
 	}
 
 	private buildCycleOutcome(record: ContinuousCompileRecord, event: "success" | "warning" | "failure"): ContinuousCompileOutcome {
@@ -541,12 +541,13 @@ export class HostServiceContinuousCompileManager {
 		return outcome.outcome;
 	}
 
-	private resolveFreshWaiters(record: ContinuousCompileRecord): void {
+	private resolveObservedCycleWaiters(record: ContinuousCompileRecord, cycleOutcome: ContinuousCompileOutcome): void {
+		const reusableOutcome = this.freshOutcome(record);
 		for (const waiter of [...record.waiters]) {
 			if (waiter.compilerIdentity !== record.engineIdentity) {
 				continue;
 			}
-			const outcome = this.freshOutcome(record);
+			const outcome = cycleOutcome.outcome.status === "failure" ? cycleOutcome.outcome : reusableOutcome;
 			if (outcome === undefined) {
 				continue;
 			}
