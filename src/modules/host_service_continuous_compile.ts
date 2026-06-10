@@ -364,6 +364,22 @@ export class HostServiceContinuousCompileManager {
 		};
 	}
 
+	async removeSubscriptionForCompileRequest(
+		rootSource: string,
+		sessionId: string,
+		compilerIdentity: string,
+	): Promise<{ continuous: HostServiceContinuousCompileDetails; error?: HostServiceCompileCoordinationError }> {
+		const record = this.recordsByRootSource.get(rootSource);
+		const error = record !== undefined && record.engineIdentity !== compilerIdentity
+			? new HostServiceCompileCoordinationError(
+				`continuous compilation is already active for this root with compiler ${record.compilerLabel}; use the active compiler or stop continuous compilation first before requesting a different compiler`,
+				"continuous_compiler_engine_mismatch",
+			)
+			: undefined;
+		const continuous = await this.removeSubscription(rootSource, sessionId);
+		return { continuous, error };
+	}
+
 	removeSessions(sessionIds: Iterable<string>): void {
 		const expired = new Set([...sessionIds].map((sessionId) => sessionId.trim()).filter(Boolean));
 		if (!expired.size) {
@@ -392,6 +408,10 @@ export class HostServiceContinuousCompileManager {
 
 	subscriberCount(rootSource: string): number {
 		return this.recordsByRootSource.get(rootSource)?.subscribers.size ?? 0;
+	}
+
+	waiterCount(rootSource: string): number {
+		return this.recordsByRootSource.get(rootSource)?.waiters.size ?? 0;
 	}
 
 	cycleState(rootSource: string): ContinuousCompileCycleState | undefined {

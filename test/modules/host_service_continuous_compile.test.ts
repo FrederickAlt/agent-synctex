@@ -185,6 +185,13 @@ process.exit(0);
 	chmodSync(compilerPath, 0o700);
 }
 
+function recordedLatexmkInvocationCount(recordPath: string): number {
+	if (!existsSync(recordPath)) {
+		return 0;
+	}
+	return readFileSync(recordPath, "utf8").trim().split("\n").filter(Boolean).length;
+}
+
 function writeNoopLatexmk(binDir: string): void {
 	mkdirSync(binDir, { recursive: true, mode: 0o700 });
 	const compilerPath = join(binDir, "latexmk");
@@ -907,7 +914,52 @@ test("clean=true active continuous reports restart failures clearly", async () =
 	});
 });
 
-test("continuous=false compatible active compile uses continuous result and unsubscribes without spawning another latexmk", async () => {
+test("continuous=false final subscriber stops active continuous before waiting and compiles once", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		emitContinuousEvent(fixture.processes[0]!, "compiling");
+
+		const startedAt = Date.now();
+		const result = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: false }, { cwd: baseDir, session_id: "session-A" });
+
+		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
+		assert.equal(result.continuous?.status, "stopped");
+		assert.equal(result.continuous?.subscriber_count, 0);
+		assert.equal(fixture.processes[0]?.killed, true);
+		assert.equal(fixture.manager.activeRootCount(), 0);
+		assert.equal(recordedLatexmkInvocationCount(recordPath), 2);
+		assert.ok(Date.now() - startedAt < 1_000, "unsubscribe should not wait for a fresh continuous event");
+	});
+});
+
+
+test("continuous=false does not spawn a one-shot while final active continuous is still stopping", async () => {
+	const fixture = makeFakeContinuousManager({ autoExitSignals: [], shutdownGraceMs: 500, shutdownForceMs: 500 });
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		const unsubscribe = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: false }, { cwd: baseDir, session_id: "session-A" });
+
+		await waitUntil(() => fixture.processes[0]?.killSignals.includes("SIGTERM") === true);
+		assert.equal(fixture.manager.cycleState(root), "stopping");
+		assert.equal(recordedLatexmkInvocationCount(recordPath), 1);
+
+		fixture.processes[0]!.emit("exit", null, "SIGTERM");
+		const result = await unsubscribe;
+		assert.equal(result.continuous?.status, "stopped");
+		assert.equal(recordedLatexmkInvocationCount(recordPath), 2);
+	});
+});
+
+
+test("continuous=false compatible active compile with other subscribers uses active result without spawning another latexmk", async () => {
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
 		const recordPath = join(baseDir, "latexmk-args.jsonl");
@@ -915,19 +967,51 @@ test("continuous=false compatible active compile uses continuous result and unsu
 		const root = join(baseDir, "paper.tex");
 
 		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		fixture.manager.ensureSubscription(root, "session-B", "lualatex");
 		emitContinuousEvent(fixture.processes[0]!, "compiling");
 		const unsubscribe = client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: false }, { cwd: baseDir, session_id: "session-A" });
 		await sleep(50);
 		assert.equal(fixture.processes[0]?.killed, false);
+		assert.equal(fixture.manager.subscriberCount(root), 1);
+		assert.equal(recordedLatexmkInvocationCount(recordPath), 1);
 
 		writeContinuousRecorderArtifacts(root);
 		emitContinuousEvent(fixture.processes[0]!, "success");
 		const result = await unsubscribe;
 		assert.equal(result.pdf, join(baseDir, "paper.pdf"));
-		assert.equal(result.continuous?.status, "stopped");
-		assert.equal(result.continuous?.subscriber_count, 0);
-		assert.equal(fixture.processes[0]?.killed, true);
-		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1);
+		assert.equal(result.continuous?.status, "still_active_for_other_subscribers");
+		assert.equal(result.continuous?.subscriber_count, 1);
+		assert.equal(fixture.processes[0]?.killed, false);
+		assert.equal(recordedLatexmkInvocationCount(recordPath), 1);
+	});
+});
+
+
+test("aborted continuous=false wait on active continuous removes waiter and allows later same-root request", async () => {
+	const fixture = makeFakeContinuousManager();
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const recordPath = join(baseDir, "latexmk-args.jsonl");
+		writeRecordingLatexmk(join(baseDir, "bin"), recordPath);
+		const root = join(baseDir, "paper.tex");
+
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		fixture.manager.ensureSubscription(root, "session-B", "lualatex");
+		const abortController = new AbortController();
+		const waiting = client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", continuous: false },
+			{ cwd: baseDir, session_id: "session-A" },
+			abortController.signal,
+		);
+
+		await waitUntil(() => fixture.manager.waiterCount(root) === 1);
+		abortController.abort();
+		await assert.rejects(waiting, /host service request aborted/);
+		await waitUntil(() => fixture.manager.waiterCount(root) === 0);
+		assert.equal(fixture.manager.subscriberCount(root), 1);
+
+		const later = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: false }, { cwd: baseDir, session_id: "session-B" });
+		assert.equal(later.continuous?.status, "stopped");
+		assert.equal(recordedLatexmkInvocationCount(recordPath), 2);
 	});
 });
 
@@ -954,7 +1038,7 @@ test("continuous=false compiler mismatch rejects with guidance and unsubscribes 
 		assert.equal(details?.continuous?.status, "stopped");
 		assert.equal(details?.continuous?.subscriber_count, 0);
 		assert.equal(fixture.processes[0]?.killed, true);
-		assert.equal(readFileSync(recordPath, "utf8").trim().split("\n").length, 1);
+		assert.equal(recordedLatexmkInvocationCount(recordPath), 1);
 	});
 });
 
@@ -1436,6 +1520,8 @@ test("continuous=false unsubscribes even when routed continuous compile fails fo
 				{ latex_file_path: "~/paper.tex", compiler: "lualatex", continuous: true },
 				{ cwd: baseDir, session_id: "session-A" },
 			);
+			const root = join(homeDir, "paper.tex");
+			fixture.manager.ensureSubscription(root, "session-B", "lualatex");
 			assert.equal(fixture.manager.activeRootCount(), 1);
 
 			rmSync(join(homeDir, "paper.pdf"), { force: true });
@@ -1456,11 +1542,12 @@ test("continuous=false unsubscribes even when routed continuous compile fails fo
 			assert.ok(observed instanceof Error);
 			assert.match(observed.message, /continuous compile failed|Undefined control sequence/);
 			const details = (observed as { statusDetails?: { continuous?: { status?: string; subscriber_count?: number; root_source?: string } } }).statusDetails;
-			assert.equal(details?.continuous?.status, "stopped");
-			assert.equal(details?.continuous?.subscriber_count, 0);
+			assert.equal(details?.continuous?.status, "still_active_for_other_subscribers");
+			assert.equal(details?.continuous?.subscriber_count, 1);
 			assert.equal(details?.continuous?.root_source, join(homeDir, "paper.tex"));
-			assert.equal(fixture.manager.activeRootCount(), 0);
-			assert.equal(fixture.processes[0]?.killed, true);
+			assert.equal(fixture.manager.activeRootCount(), 1);
+			assert.equal(fixture.manager.subscriberCount(root), 1);
+			assert.equal(fixture.processes[0]?.killed, false);
 		} finally {
 			if (originalHome === undefined) {
 				delete process.env.HOME;
@@ -1483,14 +1570,10 @@ test("continuous=false unsubscribes even when open_pdf fails", async () => {
 		viewerBackend.setAvailable(false);
 		let observed: unknown;
 		try {
-			const unsubscribe = client.requestCompileLatexFile(
+			await client.requestCompileLatexFile(
 				{ latex_file_path: "paper.tex", compiler: "lualatex", open_pdf: true, continuous: false },
 				{ cwd: baseDir, session_id: "session-A" },
 			);
-			await sleep(20);
-			writeContinuousRecorderArtifacts(join(baseDir, "paper.tex"));
-			emitContinuousEvent(fixture.processes[0]!, "success");
-			await unsubscribe;
 		} catch (error) {
 			observed = error;
 		}

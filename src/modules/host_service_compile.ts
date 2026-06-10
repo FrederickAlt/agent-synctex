@@ -170,6 +170,7 @@ export class HostServiceCompileService {
 			open_pdf: request.details.open_pdf === true,
 		});
 
+		let continuousAppliedBeforeCompile: HostServiceContinuousCompileDetails | undefined;
 		try {
 			let cleanRestartContinuous: HostServiceContinuousCompileDetails | undefined;
 			const resolvedCompiler = hostServiceLatexFileCompiler.resolveLatexCompiler(request.details.compiler);
@@ -188,6 +189,13 @@ export class HostServiceCompileService {
 			const result = await this.rootCompileCoordinator.runExclusive(
 				rootKey,
 				async () => {
+					if (request.details.continuous === false) {
+						const unsubscribe = await this.applyContinuousUnsubscribeBeforeCompile(request, normalizedPath, compilerIdentity);
+						continuousAppliedBeforeCompile = unsubscribe.continuous;
+						if (unsubscribe.error !== undefined) {
+							throw unsubscribe.error;
+						}
+					}
 					if (shouldClean) {
 						const continuousClean = await this.continuousCompileManager.cleanRestartAndWaitForFreshResult(
 							normalizedPath,
@@ -246,7 +254,9 @@ export class HostServiceCompileService {
 			}
 			const artifactPaths = getExistingArtifacts(result.pdfPath, resultLogPath);
 			this.clearSuccessfulImmediateCompileNotification(request, result.source);
-			const requestedContinuous = await this.applyContinuousCompileRequest(request, result.source);
+			const requestedContinuous = request.details.continuous === false
+				? continuousAppliedBeforeCompile
+				: await this.applyContinuousCompileRequest(request, result.source);
 			const continuous = requestedContinuous ?? cleanRestartContinuous;
 			const continuousError = continuous && ["unavailable", "error"].includes(continuous.status) ? continuous : undefined;
 			const openResponse = await this.openCompiledPdfThroughManagedViewerAfterCompile(
@@ -325,7 +335,7 @@ export class HostServiceCompileService {
 				error,
 			});
 			const nowNs = this.nowNs();
-			const continuous = await this.applyContinuousUnsubscribeAfterFailure(request, normalizedPath, error);
+			const continuous = continuousAppliedBeforeCompile ?? await this.applyContinuousUnsubscribeAfterFailure(request, normalizedPath, error);
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -497,6 +507,29 @@ export class HostServiceCompileService {
 				},
 			};
 		}
+	}
+
+	private async applyContinuousUnsubscribeBeforeCompile(
+		request: HostServiceCompileRequest,
+		rootSource: string,
+		compilerIdentity: string,
+	): Promise<{ continuous?: HostServiceContinuousCompileDetails; error?: HostServiceCompileCoordinationError }> {
+		const sessionId = request.workspace_context.session_id?.trim();
+		if (!sessionId) {
+			return {
+				continuous: {
+					requested: true,
+					status: "error",
+					root_source: rootSource,
+					session_id: "",
+					subscriber_count: 0,
+					error: "workspace_context.session_id is required for continuous compilation",
+					error_code: "invalid_request",
+				},
+			};
+		}
+		this.refreshContinuousSessionLease?.(request.workspace_context);
+		return this.continuousCompileManager.removeSubscriptionForCompileRequest(rootSource, sessionId, compilerIdentity);
 	}
 
 	private async applyContinuousUnsubscribeAfterFailure(
