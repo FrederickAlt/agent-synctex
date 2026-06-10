@@ -94,6 +94,7 @@ interface ContinuousCompileRecord {
 	waiters: Set<ContinuousCompileWaiter>;
 	lastPdfSnapshot?: PdfSnapshot;
 	lastFailureFingerprint?: string;
+	restartSubscribersOnExitAfterAbortedCleanStop?: boolean;
 	stopping?: boolean;
 	stopPromise?: Promise<void>;
 }
@@ -309,24 +310,16 @@ export class HostServiceContinuousCompileManager {
 				this.recordOutputChunk(rootSource, record, Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
 			});
 			child.on("exit", () => {
-				this.rejectWaiters(record, new HostServiceCompileCoordinationError(
+				this.handleProcessStopped(rootSource, record, new HostServiceCompileCoordinationError(
 					"continuous compiler stopped before producing a fresh result",
 					"continuous_compiler_stopped",
 				));
-				record.cycleState = "stopped";
-				if (this.recordsByRootSource.get(rootSource) === record) {
-					this.recordsByRootSource.delete(rootSource);
-				}
 			});
 			child.on("error", () => {
-				this.rejectWaiters(record, new HostServiceCompileCoordinationError(
+				this.handleProcessStopped(rootSource, record, new HostServiceCompileCoordinationError(
 					"continuous compiler failed before producing a fresh result",
 					"continuous_compiler_failed",
 				));
-				record.cycleState = "stopped";
-				if (this.recordsByRootSource.get(rootSource) === record) {
-					this.recordsByRootSource.delete(rootSource);
-				}
 			});
 			return this.details("started", record, sessionId);
 		} catch (error) {
@@ -429,26 +422,20 @@ export class HostServiceContinuousCompileManager {
 			);
 		}
 
-		await this.stopRecordAndWait(rootSource, record);
+		this.throwIfSignalAborted(signal, "compile request cancelled before stopping active continuous compilation for clean");
+		await this.stopRecordAndWaitForCleanRestart(rootSource, record, subscribers, signal);
+		if (signal?.aborted) {
+			this.restartSubscribersAfterCleanStop(rootSource, subscribers, compiler);
+			this.throwIfSignalAborted(signal, "compile request cancelled after stopping active continuous compilation before clean");
+		}
+		this.throwIfSignalAborted(signal, "compile request cancelled before deleting clean artifacts");
 		const cleanedArtifacts = cleanArtifacts();
-		const start = this.ensureSubscription(rootSource, sessionId, compiler);
-		if (start.status === "error" || start.status === "unavailable") {
-			throw new HostServiceCompileCoordinationError(
-				`failed to restart continuous compilation after clean: ${start.error ?? start.status}`,
-				"continuous_compiler_restart_failed",
-			);
+		if (signal?.aborted) {
+			this.restartSubscribersAfterCleanStop(rootSource, subscribers, compiler);
+			this.throwIfSignalAborted(signal, "compile request cancelled after deleting clean artifacts before restarting continuous compilation");
 		}
-		for (const subscriber of subscribers.slice(1)) {
-			const added = this.ensureSubscription(rootSource, subscriber, compiler);
-			if (added.status === "error" || added.status === "unavailable") {
-				throw new HostServiceCompileCoordinationError(
-					`failed to restore continuous subscriber after clean: ${added.error ?? added.status}`,
-					"continuous_compiler_restart_failed",
-				);
-			}
-		}
-		const restartedRecord = this.recordsByRootSource.get(rootSource);
-		const continuous = restartedRecord === undefined ? start : this.details("started", restartedRecord, sessionId);
+		this.throwIfSignalAborted(signal, "compile request cancelled before restarting continuous compilation after clean");
+		const continuous = this.restartSubscribersAfterCleanStop(rootSource, subscribers, compiler);
 		const result = await this.waitForFreshResult(rootSource, compilerIdentity, signal);
 		if (result === undefined) {
 			throw new HostServiceCompileCoordinationError(
@@ -707,6 +694,24 @@ export class HostServiceContinuousCompileManager {
 		};
 	}
 
+	private handleProcessStopped(rootSource: string, record: ContinuousCompileRecord, error: HostServiceCompileCoordinationError): void {
+		this.rejectWaiters(record, error);
+		record.cycleState = "stopped";
+		const shouldRecoverSubscribers = record.restartSubscribersOnExitAfterAbortedCleanStop === true && record.subscribers.size > 0;
+		const subscribers = shouldRecoverSubscribers ? Array.from(record.subscribers) : [];
+		const compiler = record.compiler;
+		if (this.recordsByRootSource.get(rootSource) === record) {
+			this.recordsByRootSource.delete(rootSource);
+		}
+		if (shouldRecoverSubscribers) {
+			try {
+				this.restartSubscribersAfterCleanStop(rootSource, subscribers, compiler);
+			} catch {
+				// Recovery is best-effort after the request already aborted; keep artifacts untouched and leave state stopped on restart failure.
+			}
+		}
+	}
+
 	private details(status: ContinuousCompileStatus, record: ContinuousCompileRecord, sessionId: string): HostServiceContinuousCompileDetails {
 		return {
 			requested: true,
@@ -718,10 +723,97 @@ export class HostServiceContinuousCompileManager {
 		};
 	}
 
+	private throwIfSignalAborted(signal: AbortSignal | undefined, message: string): void {
+		if (signal?.aborted) {
+			throw new HostServiceCompileCoordinationError(message, "compile_cancelled");
+		}
+	}
+
+	private restartSubscribersAfterCleanStop(rootSource: string, subscribers: string[], compiler: LatexCompiler | undefined): HostServiceContinuousCompileDetails {
+		const sessionId = subscribers[0];
+		if (sessionId === undefined) {
+			throw new HostServiceCompileCoordinationError(
+				"cannot restart continuous compilation after clean because the active compiler has no subscribers",
+				"continuous_compiler_restart_failed",
+			);
+		}
+		const start = this.ensureSubscription(rootSource, sessionId, compiler);
+		if (start.status === "error" || start.status === "unavailable") {
+			throw new HostServiceCompileCoordinationError(
+				`failed to restart continuous compilation after clean: ${start.error ?? start.status}`,
+				"continuous_compiler_restart_failed",
+			);
+		}
+		for (const subscriber of subscribers.slice(1)) {
+			const added = this.ensureSubscription(rootSource, subscriber, compiler);
+			if (added.status === "error" || added.status === "unavailable") {
+				throw new HostServiceCompileCoordinationError(
+					`failed to restore continuous subscriber after clean: ${added.error ?? added.status}`,
+					"continuous_compiler_restart_failed",
+				);
+			}
+		}
+		const restartedRecord = this.recordsByRootSource.get(rootSource);
+		return restartedRecord === undefined ? start : this.details("started", restartedRecord, sessionId);
+	}
+
+	private async stopRecordAndWaitForCleanRestart(
+		rootSource: string,
+		record: ContinuousCompileRecord,
+		subscribers: string[],
+		signal: AbortSignal | undefined,
+	): Promise<void> {
+		const previousCycleState = record.cycleState;
+		record.restartSubscribersOnExitAfterAbortedCleanStop = false;
+		record.stopping = true;
+		record.cycleState = "stopping";
+		this.rejectWaiters(record, new HostServiceCompileCoordinationError(
+			"continuous compilation is stopping before producing a fresh result",
+			"continuous_compiler_stopping",
+		));
+		const exited = this.waitForProcessExit(record.process);
+		record.process.kill("SIGTERM");
+		const graceResult = await this.waitForBoundedExitOrAbort(exited, this.shutdownGraceMs, signal);
+		if (graceResult === "aborted") {
+			this.restoreRecordAfterAbortedCleanStop(rootSource, record, subscribers, previousCycleState);
+			this.throwIfSignalAborted(signal, "compile request cancelled while stopping active continuous compilation before clean");
+			return;
+		}
+		if (graceResult === "timeout") {
+			record.process.kill("SIGKILL");
+			const forceResult = await this.waitForBoundedExitOrAbort(exited, this.shutdownForceMs, signal);
+			if (forceResult === "aborted") {
+				this.restoreRecordAfterAbortedCleanStop(rootSource, record, subscribers, previousCycleState);
+				this.throwIfSignalAborted(signal, "compile request cancelled while force-stopping active continuous compilation before clean");
+				return;
+			}
+		}
+		if (this.recordsByRootSource.get(rootSource) === record) {
+			this.recordsByRootSource.delete(rootSource);
+		}
+	}
+
+	private restoreRecordAfterAbortedCleanStop(
+		rootSource: string,
+		record: ContinuousCompileRecord,
+		subscribers: string[],
+		previousCycleState: ContinuousCompileCycleState,
+	): void {
+		if (this.recordsByRootSource.get(rootSource) !== record) {
+			return;
+		}
+		record.subscribers = new Set(subscribers);
+		record.restartSubscribersOnExitAfterAbortedCleanStop = true;
+		record.stopping = false;
+		record.stopPromise = undefined;
+		record.cycleState = previousCycleState === "stopping" || previousCycleState === "stopped" ? "idle" : previousCycleState;
+	}
+
 	private stopRecordAndWait(rootSource: string, record: ContinuousCompileRecord): Promise<void> {
 		if (record.stopPromise) {
 			return record.stopPromise;
 		}
+		record.restartSubscribersOnExitAfterAbortedCleanStop = false;
 		record.stopping = true;
 		record.cycleState = "stopping";
 		record.subscribers.clear();
@@ -758,17 +850,32 @@ export class HostServiceContinuousCompileManager {
 	}
 
 	private async waitForBoundedExit(exited: Promise<void>, timeoutMs: number): Promise<boolean> {
+		return (await this.waitForBoundedExitOrAbort(exited, timeoutMs, undefined)) === "exited";
+	}
+
+	private async waitForBoundedExitOrAbort(exited: Promise<void>, timeoutMs: number, signal: AbortSignal | undefined): Promise<"exited" | "timeout" | "aborted"> {
+		if (signal?.aborted) {
+			return "aborted";
+		}
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
 		try {
 			return await Promise.race([
-				exited.then(() => true),
-				new Promise<boolean>((resolve) => {
-					timer = setTimeout(() => resolve(false), timeoutMs);
+				exited.then(() => "exited" as const),
+				new Promise<"timeout" | "aborted">((resolve) => {
+					timer = setTimeout(() => resolve("timeout"), timeoutMs);
+					if (signal !== undefined) {
+						onAbort = () => resolve("aborted");
+						signal.addEventListener("abort", onAbort, { once: true });
+					}
 				}),
 			]);
 		} finally {
 			if (timer) {
 				clearTimeout(timer);
+			}
+			if (signal !== undefined && onAbort !== undefined) {
+				signal.removeEventListener("abort", onAbort);
 			}
 		}
 	}

@@ -642,6 +642,54 @@ test("clean=true active continuous timeout leaves restarted subscribers active",
 	});
 });
 
+test("clean=true active continuous timeout during stop preserves artifacts and recovers subscribers", async () => {
+	const fixture = makeFakeContinuousManager({ autoExitSignals: ["SIGKILL"], shutdownGraceMs: 200, shutdownForceMs: 20 });
+	await withCompileServer(fixture, async (client, baseDir) => {
+		const root = join(baseDir, "paper.tex");
+		const pdf = join(baseDir, "paper.pdf");
+		const log = join(baseDir, "paper.log");
+		const aux = join(baseDir, "paper.aux");
+		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex", continuous: true }, { cwd: baseDir, session_id: "session-A" });
+		fixture.manager.ensureSubscription(root, "session-B", "lualatex");
+		writeFileSync(pdf, "old pdf");
+		writeFileSync(log, "old log");
+		writeFileSync(aux, "old aux");
+
+		const clean = client.requestCompileLatexFile(
+			{ latex_file_path: "paper.tex", compiler: "lualatex", clean: true },
+			{ cwd: baseDir, session_id: "session-A" },
+			undefined,
+			50,
+		);
+		await waitUntil(() => fixture.processes[0]?.killSignals.includes("SIGTERM") === true);
+
+		let observed: unknown;
+		try {
+			await clean;
+		} catch (error) {
+			observed = error;
+		}
+		assert.ok(observed instanceof Error);
+		assert.match(observed.message, /timed out/);
+		await waitUntil(() => fixture.manager.cycleState(root) === "idle" && fixture.manager.subscriberCount(root) === 2);
+		await sleep(250);
+
+		assert.equal(existsSync(pdf), true, "PDF must not be deleted after the request timeout aborts stop");
+		assert.equal(existsSync(log), true);
+		assert.equal(existsSync(aux), true);
+		assert.equal(fixture.processes.length, 1, "abort during stop should not restart while the original process remains active");
+		assert.deepEqual(fixture.processes[0]?.killSignals, ["SIGTERM"], "abort should cancel the stop budget before SIGKILL");
+		assert.equal(fixture.manager.activeRootCount(), 1);
+		assert.equal(fixture.manager.subscriberCount(root), 2);
+
+		fixture.processes[0]!.emit("exit", null, "SIGTERM");
+		await waitUntil(() => fixture.processes.length === 2 && fixture.manager.subscriberCount(root) === 2);
+		assert.equal(existsSync(pdf), true, "PDF must not be deleted if the aborted stop exits later and subscribers are recovered");
+		assert.equal(existsSync(log), true);
+		assert.equal(existsSync(aux), true);
+	});
+});
+
 test("clean=true active continuous reports post-clean compile failures with diagnostics", async () => {
 	const fixture = makeFakeContinuousManager();
 	await withCompileServer(fixture, async (client, baseDir) => {
