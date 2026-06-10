@@ -13,6 +13,7 @@
     "check": "tsc --noEmit",
     "test": "node --test --test-reporter=./scripts/fail-only-test-reporter.ts \"test/**/*.test.ts\"",
     "test:verbose": "node --test \"test/**/*.test.ts\"",
+    "test:real-tex-smoke": "AGENT_SYNCTEX_REAL_TEX_SMOKE=1 node --test test/modules/host_service_real_latexmk_smoke.test.ts",
     "verify": "npm run check && npm test",
     "host-service:start": "node scripts/tex-actionsctl.ts start",
     "host-service:status": "node scripts/tex-actionsctl.ts status",

@@ -25,6 +25,7 @@ import {
 	type HostServiceOpenRequest,
 } from "../../src/modules/host_service.ts";
 import { HostServiceManagedViewerService } from "../../src/modules/host_service_managed_viewer.ts";
+import { buildLatexmkFreshnessSnapshot, isLatexmkFreshnessSnapshotFresh } from "../../src/modules/host_service_root_compile_coordinator.ts";
 import { getMcpFixedPreviewPdfPath } from "../../src/modules/runtime_paths.ts";
 import { INLINE_PREVIEW_DIR } from "../../src/modules/preview/inline_preview.ts";
 
@@ -1319,6 +1320,41 @@ test("host service reuses fresh queued same-root one-shot result without spawnin
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("latexmk freshness ignores missing recorder temp outputs outside the root directory", () => {
+	const baseDir = temporaryDir("host-service-compile-cache-external-output-");
+	try {
+		const sourcePath = join(baseDir, "paper.tex");
+		const pdfPath = join(baseDir, "paper.pdf");
+		const logPath = join(baseDir, "paper.log");
+		const flsPath = join(baseDir, "paper.fls");
+		writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}hi\\end{document}\n");
+		writeFileSync(pdfPath, "%PDF-1.4\n");
+		writeFileSync(logPath, "Output written on paper.pdf\n");
+		writeFileSync(flsPath, [
+			`PWD ${baseDir}`,
+			"INPUT paper.tex",
+			"OUTPUT paper.log",
+			`OUTPUT ${join(tmpdir(), "missing-luatex-recorder-temp.tmp")}`,
+			"OUTPUT paper.pdf",
+			"",
+		].join("\n"));
+
+		const snapshot = buildLatexmkFreshnessSnapshot({
+			rootSource: sourcePath,
+			pdfPath,
+			logPath,
+			compiledAfterMs: Date.now() + 1_000,
+			requirePdf: true,
+		});
+
+		assert.ok(snapshot);
+		assert.equal(isLatexmkFreshnessSnapshotFresh(snapshot), true);
+	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });

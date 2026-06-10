@@ -44,10 +44,14 @@ interface HostServiceMcpPdfOperations {
 		callbackTarget: HostServiceCallbackTarget | undefined,
 	) => Promise<HostServiceCallbackTarget | undefined>;
 	continuousCompileManager?: HostServiceContinuousCompileManager;
+	compileService?: HostServiceCompileService;
 	refreshSessionLease?: (workspaceContext: HostServiceWorkspaceContext) => void | Promise<void>;
 }
 
 function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): HostServiceCompileService {
+	if (pdfOperations.compileService) {
+		return pdfOperations.compileService;
+	}
 	return new HostServiceCompileService({
 		protocolVersion: MCP_HOST_SERVICE_PROTOCOL_VERSION,
 		managedViewerService: {

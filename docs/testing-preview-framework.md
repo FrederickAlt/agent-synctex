@@ -185,6 +185,18 @@ Do not treat direct `zathura ...` commands launched from an agent `bash` tool as
 
 A dedicated runtime guardrail test (`viewer_guardrails.test.ts`) enforces that extension production code never directly controls GUI viewers (no direct `zathura`/`evince` spawns, no session discovery via `/proc`, no raw session-env probing). Keep it green whenever the viewer path changes.
 
+### Headless real-TeX coordination smoke
+
+The selective smoke `test/modules/host_service_real_latexmk_smoke.test.ts` starts an isolated in-process Host Service socket and drives `compile_latex_file` over MCP Content-Length frames with `open_pdf=false`. It uses real `latexmk` and `lualatex`, records LuaLaTeX JSONL compile events, and should be run only where TeX Live/MacTeX is available:
+
+```bash
+npm run test:real-tex-smoke
+# equivalent:
+AGENT_SYNCTEX_REAL_TEX_SMOKE=1 node --test test/modules/host_service_real_latexmk_smoke.test.ts
+```
+
+Without `AGENT_SYNCTEX_REAL_TEX_SMOKE=1`, or when `latexmk`/`lualatex` are missing from `PATH`, the test skips with a clear reason. It is headless and must not require Zathura, D-Bus, terminal graphics, or human interaction.
+
 ### Brokered real-service iteration
 
 When the project-local Firejail include is installed, agents in this repo may have access to a narrow host broker via

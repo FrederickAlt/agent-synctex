@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
-import { basename, dirname, extname, isAbsolute, normalize, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, normalize, relative, resolve } from "node:path";
 
 export class HostServiceCompileCoordinationError extends Error {
 	readonly errorCode: string;
@@ -232,11 +232,13 @@ export function buildLatexmkFreshnessSnapshot(options: {
 		return undefined;
 	}
 
+	const rootDirectory = dirname(options.rootSource);
+	const recorderOutputs = recorder.outputs.filter((path) => existsSync(path) || isPathInside(rootDirectory, path));
 	const outputPaths = [
 		...(options.requirePdf && options.pdfPath !== undefined ? [options.pdfPath] : []),
 		options.logPath,
 		flsPath,
-		...recorder.outputs,
+		...recorderOutputs,
 		...existingLatexmkDatabaseArtifacts(options.rootSource),
 	];
 	const outputFiles = snapshotFiles(outputPaths);
@@ -248,6 +250,11 @@ export function buildLatexmkFreshnessSnapshot(options: {
 
 export function isLatexmkFreshnessSnapshotFresh(snapshot: HostServiceCompileFreshnessSnapshot): boolean {
 	return filesMatch(snapshot.dependencyFiles) && filesMatch(snapshot.outputFiles);
+}
+
+function isPathInside(parent: string, child: string): boolean {
+	const childRelativePath = relative(parent, child);
+	return childRelativePath === "" || (!childRelativePath.startsWith("..") && !isAbsolute(childRelativePath));
 }
 
 function filesMatch(snapshots: HostServiceFileSnapshot[]): boolean {

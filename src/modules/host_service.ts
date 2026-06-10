@@ -183,7 +183,7 @@ const REQUIRED_DIRECTORY_MODE = 0o700;
 const REQUIRED_SOCKET_MODE = 0o600;
 const MAX_PAYLOAD_BYTES = 16_384;
 const STARTUP_SOCKET_CHECK_TIMEOUT_MS = 250;
-const ACTIVE_CONNECTION_TIMEOUT_MS = 10_000;
+const ACTIVE_CONNECTION_TIMEOUT_MS = 300_000;
 const DEFAULT_SESSION_PRUNE_INTERVAL_MS = 1_000;
 const FALLBACK_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
 export const MIN_ACTIVE_PDF_ID = 1;
@@ -1277,6 +1277,7 @@ export class HostServiceServer {
 				resolveManagedOpenCallback: (workspaceContext, callbackTargetId, callbackTarget) =>
 					this.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget),
 				continuousCompileManager: this.continuousCompileManager,
+				compileService: this.compileService,
 				refreshSessionLease: (workspaceContext) => {
 					if (!this.stopping) {
 						this.sessionLeases.heartbeat(workspaceContext);
