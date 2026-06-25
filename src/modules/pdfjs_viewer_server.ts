@@ -34,6 +34,7 @@ function wsUrlFromConfig(config) {
 }
 
 let activeConfig;
+let activeViewerSocket;
 let renderSequence = 0;
 
 function pdfUrlForRevision(config) {
@@ -66,6 +67,16 @@ async function renderPdf(config, options = {}) {
 		canvas.width = viewport.width;
 		canvas.height = viewport.height;
 		canvas.dataset.pageNumber = String(pageNumber);
+		canvas.addEventListener("click", (event) => {
+			if (!activeViewerSocket || activeViewerSocket.readyState !== WebSocket.OPEN) return;
+			const rect = canvas.getBoundingClientRect();
+			activeViewerSocket.send(JSON.stringify({
+				type: "reverse_synctex",
+				page: pageNumber,
+				x: (event.clientX - rect.left) / 1.25,
+				y: (event.clientY - rect.top) / 1.25,
+			}));
+		});
 		const pageContainer = document.createElement("div");
 		pageContainer.style.position = "relative";
 		pageContainer.style.width = String(viewport.width) + "px";
@@ -101,6 +112,7 @@ function handleSynctexMessage(message) {
 
 function connectViewerSocket(config) {
 	const ws = new WebSocket(wsUrlFromConfig(config));
+	activeViewerSocket = ws;
 	ws.addEventListener("message", (event) => {
 		try {
 			const message = JSON.parse(event.data);
@@ -118,6 +130,10 @@ function connectViewerSocket(config) {
 			}
 			if (message.type === "synctex") {
 				handleSynctexMessage(message);
+				return;
+			}
+			if (message.type === "reverse_synctex_error") {
+				setStatus("Reverse SyncTeX failed: " + message.error);
 			}
 		} catch {
 			// Ignore protocol messages this minimal viewer does not understand yet.
@@ -213,6 +229,65 @@ function encodeWebSocketTextFrame(message: string): Buffer {
 	return Buffer.concat([header, payload]);
 }
 
+function decodeWebSocketTextFrames(frameBuffer: Buffer): { messages: string[]; remaining: Buffer } {
+	const messages: string[] = [];
+	let cursor = 0;
+	while (cursor + 2 <= frameBuffer.length) {
+		const firstByte = frameBuffer[cursor];
+		const opcode = firstByte & 0x0f;
+		const masked = (frameBuffer[cursor + 1] & 0x80) !== 0;
+		let payloadLength = frameBuffer[cursor + 1] & 0x7f;
+		let offset = cursor + 2;
+		if (payloadLength === 126) {
+			if (frameBuffer.length < offset + 2) break;
+			payloadLength = frameBuffer.readUInt16BE(offset);
+			offset += 2;
+		} else if (payloadLength === 127) {
+			if (frameBuffer.length < offset + 8) break;
+			const bigLength = frameBuffer.readBigUInt64BE(offset);
+			if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) break;
+			payloadLength = Number(bigLength);
+			offset += 8;
+		}
+		let mask: Buffer | undefined;
+		if (masked) {
+			if (frameBuffer.length < offset + 4) break;
+			mask = frameBuffer.subarray(offset, offset + 4);
+			offset += 4;
+		}
+		const nextCursor = offset + payloadLength;
+		if (frameBuffer.length < nextCursor) break;
+		if (opcode === 0x01) {
+			const payload = Buffer.from(frameBuffer.subarray(offset, nextCursor));
+			if (mask) {
+				for (let index = 0; index < payload.length; index += 1) {
+					payload[index] ^= mask[index % 4];
+				}
+			}
+			messages.push(payload.toString("utf8"));
+		}
+		cursor = nextCursor;
+	}
+	return { messages, remaining: frameBuffer.subarray(cursor) };
+}
+
+function parseReverseSynctexClick(pdfId: number, rawMessage: string): ReverseSynctexClick | undefined {
+	let message: unknown;
+	try {
+		message = JSON.parse(rawMessage);
+	} catch {
+		return undefined;
+	}
+	if (typeof message !== "object" || message === null) return undefined;
+	const record = message as Record<string, unknown>;
+	if (record.type !== "reverse_synctex") return undefined;
+	const { page, x, y } = record;
+	if (!Number.isInteger(page) || (page as number) < 1) return undefined;
+	if (typeof x !== "number" || !Number.isFinite(x) || x < 0) return undefined;
+	if (typeof y !== "number" || !Number.isFinite(y) || y < 0) return undefined;
+	return { pdfId, page: page as number, x, y };
+}
+
 class SocketViewerClient implements PdfJsViewerClient {
 	private readonly socket: Socket;
 	constructor(socket: Socket) {
@@ -229,11 +304,19 @@ export interface PdfJsViewerFileSystem {
 	createReadStream(path: string): Readable;
 }
 
+export interface ReverseSynctexClick {
+	pdfId: number;
+	page: number;
+	x: number;
+	y: number;
+}
+
 export interface PdfJsViewerServerOptions {
 	registry: PdfJsViewerRegistry;
 	host?: string;
 	port?: number;
 	fileSystem?: PdfJsViewerFileSystem;
+	onReverseSynctex?: (click: ReverseSynctexClick) => void | Promise<void>;
 }
 
 export class PdfJsViewerServer {
@@ -241,6 +324,7 @@ export class PdfJsViewerServer {
 	private readonly host: string;
 	private readonly port: number;
 	private readonly fileSystem: PdfJsViewerFileSystem;
+	private readonly onReverseSynctex: ((click: ReverseSynctexClick) => void | Promise<void>) | undefined;
 	private server: Server | null = null;
 	private activeSockets = new Set<Socket>();
 	private activeWebSockets = new Set<Socket>();
@@ -254,6 +338,7 @@ export class PdfJsViewerServer {
 			stat: statFile,
 			createReadStream,
 		};
+		this.onReverseSynctex = options.onReverseSynctex;
 	}
 
 	get origin(): string {
@@ -490,18 +575,35 @@ export class PdfJsViewerServer {
 		this.activeWebSockets.add(socket);
 		const clientId = this.registry.addClient(pdfId, new SocketViewerClient(socket));
 		let cleanedUp = false;
+		let webSocketInputBuffer: Buffer = Buffer.alloc(0);
 		const cleanup = () => {
 			if (cleanedUp) return;
 			cleanedUp = true;
+			webSocketInputBuffer = Buffer.alloc(0);
 			this.activeWebSockets.delete(socket);
 			this.registry.removeClient(clientId);
 		};
 		socket.on("data", (chunk) => {
-			const firstByte = Buffer.isBuffer(chunk) && chunk.length > 0 ? chunk[0] : 0;
+			const frame = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			webSocketInputBuffer = webSocketInputBuffer.length === 0 ? frame : Buffer.concat([webSocketInputBuffer, frame]);
+			const firstByte = webSocketInputBuffer.length > 0 ? webSocketInputBuffer[0] : 0;
 			const opcode = firstByte & 0x0f;
 			if (opcode === 0x08) {
 				cleanup();
 				socket.end();
+				return;
+			}
+			const decoded = decodeWebSocketTextFrames(webSocketInputBuffer);
+			webSocketInputBuffer = decoded.remaining;
+			for (const rawMessage of decoded.messages) {
+				const click = parseReverseSynctexClick(pdfId, rawMessage);
+				if (click === undefined || this.onReverseSynctex === undefined) continue;
+				void Promise.resolve(this.onReverseSynctex(click)).catch((error) => {
+					const message = error instanceof Error ? error.message : String(error);
+					if (socket.writable) {
+						socket.write(encodeWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex_error", pdf_id: pdfId, error: message })));
+					}
+				});
 			}
 		});
 		socket.once("end", cleanup);

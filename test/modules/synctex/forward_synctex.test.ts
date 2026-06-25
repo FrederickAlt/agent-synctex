@@ -3,7 +3,7 @@ import { copyFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { mapForwardSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
+import { mapForwardSynctex, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
 
 const FIXTURE_DIR = resolve("test/fixtures/synctex-forward");
 
@@ -29,6 +29,35 @@ test("forward SyncTeX mapper reads realistic .synctex fixtures and maps source l
 		assert.equal(jump.page, 1);
 		assert.equal(jump.x, 144.27);
 		assert.equal(jump.y, 155.27);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX mapper reads realistic .synctex fixtures and maps page coordinates to source lines", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+
+		assert.equal(location.sidecarPath, join(project.dir, "paper.synctex"));
+		assert.equal(location.sourceFile, project.sourcePath);
+		assert.equal(location.line, 3);
+		assert.equal(location.column, 1);
+		assert.equal(location.sourceLine, "First paragraph text that should wrap a little and create boxes.");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX mapper reads realistic .synctex.gz fixtures", () => {
+	const project = makeFixtureProject({ sidecar: "synctex.gz" });
+	try {
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 167.27, cwd: project.dir });
+
+		assert.equal(location.sidecarPath, join(project.dir, "paper.synctex.gz"));
+		assert.equal(location.sourceFile, project.sourcePath);
+		assert.equal(location.line, 5);
+		assert.equal(location.sourceLine, "Second paragraph text on a different source line for SyncTeX mapping.");
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

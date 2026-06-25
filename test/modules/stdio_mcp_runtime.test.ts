@@ -107,10 +107,14 @@ test("stdio runtime rejects get_pdf_events arguments that violate its schema", a
 			runtime.start();
 			const invalidArguments = [
 				"bad",
-				{ pdf_id: 0 },
-				{ pdf_id: "1" },
-				{ since_event_id: 5 },
-				{ unknown: true },
+				{},
+				{ max_events: 0 },
+				{ max_events: 1.5 },
+				{ max_events: "1" },
+				{ pdf_id: 0, max_events: 1 },
+				{ pdf_id: "1", max_events: 1 },
+				{ since_event_id: "cursor-1", max_events: 1 },
+				{ unknown: true, max_events: 1 },
 			];
 			const output = collectMcpFrames(stdout, invalidArguments.length);
 			for (const [index, args] of invalidArguments.entries()) {
@@ -142,21 +146,20 @@ test("stdio runtime accepts valid get_pdf_events arguments", async () => {
 		try {
 			runtime.start();
 			const validArguments = [
-				{},
-				{ pdf_id: 1 },
-				{ since_event_id: "cursor-1" },
-				{ pdf_id: 2, since_event_id: "cursor-2" },
+				{ max_events: 1 },
+				{ pdf_id: 1, max_events: 1 },
+				{ pdf_id: 2, max_events: 5 },
 			];
 			const output = collectMcpFrames(stdout, validArguments.length);
 			for (const [index, args] of validArguments.entries()) {
 				stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 30 + index, method: "tools/call", params: { name: "get_pdf_events", arguments: args } }));
 			}
-			const responses = await output as Array<{ id: number; result?: { details?: { events?: unknown[]; next_cursor?: unknown } }; error?: unknown }>;
+			const responses = await output as Array<{ id: number; result?: { details?: { events?: unknown[] } }; error?: unknown }>;
 			assert.equal(responses.length, validArguments.length);
 			for (const [index, response] of responses.entries()) {
 				assert.equal(response.id, 30 + index);
 				assert.equal(response.error, undefined);
-				assert.deepEqual(response.result?.details, { events: [], next_cursor: null });
+				assert.deepEqual(response.result?.details, { events: [] });
 			}
 		} finally {
 			runtime.close();

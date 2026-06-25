@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { lstatSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { assertReadablePdfFile, assertReadableSourceFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
-import { mapForwardSynctex } from "./synctex/forward_synctex.ts";
+import { mapForwardSynctex, mapReverseSynctex } from "./synctex/forward_synctex.ts";
+import { PdfEventStore, type GetPdfEventsRequest, type PdfEvent } from "./pdf_events.ts";
 import type {
 	HostServiceCloseRequest,
 	HostServiceCloseResponseEnvelope,
@@ -13,7 +14,7 @@ import type {
 } from "./host_service_protocol.ts";
 import type { HostServiceMcpPdfOperations } from "./host_service_mcp.ts";
 import { arePdfSnapshotsEqual, PdfJsViewerRegistry, type PdfJsViewerFileSnapshot, type PdfJsViewerRecord } from "./pdfjs_viewer_registry.ts";
-import { PdfJsViewerServer } from "./pdfjs_viewer_server.ts";
+import { PdfJsViewerServer, type ReverseSynctexClick } from "./pdfjs_viewer_server.ts";
 
 const PDFJS_VIEWER_BACKEND_NAME = "pdfjs-browser";
 const PDFJS_VIEWER_BACKEND_CAPABILITIES = {
@@ -108,6 +109,7 @@ export interface PdfJsViewerMcpServiceOptions {
 	server?: PdfJsViewerServer;
 	browserLauncher?: BrowserLauncher;
 	pdfRefresh?: PdfJsViewerRefreshOptions;
+	eventStore?: PdfEventStore;
 }
 
 export interface MarkTrackedPdfUpdatedResult {
@@ -135,6 +137,7 @@ export class PdfJsViewerMcpService {
 	private readonly registry: PdfJsViewerRegistry;
 	private readonly server: PdfJsViewerServer;
 	private readonly browserLauncher: BrowserLauncher;
+	private readonly eventStore: PdfEventStore;
 	private readonly pdfRefreshAutoStart: boolean;
 	private readonly pdfRefreshPollIntervalMs: number;
 	private readonly pdfRefreshStabilityDebounceMs: number;
@@ -145,7 +148,11 @@ export class PdfJsViewerMcpService {
 
 	constructor(options: PdfJsViewerMcpServiceOptions = {}) {
 		this.registry = options.registry ?? new PdfJsViewerRegistry();
-		this.server = options.server ?? new PdfJsViewerServer({ registry: this.registry });
+		this.eventStore = options.eventStore ?? new PdfEventStore();
+		this.server = options.server ?? new PdfJsViewerServer({
+			registry: this.registry,
+			onReverseSynctex: (click) => this.handleReverseSynctexClick(click),
+		});
 		this.browserLauncher = options.browserLauncher ?? new DefaultBrowserLauncher();
 		this.pdfRefreshAutoStart = options.pdfRefresh?.autoStart ?? true;
 		this.pdfRefreshPollIntervalMs = options.pdfRefresh?.pollIntervalMs ?? DEFAULT_PDF_REFRESH_POLL_INTERVAL_MS;
@@ -154,6 +161,7 @@ export class PdfJsViewerMcpService {
 			openPdf: (request) => this.openPdf(request),
 			jumpPdf: (request) => this.jumpPdf(request),
 			closePdf: (request) => this.closePdf(request),
+			getPdfEvents: (request) => this.getPdfEvents(request),
 			markTrackedPdfUpdated: (pdfPath) => this.markTrackedPdfUpdated(pdfPath),
 		};
 	}
@@ -192,6 +200,7 @@ export class PdfJsViewerMcpService {
 		const record = this.registry.registerPdf({
 			pdfPath,
 			fileSnapshot,
+			workspaceCwd: request.workspace_context.cwd,
 			viewerUrlForPdfId: (pdfId) => this.server.viewerUrl(pdfId),
 		});
 		if (existing !== undefined) {
@@ -387,6 +396,10 @@ export class PdfJsViewerMcpService {
 		}
 	}
 
+	getPdfEvents(request: GetPdfEventsRequest): PdfEvent[] {
+		return this.eventStore.getEvents(request);
+	}
+
 	async markTrackedPdfUpdated(pdfPath: string): Promise<MarkTrackedPdfUpdatedResult> {
 		const record = this.registry.findActiveRecordByPath(pdfPath);
 		if (!record) {
@@ -431,6 +444,29 @@ export class PdfJsViewerMcpService {
 		this.pendingRefreshes.clear();
 		await this.server.stop();
 		this.registry.clear();
+	}
+
+	private handleReverseSynctexClick(click: ReverseSynctexClick): void {
+		const record = this.registry.getActiveRecord(click.pdfId);
+		const location = mapReverseSynctex({
+			pdfPath: record.pdfPath,
+			page: click.page,
+			x: click.x,
+			y: click.y,
+			cwd: record.workspaceCwd ?? dirname(record.pdfPath),
+		});
+		this.eventStore.appendReverseSynctexEvent({
+			type: "reverse_synctex",
+			pdf_id: click.pdfId,
+			source_file: location.sourceFile,
+			line: location.line,
+			column: location.column,
+			...(location.sourceLine === undefined ? {} : { source_line: location.sourceLine }),
+			timestamp: new Date().toISOString(),
+			page: click.page,
+			x: click.x,
+			y: click.y,
+		});
 	}
 
 	private startPdfRefreshPolling(): void {

@@ -22,6 +22,7 @@ export interface PdfJsViewerRecord {
 	createdAtNs: number;
 	revision: number;
 	fileSnapshot?: PdfJsViewerFileSnapshot;
+	workspaceCwd?: string;
 	clients: Set<string>;
 }
 
@@ -78,7 +79,7 @@ export class PdfJsViewerRegistry {
 		return this.activeRecords.size;
 	}
 
-	registerPdf(input: { pdfPath: string; viewerUrl?: string; viewerUrlForPdfId?: (pdfId: number) => string; fileSnapshot?: PdfJsViewerFileSnapshot }): PdfJsViewerRecord {
+	registerPdf(input: { pdfPath: string; viewerUrl?: string; viewerUrlForPdfId?: (pdfId: number) => string; fileSnapshot?: PdfJsViewerFileSnapshot; workspaceCwd?: string }): PdfJsViewerRecord {
 		const pdfPath = resolve(input.pdfPath);
 		const existing = this.activeRecordsByPath.get(pdfPath);
 		if (existing) {
@@ -96,6 +97,7 @@ export class PdfJsViewerRegistry {
 			createdAtNs: Date.now() * 1_000_000,
 			revision: 1,
 			...(input.fileSnapshot === undefined ? {} : { fileSnapshot: input.fileSnapshot }),
+			...(input.workspaceCwd === undefined ? {} : { workspaceCwd: resolve(input.workspaceCwd) }),
 			clients: new Set(),
 		};
 		this.activeRecords.set(pdfId, record);
