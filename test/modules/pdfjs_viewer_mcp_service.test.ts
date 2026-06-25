@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { Socket } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
@@ -35,6 +38,62 @@ function writeForwardSynctexFixture(baseDir: string): { pdfPath: string; sourceP
 		"",
 	].join("\n"));
 	return { pdfPath, sourcePath };
+}
+
+function websocketAcceptKey(key: string): string {
+	return createHash("sha1")
+		.update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+		.digest("base64");
+}
+
+async function connectRawWebSocket(url: URL): Promise<Socket> {
+	const socket = new Socket();
+	await new Promise<void>((resolve, reject) => {
+		socket.once("error", reject);
+		socket.connect(Number(url.port), url.hostname, () => {
+			socket.off("error", reject);
+			resolve();
+		});
+	});
+	const key = randomBytes(16).toString("base64");
+	socket.write([
+		`GET ${url.pathname}${url.search} HTTP/1.1`,
+		`Host: ${url.host}`,
+		"Upgrade: websocket",
+		"Connection: Upgrade",
+		"Sec-WebSocket-Version: 13",
+		`Sec-WebSocket-Key: ${key}`,
+		"",
+		"",
+	].join("\r\n"));
+	let response = "";
+	while (!response.includes("\r\n\r\n")) {
+		const [chunk] = await once(socket, "data") as [Buffer];
+		response += chunk.toString("utf8");
+	}
+	assert.match(response, /^HTTP\/1\.1 101 Switching Protocols/);
+	assert.equal(response.toLowerCase().includes(`sec-websocket-accept: ${websocketAcceptKey(key).toLowerCase()}`), true);
+	return socket;
+}
+
+function encodeClientWebSocketTextFrame(message: string): Buffer {
+	const payload = Buffer.from(message, "utf8");
+	const mask = Buffer.from([1, 2, 3, 4]);
+	const header = payload.length < 126 ? Buffer.from([0x81, 0x80 | payload.length]) : Buffer.from([0x81, 0x80 | 126, payload.length >> 8, payload.length & 0xff]);
+	const masked = Buffer.alloc(payload.length);
+	for (let index = 0; index < payload.length; index += 1) {
+		masked[index] = payload[index] ^ mask[index % 4];
+	}
+	return Buffer.concat([header, mask, masked]);
+}
+
+async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
+	const deadline = Date.now() + 500;
+	while (Date.now() < deadline) {
+		if (await predicate()) return;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.equal(await predicate(), true);
 }
 
 class FakeBrowserLauncher implements BrowserLauncher {
@@ -420,6 +479,125 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 			line: 3,
 		});
 		assert.equal(launcher.urls.length, 1, "jump_pdf must not launch or command a native viewer");
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_pdf_events results", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-reverse-synctex-"));
+	const { pdfPath, sourcePath } = writeForwardSynctexFixture(baseDir);
+	const service = new PdfJsViewerMcpService({
+		browserLauncher: new FakeBrowserLauncher({ ok: true }),
+		registry: new PdfJsViewerRegistry({ makePdfId: () => 51 }),
+		pdfRefresh: { autoStart: false },
+	});
+	try {
+		const open = await service.openPdf({
+			protocol_version: 1,
+			request_id: "open-reverse",
+			operation: "open_pdf",
+			created_at_ns: 1,
+			workspace_context: { cwd: baseDir },
+			details: { pdf_path: pdfPath },
+		});
+		const pdfId = open.status_details.pdf_id ?? 0;
+		const origin = new URL(open.status_details.viewer_url ?? "").origin;
+		const wsUrl = new URL(`/ws?pdf_id=${pdfId}`, origin);
+		wsUrl.protocol = "ws:";
+		const socket = await connectRawWebSocket(wsUrl);
+
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 0, x: 110, y: 220 })));
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 1, x: 110, y: 220 })));
+
+		let events: Array<Record<string, unknown>> = [];
+		await waitFor(async () => {
+			const response = await handleMcpRequest(JSON.stringify({
+				jsonrpc: "2.0",
+				id: 70,
+				method: "tools/call",
+				params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } },
+			}), service.pdfOperations);
+			assert.ok(response && "result" in response);
+			events = ((response.result as { details?: { events?: Array<Record<string, unknown>> } }).details?.events) ?? [];
+			return events.length === 1;
+		});
+
+		assert.equal(events.length, 1);
+		const event = events[0];
+		assert.equal(event.type, "reverse_synctex");
+		assert.equal(event.sequence, 1);
+		assert.equal(event.pdf_id, pdfId);
+		assert.equal(event.source_file, sourcePath);
+		assert.equal(event.line, 3);
+		assert.equal(event.column, 1);
+		assert.equal(event.source_line, "Jump target text.");
+		assert.equal(typeof event.timestamp, "string");
+		assert.equal("callback" in event, false);
+		assert.equal("socket_path" in event, false);
+		assert.equal("synctex_callback_command" in event, false);
+
+		const secondRead = await handleMcpRequest(JSON.stringify({
+			jsonrpc: "2.0",
+			id: 71,
+			method: "tools/call",
+			params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } },
+		}), service.pdfOperations);
+		assert.ok(secondRead && "result" in secondRead);
+		assert.deepEqual(((secondRead.result as { details: { events: Array<Record<string, unknown>> } }).details.events).map((item) => item.sequence), [1]);
+		socket.end();
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("PDF.js MCP service preserves reverse_synctex WebSocket frames split across TCP chunks", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-reverse-synctex-split-"));
+	const { pdfPath, sourcePath } = writeForwardSynctexFixture(baseDir);
+	const service = new PdfJsViewerMcpService({
+		browserLauncher: new FakeBrowserLauncher({ ok: true }),
+		registry: new PdfJsViewerRegistry({ makePdfId: () => 52 }),
+		pdfRefresh: { autoStart: false },
+	});
+	try {
+		const open = await service.openPdf({
+			protocol_version: 1,
+			request_id: "open-reverse-split",
+			operation: "open_pdf",
+			created_at_ns: 1,
+			workspace_context: { cwd: baseDir },
+			details: { pdf_path: pdfPath },
+		});
+		const pdfId = open.status_details.pdf_id ?? 0;
+		const origin = new URL(open.status_details.viewer_url ?? "").origin;
+		const wsUrl = new URL(`/ws?pdf_id=${pdfId}`, origin);
+		wsUrl.protocol = "ws:";
+		const socket = await connectRawWebSocket(wsUrl);
+
+		const frame = encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 1, x: 110, y: 220 }));
+		const splitAt = Math.floor(frame.length / 2);
+		socket.write(frame.subarray(0, splitAt));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		socket.write(frame.subarray(splitAt));
+
+		let events: Array<Record<string, unknown>> = [];
+		await waitFor(async () => {
+			const response = await handleMcpRequest(JSON.stringify({
+				jsonrpc: "2.0",
+				id: 72,
+				method: "tools/call",
+				params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } },
+			}), service.pdfOperations);
+			assert.ok(response && "result" in response);
+			events = ((response.result as { details?: { events?: Array<Record<string, unknown>> } }).details?.events) ?? [];
+			return events.length === 1;
+		});
+
+		assert.equal(events[0].source_file, sourcePath);
+		assert.equal(events[0].line, 3);
+		socket.end();
 	} finally {
 		await service.stop();
 		rmSync(baseDir, { recursive: true, force: true });

@@ -28,6 +28,17 @@ export interface ForwardSynctexJump {
 	sidecarPath: string;
 }
 
+export interface ReverseSynctexLocation {
+	page: number;
+	x: number;
+	y: number;
+	sourceFile: string;
+	line: number;
+	column: number;
+	sourceLine?: string;
+	sidecarPath: string;
+}
+
 interface SynctexInputRecord {
 	tag: number;
 	path: string;
@@ -269,6 +280,22 @@ function selectLinePosition(linePositions: SynctexLineAggregate[], targetLine: n
 	return nearest && nearest.distance <= MAX_NEAREST_LINE_DISTANCE ? nearest.candidate : undefined;
 }
 
+function distanceToPosition(position: SynctexPositionRecord, x: number, y: number): number {
+	const minX = position.x;
+	const maxX = position.x + Math.max(0, position.width);
+	const minY = position.y;
+	const maxY = position.y + Math.max(0, position.height) + Math.max(0, position.depth);
+	const dx = x < minX ? minX - x : x > maxX ? x - maxX : 0;
+	const dy = y < minY ? minY - y : y > maxY ? y - maxY : 0;
+	return Math.hypot(dx, dy);
+}
+
+function estimateColumn(sourceLine: string | undefined, aggregate: SynctexLineAggregate | undefined, x: number): number {
+	if (!sourceLine || !aggregate || aggregate.maxX <= aggregate.minX) return 1;
+	const ratio = Math.max(0, Math.min(1, (x - aggregate.minX) / (aggregate.maxX - aggregate.minX)));
+	return Math.max(1, Math.min(sourceLine.length + 1, Math.round(ratio * sourceLine.length) + 1));
+}
+
 export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; line: number; cwd: string }): ForwardSynctexJump {
 	if (!Number.isInteger(input.line) || input.line < 1) {
 		throw new Error("line must be a positive integer");
@@ -311,6 +338,48 @@ export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; 
 		sourceFile,
 		line: input.line,
 		sourceLine,
+		sidecarPath,
+	};
+}
+
+export function mapReverseSynctex(input: { pdfPath: string; page: number; x: number; y: number; cwd: string }): ReverseSynctexLocation {
+	if (!Number.isInteger(input.page) || input.page < 1) {
+		throw new Error("page must be a positive integer");
+	}
+	if (!Number.isFinite(input.x) || input.x < 0 || !Number.isFinite(input.y) || input.y < 0) {
+		throw new Error("x and y must be non-negative finite numbers");
+	}
+	const pdfPath = resolve(input.pdfPath);
+	const sidecarPath = resolveSynctexSidecar(pdfPath);
+	if (sidecarPath === undefined) {
+		throw new Error(`PDF ${pdfPath} is missing SyncTeX sidecar (${pdfPath.replace(/\.pdf$/i, "")}.synctex or .synctex.gz)`);
+	}
+
+	const parsed = parseSynctexText(readSynctexSidecar(sidecarPath), dirname(pdfPath), input.cwd);
+	const pagePositions = parsed.positions.filter((position) => position.page === input.page && parsed.inputs.has(position.tag));
+	const candidates = pagePositions.filter((position) => position.primary);
+	const pool = candidates.length > 0 ? candidates : pagePositions;
+	const nearest = pool
+		.map((position) => ({ position, distance: distanceToPosition(position, input.x, input.y) }))
+		.sort((left, right) => left.distance - right.distance)[0]?.position;
+	if (!nearest) {
+		throw new Error(`No SyncTeX mapping found for page ${input.page} at ${input.x},${input.y}`);
+	}
+	const sourceFile = parsed.inputs.get(nearest.tag)?.path;
+	if (!sourceFile) {
+		throw new Error(`No SyncTeX input record matched tag ${nearest.tag}`);
+	}
+	const sourceLine = readSourceLine(sourceFile, nearest.line, input.cwd);
+	const lineAggregate = aggregateLinePositions(parsed.positions, new Set([nearest.tag]), false)
+		.find((candidate) => candidate.page === nearest.page && candidate.line === nearest.line);
+	return {
+		page: input.page,
+		x: input.x,
+		y: input.y,
+		sourceFile,
+		line: nearest.line,
+		column: estimateColumn(sourceLine, lineAggregate, input.x),
+		...(sourceLine === undefined ? {} : { sourceLine }),
 		sidecarPath,
 	};
 }

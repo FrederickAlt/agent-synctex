@@ -3,6 +3,7 @@ import { getLatexPreambleFilePath } from "./runtime_preamble.ts";
 import { writeLatexPreambleToTmpdir } from "./runtime_preamble.ts";
 import { resolveTexActionsAgentRuntimeDir } from "./agent_runtime_context.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
+import type { GetPdfEventsRequest, PdfEvent } from "./pdf_events.ts";
 import type {
 	HostServiceCallbackTarget,
 	HostServiceCloseRequest,
@@ -37,6 +38,7 @@ export interface HostServiceMcpPdfOperations {
 	openPdf?: (request: HostServiceOpenRequest) => Promise<HostServiceOpenResponseEnvelope>;
 	jumpPdf?: (request: HostServiceJumpRequest) => Promise<HostServiceJumpResponseEnvelope>;
 	closePdf?: (request: HostServiceCloseRequest) => Promise<HostServiceCloseResponseEnvelope>;
+	getPdfEvents?: (request: GetPdfEventsRequest) => PdfEvent[] | Promise<PdfEvent[]>;
 	markTrackedPdfUpdated?: (pdfPath: string) => Promise<unknown>;
 	resolveManagedOpenCallback?: (
 		workspaceContext: HostServiceWorkspaceContext,
@@ -745,13 +747,14 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "get_pdf_events",
-			description: "Return queued PDF.js viewer events for this MCP runtime. This v1 scaffold currently returns an empty event list until the PDF.js viewer bridge is implemented.",
+			description: "Return the last N process-local PDF.js viewer events. Reads are non-destructive. Optionally filter by pdf_id.",
 			inputSchema: {
 				type: "object",
 				properties: {
-					pdf_id: { type: "number", minimum: 1 },
-					since_event_id: { type: "string" },
+					pdf_id: { type: "integer", minimum: 1 },
+					max_events: { type: "integer", minimum: 1 },
 				},
+				required: ["max_events"],
 				additionalProperties: false,
 			},
 		},
@@ -976,34 +979,42 @@ async function handleSetLatexPreambleTool(
 	}
 }
 
-function validateGetPdfEventsArgs(args: Record<string, unknown>): string | undefined {
+function parseGetPdfEventsRequest(args: Record<string, unknown>): GetPdfEventsRequest {
 	for (const key of Object.keys(args)) {
-		if (key !== "pdf_id" && key !== "since_event_id") {
-			return `get_pdf_events unknown argument: ${key}`;
+		if (key !== "pdf_id" && key !== "max_events") {
+			throw new Error(`get_pdf_events unknown argument: ${key}`);
 		}
 	}
-	if (args.pdf_id !== undefined && (typeof args.pdf_id !== "number" || !Number.isFinite(args.pdf_id) || args.pdf_id < 1)) {
-		return "get_pdf_events pdf_id must be a number >= 1";
+	const maxEvents = args.max_events;
+	if (typeof maxEvents !== "number" || !Number.isInteger(maxEvents) || maxEvents < 1) {
+		throw new Error("get_pdf_events max_events must be a positive integer");
 	}
-	if (args.since_event_id !== undefined && typeof args.since_event_id !== "string") {
-		return "get_pdf_events since_event_id must be a string";
+	if (args.pdf_id !== undefined && (typeof args.pdf_id !== "number" || !Number.isInteger(args.pdf_id) || args.pdf_id < 1)) {
+		throw new Error("get_pdf_events pdf_id must be a positive integer");
 	}
-	return undefined;
+	return {
+		max_events: maxEvents,
+		...(args.pdf_id === undefined ? {} : { pdf_id: args.pdf_id }),
+	};
 }
 
 async function handleGetPdfEventsTool(
 	requestId: ParsedMcpRequestId,
 	args: Record<string, unknown>,
-	_pdfOperations: HostServiceMcpPdfOperations,
+	pdfOperations: HostServiceMcpPdfOperations,
 	_mcpCompileService: HostServiceCompileService,
 ): Promise<McpResponsePayload> {
-	const validationError = validateGetPdfEventsArgs(args);
-	if (validationError !== undefined) {
-		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, validationError);
+	let request: GetPdfEventsRequest;
+	try {
+		request = parseGetPdfEventsRequest(args);
+	} catch (error) {
+		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, error instanceof Error ? error.message : String(error));
 	}
+	const events = await pdfOperations.getPdfEvents?.(request) ?? [];
+	const filterText = request.pdf_id === undefined ? "" : ` for pdf_id=${request.pdf_id}`;
 	return buildSuccess(requestId, {
-		content: [{ type: "text", text: "No PDF events are queued for this MCP runtime." }],
-		details: { events: [], next_cursor: null },
+		content: [{ type: "text", text: events.length === 0 ? `No PDF events found${filterText}.` : `Returned ${events.length} PDF event(s)${filterText}.` }],
+		details: { events },
 	});
 }
 
