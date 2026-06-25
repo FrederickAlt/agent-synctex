@@ -229,17 +229,13 @@ function parseCompileWorkspaceContext(sourcePath: string, rawWorkspaceContext: u
 	return workspaceContext;
 }
 function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompileSnippetRequest {
+	for (const key of Object.keys(args)) {
+		if (!["source", "compiler", "workspace_context"].includes(key)) {
+			throw new Error(`show_latex unknown argument: ${key}`);
+		}
+	}
 	const source = parseStringArg(args, "source");
 	const compiler = parseOptionalStringArg(args, "compiler");
-	const inline = parseBooleanArg(args, "inline");
-	const openPdf = inline === false ? true : parseBooleanArg(args, "open_pdf");
-	if (args.fixed_preview_pdf_path !== undefined) {
-		throw new Error("fixed_preview_pdf_path is not supported; use fixed_preview");
-	}
-	const fixedPreview = openPdf ? (inline === false ? true : parseBooleanArg(args, "fixed_preview")) : undefined;
-	const reuseExisting = openPdf ? parseBooleanArg(args, "reuse_existing") : undefined;
-	const requirePersistentViewer = openPdf ? parseBooleanArg(args, "require_persistent_viewer") : undefined;
-	const callback = openPdf ? parseCallbackTargetArg(args) : undefined;
 	const rawWorkspaceContext = args.workspace_context;
 	const workspaceContext = rawWorkspaceContext === undefined
 		? { cwd: MCP_DEFAULT_WORKSPACE_CONTEXT.cwd }
@@ -256,15 +252,7 @@ function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompil
 		details: {
 			latex_source: source,
 			...(compiler === undefined ? {} : { compiler }),
-			...(openPdf === true ? { open_pdf: true } : {}),
-			...(openPdf === true
-				? {
-					...(fixedPreview === undefined ? {} : { fixed_preview: fixedPreview }),
-					reuse_existing: reuseExisting,
-					require_persistent_viewer: requirePersistentViewer,
-					...(callback === undefined ? {} : { callback }),
-				}
-				: {}),
+			open_pdf: true,
 		},
 	};
 }
@@ -477,8 +465,9 @@ function parseToolResult(
 		const warningCount = details.warning_count ? ` warnings=${details.warning_count}` : "";
 		const exitCode = details.compile_status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 		const log = details.log ? `\nLog: ${details.log}` : "";
+		const viewerUrl = typeof details.viewer_url === "string" && details.viewer_url ? ` viewer_url=${details.viewer_url}` : "";
 		return {
-			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${exitCode}${warningCount}${log}${formatContinuousSummary(details)}${formatContinuousActiveNotice(details)}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim() }],
+			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${viewerUrl}${exitCode}${warningCount}${log}${formatContinuousSummary(details)}${formatContinuousActiveNotice(details)}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim() }],
 			details: agentFacingCompileDetails(details, options.hideWarnings === true),
 		};
 	}
@@ -665,28 +654,12 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 	return [
 		{
 			name: "show_latex",
-			description: "Render a LaTeX snippet and optionally open a tracked PDF preview.",
+			description: "Render a LaTeX snippet as a temporary PDF.js viewer document.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					source: { type: "string", minLength: 1 },
 					compiler: { type: "string" },
-					inline: { type: "boolean" },
-					open_pdf: { type: "boolean" },
-					fixed_preview: { type: "boolean" },
-					reuse_existing: { type: "boolean" },
-					require_persistent_viewer: { type: "boolean" },
-					callback: {
-						type: "object",
-						properties: {
-							kind: { type: "string", const: "pi-synctex-callback-v1" },
-							transport: { type: "string", const: "unix" },
-							socket_path: { type: "string", minLength: 1 },
-							token: { type: "string", minLength: 1 },
-						},
-						required: ["kind", "transport", "socket_path", "token"],
-						additionalProperties: false,
-					},
 					workspace_context: workspaceContextSchema(),
 				},
 				required: ["source"],

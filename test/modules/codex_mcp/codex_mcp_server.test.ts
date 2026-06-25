@@ -688,7 +688,7 @@ test("Relay stops heartbeat refresh after close", async () => {
 	}
 });
 
-test("Relay forces Codex show_latex calls to inline false and injects workspace context", async () => {
+test("Relay strips Codex show_latex inline calls and injects workspace context", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "codex-mcp-relay-show-latex-inline-"));
 	const socketPath = join(baseDir, "host-service.sock");
 	const previousMcpTmpdir = process.env.MCP_TMPDIR;
@@ -734,7 +734,8 @@ test("Relay forces Codex show_latex calls to inline false and injects workspace 
 		const args = observedArguments as Record<string, unknown>;
 		const workspaceContext = args.workspace_context as Record<string, unknown>;
 		assert.equal(args.source, "\\[x\\]");
-		assert.equal(args.inline, false);
+		assert.equal(args.inline, undefined);
+		assert.equal(Object.prototype.hasOwnProperty.call(args, "inline"), false);
 		assert.equal(workspaceContext.cwd, process.cwd());
 		assert.equal(workspaceContext.session_id, "codex-agent-A");
 		assert.equal(workspaceContext.workspace_root, resolve(process.env.MCP_TMPDIR, "agents", "codex-agent-A"));

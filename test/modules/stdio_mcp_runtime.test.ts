@@ -57,7 +57,8 @@ test("actual tex-actions-mcp entrypoint answers initialize and tools/list over s
 		assert.equal(toolsList.id, 2);
 		const names = toolsList.result.tools.map((tool) => tool.name);
 		assert.deepEqual(names, ["show_latex", "compile_latex_file", "open_pdf", "jump_pdf", "close_pdf", "set_latex_preamble", "get_pdf_events"]);
-		assert.equal(toolsList.result.tools.find((tool) => tool.name === "show_latex")?.inputSchema.properties?.inline, undefined);
+		const showLatexProperties = toolsList.result.tools.find((tool) => tool.name === "show_latex")?.inputSchema.properties ?? {};
+		assert.deepEqual(Object.keys(showLatexProperties).sort(), ["compiler", "source"]);
 		assert.equal(toolsList.result.tools.find((tool) => tool.name === "compile_latex_file")?.inputSchema.properties?.continuous, undefined);
 	} finally {
 		child.kill("SIGTERM");
