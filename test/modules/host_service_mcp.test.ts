@@ -405,12 +405,13 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.match(compileFileTool.inputSchema.properties.hide_warnings?.description ?? "", /hide_warnings=false/);
 		assert.match(closePdfTool.description ?? "", /does not stop continuous compilation/);
 		assert.match(closePdfTool.description ?? "", /continuous=false/);
-		assert.deepEqual((showLatexTool.inputSchema.properties as { callback?: { required?: string[] } }).callback?.required, ["kind", "transport", "socket_path", "token"]);
+		assert.deepEqual(Object.keys(showLatexTool.inputSchema.properties).sort(), ["compiler", "source", "workspace_context"]);
+		assert.equal(showLatexTool.inputSchema.properties.inline, undefined);
 		assert.equal(showLatexTool.inputSchema.properties.fixed_preview_pdf_path, undefined);
-		assert.ok(showLatexTool.inputSchema.properties.fixed_preview);
-		assert.ok(showLatexTool.inputSchema.properties.reuse_existing);
-		assert.ok(showLatexTool.inputSchema.properties.require_persistent_viewer);
-		assert.ok(showLatexTool.inputSchema.properties.callback);
+		assert.equal(showLatexTool.inputSchema.properties.fixed_preview, undefined);
+		assert.equal(showLatexTool.inputSchema.properties.reuse_existing, undefined);
+		assert.equal(showLatexTool.inputSchema.properties.require_persistent_viewer, undefined);
+		assert.equal(showLatexTool.inputSchema.properties.callback, undefined);
 		const setPreamblePayload = JSON.stringify({
 			jsonrpc: "2.0",
 			id: 4,
@@ -1482,7 +1483,7 @@ test("daemon renders show_latex through compile flow", async () => {
 	}
 });
 
-test("daemon show_latex inline=false compiles, opens, and returns a managed PDF id", async () => {
+test("daemon show_latex compiles, opens, and returns a managed PDF id", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-show-open-");
 	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-show-open-"));
 	const socketPath = join(baseDir, "host-service.sock");
@@ -1495,12 +1496,6 @@ test("daemon show_latex inline=false compiles, opens, and returns a managed PDF 
 		cwd: baseDir,
 		workspace_root: baseDir,
 	};
-	const callback = {
-		kind: "pi-synctex-callback-v1",
-		transport: "unix",
-		socket_path: "/tmp/test-callback.sock",
-		token: "token",
-	};
 	const requestPayload = JSON.stringify({
 		jsonrpc: "2.0",
 		id: 12,
@@ -1509,10 +1504,6 @@ test("daemon show_latex inline=false compiles, opens, and returns a managed PDF 
 			name: "show_latex",
 			arguments: {
 				source: "x",
-				inline: false,
-				reuse_existing: false,
-				require_persistent_viewer: true,
-				callback,
 				workspace_context: workspaceContext,
 			},
 		},
@@ -1525,13 +1516,13 @@ test("daemon show_latex inline=false compiles, opens, and returns a managed PDF 
 		assert.equal(typeof response.result.details.pdf_id, "number");
 		assert.equal(response.result.details.managed_record?.id, response.result.details.pdf_id);
 		assert.equal(response.result.details.managed_record?.pdfPath, response.result.details.pdf);
-		assert.equal(response.result.details.pdf, getMcpFixedPreviewPdfPath());
+		assert.notEqual(response.result.details.pdf, getMcpFixedPreviewPdfPath());
 		assert.match(response.result.content[0].text, /pdf_id=\d+/);
 		assert.equal(backend.openRequests.length, 1);
 		assert.equal(backend.openRequests[0]?.details.pdf_path, response.result.details.pdf);
-		assert.deepEqual(backend.openRequests[0]?.details.callback, callback);
-		assert.equal(backend.openRequests[0]?.details.reuse_existing, false);
-		assert.equal(backend.openRequests[0]?.details.require_persistent_viewer, true);
+		assert.equal(backend.openRequests[0]?.details.callback, undefined);
+		assert.equal(backend.openRequests[0]?.details.reuse_existing, true);
+		assert.equal(backend.openRequests[0]?.details.require_persistent_viewer, false);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -1564,7 +1555,6 @@ test("daemon rejects public show_latex fixed_preview_pdf_path", async () => {
 			name: "show_latex",
 			arguments: {
 				source: "x",
-				inline: false,
 				fixed_preview_pdf_path: invalidPreviewPath,
 				workspace_context: workspaceContext,
 			},
@@ -1575,7 +1565,7 @@ test("daemon rejects public show_latex fixed_preview_pdf_path", async () => {
 			return await sendFramedRequest(socketPath, requestPayload);
 		})) as { error: { code: number; message: string } };
 		assert.equal(response.error.code, -32602);
-		assert.equal(response.error.message, "fixed_preview_pdf_path is not supported; use fixed_preview");
+		assert.equal(response.error.message, "show_latex unknown argument: fixed_preview_pdf_path");
 		assert.equal(existsSync(invalidPreviewPath), false);
 	} finally {
 		await server.stop();

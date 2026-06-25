@@ -75,6 +75,10 @@ function rewriteToolCallArgumentsForCodex(request: Record<string, unknown>): Rec
 		return request;
 	}
 	const currentArguments = isRecord(request.params.arguments) ? request.params.arguments : {};
+	const nextArguments = { ...currentArguments };
+	if (request.params.name === "show_latex") {
+		delete nextArguments.inline;
+	}
 	const workspaceContext = resolveAgentWorkspaceContext();
 	initializeLatexPreambleFile({
 		cwd: workspaceContext.cwd,
@@ -86,8 +90,7 @@ function rewriteToolCallArgumentsForCodex(request: Record<string, unknown>): Rec
 		params: {
 			...request.params,
 			arguments: {
-				...currentArguments,
-				...(request.params.name === "show_latex" ? { inline: false } : {}),
+				...nextArguments,
 				workspace_context: workspaceContext,
 			},
 		},

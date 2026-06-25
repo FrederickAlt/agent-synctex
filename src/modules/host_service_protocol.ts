@@ -287,6 +287,7 @@ export interface HostServiceCompileResponseDetails {
 	error_summary?: string;
 	diagnostics?: LatexDiagnosticSummary[];
 	pdf_id?: number;
+	viewer_url?: string;
 	managed_record?: HostServiceManagedViewerRecord;
 	continuous?: HostServiceContinuousCompileDetails;
 	continuous_active_notice?: string;
@@ -317,6 +318,7 @@ export interface HostServiceCompileSnippetResponseDetails {
 	operation_pdf?: string;
 	operation_artifact_paths?: string[];
 	pdf_id?: number;
+	viewer_url?: string;
 	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
 }

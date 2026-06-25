@@ -376,6 +376,7 @@ export class HostServiceCompileService {
 					artifact_paths: artifactPaths,
 					...compileDiagnosticsDetails(result),
 					pdf_id: openResponse?.status_details.pdf_id,
+					viewer_url: openResponse?.status_details.viewer_url,
 					managed_record: openResponse?.status_details.managed_record,
 					...(continuous === undefined ? {} : { continuous }),
 					...(continuousActiveNotice === undefined ? {} : { continuous_active_notice: continuousActiveNotice }),
@@ -529,6 +530,7 @@ export class HostServiceCompileService {
 					...compileDiagnosticsDetails(result),
 					operation_artifact_paths: operationArtifactPaths,
 					pdf_id: openResponse?.status_details.pdf_id,
+					viewer_url: openResponse?.status_details.viewer_url,
 					managed_record: openResponse?.status_details.managed_record,
 				},
 			};
