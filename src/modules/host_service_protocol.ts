@@ -437,6 +437,10 @@ export interface HostServiceJumpResponseDetails {
 	source_file?: string;
 	line?: number;
 	source_line?: string;
+	page?: number;
+	x?: number;
+	y?: number;
+	viewer_notifications?: number;
 	reason?: string;
 	handle?: string;
 	error_code?: string;

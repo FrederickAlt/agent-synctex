@@ -1,9 +1,13 @@
 import { spawn } from "node:child_process";
+import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import { assertReadablePdfFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
+import { assertReadablePdfFile, assertReadableSourceFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
+import { mapForwardSynctex } from "./synctex/forward_synctex.ts";
 import type {
 	HostServiceCloseRequest,
 	HostServiceCloseResponseEnvelope,
+	HostServiceJumpRequest,
+	HostServiceJumpResponseEnvelope,
 	HostServiceOpenRequest,
 	HostServiceOpenResponseEnvelope,
 } from "./host_service_protocol.ts";
@@ -15,7 +19,7 @@ const PDFJS_VIEWER_BACKEND_NAME = "pdfjs-browser";
 const PDFJS_VIEWER_BACKEND_CAPABILITIES = {
 	open: true,
 	close: true,
-	forward_search: false,
+	forward_search: true,
 	inverse_search: false,
 	reuse: true,
 };
@@ -97,6 +101,18 @@ export interface PdfJsViewerMcpServiceOptions {
 	browserLauncher?: BrowserLauncher;
 }
 
+function assertReadableSourceFileOrSymlink(sourceFile: string): void {
+	try {
+		if (lstatSync(sourceFile).isSymbolicLink()) {
+			assertReadableSourceFile(realpathSync.native(sourceFile));
+			return;
+		}
+	} catch {
+		// Preserve assertReadableSourceFile's existing clear error text for missing paths.
+	}
+	assertReadableSourceFile(sourceFile);
+}
+
 export class PdfJsViewerMcpService {
 	private readonly registry: PdfJsViewerRegistry;
 	private readonly server: PdfJsViewerServer;
@@ -109,6 +125,7 @@ export class PdfJsViewerMcpService {
 		this.browserLauncher = options.browserLauncher ?? new DefaultBrowserLauncher();
 		this.pdfOperations = {
 			openPdf: (request) => this.openPdf(request),
+			jumpPdf: (request) => this.jumpPdf(request),
 			closePdf: (request) => this.closePdf(request),
 		};
 	}
@@ -180,6 +197,103 @@ export class PdfJsViewerMcpService {
 		};
 	}
 
+	async jumpPdf(request: HostServiceJumpRequest): Promise<HostServiceJumpResponseEnvelope> {
+		let pdfPath: string | undefined;
+		let sourceFile: string | undefined;
+		try {
+			const record = this.registry.getActiveRecord(request.pdf_id);
+			pdfPath = record.pdfPath;
+			sourceFile = request.source_file ?? inferDefaultSourceFileForPdf(pdfPath);
+			if (!sourceFile) {
+				throw new Error(`No default source_file is known for tracked pdf_id=${request.pdf_id}. Pass source_file explicitly.`);
+			}
+			sourceFile = isAbsolute(sourceFile) ? resolve(sourceFile) : resolve(request.workspace_context.cwd, sourceFile);
+			assertReadableSourceFileOrSymlink(sourceFile);
+			assertReadablePdfFile(pdfPath);
+			const jump = mapForwardSynctex({ pdfPath, sourceFile, line: request.line, cwd: request.workspace_context.cwd });
+			const viewerNotifications = this.server.notifySynctex(request.pdf_id, {
+				page: jump.page,
+				x: jump.x,
+				y: jump.y,
+				source_file: jump.sourceFile,
+				line: jump.line,
+			});
+			return {
+				protocol_version: request.protocol_version,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "ok",
+				generated_at_ns: Date.now() * 1_000_000,
+				status_details: {
+					protocol_version: request.protocol_version,
+					supported: true,
+					service_available: true,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: PDFJS_VIEWER_BACKEND_NAME,
+					backend_path: PDFJS_VIEWER_BACKEND_NAME,
+					backend_identity_ok: true,
+					handled: true,
+					reopened: false,
+					pdf: pdfPath,
+					pdf_id: request.pdf_id,
+					source_file: jump.sourceFile,
+					line: jump.line,
+					source_line: jump.sourceLine,
+					page: jump.page,
+					x: jump.x,
+					y: jump.y,
+					viewer_notifications: viewerNotifications,
+					handle: record.viewerUrl,
+					reason: `notified_viewers=${viewerNotifications}`,
+					managed_record: {
+						id: record.pdfId,
+						pdfPath: record.pdfPath,
+						viewerHandle: record.viewerUrl,
+						viewerBackend: PDFJS_VIEWER_BACKEND_NAME,
+						viewerOwned: true,
+						createdAtNs: record.createdAtNs,
+						reused: false,
+						capabilities: PDFJS_VIEWER_BACKEND_CAPABILITIES,
+						backendPath: PDFJS_VIEWER_BACKEND_NAME,
+						defaultSourcePath: inferDefaultSourceFileForPdf(pdfPath),
+						metadata: { viewer_url: record.viewerUrl, synctex_sidecar: jump.sidecarPath, viewer_notifications: viewerNotifications },
+					},
+				},
+			};
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			return {
+				protocol_version: request.protocol_version,
+				request_id: request.request_id,
+				operation: "jump_pdf",
+				status: "error",
+				generated_at_ns: Date.now() * 1_000_000,
+				error: reason,
+				status_details: {
+					protocol_version: request.protocol_version,
+					supported: false,
+					service_available: false,
+					workspace_context: request.workspace_context,
+					request_id: request.request_id,
+					operation: "jump_pdf",
+					backend: PDFJS_VIEWER_BACKEND_NAME,
+					backend_path: PDFJS_VIEWER_BACKEND_NAME,
+					backend_identity_ok: true,
+					handled: false,
+					reopened: false,
+					pdf: pdfPath,
+					pdf_id: request.pdf_id,
+					source_file: sourceFile,
+					line: request.line,
+					error_code: this.jumpErrorCode(reason),
+					reason,
+				},
+			};
+		}
+	}
+
 	async closePdf(request: HostServiceCloseRequest): Promise<HostServiceCloseResponseEnvelope> {
 		let notifications = 0;
 		try {
@@ -240,6 +354,14 @@ export class PdfJsViewerMcpService {
 	async stop(): Promise<void> {
 		await this.server.stop();
 		this.registry.clear();
+	}
+
+	private jumpErrorCode(reason: string): string {
+		if (/missing SyncTeX sidecar/i.test(reason)) return "synctex_missing";
+		if (/No SyncTeX mapping found/i.test(reason)) return "synctex_unmapped";
+		if (/Unknown pdf_id|Closed pdf_id/i.test(reason)) return "invalid_request";
+		if (/source_file/i.test(reason)) return "invalid_request";
+		return "synctex_failed";
 	}
 
 	private openStatusBase(request: HostServiceOpenRequest, pdfPath: string) {

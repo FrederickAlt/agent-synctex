@@ -75,6 +75,21 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 	assert.equal(predicate(), true);
 }
 
+async function readWebSocketTextFrame(socket: Socket): Promise<string> {
+	const [chunk] = await once(socket, "data") as [Buffer];
+	const firstLength = chunk[1] & 0x7f;
+	let offset = 2;
+	let payloadLength = firstLength;
+	if (firstLength === 126) {
+		payloadLength = chunk.readUInt16BE(offset);
+		offset += 2;
+	} else if (firstLength === 127) {
+		payloadLength = Number(chunk.readBigUInt64BE(offset));
+		offset += 8;
+	}
+	return chunk.subarray(offset, offset + payloadLength).toString("utf8");
+}
+
 test("PDF.js viewer server serves shell/config/assets and registered PDF bytes only", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-server-"));
 	const pdfPath = join(baseDir, "paper.pdf");
@@ -204,6 +219,32 @@ test("PDF.js viewer server streams registered PDF bytes for GET", async () => {
 		assert.equal(streamOpenCount, 1);
 	} finally {
 		await server.stop();
+	}
+});
+
+test("PDF.js viewer server delivers synctex notifications to connected WebSocket clients", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-ws-synctex-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new PdfJsViewerRegistry({ makePdfId: () => 16 });
+	const server = new PdfJsViewerServer({ registry });
+	try {
+		await server.start();
+		const record = registry.registerPdf({ pdfPath, viewerUrl: server.viewerUrl(16) });
+		const wsUrl = new URL(`/ws?pdf_id=${record.pdfId}`, server.origin);
+		wsUrl.protocol = "ws:";
+		const socket = await connectRawWebSocket(wsUrl);
+		await waitFor(() => registry.clientCount(record.pdfId) === 1);
+
+		const notified = server.notifySynctex(record.pdfId, { page: 2, x: 12.5, y: 34.75, source_file: "/tmp/main.tex", line: 9 });
+		const message = JSON.parse(await readWebSocketTextFrame(socket));
+
+		assert.equal(notified, 1);
+		assert.deepEqual(message, { type: "synctex", pdf_id: record.pdfId, page: 2, x: 12.5, y: 34.75, source_file: "/tmp/main.tex", line: 9 });
+		socket.end();
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
 	}
 });
 
