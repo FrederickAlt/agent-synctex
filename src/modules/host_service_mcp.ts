@@ -3,7 +3,6 @@ import { getLatexPreambleFilePath } from "./runtime_preamble.ts";
 import { writeLatexPreambleToTmpdir } from "./runtime_preamble.ts";
 import { resolveTexActionsAgentRuntimeDir } from "./agent_runtime_context.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
-import type { HostServiceContinuousCompileManager } from "./host_service_continuous_compile.ts";
 import type {
 	HostServiceCallbackTarget,
 	HostServiceCloseRequest,
@@ -44,9 +43,7 @@ export interface HostServiceMcpPdfOperations {
 		callbackTargetId: string | undefined,
 		callbackTarget: HostServiceCallbackTarget | undefined,
 	) => Promise<HostServiceCallbackTarget | undefined>;
-	continuousCompileManager?: HostServiceContinuousCompileManager;
 	compileService?: HostServiceCompileService;
-	refreshSessionLease?: (workspaceContext: HostServiceWorkspaceContext) => void | Promise<void>;
 }
 
 function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): HostServiceCompileService {
@@ -68,10 +65,6 @@ function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): Ho
 			pdfOperations.resolveManagedOpenCallback
 				? pdfOperations.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget)
 				: callbackTarget,
-		refreshContinuousSessionLease: (workspaceContext) => {
-			void pdfOperations.refreshSessionLease?.(workspaceContext);
-		},
-		continuousCompileManager: pdfOperations.continuousCompileManager,
 	});
 }
 
@@ -324,20 +317,22 @@ function parseJumpWorkspaceContext(rawWorkspaceContext: unknown, sourceFile?: st
 }
 
 function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileRequest: HostServiceCompileRequest; hideWarnings: boolean } {
+	const allowedArgs = new Set(["latex_file_path", "compiler", "clean", "open_pdf", "hide_warnings", "callback", "callback_target_id", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
+	for (const key of Object.keys(args)) {
+		if (!allowedArgs.has(key)) {
+			throw new Error(`compile_latex_file unknown argument: ${key}`);
+		}
+	}
 	const latexFilePath = parseStringArg(args, "latex_file_path");
 	const compiler = parseOptionalStringArg(args, "compiler");
 	const clean = parseBooleanArg(args, "clean");
 	const openPdf = parseBooleanArg(args, "open_pdf");
-	const continuous = parseBooleanArg(args, "continuous");
 	const hideWarnings = parseBooleanArg(args, "hide_warnings") ?? true;
 	const callback = openPdf ? parseCallbackTargetArg(args) : undefined;
 	const callbackTargetId = openPdf ? parseOptionalStringArg(args, "callback_target_id") : undefined;
 	const reuseExisting = openPdf ? parseBooleanArg(args, "reuse_existing") : undefined;
 	const requirePersistentViewer = openPdf ? parseBooleanArg(args, "require_persistent_viewer") : undefined;
 	const workspaceContext = parseCompileWorkspaceContext(latexFilePath, args.workspace_context);
-	if (continuous !== undefined && !workspaceContext.session_id?.trim()) {
-		throw new Error("workspace_context.session_id is required for continuous compilation");
-	}
 	return {
 		compileRequest: {
 			protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
@@ -350,7 +345,6 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 				...(compiler === undefined ? {} : { compiler }),
 				...(clean === undefined ? {} : { clean }),
 				...(openPdf === undefined ? {} : { open_pdf: openPdf }),
-				...(continuous === undefined ? {} : { continuous }),
 				...(callback === undefined ? {} : { callback }),
 				...(callbackTargetId === undefined ? {} : { callback_target_id: callbackTargetId }),
 				...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
@@ -419,22 +413,6 @@ function parseClosePdfRequest(args: Record<string, unknown>): HostServiceCloseRe
 	};
 }
 
-function formatContinuousSummary(details: unknown): string {
-	if (!isRecord(details) || !isRecord(details.continuous)) return "";
-	const continuous = details.continuous;
-	const status = typeof continuous.status === "string" ? continuous.status : "unknown";
-	const subscribers = typeof continuous.subscriber_count === "number" ? continuous.subscriber_count : "unknown";
-	const pid = typeof continuous.pid === "number" ? ` pid=${continuous.pid}` : "";
-	const root = typeof continuous.root_source === "string" ? ` root=${continuous.root_source}` : "";
-	const error = typeof continuous.error === "string" ? ` error=${continuous.error}` : "";
-	return `\nContinuous: ${status} subscribers=${subscribers}${pid}${root}${error}`;
-}
-
-function formatContinuousActiveNotice(details: unknown): string {
-	if (!isRecord(details) || typeof details.continuous_active_notice !== "string" || !details.continuous_active_notice) return "";
-	return `\n${details.continuous_active_notice}`;
-}
-
 function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }, hideWarnings = false): string {
 	if (typeof details.warning_count !== "number" || details.warning_count <= 0) return "";
 	if (hideWarnings) return `\nWarnings: ${details.warning_count} warnings hidden.`;
@@ -469,7 +447,7 @@ function parseToolResult(
 		const log = details.log ? `\nLog: ${details.log}` : "";
 		const viewerUrl = typeof details.viewer_url === "string" && details.viewer_url ? ` viewer_url=${details.viewer_url}` : "";
 		return {
-			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${viewerUrl}${exitCode}${warningCount}${log}${formatContinuousSummary(details)}${formatContinuousActiveNotice(details)}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim() }],
+			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${viewerUrl}${exitCode}${warningCount}${log}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim() }],
 			details: agentFacingCompileDetails(details, options.hideWarnings === true),
 		};
 	}
@@ -478,7 +456,7 @@ function parseToolResult(
 	const log = details.log ? `\nLog: ${details.log}` : "";
 	return {
 		isError: true,
-		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}${formatContinuousActiveNotice(details)}` }],
+		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}` }],
 		details,
 	};
 }
@@ -670,7 +648,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "compile_latex_file",
-			description: "Compile a LaTeX source file with latexmk and optionally register a host-service PDF. The compiler option selects the TeX engine latexmk should run. Same-root requests are coordinated by the Host Service: a one-shot compile may wait for an active same-root compile or continuous compiler, or reuse a fresh cached result instead of spawning another latexmk. Set clean=true to clean artifacts safely; when continuous compilation is active for the root, the Host Service stops and restarts it before returning the post-clean result. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc background recompilation; set continuous=false to compile once and unsubscribe this session; omitting continuous performs a coordinated latexmk-backed one-shot compile and leaves existing continuous state unchanged. Use continuous=false, not close_pdf, to stop continuous compilation because close_pdf does not stop continuous compilation. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
+			description: "Compile a LaTeX source file once with latexmk and optionally register/open the output PDF through the browser PDF.js viewer. The compiler option selects the TeX engine latexmk should run. Same-root requests are coordinated by the Host Service to avoid overlapping latexmk processes. Set clean=true to remove common same-basename artifacts before compiling. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -678,7 +656,6 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 					compiler: { type: "string" },
 					clean: { type: "boolean" },
 					open_pdf: { type: "boolean" },
-					continuous: { type: "boolean", description: "When true, immediately compile with latexmk using the selected engine, then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file. latexmk runs with -norc, -view=none, recorder/SyncTeX-friendly flags, selected-engine configuration, and -no-shell-escape engine commands so project latexmkrc files cannot override the default commands; this provides no latexmk-owned viewer launch. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit for a latexmk-backed one-shot compile that leaves continuous compilation unchanged." },
 					hide_warnings: { type: "boolean", default: true, description: "Defaults to true. When true, successful compiles keep warning_count metadata but hide warning message details from text and omit details.warnings. Set hide_warnings=false to show warning summaries and details.warnings." },
 					callback_target_id: { type: "string", minLength: 1 },
 					callback: {
@@ -743,7 +720,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "close_pdf",
-			description: "Close a tracked PDF by id. This only affects viewer lifecycle; it does not stop continuous compilation. Use compile_latex_file with continuous=false for the root source to stop a continuous subscription.",
+			description: "Close a tracked PDF by id. This only affects viewer lifecycle.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -848,9 +825,6 @@ async function handleCompileLatexFileTool(
 		);
 	}
 	try {
-		if (compileRequest.details.continuous !== undefined) {
-			await pdfOperations.refreshSessionLease?.(compileRequest.workspace_context);
-		}
 		const compileResponse = await mcpCompileService.compileLatexFileRequest(compileRequest);
 		return buildSuccess(requestId, parseToolResult(compileResponse, "ok:", { hideWarnings }));
 	} catch (error) {

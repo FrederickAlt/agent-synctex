@@ -37,9 +37,6 @@ function sanitizeToolForV1(tool: unknown): unknown {
 	if (isRecord(tool) && tool.name === "show_latex") {
 		omitted.push("inline");
 	}
-	if (isRecord(tool) && tool.name === "compile_latex_file") {
-		omitted.push("continuous");
-	}
 	return omitToolInputSchemaProperties(tool, omitted);
 }
 
@@ -127,9 +124,6 @@ export class TexActionsStdioMcpRuntime {
 			delete nextArguments.workspace_context;
 			if (parsed.params.name === "show_latex") {
 				delete nextArguments.inline;
-			}
-			if (parsed.params.name === "compile_latex_file") {
-				delete nextArguments.continuous;
 			}
 			return JSON.stringify({
 				...parsed,

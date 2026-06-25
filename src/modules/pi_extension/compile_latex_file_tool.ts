@@ -50,9 +50,6 @@ const CompileLatexFileParams = Type.Object(
 			description: "When true, remove common LaTeX artifacts for this source file's basename before compiling, including the previous PDF and SyncTeX sidecar. Defaults to false.",
 			default: false,
 		})),
-		continuous: Type.Optional(Type.Boolean({
-			description: "All file compiles use latexmk. When true, immediately compile with non-continuous latexmk then subscribe this session to one shared host-service latexmk -pvc compiler for the normalized root file; latexmk handles multi-file dependency tracking with -norc, recorder/SyncTeX-friendly flags, no shell escape, and no latexmk-owned viewer. When false, immediately compile then unsubscribe this session, stopping the compiler only when no other sessions remain. Omit continuous to leave continuous compilation unchanged.",
-		})),
 		hide_warnings: Type.Optional(Type.Boolean({
 			description: "When true (the default), successful compiles with warnings keep warning_count metadata but hide warning message details from the tool text/details. Set hide_warnings=false to show warning summaries and details.warnings.",
 			default: true,
@@ -105,24 +102,12 @@ function agentFacingCompileDetails<T extends Record<string, unknown>>(details: T
 	return { ...filteredDetails, warnings_hidden: true };
 }
 
-function continuousSummary(details: HostServiceCompileResponseDetails): string {
-	const continuous = details.continuous;
-	if (!continuous) return "";
-	const pid = continuous.pid === undefined ? "" : ` pid=${continuous.pid}`;
-	const error = continuous.error ? ` error=${continuous.error}` : "";
-	return `\nContinuous: ${continuous.status} subscribers=${continuous.subscriber_count}${pid} root=${continuous.root_source}${error}`;
-}
-
-function continuousActiveNotice(details: HostServiceCompileResponseDetails): string {
-	return details.continuous_active_notice ? `\n${details.continuous_active_notice}` : "";
-}
-
 function compileSuccessText(details: HostServiceCompileResponseDetails, hideWarnings: boolean): string {
 	const status = details.compile_status ?? "ok";
 	const warningCount = details.warning_count ? ` warnings=${details.warning_count}` : "";
 	const exitCode = status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 	const prefix = status === "ok" ? "ok" : status;
-	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${continuousSummary(details)}${continuousActiveNotice(details)}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated, hideWarnings)}`;
+	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated, hideWarnings)}`;
 }
 
 function describeCompileFailureContext(
@@ -162,10 +147,15 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 			let compiler: LatexCompiler | undefined;
 			let shouldOpenPdf = false;
 			let shouldClean = false;
-			let continuous: boolean | undefined;
 			let hideWarnings = true;
 			let targetId = "";
 			try {
+				const allowedParams = new Set(["latex_file_path", "compiler", "open_pdf", "clean", "hide_warnings"]);
+				for (const key of Object.keys(params)) {
+					if (!allowedParams.has(key)) {
+						throw new Error(`compile_latex_file unknown argument: ${key}`);
+					}
+				}
 				requestedPath = String(params.latex_file_path ?? "");
 				if (!requestedPath.trim()) {
 					throw new Error("latex_file_path must be a non-empty string");
@@ -175,12 +165,6 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				compiler = latexFileCompileToolSupport.resolveLatexCompiler(params.compiler);
 				shouldOpenPdf = params.open_pdf === true;
 				shouldClean = params.clean === true;
-				if (params.continuous !== undefined) {
-					if (typeof params.continuous !== "boolean") {
-						throw new Error("continuous must be a boolean");
-					}
-					continuous = params.continuous;
-				}
 				if (params.hide_warnings !== undefined) {
 					if (typeof params.hide_warnings !== "boolean") {
 						throw new Error("hide_warnings must be a boolean");
@@ -194,7 +178,6 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 					compiler?: string;
 					clean?: boolean;
 					open_pdf?: boolean;
-					continuous?: boolean;
 					callback_target_id?: string;
 				} = {
 					latex_file_path: requestedPathInWorkspace,
@@ -202,9 +185,6 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				};
 				if (compiler !== undefined) {
 					compileRequest.compiler = compiler;
-				}
-				if (continuous !== undefined) {
-					compileRequest.continuous = continuous;
 				}
 				if (shouldOpenPdf && ctx) {
 					targetId = await callbackManager.ensureHostServiceCallbackTarget(ctx);
@@ -226,8 +206,6 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 							source: compileResult.source,
 							pdf: compileResult.pdf,
 							log: compileResult.log,
-							continuous: compileResult.continuous,
-							continuous_active_notice: compileResult.continuous_active_notice,
 							clean: compileResult.clean,
 							cleaned_artifacts: compileResult.cleaned_artifacts,
 							compile_status: compileResult.compile_status,
@@ -252,13 +230,11 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				const status = compileResponse.compile_status ?? "ok";
 				const warningCount = compileResponse.warning_count ? ` warnings=${compileResponse.warning_count}` : "";
 				return {
-					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${continuousSummary(compileResponse)}${continuousActiveNotice(compileResponse)}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated, hideWarnings)}` }],
+					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated, hideWarnings)}` }],
 					details: agentFacingCompileDetails({
 						source: compileResponse.source,
 						pdf: compileResponse.pdf,
 						pdf_id: compileResponse.pdf_id,
-						continuous: compileResponse.continuous,
-						continuous_active_notice: compileResponse.continuous_active_notice,
 						pid: managedRecord?.pid,
 						viewer_handle: managedRecord?.viewerHandle,
 						viewer_backend: managedRecord?.viewerBackend,
@@ -310,17 +286,15 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 		name: "compile_latex_file",
 		label: "Compile LaTeX File",
 		description:
-			"Compile an existing local LaTeX source file from its own directory using latexmk. Defaults to lualatex; pass compiler to choose the TeX engine latexmk should run: lualatex, pdflatex, xelatex, or latexmk default behavior. The Host Service coordinates same-root compiles: a one-shot request may wait for active same-root compilation or reuse a fresh cached result instead of spawning another latexmk. Set clean=true to remove common same-basename LaTeX artifacts before compiling; if continuous compilation is active for the root, clean=true stops and restarts it safely before returning the post-clean result. Set open_pdf=true to request a host-service open/track after coordinated compilation succeeds; leave it false (the default) to compile without requesting external service state. Set continuous=true to compile once and subscribe this session to shared latexmk -pvc recompilation; set continuous=false to compile once and unsubscribe this session; omit continuous for a coordinated latexmk-backed one-shot compile that leaves continuous state unchanged. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
+			"Compile an existing local LaTeX source file once from its own directory using latexmk. Defaults to lualatex; pass compiler to choose the TeX engine latexmk should run: lualatex, pdflatex, xelatex, or latexmk default behavior. The Host Service coordinates same-root compiles to avoid overlapping latexmk processes. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track after compilation succeeds; leave it false (the default) to compile without requesting viewer state. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
 		promptSnippet: "Compile a local LaTeX file as PDF",
 		promptGuidelines: [
 			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",
 			"By default this compiles only. Leave open_pdf false (or omit it) when you want to compile without requesting external service state; set open_pdf=true only when the user wants the compiled PDF opened/tracked by the host service immediately.",
-			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling; when same-root continuous compilation is active, the Host Service stops it, cleans, restarts it for existing subscribers, and waits for the first post-clean result.",
-			"Use continuous=true for iterative project editing. Omit continuous for a coordinated latexmk-backed one-shot compile that does not alter continuous state; it may wait for active same-root compilation or reuse a fresh cached result. Use continuous=false to stop only this session's subscription; close_pdf does not stop continuous compilation.",
+			"Use clean=true when stale or broken same-basename LaTeX artifacts may be causing problems. It removes common artifacts such as .aux, .log, .out, .pdf, .synctex, and .synctex.gz before compiling.",
 			"Warnings are hidden by default to keep compile output concise: warning_count remains in details and text, and warnings_hidden=true is set when warning details were omitted. Set hide_warnings=false when you need the warning summary text and details.warnings.",
 			"File compilation requires latexmk. If compile_latex_file reports latexmk is unavailable, install MacTeX or TeX Live; BasicTeX users may need to install latexmk separately and ensure it is on PATH.",
-			"latexmk starts with -norc, -view=none, recorder/SyncTeX-friendly flags, selected-engine configuration, and -no-shell-escape engine commands so project latexmkrc files cannot override default commands or launch a latexmk-owned viewer. Continuous mode adds -pvc.",
-			"Continuous subscriptions are tied to the agent session heartbeat. If the session stops heartbeating, the Host Service removes the subscription and stops unreferenced compilers; unresolved background failures are delivered later as pending [system info] messages and cleared by later success or delivery.",
+			"latexmk starts with -norc, -view=none, recorder/SyncTeX-friendly flags, selected-engine configuration, and -no-shell-escape engine commands so project latexmkrc files cannot override default commands or launch a latexmk-owned viewer.",
 			"latexmk handles multi-file dependency tracking, including included files and bibliography dependencies; the Host Service intentionally does not recursively watch the project tree.",
 			"Use this for complete .tex documents. File compiles run in the file's own directory so relative includes and assets resolve normally, and the fixed temp preamble is not injected.",
 			"For multi-file LaTeX projects, compile the root file that produces the PDF, such as main.tex, and use open_pdf=true only when a host-service-tracked PDF is needed. The returned pdf_id identifies the running service-tracked PDF and can be reused for jumps into any included .tex file via jump_pdf with source_file set explicitly.",

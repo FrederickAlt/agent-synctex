@@ -540,7 +540,6 @@ export class HostServiceClient {
 				...(request.compiler === undefined ? {} : { compiler: request.compiler }),
 				...(request.clean === undefined ? {} : { clean: request.clean }),
 				...(request.open_pdf === undefined ? {} : { open_pdf: request.open_pdf }),
-				...(request.continuous === undefined ? {} : { continuous: request.continuous }),
 				...(request.reuse_existing === undefined ? {} : { reuse_existing: request.reuse_existing }),
 				...(request.require_persistent_viewer === undefined ? {} : { require_persistent_viewer: request.require_persistent_viewer }),
 				...(request.callback_target_id === undefined ? {} : { callback_target_id: request.callback_target_id }),
@@ -556,8 +555,7 @@ export class HostServiceClient {
 		}
 		if (response.status === "error") {
 			const suffix = response.status_details.error_code ? ` (code=${response.status_details.error_code})` : "";
-			const continuousActiveNotice = response.status_details.continuous_active_notice ? `\n${response.status_details.continuous_active_notice}` : "";
-			const error = new Error(`${response.error || "host service returned error status"}${suffix}${continuousActiveNotice}`) as HostServiceResponseError;
+			const error = new Error(`${response.error || "host service returned error status"}${suffix}`) as HostServiceResponseError;
 			error.statusDetails = response.status_details;
 			error.errorCode = response.status_details.error_code;
 			error.requestId = response.request_id;
@@ -1042,11 +1040,10 @@ export class HostServiceClient {
 		}
 		const phases = [
 			"queued behind an active same-root compile",
-			"waiting on active same-root continuous compilation",
 			"running latexmk",
 		];
 		if (request.details.clean === true) {
-			phases.splice(2, 0, "cleaning/restarting continuous compilation");
+			phases.splice(1, 0, "cleaning same-basename LaTeX artifacts");
 		}
 		if (request.details.open_pdf === true) {
 			phases.push("opening the coherent compiled PDF in the managed viewer after compile coordination");
@@ -1100,12 +1097,6 @@ export class HostServiceServer {
 			protocolVersion: this.protocolVersion,
 			managedViewerService: this.managedViewerService,
 			resolveManagedOpenCallback: this.resolveManagedOpenCallback.bind(this),
-			refreshContinuousSessionLease: (workspaceContext) => {
-				if (!this.stopping) {
-					this.sessionLeases.heartbeat(workspaceContext);
-				}
-			},
-			continuousCompileManager: this.continuousCompileManager,
 		});
 		this.sessionLeases.onExpiredSessions((sessionIds) => this.continuousCompileManager.removeSessions(sessionIds));
 	}
@@ -1277,13 +1268,7 @@ export class HostServiceServer {
 				closePdf: (request) => this.managedViewerService.closeViewer(request),
 				resolveManagedOpenCallback: (workspaceContext, callbackTargetId, callbackTarget) =>
 					this.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget),
-				continuousCompileManager: this.continuousCompileManager,
 				compileService: this.compileService,
-				refreshSessionLease: (workspaceContext) => {
-					if (!this.stopping) {
-						this.sessionLeases.heartbeat(workspaceContext);
-					}
-				},
 			});
 			if (response === null) {
 				return;
@@ -1417,9 +1402,6 @@ export class HostServiceServer {
 				}
 				case "compile_latex_file": {
 					this.totalRequests += 1;
-					if (request.details.continuous !== undefined) {
-						this.sessionLeases.heartbeat(request.workspace_context);
-					}
 					const abortController = new AbortController();
 					const abortCompile = () => abortController.abort();
 					socket.once("close", abortCompile);
@@ -1960,6 +1942,12 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				throw new Error("missing compile details");
 			}
 			const rawDetails = value.details;
+			const allowedDetails = new Set(["latex_file_path", "compiler", "clean", "open_pdf", "reuse_existing", "require_persistent_viewer", "callback_target_id", "callback"]);
+			for (const key of Object.keys(rawDetails)) {
+				if (!allowedDetails.has(key)) {
+					throw new Error(`compile_latex_file unknown detail: ${key}`);
+				}
+			}
 			if (typeof rawDetails.latex_file_path !== "string" || !rawDetails.latex_file_path.trim()) {
 				throw new Error("missing latex_file_path");
 			}
@@ -1971,9 +1959,6 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 			}
 			if (rawDetails.open_pdf !== undefined && typeof rawDetails.open_pdf !== "boolean") {
 				throw new Error("open_pdf must be a boolean");
-			}
-			if (rawDetails.continuous !== undefined && typeof rawDetails.continuous !== "boolean") {
-				throw new Error("continuous must be a boolean");
 			}
 			if (rawDetails.reuse_existing !== undefined && typeof rawDetails.reuse_existing !== "boolean") {
 				throw new Error("reuse_existing must be a boolean");
@@ -1991,9 +1976,7 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				throw new Error("callback must be a valid callback target");
 			}
 			const openPdf = rawDetails.open_pdf === true;
-			const workspaceContext = rawDetails.continuous === undefined
-				? normalizeWorkspaceContextForCompile(value.workspace_context)
-				: normalizeWorkspaceContextWithSession(normalizeWorkspaceContextForCompile(value.workspace_context));
+			const workspaceContext = normalizeWorkspaceContextForCompile(value.workspace_context);
 			return {
 				protocol_version: PROTOCOL_VERSION,
 				request_id: value.request_id,
@@ -2005,7 +1988,6 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 					compiler: rawDetails.compiler,
 					clean: rawDetails.clean === true,
 					open_pdf: openPdf,
-					continuous: rawDetails.continuous,
 					reuse_existing: rawDetails.reuse_existing,
 					require_persistent_viewer: rawDetails.require_persistent_viewer,
 					callback_target_id: rawDetails.callback_target_id,
@@ -2643,12 +2625,6 @@ function isValidCompileResponseLike(
 		return false;
 	}
 	if (details.managed_record !== undefined && !isValidManagedViewerRecord(details.managed_record)) {
-		return false;
-	}
-	if (details.continuous !== undefined && !isValidContinuousCompileDetails(details.continuous)) {
-		return false;
-	}
-	if (details.continuous_active_notice !== undefined && typeof details.continuous_active_notice !== "string") {
 		return false;
 	}
 	if (typeof details.error_code !== "undefined" && typeof details.error_code !== "string") {

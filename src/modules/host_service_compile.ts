@@ -6,7 +6,6 @@ import {
 	DEFAULT_SNIPPET_PREAMBLE,
 } from "./latex/latex_preamble.ts";
 import {
-	cleanLatexFileArtifacts,
 	createLatexFileCompileToolSupport,
 	latexmkEngineIdentity,
 	LoggedToolError,
@@ -28,7 +27,6 @@ import type {
 	HostServiceWorkspaceContext,
 } from "./host_service_protocol.ts";
 import { createLogger } from "./logging.ts";
-import { HostServiceContinuousCompileManager, type HostServiceContinuousCompileDetails } from "./host_service_continuous_compile.ts";
 import {
 	buildLatexmkFreshnessSnapshot,
 	HostServiceCompileCoordinationError,
@@ -44,18 +42,7 @@ const HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES = [
 	"preamble.tex",
 	"praeamble.tex",
 ] as const;
-const UNOBSERVED_IDLE_CONTINUOUS_WAIT_MS = 500;
-
 const hostServiceLatexFileCompiler = createLatexFileCompileToolSupport();
-
-function continuousActiveNoticeForResult(result: LatexFileCompileResult): string {
-	const warningCount = result.warningCount > 0 ? `, warnings=${result.warningCount}` : "";
-	return `Continuous: active for this root. You usually do not need to call compile_latex_file while continuous compilation is running; it already rebuilds after changes and compile errors are delivered to you as pending system-info notifications. Use continuous=false to stop continuous compilation. Last continuous result: ${result.compileStatus}${warningCount}.`;
-}
-
-function continuousActiveNoticeForFailure(): string {
-	return "Continuous: active for this root. You usually do not need to call compile_latex_file while continuous compilation is running; it already rebuilds after changes and compile errors are delivered to you as pending system-info notifications. Use continuous=false to stop continuous compilation. Last continuous result: failed.";
-}
 
 interface HostServiceManagedViewerServiceLike {
 	openViewer(request: HostServiceOpenRequest): Promise<HostServiceOpenResponseEnvelope>;
@@ -83,9 +70,7 @@ export interface HostServiceCompileServiceOptions {
 		callbackTargetId: string | undefined,
 		callbackTarget: HostServiceCallbackTarget | undefined,
 	) => Promise<HostServiceCallbackTarget | undefined>;
-	refreshContinuousSessionLease?: (workspaceContext: HostServiceWorkspaceContext) => void;
 	nowNs?: () => number;
-	continuousCompileManager?: HostServiceContinuousCompileManager;
 	rootCompileCoordinator?: HostServiceRootCompileCoordinator;
 }
 
@@ -93,18 +78,15 @@ export class HostServiceCompileService {
 	private readonly protocolVersion: number;
 	private readonly managedViewerService: HostServiceManagedViewerServiceLike;
 	private readonly resolveManagedOpenCallback: HostServiceCompileServiceOptions["resolveManagedOpenCallback"];
-	private readonly refreshContinuousSessionLease: HostServiceCompileServiceOptions["refreshContinuousSessionLease"];
 	private readonly nowNs: () => number;
-	private readonly continuousCompileManager: HostServiceContinuousCompileManager;
 	private readonly rootCompileCoordinator: HostServiceRootCompileCoordinator;
+	private readonly activeCompileAbortControllers = new Set<AbortController>();
 
 	constructor(options: HostServiceCompileServiceOptions) {
 		this.protocolVersion = options.protocolVersion;
 		this.managedViewerService = options.managedViewerService;
 		this.resolveManagedOpenCallback = options.resolveManagedOpenCallback;
-		this.refreshContinuousSessionLease = options.refreshContinuousSessionLease;
 		this.nowNs = options.nowNs ?? (() => Date.now() * 1_000_000);
-		this.continuousCompileManager = options.continuousCompileManager ?? new HostServiceContinuousCompileManager();
 		this.rootCompileCoordinator = options.rootCompileCoordinator ?? new HostServiceRootCompileCoordinator();
 	}
 
@@ -113,7 +95,14 @@ export class HostServiceCompileService {
 	}
 
 	stop(): void {
-		this.rootCompileCoordinator.stop();
+		const stoppedError = new HostServiceCompileCoordinationError(
+			"host service stopped while compile request was in progress",
+			"host_service_stopped",
+		);
+		for (const controller of this.activeCompileAbortControllers) {
+			controller.abort(stoppedError);
+		}
+		this.rootCompileCoordinator.stop(stoppedError);
 	}
 
 	private recordLastCompileSuccess(
@@ -167,6 +156,17 @@ export class HostServiceCompileService {
 	}
 
 	async compileLatexFileRequest(request: HostServiceCompileRequest, signal?: AbortSignal): Promise<HostServiceCompileResponseEnvelope> {
+		const stopAbortController = new AbortController();
+		this.activeCompileAbortControllers.add(stopAbortController);
+		const compileSignal = signal === undefined ? stopAbortController.signal : AbortSignal.any([signal, stopAbortController.signal]);
+		try {
+			return await this.compileLatexFileRequestInner(request, compileSignal);
+		} finally {
+			this.activeCompileAbortControllers.delete(stopAbortController);
+		}
+	}
+
+	private async compileLatexFileRequestInner(request: HostServiceCompileRequest, signal?: AbortSignal): Promise<HostServiceCompileResponseEnvelope> {
 		const startedAt = Date.now();
 		const requestedPath = request.details.latex_file_path;
 		const normalizedPath = normalizeLatexSourcePath(requestedPath, request.workspace_context.cwd);
@@ -181,18 +181,10 @@ export class HostServiceCompileService {
 			open_pdf: request.details.open_pdf === true,
 		});
 
-		let continuousAppliedBeforeCompile: HostServiceContinuousCompileDetails | undefined;
-		let continuousActiveNotice: string | undefined;
 		try {
-			let cleanRestartContinuous: HostServiceContinuousCompileDetails | undefined;
 			const resolvedCompiler = hostServiceLatexFileCompiler.resolveLatexCompiler(request.details.compiler);
 			const compilerIdentity = latexmkEngineIdentity(resolvedCompiler);
 			const rootKey = normalizeLatexRootKey(normalizedPath);
-			const canReuseLastResult = !shouldClean && request.details.continuous !== true;
-			const canRouteThroughContinuous = !shouldClean;
-			const canUseInitialContinuousCompileCache = request.details.continuous === undefined;
-			const shouldShowRedundantContinuousNotice = request.details.continuous === undefined;
-			const canRecordLastResult = true;
 			const compileRequest: LatexFileCompileRequest = {
 				requestedPath,
 				compiler: request.details.compiler,
@@ -200,101 +192,34 @@ export class HostServiceCompileService {
 				cwd: request.workspace_context.cwd,
 				signal,
 			};
+			const throwIfAborted = () => {
+				if (signal?.aborted !== true) {
+					return;
+				}
+				if (signal.reason instanceof Error) {
+					throw signal.reason;
+				}
+				throw new HostServiceCompileCoordinationError("compile request cancelled", "compile_cancelled");
+			};
 			const result = await this.rootCompileCoordinator.runExclusive(
 				rootKey,
 				async () => {
-					if (request.details.continuous === false) {
-						const unsubscribe = await this.applyContinuousUnsubscribeBeforeCompile(request, normalizedPath, compilerIdentity);
-						continuousAppliedBeforeCompile = unsubscribe.continuous;
-						if (unsubscribe.error !== undefined) {
-							throw unsubscribe.error;
-						}
-					}
 					if (shouldClean) {
-						const continuousClean = await this.continuousCompileManager.cleanRestartAndWaitForFreshResult(
-							normalizedPath,
-							compilerIdentity,
-							() => {
-								this.rootCompileCoordinator.clearLastResult(rootKey);
-								const removed = cleanLatexFileArtifacts(normalizedPath);
-								cleanArtifacts.push(...removed);
-								return removed;
-							},
-							signal,
-						);
-						if (continuousClean !== undefined) {
-							cleanRestartContinuous = continuousClean.continuous;
-							return {
-								...continuousClean.result,
-								clean: true,
-								cleanedArtifacts: continuousClean.cleanedArtifacts,
-							};
-						}
+						this.rootCompileCoordinator.clearLastResult(rootKey);
 					}
-					if (canRouteThroughContinuous) {
-						const continuousState = this.continuousCompileManager.rootState(normalizedPath, compilerIdentity);
-						const mayBeDormantInitialContinuous = canUseInitialContinuousCompileCache
-							&& continuousState.active
-							&& continuousState.compatible
-							&& continuousState.cycleState !== "compiling"
-							&& continuousState.hasObservedOutcome !== true;
-						if (canReuseLastResult && mayBeDormantInitialContinuous) {
-							const cached = this.rootCompileCoordinator.freshCachedResult<LatexFileCompileResult>(rootKey, normalizedPath, compilerIdentity);
-							if (cached?.status === "success") {
-								if (shouldShowRedundantContinuousNotice) {
-									continuousActiveNotice = continuousActiveNoticeForResult(cached.value);
-								}
-								return cached.value;
-							}
-							if (cached?.status === "failure") {
-								if (shouldShowRedundantContinuousNotice) {
-									continuousActiveNotice = continuousActiveNoticeForFailure();
-								}
-								throw cached.error;
-							}
-						}
-						try {
-							const continuousResult = await this.continuousCompileManager.waitForFreshResult(
-								normalizedPath,
-								compilerIdentity,
-								signal,
-								mayBeDormantInitialContinuous ? UNOBSERVED_IDLE_CONTINUOUS_WAIT_MS : undefined,
-							);
-							if (continuousResult !== undefined) {
-								if (shouldShowRedundantContinuousNotice) {
-									continuousActiveNotice = continuousActiveNoticeForResult(continuousResult);
-								}
-								return continuousResult;
-							}
-						} catch (error) {
-							if (shouldShowRedundantContinuousNotice && continuousState.active && continuousState.compatible && !(error instanceof HostServiceCompileCoordinationError)) {
-								continuousActiveNotice = continuousActiveNoticeForFailure();
-							}
-							throw error;
-						}
-					}
-					if (canReuseLastResult) {
-						const cached = this.rootCompileCoordinator.freshCachedResult<LatexFileCompileResult>(rootKey, normalizedPath, compilerIdentity);
-						if (cached?.status === "success") {
-							return cached.value;
-						}
-						if (cached?.status === "failure") {
-							throw cached.error;
-						}
-					}
-
 					const compiledAfterMs = Date.now();
 					try {
 						const freshResult = await hostServiceLatexFileCompiler.compileLatexFile(compileRequest);
-						this.recordLastCompileSuccess(rootKey, normalizedPath, compilerIdentity, freshResult, compiledAfterMs, canRecordLastResult);
+						this.recordLastCompileSuccess(rootKey, normalizedPath, compilerIdentity, freshResult, compiledAfterMs, true);
 						return freshResult;
 					} catch (compileError) {
-						this.recordLastCompileFailure(rootKey, normalizedPath, compilerIdentity, compileError, compiledAfterMs, canRecordLastResult);
+						this.recordLastCompileFailure(rootKey, normalizedPath, compilerIdentity, compileError, compiledAfterMs, true);
 						throw compileError;
 					}
 				},
 				signal,
 			);
+			throwIfAborted();
 			const resultLogPath = inferLatexLogPath(result.source);
 			const nowNs = this.nowNs();
 			for (const cleaned of result.cleanedArtifacts) {
@@ -303,15 +228,9 @@ export class HostServiceCompileService {
 				}
 			}
 			const artifactPaths = getExistingArtifacts(result.pdfPath, resultLogPath);
-			this.clearSuccessfulImmediateCompileNotification(request, result.source);
 			if (request.details.open_pdf !== true) {
 				await this.markCompiledPdfUpdated(result.pdfPath, request.request_id);
 			}
-			const requestedContinuous = request.details.continuous === false
-				? continuousAppliedBeforeCompile
-				: await this.applyContinuousCompileRequest(request, result.source);
-			const continuous = requestedContinuous ?? cleanRestartContinuous;
-			const continuousError = continuous && ["unavailable", "error"].includes(continuous.status) ? continuous : undefined;
 			const openResponse = await this.openCompiledPdfThroughManagedViewerAfterCompile(
 				request,
 				result.source,
@@ -332,16 +251,7 @@ export class HostServiceCompileService {
 					open_status: openResponse.status,
 					error: openResponse.error,
 				});
-				return continuous === undefined && continuousActiveNotice === undefined
-					? openResponse
-					: {
-						...openResponse,
-						status_details: {
-							...openResponse.status_details,
-							...(continuous === undefined ? {} : { continuous }),
-							...(continuousActiveNotice === undefined ? {} : { continuous_active_notice: continuousActiveNotice }),
-						},
-					};
+				return openResponse;
 			}
 			logger.info("compile_file.end", {
 				request_id: request.request_id,
@@ -358,13 +268,12 @@ export class HostServiceCompileService {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
 				operation: request.operation,
-				status: continuousError === undefined ? "ok" : "error",
+				status: "ok",
 				generated_at_ns: nowNs,
-				...(continuousError === undefined ? {} : { error: continuousError.error ?? "continuous compilation failed" }),
 				status_details: {
 					protocol_version: this.protocolVersion,
-					supported: continuousError === undefined,
-					service_available: continuousError === undefined,
+					supported: true,
+					service_available: true,
 					workspace_context: request.workspace_context,
 					request_id: request.request_id,
 					operation: request.operation,
@@ -378,9 +287,6 @@ export class HostServiceCompileService {
 					pdf_id: openResponse?.status_details.pdf_id,
 					viewer_url: openResponse?.status_details.viewer_url,
 					managed_record: openResponse?.status_details.managed_record,
-					...(continuous === undefined ? {} : { continuous }),
-					...(continuousActiveNotice === undefined ? {} : { continuous_active_notice: continuousActiveNotice }),
-					...(continuousError === undefined ? {} : { error_code: continuousError.error_code ?? "continuous_compiler_start_failed" }),
 				},
 			};
 		} catch (error) {
@@ -397,7 +303,6 @@ export class HostServiceCompileService {
 				error,
 			});
 			const nowNs = this.nowNs();
-			const continuous = continuousAppliedBeforeCompile ?? await this.applyContinuousUnsubscribeAfterFailure(request, normalizedPath, error);
 			return {
 				protocol_version: this.protocolVersion,
 				request_id: request.request_id,
@@ -420,8 +325,6 @@ export class HostServiceCompileService {
 					...compileErrorDiagnosticsDetails(error),
 					error_code: extractCompileErrorCode(error),
 					artifact_paths: getExistingArtifacts(errorPdf, log),
-					...(continuous === undefined ? {} : { continuous }),
-					...(continuousActiveNotice === undefined ? {} : { continuous_active_notice: continuousActiveNotice }),
 				},
 			};
 		}
@@ -574,76 +477,6 @@ export class HostServiceCompileService {
 				},
 			};
 		}
-	}
-
-	private async applyContinuousUnsubscribeBeforeCompile(
-		request: HostServiceCompileRequest,
-		rootSource: string,
-		compilerIdentity: string,
-	): Promise<{ continuous?: HostServiceContinuousCompileDetails; error?: HostServiceCompileCoordinationError }> {
-		const sessionId = request.workspace_context.session_id?.trim();
-		if (!sessionId) {
-			return {
-				continuous: {
-					requested: true,
-					status: "error",
-					root_source: rootSource,
-					session_id: "",
-					subscriber_count: 0,
-					error: "workspace_context.session_id is required for continuous compilation",
-					error_code: "invalid_request",
-				},
-			};
-		}
-		this.refreshContinuousSessionLease?.(request.workspace_context);
-		return this.continuousCompileManager.removeSubscriptionForCompileRequest(rootSource, sessionId, compilerIdentity);
-	}
-
-	private async applyContinuousUnsubscribeAfterFailure(
-		request: HostServiceCompileRequest,
-		rootSource: string,
-		error?: unknown,
-	): Promise<HostServiceContinuousCompileDetails | undefined> {
-		if (request.details.continuous === false) {
-			return await this.applyContinuousCompileRequest(request, rootSource);
-		}
-		return request.details.continuous === true
-			&& error instanceof HostServiceCompileCoordinationError
-			&& error.errorCode === "continuous_compiler_engine_mismatch"
-			? this.applyContinuousCompileRequest(request, rootSource)
-			: undefined;
-	}
-
-	private clearSuccessfulImmediateCompileNotification(request: HostServiceCompileRequest, rootSource: string): void {
-		const sessionId = request.workspace_context.session_id?.trim();
-		if (sessionId) {
-			this.continuousCompileManager.clearPendingNotificationsForSessionRoot(sessionId, rootSource);
-		}
-	}
-
-	private async applyContinuousCompileRequest(
-		request: HostServiceCompileRequest,
-		rootSource: string,
-	): Promise<HostServiceContinuousCompileDetails | undefined> {
-		if (request.details.continuous === undefined) {
-			return undefined;
-		}
-		const sessionId = request.workspace_context.session_id?.trim();
-		if (!sessionId) {
-			return {
-				requested: true,
-				status: "error",
-				root_source: rootSource,
-				session_id: "",
-				subscriber_count: 0,
-				error: "workspace_context.session_id is required for continuous compilation",
-				error_code: "invalid_request",
-			};
-		}
-		this.refreshContinuousSessionLease?.(request.workspace_context);
-		return request.details.continuous
-			? this.continuousCompileManager.ensureSubscription(rootSource, sessionId, request.details.compiler)
-			: this.continuousCompileManager.removeSubscription(rootSource, sessionId);
 	}
 
 	private async markCompiledPdfUpdated(pdfPath: string, requestId: string): Promise<void> {

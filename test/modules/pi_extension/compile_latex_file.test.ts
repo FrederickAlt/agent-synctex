@@ -289,13 +289,12 @@ test("compile_latex_file Pi tool docs describe coordinated same-root behavior wi
 	const text = [tool.description, ...(tool.promptGuidelines ?? [])].join("\n");
 
 	assert.match(text, /same-root/i);
-	assert.match(text, /wait/i);
-	assert.match(text, /cached|reuse/i);
-	assert.match(text, /clean=true.*restart/i);
+	assert.match(text, /avoid overlapping latexmk/i);
+	assert.match(text, /clean=true/i);
+	assert.doesNotMatch(text, /continuous/);
 	assert.deepEqual(Object.keys(tool.parameters?.properties ?? {}).sort(), [
 		"clean",
 		"compiler",
-		"continuous",
 		"hide_warnings",
 		"latex_file_path",
 		"open_pdf",
@@ -607,6 +606,19 @@ test("compile_latex_file validates hide_warnings", async () => {
 	}
 });
 
+test("compile_latex_file rejects removed continuous direct executor input", async () => {
+	const { root, sourcePath } = withTemporaryProject();
+	const tool = await captureCompileTool();
+	try {
+		await assert.rejects(
+			() => tool.execute("compile-latex-file-continuous-validation", { latex_file_path: sourcePath, continuous: true }, undefined, undefined, undefined),
+			/unknown argument: continuous/,
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("compile_latex_file requests compilation with extended timeout", async () => {
 	const { root, sourcePath } = withTemporaryProject();
 	const tool = await captureCompileTool();
@@ -651,179 +663,29 @@ test("compile_latex_file requests compilation with extended timeout", async () =
 	}
 });
 
-test("Pi tool descriptions document continuous lifecycle boundaries", async () => {
+test("Pi tool descriptions document one-shot compile and hide_warnings boundaries", async () => {
 	const { compileTool, closePdfTool } = await captureTools();
 	const closeTool = closePdfTool as unknown as { description?: string; promptGuidelines?: string[] };
 	const closeText = [closeTool.description, ...(closeTool.promptGuidelines ?? [])].join("\n");
-	assert.match(closeText, /does not stop continuous compilation/);
-	assert.match(closeText, /continuous=false/);
+	assert.doesNotMatch(closeText, /continuous/);
 
 	const tool = compileTool as unknown as {
 		description?: string;
 		promptGuidelines?: string[];
-		parameters?: { properties?: { continuous?: { schema?: { options?: { description?: string } } }; hide_warnings?: { schema?: { options?: { description?: string; default?: boolean } } } } };
+		parameters?: { properties?: { continuous?: unknown; hide_warnings?: { schema?: { options?: { description?: string; default?: boolean } } } } };
 	};
-	const text = [tool.description, ...(tool.promptGuidelines ?? []), tool.parameters?.properties?.continuous?.schema?.options?.description, tool.parameters?.properties?.hide_warnings?.schema?.options?.description].join("\n");
-	assert.match(text, /continuous=true/);
-	assert.match(text, /continuous=false/);
-	assert.match(text, /omit continuous/);
-	assert.match(text, /close_pdf does not stop continuous compilation/);
+	const text = [tool.description, ...(tool.promptGuidelines ?? []), tool.parameters?.properties?.hide_warnings?.schema?.options?.description].join("\n");
+	assert.equal(tool.parameters?.properties?.continuous, undefined);
+	assert.doesNotMatch(text, /continuous/);
 	assert.match(text, /latexmk/);
 	assert.match(text, /-norc/);
 	assert.match(text, /latexmkrc/);
 	assert.match(text, /no shell escape|-no-shell-escape/);
 	assert.match(text, /multi-file dependency tracking/);
-	assert.match(text, /heartbeat/);
-	assert.match(text, /\[system info\]/);
 	assert.match(text, /hide_warnings=false/);
 	assert.match(text, /hidden by default/i);
 	assert.ok(tool.parameters?.properties?.hide_warnings);
 });
-
-test("compile_latex_file renders redundant active-continuous notice for omitted one-shot results", async () => {
-	const { root, sourcePath } = withTemporaryProject();
-	const tool = await captureCompileTool();
-	const expectedPdf = resolve(root, "paper.pdf");
-	const expectedLog = resolve(root, "paper.log");
-	const notice = "Continuous: active for this root. You usually do not need to call compile_latex_file while continuous compilation is running; it already rebuilds after changes and compile errors are delivered to you as pending system-info notifications. Use continuous=false to stop continuous compilation. Last continuous result: ok_with_warnings, warnings=2.";
-	const proto = HostServiceClient.prototype as { requestCompileLatexFile: HostServiceClient["requestCompileLatexFile"] };
-	const originalRequestCompileLatexFile = proto.requestCompileLatexFile;
-	try {
-		proto.requestCompileLatexFile = async (_request, workspaceContext) => ({
-			protocol_version: 1,
-			supported: true,
-			service_available: true,
-			workspace_context: workspaceContext,
-			request_id: "redundant-continuous-pi-test",
-			operation: "compile_latex_file",
-			source: sourcePath,
-			pdf: expectedPdf,
-			log: expectedLog,
-			artifact_paths: [expectedPdf],
-			clean: false,
-			cleaned_artifacts: [],
-			compile_status: "ok_with_warnings",
-			warning_count: 2,
-			warnings: [],
-			warnings_truncated: false,
-			continuous_active_notice: notice,
-		});
-
-		const result = await tool.execute(
-			"compile-latex-file-redundant-continuous",
-			{ latex_file_path: sourcePath },
-			undefined,
-			undefined,
-			createSessionContext(root, "pi-continuous-session"),
-		);
-		assert.match(result.content[0].text, /Continuous: active for this root/);
-		assert.match(result.content[0].text, /pending system-info notifications/);
-		assert.match(result.content[0].text, /continuous=false/);
-		assert.match(result.content[0].text, /Last continuous result: ok_with_warnings, warnings=2\./);
-		assert.equal((result.details as { continuous_active_notice?: string }).continuous_active_notice, notice);
-	} finally {
-		proto.requestCompileLatexFile = originalRequestCompileLatexFile;
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("compile_latex_file omits active-continuous notice for ordinary one-shot results", async () => {
-	const { root, sourcePath } = withTemporaryProject();
-	const tool = await captureCompileTool();
-	const expectedPdf = resolve(root, "paper.pdf");
-	const expectedLog = resolve(root, "paper.log");
-	const proto = HostServiceClient.prototype as { requestCompileLatexFile: HostServiceClient["requestCompileLatexFile"] };
-	const originalRequestCompileLatexFile = proto.requestCompileLatexFile;
-	try {
-		proto.requestCompileLatexFile = async (_request, workspaceContext) => ({
-			protocol_version: 1,
-			supported: true,
-			service_available: true,
-			workspace_context: workspaceContext,
-			request_id: "ordinary-pi-test",
-			operation: "compile_latex_file",
-			source: sourcePath,
-			pdf: expectedPdf,
-			log: expectedLog,
-			artifact_paths: [expectedPdf],
-			clean: false,
-			cleaned_artifacts: [],
-			compile_status: "ok",
-			warning_count: 0,
-			warnings: [],
-			warnings_truncated: false,
-		});
-
-		const result = await tool.execute(
-			"compile-latex-file-ordinary-one-shot",
-			{ latex_file_path: sourcePath },
-			undefined,
-			undefined,
-			createSessionContext(root, "pi-ordinary-session"),
-		);
-		assert.doesNotMatch(result.content[0].text, /Continuous: active for this root/);
-		assert.doesNotMatch(result.content[0].text, /pending system-info notifications/);
-		assert.equal((result.details as { continuous_active_notice?: string }).continuous_active_notice, undefined);
-	} finally {
-		proto.requestCompileLatexFile = originalRequestCompileLatexFile;
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("compile_latex_file passes continuous flag through and renders continuous metadata", async () => {
-	const { root, sourcePath } = withTemporaryProject();
-	const tool = await captureCompileTool();
-	const expectedPdf = resolve(root, "paper.pdf");
-	const expectedLog = resolve(root, "paper.log");
-	let capturedRequest: Parameters<HostServiceClient["requestCompileLatexFile"]>[0] | undefined;
-	let capturedContext: Parameters<HostServiceClient["requestCompileLatexFile"]>[1] | undefined;
-	const proto = HostServiceClient.prototype as { requestCompileLatexFile: HostServiceClient["requestCompileLatexFile"] };
-	const originalRequestCompileLatexFile = proto.requestCompileLatexFile;
-	try {
-		proto.requestCompileLatexFile = async (request, workspaceContext) => {
-			capturedRequest = request;
-			capturedContext = workspaceContext;
-			return {
-				protocol_version: 1,
-				supported: true,
-				service_available: true,
-				workspace_context: workspaceContext,
-				request_id: "continuous-pi-test",
-				operation: "compile_latex_file",
-				source: sourcePath,
-				pdf: expectedPdf,
-				log: expectedLog,
-				artifact_paths: [expectedPdf],
-				clean: false,
-				cleaned_artifacts: [],
-				continuous: {
-					requested: true,
-					status: "started",
-					root_source: sourcePath,
-					session_id: workspaceContext.session_id ?? "",
-					subscriber_count: 1,
-					pid: 12345,
-				},
-			};
-		};
-
-		const result = await tool.execute(
-			"compile-latex-file-continuous",
-			{ latex_file_path: sourcePath, continuous: true },
-			undefined,
-			undefined,
-			createSessionContext(root, "pi-continuous-session"),
-		);
-		assert.equal(capturedRequest?.continuous, true);
-		assert.equal(capturedContext?.session_id, "pi-continuous-session");
-		assert.match(result.content[0].text, /Continuous: started subscribers=1 pid=12345/);
-		assert.equal((result.details as { continuous?: { status?: string } }).continuous?.status, "started");
-	} finally {
-		proto.requestCompileLatexFile = originalRequestCompileLatexFile;
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
 
 test("compile_latex_file resolves source path with a relative path", async () => {
 	const root = mkdtempSync(resolve(tmpdir(), "pdf-preview-compile-test-"));

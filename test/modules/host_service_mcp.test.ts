@@ -384,27 +384,16 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.ok(compileFileTool.inputSchema.properties.callback);
 		assert.ok(compileFileTool.inputSchema.properties.reuse_existing);
 		assert.ok(compileFileTool.inputSchema.properties.require_persistent_viewer);
-		assert.equal(compileFileTool.inputSchema.properties.continuous?.type, "boolean");
+		assert.equal(compileFileTool.inputSchema.properties.continuous, undefined);
 		assert.equal(compileFileTool.inputSchema.properties.hide_warnings?.type, "boolean");
-		assert.match(compileFileTool.description ?? "", /continuous=true/);
-		assert.match(compileFileTool.description ?? "", /continuous=false/);
-		assert.match(compileFileTool.description ?? "", /omitting continuous/);
-		assert.match(compileFileTool.description ?? "", /close_pdf does not stop continuous compilation/);
+		assert.doesNotMatch(compileFileTool.description ?? "", /continuous/);
 		assert.match(compileFileTool.description ?? "", /hide_warnings=false/);
 		assert.match(compileFileTool.description ?? "", /hidden by default/i);
 		assert.match(compileFileTool.description ?? "", /same-root/i);
-		assert.match(compileFileTool.description ?? "", /wait/i);
-		assert.match(compileFileTool.description ?? "", /cached|reuse/i);
-		assert.match(compileFileTool.description ?? "", /clean=true.*restart/i);
-		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /latexmk -pvc/);
-		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /-norc/);
-		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /latexmkrc/);
-		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /no shell escape|-no-shell-escape/);
-		assert.match(compileFileTool.inputSchema.properties.continuous?.description ?? "", /no latexmk-owned viewer/);
+		assert.match(compileFileTool.description ?? "", /clean=true/);
 		assert.match(compileFileTool.inputSchema.properties.hide_warnings?.description ?? "", /default/i);
 		assert.match(compileFileTool.inputSchema.properties.hide_warnings?.description ?? "", /hide_warnings=false/);
-		assert.match(closePdfTool.description ?? "", /does not stop continuous compilation/);
-		assert.match(closePdfTool.description ?? "", /continuous=false/);
+		assert.doesNotMatch(closePdfTool.description ?? "", /continuous/);
 		assert.deepEqual(Object.keys(showLatexTool.inputSchema.properties).sort(), ["compiler", "source", "workspace_context"]);
 		assert.equal(showLatexTool.inputSchema.properties.inline, undefined);
 		assert.equal(showLatexTool.inputSchema.properties.fixed_preview_pdf_path, undefined);
@@ -607,7 +596,7 @@ test("daemon rejects invalid set_latex_preamble arguments", async () => {
 	}
 });
 
-test("daemon rejects compile_latex_file continuous arguments without session identity", async () => {
+test("daemon rejects removed compile_latex_file continuous arguments", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-continuous-missing-session-");
 	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-continuous-missing-session-"));
 	const socketPath = join(baseDir, "host-service.sock");
@@ -629,7 +618,7 @@ test("daemon rejects compile_latex_file continuous arguments without session ide
 		});
 		const response = (await sendFramedRequest(socketPath, payload)) as { error: { code: number; message: string } };
 		assert.equal(response.error.code, -32602);
-		assert.match(response.error.message, /workspace_context\.session_id is required for continuous compilation/);
+		assert.match(response.error.message, /unknown argument: continuous/);
 
 		const malformedPayload = JSON.stringify({
 			jsonrpc: "2.0",
@@ -646,7 +635,7 @@ test("daemon rejects compile_latex_file continuous arguments without session ide
 		});
 		const malformedResponse = (await sendFramedRequest(socketPath, malformedPayload)) as { error: { code: number; message: string } };
 		assert.equal(malformedResponse.error.code, -32602);
-		assert.equal(malformedResponse.error.message, "continuous must be a boolean");
+		assert.match(malformedResponse.error.message, /unknown argument: continuous/);
 
 		const malformedHideWarningsPayload = JSON.stringify({
 			jsonrpc: "2.0",

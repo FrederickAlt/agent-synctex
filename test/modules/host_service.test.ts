@@ -1286,7 +1286,7 @@ test("host service serializes concurrent same-root compile_latex_file requests",
 });
 
 
-test("host service reuses fresh queued same-root one-shot result without spawning latexmk again", async () => {
+test("host service serializes queued same-root one-shot requests without reusing cached compile results", async () => {
 	const baseDir = temporaryDir("host-service-compile-cache-reuse-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const originalPath = process.env.PATH ?? "";
@@ -1313,10 +1313,10 @@ test("host service reuses fresh queued same-root one-shot result without spawnin
 		assert.equal(second.compiler_signal, null);
 		assert.equal(second.warning_count, 1);
 		assert.deepEqual(second.warnings, first.warnings);
-		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "1");
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "2");
 
 		await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "pdflatex" }, { cwd: baseDir });
-		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "2");
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "3");
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
@@ -1421,12 +1421,12 @@ test("host service preserves cached fatal diagnostics and replaces stale failure
 		const cachedDetails = cachedFailure.statusDetails as Record<string, unknown>;
 		assert.equal(cachedDetails.error_code, firstDetails.error_code);
 		assert.deepEqual(cachedDetails.diagnostics, firstDetails.diagnostics);
-		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "1");
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "2");
 
 		writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nfixed\\end{document}\n");
 		const success = await client.requestCompileLatexFile({ latex_file_path: "paper.tex", compiler: "lualatex" }, { cwd: baseDir });
 		assert.equal(success.compile_status, "ok_with_warnings");
-		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "2");
+		assert.equal(readFileSync(join(stateDir, "paper.count"), "utf8"), "3");
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
@@ -1584,7 +1584,6 @@ test("host service stop releases queued same-root compile requests", async () =>
 		await server.stop();
 		const results = await Promise.allSettled([first, second]);
 		assert.equal(results.every((result) => result.status === "rejected"), true);
-		assert.equal(results.some((result) => result.status === "rejected" && /host_service_stopped/.test(String(result.reason))), true);
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
