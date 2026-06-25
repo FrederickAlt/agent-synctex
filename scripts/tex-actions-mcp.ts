@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { startCodexMcpDaemonRelay } from "../src/modules/codex_mcp/codex_mcp_server.ts";
+import { startTexActionsStdioMcpRuntime } from "../src/modules/stdio_mcp_runtime.ts";
 
-const relay = startCodexMcpDaemonRelay();
-process.once("SIGINT", () => relay.close());
-process.once("SIGTERM", () => relay.close());
+const runtime = startTexActionsStdioMcpRuntime();
+process.once("SIGINT", () => runtime.close());
+process.once("SIGTERM", () => runtime.close());

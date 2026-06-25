@@ -1,19 +1,27 @@
 import { createConnection } from "node:net";
-import { once } from "node:events";
 import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
 import type { Readable, Writable } from "node:stream";
 import {
 	MCP_ERROR_INTERNAL,
 	MCP_ERROR_PARSE_ERROR,
-	type HostServiceDaemonFrame,
 	type McpRequestId,
 	HostServiceMcpFrameReader,
 	buildMcpErrorResponse,
-	mcpFramedResponse,
 } from "../host_service_mcp.ts";
 import { resolveAgentWorkspaceContext } from "../agent_runtime_context.ts";
 import { HostServiceClient, resolveHostServiceSocketPath } from "../host_service.ts";
 import { initializeLatexPreambleFile } from "../pi_extension/latex_preamble_manager.ts";
+import {
+	asError,
+	frameClientPayload,
+	frameMcpPayload,
+	isRecord,
+	type McpClientFrameProtocol,
+	McpStdioFrameLoop,
+	omitToolInputSchemaProperties,
+	requestMetadata,
+	writeStreamPayload,
+} from "../mcp_stdio_transport.ts";
 
 export interface CodexMcpDaemonRelayOptions {
 	socketPath?: string;
@@ -28,77 +36,14 @@ export interface CodexMcpDaemonRelayOptions {
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_FRAME_SIZE_BYTES = 16_384;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
-type ClientFrameProtocol = HostServiceDaemonFrame["protocol"];
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function framePayload(payload: string): string {
-	return `Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n${payload}`;
-}
-
-function frameClientPayload(payload: string, protocol: ClientFrameProtocol): string {
-	if (protocol === "mcp") {
-		return framePayload(payload);
-	}
-	return `${payload}\n`;
-}
-
-function requestMetadata(payload: string): { requestId: McpRequestId; expectsResponse: boolean } {
-	try {
-		const parsed = JSON.parse(payload);
-		if (!isRecord(parsed)) {
-			return { requestId: null, expectsResponse: true };
-		}
-		if (!Object.prototype.hasOwnProperty.call(parsed, "id")) {
-			return { requestId: null, expectsResponse: false };
-		}
-		const rawId = (parsed as { id?: unknown }).id;
-		if (rawId === null || typeof rawId === "string" || typeof rawId === "number") {
-			return { requestId: rawId, expectsResponse: true };
-		}
-		return { requestId: null, expectsResponse: true };
-	} catch {
-		return { requestId: null, expectsResponse: true };
-	}
-}
-
-function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
-	return { ...value };
-}
-
-function omitRecordKey(value: unknown, key: string): unknown {
-	if (!isRecord(value)) {
-		return value;
-	}
-	const clone = cloneRecord(value);
-	delete clone[key];
-	return clone;
-}
-
-function omitArrayValue(value: unknown, item: string): unknown {
-	if (!Array.isArray(value)) {
-		return value;
-	}
-	return value.filter((entry) => entry !== item);
-}
+type ClientFrameProtocol = McpClientFrameProtocol;
 
 function hideInternalArgumentsFromTool(tool: unknown): unknown {
-	if (!isRecord(tool) || !isRecord(tool.inputSchema)) {
-		return tool;
+	const omitted = ["workspace_context"];
+	if (isRecord(tool) && tool.name === "show_latex") {
+		omitted.push("inline");
 	}
-	const inputSchema = cloneRecord(tool.inputSchema);
-	inputSchema.properties = omitRecordKey(inputSchema.properties, "workspace_context");
-	inputSchema.required = omitArrayValue(inputSchema.required, "workspace_context");
-	if (tool.name === "show_latex") {
-		inputSchema.properties = omitRecordKey(inputSchema.properties, "inline");
-		inputSchema.required = omitArrayValue(inputSchema.required, "inline");
-	}
-	return {
-		...tool,
-		inputSchema,
-	};
+	return omitToolInputSchemaProperties(tool, omitted);
 }
 
 function rewriteToolsListForCodex(response: Record<string, unknown>): Record<string, unknown> {
@@ -183,10 +128,6 @@ function daemonUnavailableMessage(socketPath: string): string {
 	].join(" ");
 }
 
-function asError(error: unknown): Error {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
 function systemInfoNotificationPayload(message: string): string {
 	return JSON.stringify({
 		jsonrpc: "2.0",
@@ -207,37 +148,37 @@ function isUnsupportedPendingNotificationsError(error: unknown): boolean {
 
 export class CodexMcpDaemonRelay {
 	readonly socketPath: string;
-	private readonly stdin: Readable;
 	private readonly stdout: Writable;
 	private readonly stderr: Writable;
 	private readonly requestTimeoutMs: number;
 	private readonly maxPayloadBytes: number;
 	private readonly heartbeatIntervalMs: number;
-	private readonly frameReader: HostServiceMcpFrameReader;
+	private readonly frameLoop: McpStdioFrameLoop;
 	private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-	private task: Promise<void> = Promise.resolve();
 	private closed = false;
 
 	constructor(options: CodexMcpDaemonRelayOptions = {}) {
 		this.socketPath = options.socketPath ?? resolveHostServiceSocketPath();
-		this.stdin = options.stdin ?? processStdin;
 		this.stdout = options.stdout ?? processStdout;
 		this.stderr = options.stderr ?? processStderr;
 		this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 		this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_FRAME_SIZE_BYTES;
 		this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
-		this.frameReader = new HostServiceMcpFrameReader({ maxPayloadBytes: this.maxPayloadBytes });
+		this.frameLoop = new McpStdioFrameLoop({
+			stdin: options.stdin ?? processStdin,
+			stderr: this.stderr,
+			maxPayloadBytes: this.maxPayloadBytes,
+			onFrame: this.handleFrame,
+			onParseError: (error) => this.sendErrorFrame(null, MCP_ERROR_PARSE_ERROR, error.message).catch(() => undefined),
+			onDiagnostic: this.writeDiagnostic,
+		});
 	}
 
 	start(): void {
 		if (this.closed) {
 			return;
 		}
-		if (this.stdin.readableEncoding !== "utf8") {
-			this.stdin.setEncoding("utf8");
-		}
-		this.stdin.on("data", this.handleData);
-		this.stdin.once("close", this.close);
+		this.frameLoop.start();
 		this.startHeartbeat();
 	}
 
@@ -246,8 +187,7 @@ export class CodexMcpDaemonRelay {
 			return;
 		}
 		this.closed = true;
-		this.stdin.off("data", this.handleData);
-		this.stdin.off("close", this.close);
+		this.frameLoop.close();
 		if (this.heartbeatTimer) {
 			clearInterval(this.heartbeatTimer);
 			this.heartbeatTimer = undefined;
@@ -271,29 +211,7 @@ export class CodexMcpDaemonRelay {
 		await client.requestSessionHeartbeat(workspaceContext).catch(() => undefined);
 	}
 
-	private readonly handleData = (chunk: string | Buffer): void => {
-		if (this.closed) {
-			return;
-		}
-		try {
-			this.frameReader.write(chunk);
-			while (true) {
-				const frame = this.frameReader.nextFrame();
-				if (!frame) {
-					break;
-				}
-				this.task = this.task.then(() => this.handleFrame(frame)).catch((error) => {
-					this.writeDiagnostic(asError(error).message);
-				});
-			}
-		} catch (error) {
-			void this.sendErrorFrame(null, MCP_ERROR_PARSE_ERROR, asError(error).message).catch(() => {
-				// no-op
-			});
-		}
-	};
-
-	private async handleFrame(frame: HostServiceDaemonFrame): Promise<void> {
+	private readonly handleFrame = async (frame: { protocol: ClientFrameProtocol; payload: string }): Promise<void> => {
 		const { requestId, expectsResponse } = requestMetadata(frame.payload);
 		try {
 			await this.flushPendingSystemInfo(frame.protocol);
@@ -309,7 +227,7 @@ export class CodexMcpDaemonRelay {
 				frame.protocol,
 			);
 		}
-	}
+	};
 
 	private async flushPendingSystemInfo(clientProtocol: ClientFrameProtocol): Promise<void> {
 		const workspaceContext = resolveAgentWorkspaceContext();
@@ -328,7 +246,7 @@ export class CodexMcpDaemonRelay {
 
 	private async forwardToDaemon(payload: string, expectsResponse: boolean, clientProtocol: ClientFrameProtocol): Promise<void> {
 		const daemonPayload = rewriteClientRequestForCodex(payload);
-		const framed = framePayload(daemonPayload);
+		const framed = frameMcpPayload(daemonPayload);
 		if (!expectsResponse) {
 			await this.writeNotification(framed);
 			return;
@@ -435,17 +353,11 @@ export class CodexMcpDaemonRelay {
 
 	private async sendErrorFrame(requestId: McpRequestId, code: number, message: string, protocol: ClientFrameProtocol = "mcp"): Promise<void> {
 		const response = buildMcpErrorResponse(requestId, code, message);
-		if (protocol === "mcp") {
-			await this.writeOutput(mcpFramedResponse(response));
-			return;
-		}
-		await this.writeOutput(`${JSON.stringify(response)}\n`);
+		await this.writeOutput(frameClientPayload(JSON.stringify(response), protocol));
 	}
 
 	private async writeOutput(payload: string): Promise<void> {
-		if (!this.stdout.write(payload)) {
-			await once(this.stdout, "drain");
-		}
+		await writeStreamPayload(this.stdout, payload);
 	}
 
 	private writeDiagnostic(message: string): void {

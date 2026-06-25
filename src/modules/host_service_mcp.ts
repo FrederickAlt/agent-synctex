@@ -782,6 +782,18 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 				additionalProperties: false,
 			},
 		},
+		{
+			name: "get_pdf_events",
+			description: "Return queued PDF.js viewer events for this MCP runtime. This v1 scaffold currently returns an empty event list until the PDF.js viewer bridge is implemented.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					pdf_id: { type: "number", minimum: 1 },
+					since_event_id: { type: "string" },
+				},
+				additionalProperties: false,
+			},
+		},
 	];
 }
 
@@ -792,6 +804,7 @@ export const HOST_SERVICE_TOOL_NAMES = [
 	"jump_pdf",
 	"close_pdf",
 	"set_latex_preamble",
+	"get_pdf_events",
 ] as const;
 
 type HostServiceToolName = (typeof HOST_SERVICE_TOOL_NAMES)[number];
@@ -1005,6 +1018,37 @@ async function handleSetLatexPreambleTool(
 	}
 }
 
+function validateGetPdfEventsArgs(args: Record<string, unknown>): string | undefined {
+	for (const key of Object.keys(args)) {
+		if (key !== "pdf_id" && key !== "since_event_id") {
+			return `get_pdf_events unknown argument: ${key}`;
+		}
+	}
+	if (args.pdf_id !== undefined && (typeof args.pdf_id !== "number" || !Number.isFinite(args.pdf_id) || args.pdf_id < 1)) {
+		return "get_pdf_events pdf_id must be a number >= 1";
+	}
+	if (args.since_event_id !== undefined && typeof args.since_event_id !== "string") {
+		return "get_pdf_events since_event_id must be a string";
+	}
+	return undefined;
+}
+
+async function handleGetPdfEventsTool(
+	requestId: ParsedMcpRequestId,
+	args: Record<string, unknown>,
+	_pdfOperations: HostServiceMcpPdfOperations,
+	_mcpCompileService: HostServiceCompileService,
+): Promise<McpResponsePayload> {
+	const validationError = validateGetPdfEventsArgs(args);
+	if (validationError !== undefined) {
+		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, validationError);
+	}
+	return buildSuccess(requestId, {
+		content: [{ type: "text", text: "No PDF events are queued for this MCP runtime." }],
+		details: { events: [], next_cursor: null },
+	});
+}
+
 export function mcpFramedResponse(payload: McpResponsePayload): string {
 	return encodeResponse(payload);
 }
@@ -1077,6 +1121,7 @@ export async function handleMcpRequest(
 				jump_pdf: handleJumpPdfTool,
 				close_pdf: handleClosePdfTool,
 				set_latex_preamble: handleSetLatexPreambleTool,
+				get_pdf_events: handleGetPdfEventsTool,
 			};
 			const handler = toolHandlers[call.name as HostServiceToolName] ?? null;
 			if (handler === null) {

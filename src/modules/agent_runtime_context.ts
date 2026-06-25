@@ -1,7 +1,6 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { HostServiceWorkspaceContext } from "./host_service_protocol.ts";
 import { getMcpTmpDir } from "./runtime_paths.ts";
 
@@ -14,8 +13,13 @@ function processStableUuid(): string {
 	return processStableAgentId;
 }
 
-function rawPiSessionId(ctx?: ExtensionContext): string | undefined {
-	const rawSessionId = (ctx as { session_id?: unknown } | undefined)?.session_id;
+interface AgentWorkspaceContextSource {
+	cwd?: string;
+	session_id?: unknown;
+}
+
+function rawPiSessionId(ctx?: AgentWorkspaceContextSource): string | undefined {
+	const rawSessionId = ctx?.session_id;
 	return typeof rawSessionId === "string" && rawSessionId.trim().length > 0
 		? rawSessionId
 		: undefined;
@@ -29,7 +33,7 @@ export function sanitizeTexActionsAgentId(agentId: string): string {
 	return sanitized;
 }
 
-export function resolveTexActionsAgentId(ctx?: ExtensionContext): string {
+export function resolveTexActionsAgentId(ctx?: AgentWorkspaceContextSource): string {
 	const envAgentId = process.env[TEX_ACTIONS_AGENT_ID_ENV_VAR];
 	return sanitizeTexActionsAgentId(
 		(envAgentId && envAgentId.trim().length > 0)
@@ -47,7 +51,7 @@ export function ensureTexActionsAgentRuntimeDir(dir: string): void {
 	chmodSync(dir, 0o700);
 }
 
-export function resolveAgentWorkspaceContext(ctx?: ExtensionContext): HostServiceWorkspaceContext {
+export function resolveAgentWorkspaceContext(ctx?: AgentWorkspaceContextSource): HostServiceWorkspaceContext {
 	const agentId = resolveTexActionsAgentId(ctx);
 	const agentRuntimeDir = resolveTexActionsAgentRuntimeDir(agentId);
 	ensureTexActionsAgentRuntimeDir(agentRuntimeDir);

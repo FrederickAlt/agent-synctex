@@ -297,6 +297,7 @@ const HOST_TOOL_NAMES = [
 	"jump_pdf",
 	"close_pdf",
 	"set_latex_preamble",
+	"get_pdf_events",
 ];
 
 
