@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { assertReadablePdfFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
 import type {
@@ -8,7 +9,7 @@ import type {
 	HostServiceOpenResponseEnvelope,
 } from "./host_service_protocol.ts";
 import type { HostServiceMcpPdfOperations } from "./host_service_mcp.ts";
-import { PdfJsViewerRegistry } from "./pdfjs_viewer_registry.ts";
+import { arePdfSnapshotsEqual, PdfJsViewerRegistry, type PdfJsViewerFileSnapshot, type PdfJsViewerRecord } from "./pdfjs_viewer_registry.ts";
 import { PdfJsViewerServer } from "./pdfjs_viewer_server.ts";
 
 const PDFJS_VIEWER_BACKEND_NAME = "pdfjs-browser";
@@ -20,6 +21,8 @@ const PDFJS_VIEWER_BACKEND_CAPABILITIES = {
 	reuse: true,
 };
 const DEFAULT_BROWSER_LAUNCH_SETTLE_MS = 250;
+const DEFAULT_PDF_REFRESH_POLL_INTERVAL_MS = 500;
+const DEFAULT_PDF_REFRESH_STABILITY_DEBOUNCE_MS = 250;
 
 export interface BrowserLaunchResult {
 	ok: boolean;
@@ -91,25 +94,51 @@ export class DefaultBrowserLauncher implements BrowserLauncher {
 	}
 }
 
+export interface PdfJsViewerRefreshOptions {
+	autoStart?: boolean;
+	pollIntervalMs?: number;
+	stabilityDebounceMs?: number;
+}
+
 export interface PdfJsViewerMcpServiceOptions {
 	registry?: PdfJsViewerRegistry;
 	server?: PdfJsViewerServer;
 	browserLauncher?: BrowserLauncher;
+	pdfRefresh?: PdfJsViewerRefreshOptions;
+}
+
+export interface MarkTrackedPdfUpdatedResult {
+	tracked: boolean;
+	refreshed: boolean;
+	pdfId?: number;
+	revision?: number;
+	viewerNotifications: number;
+	reason?: string;
 }
 
 export class PdfJsViewerMcpService {
 	private readonly registry: PdfJsViewerRegistry;
 	private readonly server: PdfJsViewerServer;
 	private readonly browserLauncher: BrowserLauncher;
+	private readonly pdfRefreshAutoStart: boolean;
+	private readonly pdfRefreshPollIntervalMs: number;
+	private readonly pdfRefreshStabilityDebounceMs: number;
+	private readonly pendingRefreshes = new Map<number, { snapshot: PdfJsViewerFileSnapshot; stableSinceMs: number }>();
+	private pdfRefreshTimer: NodeJS.Timeout | undefined;
+	private pdfRefreshPollInFlight = false;
 	readonly pdfOperations: HostServiceMcpPdfOperations;
 
 	constructor(options: PdfJsViewerMcpServiceOptions = {}) {
 		this.registry = options.registry ?? new PdfJsViewerRegistry();
 		this.server = options.server ?? new PdfJsViewerServer({ registry: this.registry });
 		this.browserLauncher = options.browserLauncher ?? new DefaultBrowserLauncher();
+		this.pdfRefreshAutoStart = options.pdfRefresh?.autoStart ?? true;
+		this.pdfRefreshPollIntervalMs = options.pdfRefresh?.pollIntervalMs ?? DEFAULT_PDF_REFRESH_POLL_INTERVAL_MS;
+		this.pdfRefreshStabilityDebounceMs = options.pdfRefresh?.stabilityDebounceMs ?? DEFAULT_PDF_REFRESH_STABILITY_DEBOUNCE_MS;
 		this.pdfOperations = {
 			openPdf: (request) => this.openPdf(request),
 			closePdf: (request) => this.closePdf(request),
+			markTrackedPdfUpdated: (pdfPath) => this.markTrackedPdfUpdated(pdfPath),
 		};
 	}
 
@@ -140,12 +169,18 @@ export class PdfJsViewerMcpService {
 			};
 		}
 
+		const fileSnapshot = snapshotReadablePdfFile(pdfPath);
 		await this.server.start();
+		this.startPdfRefreshPolling();
 		const existing = this.registry.findActiveRecordByPath(pdfPath);
 		const record = this.registry.registerPdf({
 			pdfPath,
+			fileSnapshot,
 			viewerUrlForPdfId: (pdfId) => this.server.viewerUrl(pdfId),
 		});
+		if (existing !== undefined) {
+			this.refreshRecordIfSnapshotChanged(record, fileSnapshot);
+		}
 		const launch = await this.browserLauncher.open(record.viewerUrl);
 		return {
 			protocol_version: request.protocol_version,
@@ -161,6 +196,7 @@ export class PdfJsViewerMcpService {
 				reused: existing !== undefined,
 				handle: record.viewerUrl,
 				pdf_id: record.pdfId,
+				revision: record.revision,
 				viewer_url: record.viewerUrl,
 				browser_launch: { ...launch },
 				managed_record: {
@@ -174,7 +210,7 @@ export class PdfJsViewerMcpService {
 					capabilities: PDFJS_VIEWER_BACKEND_CAPABILITIES,
 					backendPath: PDFJS_VIEWER_BACKEND_NAME,
 					defaultSourcePath: inferDefaultSourceFileForPdf(pdfPath),
-					metadata: { viewer_url: record.viewerUrl, browser_launch: launch },
+					metadata: { viewer_url: record.viewerUrl, browser_launch: launch, revision: record.revision, file_snapshot: record.fileSnapshot },
 				},
 			},
 		};
@@ -185,6 +221,7 @@ export class PdfJsViewerMcpService {
 		try {
 			notifications = this.server.notifyPdfClosed(request.pdf_id);
 			const record = this.registry.closePdf(request.pdf_id);
+			this.pendingRefreshes.delete(request.pdf_id);
 			return {
 				protocol_version: request.protocol_version,
 				request_id: request.request_id,
@@ -237,9 +274,74 @@ export class PdfJsViewerMcpService {
 		}
 	}
 
+	async markTrackedPdfUpdated(pdfPath: string): Promise<MarkTrackedPdfUpdatedResult> {
+		const record = this.registry.findActiveRecordByPath(pdfPath);
+		if (!record) {
+			return { tracked: false, refreshed: false, viewerNotifications: 0, reason: "pdf is not tracked" };
+		}
+		const snapshot = readablePdfSnapshotOrUndefined(record.pdfPath);
+		if (!snapshot) {
+			return { tracked: true, refreshed: false, pdfId: record.pdfId, revision: record.revision, viewerNotifications: 0, reason: "pdf is not readable" };
+		}
+		return { tracked: true, ...this.refreshRecordIfSnapshotChanged(record, snapshot) };
+	}
+
+	async pollTrackedPdfChanges(nowMs = Date.now()): Promise<void> {
+		for (const record of this.registry.activePdfRecords()) {
+			const snapshot = readablePdfSnapshotOrUndefined(record.pdfPath);
+			if (!snapshot) {
+				this.pendingRefreshes.delete(record.pdfId);
+				continue;
+			}
+			if (record.fileSnapshot && arePdfSnapshotsEqual(record.fileSnapshot, snapshot)) {
+				this.pendingRefreshes.delete(record.pdfId);
+				continue;
+			}
+			const pending = this.pendingRefreshes.get(record.pdfId);
+			if (!pending || !arePdfSnapshotsEqual(pending.snapshot, snapshot)) {
+				this.pendingRefreshes.set(record.pdfId, { snapshot, stableSinceMs: nowMs });
+				continue;
+			}
+			if (nowMs - pending.stableSinceMs < this.pdfRefreshStabilityDebounceMs) {
+				continue;
+			}
+			this.pendingRefreshes.delete(record.pdfId);
+			this.refreshRecordIfSnapshotChanged(record, snapshot);
+		}
+	}
+
 	async stop(): Promise<void> {
+		if (this.pdfRefreshTimer) {
+			clearInterval(this.pdfRefreshTimer);
+			this.pdfRefreshTimer = undefined;
+		}
+		this.pendingRefreshes.clear();
 		await this.server.stop();
 		this.registry.clear();
+	}
+
+	private startPdfRefreshPolling(): void {
+		if (!this.pdfRefreshAutoStart || this.pdfRefreshTimer || this.pdfRefreshPollIntervalMs <= 0) {
+			return;
+		}
+		this.pdfRefreshTimer = setInterval(() => {
+			if (this.pdfRefreshPollInFlight) return;
+			this.pdfRefreshPollInFlight = true;
+			void this.pollTrackedPdfChanges()
+				.finally(() => {
+					this.pdfRefreshPollInFlight = false;
+				});
+		}, this.pdfRefreshPollIntervalMs);
+		this.pdfRefreshTimer.unref?.();
+	}
+
+	private refreshRecordIfSnapshotChanged(record: PdfJsViewerRecord, snapshot: PdfJsViewerFileSnapshot): Omit<MarkTrackedPdfUpdatedResult, "tracked"> {
+		const update = this.registry.updatePdfSnapshot(record.pdfId, snapshot);
+		if (!update.changed) {
+			return { refreshed: false, pdfId: record.pdfId, revision: update.revision, viewerNotifications: 0 };
+		}
+		const viewerNotifications = this.server.notifyPdfRefresh(record.pdfId, update.revision);
+		return { refreshed: true, pdfId: record.pdfId, revision: update.revision, viewerNotifications };
 	}
 
 	private openStatusBase(request: HostServiceOpenRequest, pdfPath: string) {
@@ -255,3 +357,19 @@ export class PdfJsViewerMcpService {
 		};
 	}
 }
+
+function snapshotReadablePdfFile(pdfPath: string): PdfJsViewerFileSnapshot {
+	const status = statSync(pdfPath);
+	return { size: status.size, mtimeMs: status.mtimeMs };
+}
+
+function readablePdfSnapshotOrUndefined(pdfPath: string): PdfJsViewerFileSnapshot | undefined {
+	try {
+		const status = statSync(pdfPath);
+		if (!status.isFile()) return undefined;
+		return { size: status.size, mtimeMs: status.mtimeMs };
+	} catch {
+		return undefined;
+	}
+}
+
