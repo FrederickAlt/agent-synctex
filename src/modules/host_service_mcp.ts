@@ -262,6 +262,11 @@ function parseCallbackTargetArg(args: Record<string, unknown>): HostServiceCallb
 	if (!isRecord(rawCallback)) {
 		throw new Error("callback must be an object");
 	}
+	for (const key of Object.keys(rawCallback)) {
+		if (!["kind", "transport", "socket_path", "token"].includes(key)) {
+			throw new Error(`callback unknown argument: ${key}`);
+		}
+	}
 	if (typeof rawCallback.kind !== "string" || !rawCallback.kind.trim()) {
 		throw new Error("callback.kind must be a non-empty string");
 	}
@@ -358,14 +363,13 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 }
 
 function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequest {
-	const allowedArgs = new Set(["pdf_file_path", "pdf_path", "callback", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
+	const allowedArgs = new Set(["pdf_file_path", "callback", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
 	for (const key of Object.keys(args)) {
 		if (!allowedArgs.has(key)) {
 			throw new Error(`open_pdf unknown argument: ${key}`);
 		}
 	}
-	const pdfPath = parseOptionalStringArg(args, "pdf_file_path")
-		?? parseOptionalStringArg(args, "pdf_path");
+	const pdfPath = parseOptionalStringArg(args, "pdf_file_path");
 	if (pdfPath === undefined) {
 		throw new Error("pdf_file_path must be a non-empty string");
 	}

@@ -712,9 +712,24 @@ test("daemon validates open_pdf/jump_pdf/close_pdf argument schemas", async () =
 		assert.equal(openUnknownResponse.error.code, -32602);
 		assert.equal(openUnknownResponse.error.message, "open_pdf unknown argument: extra");
 
-		const openResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+		const openAliasResponse = (await sendFramedRequest(socketPath, JSON.stringify({
 			jsonrpc: "2.0",
 			id: 102,
+			method: "tools/call",
+			params: {
+				name: "open_pdf",
+				arguments: {
+					pdf_path: "paper.pdf",
+					workspace_context: { cwd: workspaceDir },
+				},
+			},
+		}))) as { error: { code: number; message: string } };
+		assert.equal(openAliasResponse.error.code, -32602);
+		assert.equal(openAliasResponse.error.message, "open_pdf unknown argument: pdf_path");
+
+		const openResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 103,
 			method: "tools/call",
 			params: {
 				name: "open_pdf",
@@ -1137,6 +1152,27 @@ test("daemon rejects MCP open_pdf with malformed callback metadata", async () =>
 		}))) as { error: { code: number; message: string } };
 		assert.equal(response.error.code, -32602);
 		assert.equal(response.error.message, "callback.token must be a non-empty string");
+
+		const callbackUnknownArgResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 32,
+			method: "tools/call",
+			params: {
+				name: "open_pdf",
+				arguments: {
+					pdf_file_path: pdfPath,
+					callback: {
+						kind: "pi-synctex-callback-v1",
+						transport: "unix",
+						socket_path: "/tmp/callback.sock",
+						token: "token-abc",
+						other: "reject",
+					},
+				},
+			},
+		}))) as { error: { code: number; message: string } };
+		assert.equal(callbackUnknownArgResponse.error.code, -32602);
+		assert.equal(callbackUnknownArgResponse.error.message, "callback unknown argument: other");
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
