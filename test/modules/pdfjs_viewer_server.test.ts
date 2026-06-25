@@ -75,6 +75,21 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 	assert.equal(predicate(), true);
 }
 
+async function readWebSocketTextFrame(socket: Socket): Promise<string> {
+	const [chunk] = await once(socket, "data") as [Buffer];
+	const firstLength = chunk[1] & 0x7f;
+	let offset = 2;
+	let length = firstLength;
+	if (firstLength === 126) {
+		length = chunk.readUInt16BE(offset);
+		offset += 2;
+	} else if (firstLength === 127) {
+		length = Number(chunk.readBigUInt64BE(offset));
+		offset += 8;
+	}
+	return chunk.subarray(offset, offset + length).toString("utf8");
+}
+
 test("PDF.js viewer server serves shell/config/assets and registered PDF bytes only", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-server-"));
 	const pdfPath = join(baseDir, "paper.pdf");
@@ -99,7 +114,11 @@ test("PDF.js viewer server serves shell/config/assets and registered PDF bytes o
 		const asset = await readHttp(`${server.origin}/assets/viewer.js`);
 		assert.equal(asset.status, 200);
 		assert.match(asset.contentType, /javascript/);
-		assertNoExternalUrls("viewer script", asset.body.toString("utf8"));
+		const viewerScript = asset.body.toString("utf8");
+		assertNoExternalUrls("viewer script", viewerScript);
+		assert.match(viewerScript, /pdf_refresh/);
+		assert.match(viewerScript, /window\.scrollTo/);
+		assert.doesNotMatch(viewerScript, /location\.reload|viewer_reload/);
 
 		const pdfJs = await readHttp(`${server.origin}/assets/pdf.mjs`);
 		assert.equal(pdfJs.status, 200);
@@ -207,7 +226,7 @@ test("PDF.js viewer server streams registered PDF bytes for GET", async () => {
 	}
 });
 
-test("PDF.js viewer WebSocket associates clients with requested pdf_id and removes them on disconnect", async () => {
+test("PDF.js viewer WebSocket associates clients with requested pdf_id and delivers pdf_refresh", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-ws-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFakePdf(pdfPath);
@@ -215,12 +234,21 @@ test("PDF.js viewer WebSocket associates clients with requested pdf_id and remov
 	const server = new PdfJsViewerServer({ registry });
 	try {
 		await server.start();
-		const record = registry.registerPdf({ pdfPath, viewerUrl: server.viewerUrl(6) });
+		const record = registry.registerPdf({ pdfPath, viewerUrl: server.viewerUrl(6), fileSnapshot: { size: 10, mtimeMs: 20 } });
 		const wsUrl = new URL(`/ws?pdf_id=${record.pdfId}`, server.origin);
 		wsUrl.protocol = "ws:";
 
 		const socket = await connectRawWebSocket(wsUrl);
 		await waitFor(() => registry.clientCount(record.pdfId) === 1);
+
+		assert.equal(server.notifyPdfRefresh(record.pdfId, 2), 1);
+		assert.deepEqual(JSON.parse(await readWebSocketTextFrame(socket)), {
+			type: "pdf_refresh",
+			pdf_id: record.pdfId,
+			revision: 2,
+			pdf_url: `${server.origin}/pdf/${record.pdfId}?revision=2`,
+		});
+
 		socket.write(Buffer.from([0x88, 0x80, 0, 0, 0, 0]));
 		socket.end();
 		await waitFor(() => registry.clientCount(record.pdfId) === 0);

@@ -38,6 +38,7 @@ export interface HostServiceMcpPdfOperations {
 	openPdf?: (request: HostServiceOpenRequest) => Promise<HostServiceOpenResponseEnvelope>;
 	jumpPdf?: (request: HostServiceJumpRequest) => Promise<HostServiceJumpResponseEnvelope>;
 	closePdf?: (request: HostServiceCloseRequest) => Promise<HostServiceCloseResponseEnvelope>;
+	markTrackedPdfUpdated?: (pdfPath: string) => Promise<unknown>;
 	resolveManagedOpenCallback?: (
 		workspaceContext: HostServiceWorkspaceContext,
 		callbackTargetId: string | undefined,
@@ -61,6 +62,7 @@ function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): Ho
 				}
 				return pdfOperations.openPdf(openRequest);
 			},
+			markPdfUpdated: pdfOperations.markTrackedPdfUpdated,
 		},
 		resolveManagedOpenCallback: async (workspaceContext, callbackTargetId, callbackTarget) =>
 			pdfOperations.resolveManagedOpenCallback

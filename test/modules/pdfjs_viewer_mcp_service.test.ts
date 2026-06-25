@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -7,8 +7,13 @@ import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { PdfJsViewerMcpService, type BrowserLauncher } from "../../src/modules/pdfjs_viewer_mcp_service.ts";
 import { PdfJsViewerRegistry } from "../../src/modules/pdfjs_viewer_registry.ts";
 
-function writeFakePdf(path: string): void {
-	writeFileSync(path, "%PDF-1.4\n1 0 obj\n%%EOF\n");
+function writeFakePdf(path: string, body = "1 0 obj"): void {
+	writeFileSync(path, `%PDF-1.4\n${body}\n%%EOF\n`);
+}
+
+function forceMtime(path: string, mtimeMs: number): void {
+	const seconds = mtimeMs / 1000;
+	utimesSync(path, seconds, seconds);
 }
 
 class FakeBrowserLauncher implements BrowserLauncher {
@@ -42,6 +47,8 @@ test("PDF.js MCP service open_pdf validates local PDFs, returns viewer_url, and 
 		assert.equal(response.status, "ok");
 		assert.equal(response.status_details.pdf, pdfPath);
 		assert.equal(response.status_details.pdf_id, 1);
+		assert.equal(response.status_details.revision, 1);
+		assert.equal(response.status_details.managed_record?.metadata?.revision, 1);
 		assert.match(response.status_details.viewer_url ?? "", /^http:\/\/127\.0\.0\.1:\d+\/viewer\/1$/);
 		assert.deepEqual(launcher.urls, [response.status_details.viewer_url]);
 		assert.deepEqual(response.status_details.browser_launch, { ok: true, command: "fake-browser" });
@@ -128,6 +135,212 @@ test("PDF.js MCP service close_pdf untracks the record and reports best-effort v
 			details: { pdf_path: pdfPath },
 		});
 		assert.notEqual(reopen.status_details.pdf_id, pdfId);
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("PDF.js MCP service debounces changed file snapshots before sending pdf_refresh", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-refresh-debounce-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath, "first");
+	forceMtime(pdfPath, 1_000);
+	const registry = new PdfJsViewerRegistry({ makePdfId: () => 21 });
+	const service = new PdfJsViewerMcpService({
+		browserLauncher: new FakeBrowserLauncher({ ok: true }),
+		registry,
+		pdfRefresh: { autoStart: false, stabilityDebounceMs: 50 },
+	});
+	try {
+		const open = await service.openPdf({
+			protocol_version: 1,
+			request_id: "open-refresh-debounce",
+			operation: "open_pdf",
+			created_at_ns: 1,
+			workspace_context: { cwd: baseDir },
+			details: { pdf_path: pdfPath },
+		});
+		const pdfId = open.status_details.pdf_id ?? 0;
+		const record = registry.getActiveRecord(pdfId);
+		const notifications: string[] = [];
+		registry.addClient(pdfId, { send: (message) => notifications.push(message) });
+
+		writeFakePdf(pdfPath, "second body is larger");
+		forceMtime(pdfPath, 2_000);
+		await service.pollTrackedPdfChanges(100);
+		await service.pollTrackedPdfChanges(130);
+		assert.deepEqual(notifications, []);
+		assert.equal(record.revision, 1);
+
+		await service.pollTrackedPdfChanges(151);
+		assert.equal(record.revision, 2);
+		assert.equal(notifications.length, 1);
+		assert.deepEqual(JSON.parse(notifications[0]), {
+			type: "pdf_refresh",
+			pdf_id: pdfId,
+			revision: 2,
+			pdf_url: `${record.viewerUrl.replace(/\/viewer\/\d+$/, "")}/pdf/${pdfId}?revision=2`,
+		});
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("PDF.js MCP service resets refresh debounce until the PDF snapshot is stable", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-refresh-stable-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath, "first");
+	forceMtime(pdfPath, 1_000);
+	const registry = new PdfJsViewerRegistry({ makePdfId: () => 22 });
+	const service = new PdfJsViewerMcpService({
+		browserLauncher: new FakeBrowserLauncher({ ok: true }),
+		registry,
+		pdfRefresh: { autoStart: false, stabilityDebounceMs: 50 },
+	});
+	try {
+		const open = await service.openPdf({
+			protocol_version: 1,
+			request_id: "open-refresh-stable",
+			operation: "open_pdf",
+			created_at_ns: 1,
+			workspace_context: { cwd: baseDir },
+			details: { pdf_path: pdfPath },
+		});
+		const pdfId = open.status_details.pdf_id ?? 0;
+		const notifications: string[] = [];
+		registry.addClient(pdfId, { send: (message) => notifications.push(message) });
+
+		writeFakePdf(pdfPath, "second");
+		forceMtime(pdfPath, 2_000);
+		await service.pollTrackedPdfChanges(100);
+		writeFakePdf(pdfPath, "third body changes while debouncing");
+		forceMtime(pdfPath, 3_000);
+		await service.pollTrackedPdfChanges(140);
+		await service.pollTrackedPdfChanges(189);
+		assert.deepEqual(notifications, []);
+
+		await service.pollTrackedPdfChanges(191);
+		assert.equal(registry.getActiveRecord(pdfId).revision, 2);
+		assert.equal(JSON.parse(notifications[0]).revision, 2);
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("PDF.js MCP service clears pending refresh debounce state when closing a tracked PDF", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-refresh-close-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath, "first");
+	forceMtime(pdfPath, 1_000);
+	const registry = new PdfJsViewerRegistry({ makePdfId: () => 25 });
+	const service = new PdfJsViewerMcpService({
+		browserLauncher: new FakeBrowserLauncher({ ok: true }),
+		registry,
+		pdfRefresh: { autoStart: false, stabilityDebounceMs: 50 },
+	});
+	try {
+		const open = await service.openPdf({
+			protocol_version: 1,
+			request_id: "open-refresh-close",
+			operation: "open_pdf",
+			created_at_ns: 1,
+			workspace_context: { cwd: baseDir },
+			details: { pdf_path: pdfPath },
+		});
+		const pdfId = open.status_details.pdf_id ?? 0;
+		writeFakePdf(pdfPath, "second body");
+		forceMtime(pdfPath, 2_000);
+		await service.pollTrackedPdfChanges(100);
+		assert.equal((service as unknown as { pendingRefreshes: Map<number, unknown> }).pendingRefreshes.has(pdfId), true);
+
+		const close = await service.closePdf({
+			protocol_version: 1,
+			request_id: "close-refresh-close",
+			operation: "close_pdf",
+			created_at_ns: 2,
+			workspace_context: { cwd: baseDir },
+			pdf_id: pdfId,
+		});
+
+		assert.equal(close.status, "ok");
+		assert.equal((service as unknown as { pendingRefreshes: Map<number, unknown> }).pendingRefreshes.has(pdfId), false);
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("PDF.js MCP service ignores missing tracked files during refresh polling", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-refresh-missing-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new PdfJsViewerRegistry({ makePdfId: () => 23 });
+	const service = new PdfJsViewerMcpService({
+		browserLauncher: new FakeBrowserLauncher({ ok: true }),
+		registry,
+		pdfRefresh: { autoStart: false, stabilityDebounceMs: 1 },
+	});
+	try {
+		const open = await service.openPdf({
+			protocol_version: 1,
+			request_id: "open-refresh-missing",
+			operation: "open_pdf",
+			created_at_ns: 1,
+			workspace_context: { cwd: baseDir },
+			details: { pdf_path: pdfPath },
+		});
+		const pdfId = open.status_details.pdf_id ?? 0;
+		const notifications: string[] = [];
+		registry.addClient(pdfId, { send: (message) => notifications.push(message) });
+
+		unlinkSync(pdfPath);
+		await service.pollTrackedPdfChanges(100);
+		await service.pollTrackedPdfChanges(200);
+
+		assert.equal(registry.getActiveRecord(pdfId).revision, 1);
+		assert.deepEqual(notifications, []);
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("PDF.js MCP service markTrackedPdfUpdated refreshes an already tracked PDF immediately", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-mark-updated-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath, "first");
+	forceMtime(pdfPath, 1_000);
+	const registry = new PdfJsViewerRegistry({ makePdfId: () => 24 });
+	const service = new PdfJsViewerMcpService({
+		browserLauncher: new FakeBrowserLauncher({ ok: true }),
+		registry,
+		pdfRefresh: { autoStart: false, stabilityDebounceMs: 1 },
+	});
+	try {
+		const open = await service.openPdf({
+			protocol_version: 1,
+			request_id: "open-mark-updated",
+			operation: "open_pdf",
+			created_at_ns: 1,
+			workspace_context: { cwd: baseDir },
+			details: { pdf_path: pdfPath },
+		});
+		const pdfId = open.status_details.pdf_id ?? 0;
+		const notifications: string[] = [];
+		registry.addClient(pdfId, { send: (message) => notifications.push(message) });
+
+		writeFakePdf(pdfPath, "second body");
+		forceMtime(pdfPath, 2_000);
+		const result = await service.markTrackedPdfUpdated(pdfPath);
+
+		assert.deepEqual(result, { tracked: true, refreshed: true, pdfId, revision: 2, viewerNotifications: 1 });
+		assert.equal(JSON.parse(notifications[0]).type, "pdf_refresh");
+		assert.equal(JSON.parse(notifications[0]).revision, 2);
+
+		assert.deepEqual(await service.markTrackedPdfUpdated(pdfPath), { tracked: true, refreshed: false, pdfId, revision: 2, viewerNotifications: 0 });
 	} finally {
 		await service.stop();
 		rmSync(baseDir, { recursive: true, force: true });

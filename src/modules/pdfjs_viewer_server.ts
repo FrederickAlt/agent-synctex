@@ -32,12 +32,32 @@ function wsUrlFromConfig(config) {
 	return config.ws_url;
 }
 
-async function renderPdf(config) {
-	fallback.href = config.pdf_url;
+let activeConfig;
+let renderSequence = 0;
+
+function pdfUrlForRevision(config) {
+	return config.pdf_url;
+}
+
+function captureViewerState() {
+	return { scrollX: window.scrollX, scrollY: window.scrollY };
+}
+
+function restoreViewerState(state) {
+	window.scrollTo(state.scrollX, state.scrollY);
+}
+
+async function renderPdf(config, options = {}) {
+	const sequence = ++renderSequence;
+	activeConfig = config;
+	const state = options.preserveState ? captureViewerState() : undefined;
+	fallback.href = pdfUrlForRevision(config);
+	pages.replaceChildren();
 	const pdfjsLib = await import("/assets/pdf.mjs");
 	pdfjsLib.GlobalWorkerOptions.workerSrc = "/assets/pdf.worker.mjs";
-	const pdf = await pdfjsLib.getDocument(config.pdf_url).promise;
-	setStatus(\`Loaded PDF \${config.pdf_id}: \${pdf.numPages} page(s)\`);
+	const pdf = await pdfjsLib.getDocument(pdfUrlForRevision(config)).promise;
+	if (sequence !== renderSequence) return;
+	setStatus(\`Loaded PDF \${config.pdf_id} revision \${config.revision}: \${pdf.numPages} page(s)\`);
 	for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
 		const page = await pdf.getPage(pageNumber);
 		const viewport = page.getViewport({ scale: 1.25 });
@@ -48,6 +68,7 @@ async function renderPdf(config) {
 		pages.appendChild(canvas);
 		await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
 	}
+	if (state) restoreViewerState(state);
 }
 
 function connectViewerSocket(config) {
@@ -57,6 +78,14 @@ function connectViewerSocket(config) {
 			const message = JSON.parse(event.data);
 			if (message.type === "pdf_closed") {
 				setStatus("This PDF was closed/untracked by the MCP runtime. The browser tab remains open.");
+				return;
+			}
+			if (message.type === "pdf_refresh" && message.pdf_id === activeConfig?.pdf_id) {
+				const refreshedConfig = { ...activeConfig, revision: message.revision, pdf_url: message.pdf_url };
+				setStatus(\`Refreshing PDF \${message.pdf_id} revision \${message.revision}…\`);
+				void renderPdf(refreshedConfig, { preserveState: true }).catch((error) => {
+					setStatus(\`Unable to refresh PDF \${message.pdf_id}: \${error.message}\`);
+				});
 			}
 		} catch {
 			// Ignore protocol messages this minimal viewer does not understand yet.
@@ -257,6 +286,19 @@ export class PdfJsViewerServer {
 		return this.registry.sendToClients(pdfId, JSON.stringify({ type: "pdf_closed", pdf_id: pdfId }));
 	}
 
+	notifyPdfRefresh(pdfId: number, revision: number): number {
+		return this.registry.sendToClients(pdfId, JSON.stringify({
+			type: "pdf_refresh",
+			pdf_id: pdfId,
+			revision,
+			pdf_url: this.pdfUrl(pdfId, revision),
+		}));
+	}
+
+	pdfUrl(pdfId: number, revision: number): string {
+		return `${this.origin}/pdf/${pdfId}?revision=${revision}`;
+	}
+
 	private async handleHttpRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
 		const requestUrl = new URL(request.url ?? "/", this.originValue ?? `http://${this.host}`);
 		if (request.method !== "GET" && request.method !== "HEAD") {
@@ -282,9 +324,11 @@ export class PdfJsViewerServer {
 				textResponse(response, 404, "application/json; charset=utf-8", JSON.stringify({ error: "unknown pdf_id" }));
 				return;
 			}
+			const record = this.registry.getActiveRecord(pdfId);
 			const config = JSON.stringify({
 				pdf_id: pdfId,
-				pdf_url: `${this.origin}/pdf/${pdfId}`,
+				revision: record.revision,
+				pdf_url: this.pdfUrl(pdfId, record.revision),
 				ws_url: `${this.origin.replace(/^http:/, "ws:")}/ws?pdf_id=${pdfId}`,
 			});
 			textResponse(response, 200, "application/json; charset=utf-8", request.method === "HEAD" ? "" : config);

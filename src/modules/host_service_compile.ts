@@ -59,6 +59,7 @@ function continuousActiveNoticeForFailure(): string {
 
 interface HostServiceManagedViewerServiceLike {
 	openViewer(request: HostServiceOpenRequest): Promise<HostServiceOpenResponseEnvelope>;
+	markPdfUpdated?(pdfPath: string): Promise<unknown>;
 }
 
 type CompileRequest = HostServiceCompileRequest | HostServiceCompileSnippetRequest;
@@ -303,6 +304,9 @@ export class HostServiceCompileService {
 			}
 			const artifactPaths = getExistingArtifacts(result.pdfPath, resultLogPath);
 			this.clearSuccessfulImmediateCompileNotification(request, result.source);
+			if (request.details.open_pdf !== true) {
+				await this.markCompiledPdfUpdated(result.pdfPath, request.request_id);
+			}
 			const requestedContinuous = request.details.continuous === false
 				? continuousAppliedBeforeCompile
 				: await this.applyContinuousCompileRequest(request, result.source);
@@ -464,6 +468,9 @@ export class HostServiceCompileService {
 			const artifactPaths = fixedPreviewPdfPath === undefined
 				? operationArtifactPaths
 				: [...this.copySnippetArtifactsToFixedPath(operationPdfPath, fixedPreviewPdfPath), ...getExistingArtifacts(logPath)];
+			if (request.details.open_pdf !== true) {
+				await this.markCompiledPdfUpdated(previewPdfPath, request.request_id);
+			}
 			const openResponse = await this.openCompiledPdfThroughManagedViewerAfterCompile(
 				request,
 				result.source,
@@ -635,6 +642,18 @@ export class HostServiceCompileService {
 		return request.details.continuous
 			? this.continuousCompileManager.ensureSubscription(rootSource, sessionId, request.details.compiler)
 			: this.continuousCompileManager.removeSubscription(rootSource, sessionId);
+	}
+
+	private async markCompiledPdfUpdated(pdfPath: string, requestId: string): Promise<void> {
+		try {
+			await this.managedViewerService.markPdfUpdated?.(pdfPath);
+		} catch (error) {
+			logger.warn("compile.mark_pdf_updated_error", {
+				request_id: requestId,
+				pdf_path: pdfPath,
+				error,
+			});
+		}
 	}
 
 	private openCompiledPdfThroughManagedViewerAfterCompile(

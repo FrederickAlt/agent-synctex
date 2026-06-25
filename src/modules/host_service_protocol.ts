@@ -394,6 +394,7 @@ export interface HostServiceOpenResponseDetails {
 	pid_diagnostic?: string;
 	pdf?: string;
 	pdf_id?: number;
+	revision?: number;
 	viewer_url?: string;
 	browser_launch?: Record<string, unknown>;
 	managed_record?: HostServiceManagedViewerRecord;

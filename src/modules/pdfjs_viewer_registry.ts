@@ -10,11 +10,18 @@ export interface PdfJsViewerClient {
 	send(message: string): void;
 }
 
+export interface PdfJsViewerFileSnapshot {
+	size: number;
+	mtimeMs: number;
+}
+
 export interface PdfJsViewerRecord {
 	pdfId: number;
 	pdfPath: string;
 	viewerUrl: string;
 	createdAtNs: number;
+	revision: number;
+	fileSnapshot?: PdfJsViewerFileSnapshot;
 	clients: Set<string>;
 }
 
@@ -71,7 +78,7 @@ export class PdfJsViewerRegistry {
 		return this.activeRecords.size;
 	}
 
-	registerPdf(input: { pdfPath: string; viewerUrl?: string; viewerUrlForPdfId?: (pdfId: number) => string }): PdfJsViewerRecord {
+	registerPdf(input: { pdfPath: string; viewerUrl?: string; viewerUrlForPdfId?: (pdfId: number) => string; fileSnapshot?: PdfJsViewerFileSnapshot }): PdfJsViewerRecord {
 		const pdfPath = resolve(input.pdfPath);
 		const existing = this.activeRecordsByPath.get(pdfPath);
 		if (existing) {
@@ -87,6 +94,8 @@ export class PdfJsViewerRegistry {
 			pdfPath,
 			viewerUrl,
 			createdAtNs: Date.now() * 1_000_000,
+			revision: 1,
+			...(input.fileSnapshot === undefined ? {} : { fileSnapshot: input.fileSnapshot }),
 			clients: new Set(),
 		};
 		this.activeRecords.set(pdfId, record);
@@ -105,6 +114,20 @@ export class PdfJsViewerRegistry {
 
 	findActiveRecordByPath(pdfPath: string): PdfJsViewerRecord | undefined {
 		return this.activeRecordsByPath.get(resolve(pdfPath));
+	}
+
+	activePdfRecords(): PdfJsViewerRecord[] {
+		return Array.from(this.activeRecords.values());
+	}
+
+	updatePdfSnapshot(pdfId: number, fileSnapshot: PdfJsViewerFileSnapshot): { changed: boolean; revision: number; record: PdfJsViewerRecord } {
+		const record = this.getActiveRecord(pdfId);
+		if (record.fileSnapshot && arePdfSnapshotsEqual(record.fileSnapshot, fileSnapshot)) {
+			return { changed: false, revision: record.revision, record };
+		}
+		record.fileSnapshot = fileSnapshot;
+		record.revision += 1;
+		return { changed: true, revision: record.revision, record };
 	}
 
 	closePdf(pdfId: number): PdfJsViewerRecord {
@@ -194,4 +217,8 @@ export class PdfJsViewerRegistry {
 		}
 		throw new Error(`Unable to allocate unique active pdf_id after ${this.maxAllocationAttempts} attempts (collisions: ${collisions.join(", ")})`);
 	}
+}
+
+export function arePdfSnapshotsEqual(left: PdfJsViewerFileSnapshot, right: PdfJsViewerFileSnapshot): boolean {
+	return left.size === right.size && left.mtimeMs === right.mtimeMs;
 }
