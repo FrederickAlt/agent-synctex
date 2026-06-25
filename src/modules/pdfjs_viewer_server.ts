@@ -23,6 +23,7 @@ const status = document.getElementById("status");
 const pages = document.getElementById("pages");
 const fallback = document.getElementById("fallback-link");
 const configUrl = document.body.dataset.configUrl;
+let activeSynctexMarker;
 
 function setStatus(message) {
 	if (status) status.textContent = message;
@@ -65,10 +66,37 @@ async function renderPdf(config, options = {}) {
 		canvas.width = viewport.width;
 		canvas.height = viewport.height;
 		canvas.dataset.pageNumber = String(pageNumber);
-		pages.appendChild(canvas);
+		const pageContainer = document.createElement("div");
+		pageContainer.style.position = "relative";
+		pageContainer.style.width = String(viewport.width) + "px";
+		pageContainer.style.margin = "1rem auto";
+		pageContainer.dataset.pageNumber = String(pageNumber);
+		pageContainer.appendChild(canvas);
+		pages.appendChild(pageContainer);
 		await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
 	}
 	if (state) restoreViewerState(state);
+}
+
+function handleSynctexMessage(message) {
+	const page = document.querySelector("[data-page-number=\"" + message.page + "\"]");
+	if (!page) return;
+	page.scrollIntoView({ block: "center" });
+	if (activeSynctexMarker) activeSynctexMarker.remove();
+	const marker = document.createElement("div");
+	marker.style.position = "absolute";
+	marker.style.left = String(Math.max(0, Number(message.x) || 0) * 1.25) + "px";
+	marker.style.top = String(Math.max(0, Number(message.y) || 0) * 1.25) + "px";
+	marker.style.width = "1.2rem";
+	marker.style.height = "1.2rem";
+	marker.style.border = "3px solid #d11";
+	marker.style.borderRadius = "50%";
+	marker.style.background = "rgba(255,255,0,0.35)";
+	marker.style.transform = "translate(-50%, -50%)";
+	marker.style.pointerEvents = "none";
+	page.appendChild(marker);
+	activeSynctexMarker = marker;
+	setStatus("SyncTeX jump: page " + message.page);
 }
 
 function connectViewerSocket(config) {
@@ -86,6 +114,10 @@ function connectViewerSocket(config) {
 				void renderPdf(refreshedConfig, { preserveState: true }).catch((error) => {
 					setStatus(\`Unable to refresh PDF \${message.pdf_id}: \${error.message}\`);
 				});
+				return;
+			}
+			if (message.type === "synctex") {
+				handleSynctexMessage(message);
 			}
 		} catch {
 			// Ignore protocol messages this minimal viewer does not understand yet.
@@ -295,6 +327,10 @@ export class PdfJsViewerServer {
 		}));
 	}
 
+	notifySynctex(pdfId: number, target: { page: number; x: number; y: number; source_file: string; line: number }): number {
+		return this.registry.sendToClients(pdfId, JSON.stringify({ type: "synctex", pdf_id: pdfId, ...target }));
+	}
+
 	pdfUrl(pdfId: number, revision: number): string {
 		return `${this.origin}/pdf/${pdfId}?revision=${revision}`;
 	}
@@ -367,7 +403,7 @@ export class PdfJsViewerServer {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PDF.js viewer ${pdfId}</title>
-<style>body{font-family:sans-serif;margin:1rem;background:#f7f7f7}canvas{display:block;margin:1rem auto;background:white;box-shadow:0 1px 8px #999}#status{margin-bottom:1rem}</style>
+<style>body{font-family:sans-serif;margin:1rem;background:#f7f7f7}canvas{display:block;background:white;box-shadow:0 1px 8px #999}#status{margin-bottom:1rem}</style>
 </head>
 <body data-config-url="/config/${pdfId}.json">
 <h1>PDF.js viewer</h1>
