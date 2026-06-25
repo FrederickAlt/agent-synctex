@@ -394,6 +394,8 @@ export interface HostServiceOpenResponseDetails {
 	pid_diagnostic?: string;
 	pdf?: string;
 	pdf_id?: number;
+	viewer_url?: string;
+	browser_launch?: Record<string, unknown>;
 	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
 	reason?: string;
@@ -413,6 +415,7 @@ export interface HostServiceCloseResponseDetails {
 	reason?: string;
 	handle?: string;
 	pdf_id: number;
+	viewer_notifications?: number;
 	error_code?: string;
 }
 

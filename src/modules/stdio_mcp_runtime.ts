@@ -3,6 +3,7 @@ import type { Readable, Writable } from "node:stream";
 import { MCP_ERROR_PARSE_ERROR, buildMcpErrorResponse, handleMcpRequest } from "./host_service_mcp.ts";
 import { resolveAgentWorkspaceContext } from "./agent_runtime_context.ts";
 import { initializeLatexPreambleFile } from "./pi_extension/latex_preamble_manager.ts";
+import { PdfJsViewerMcpService } from "./pdfjs_viewer_mcp_service.ts";
 import {
 	frameClientPayload,
 	isRecord,
@@ -60,13 +61,15 @@ export class TexActionsStdioMcpRuntime {
 	private readonly launchCwd: string;
 	private readonly frameLoop: McpStdioFrameLoop;
 	private readonly pdfOperations: StdioMcpPdfOperations;
+	private readonly defaultPdfService?: PdfJsViewerMcpService;
 	private closed = false;
 
 	constructor(options: TexActionsStdioMcpRuntimeOptions = {}) {
 		const stderr = options.stderr ?? processStderr;
 		this.stdout = options.stdout ?? processStdout;
 		this.launchCwd = options.launchCwd ?? process.cwd();
-		this.pdfOperations = options.pdfOperations ?? {};
+		this.defaultPdfService = options.pdfOperations === undefined ? new PdfJsViewerMcpService() : undefined;
+		this.pdfOperations = options.pdfOperations ?? this.defaultPdfService?.pdfOperations ?? {};
 		this.frameLoop = new McpStdioFrameLoop({
 			stdin: options.stdin ?? processStdin,
 			stderr,
@@ -86,6 +89,7 @@ export class TexActionsStdioMcpRuntime {
 		if (this.closed) return;
 		this.closed = true;
 		this.frameLoop.close();
+		void this.defaultPdfService?.stop();
 	};
 
 	private workspaceContext() {

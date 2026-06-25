@@ -34,7 +34,7 @@ const MCP_HOST_SERVICE_DAEMON_REQUEST_PREFIX = "mcp-host-service";
 const MCP_DEFAULT_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
 let mcpHostServiceRequestCounter = 0;
 
-interface HostServiceMcpPdfOperations {
+export interface HostServiceMcpPdfOperations {
 	openPdf?: (request: HostServiceOpenRequest) => Promise<HostServiceOpenResponseEnvelope>;
 	jumpPdf?: (request: HostServiceJumpRequest) => Promise<HostServiceJumpResponseEnvelope>;
 	closePdf?: (request: HostServiceCloseRequest) => Promise<HostServiceCloseResponseEnvelope>;
@@ -513,18 +513,27 @@ function parseManagedPdfToolResult(
 			typeof details.pdf_id === "number" && details.pdf_id > 0
 				? ` pdf_id=${details.pdf_id}`
 				: "";
+		const viewerUrl =
+			typeof details.viewer_url === "string" && details.viewer_url
+				? ` viewer_url=${details.viewer_url}`
+				: "";
 		const handled =
 				typeof details.handled === "boolean" && details.handled
 					? " handled"
 					: "";
-		const closed =
-				typeof details.closed === "boolean" && details.closed
+		const viewerNotifications = typeof details.viewer_notifications === "number" && Number.isInteger(details.viewer_notifications)
+			? details.viewer_notifications
+			: undefined;
+		const closeSummary =
+			typeof details.closed === "boolean" && details.closed
+				? viewerNotifications === undefined
 					? " closed"
-					: "";
+					: ` untracked notified_viewers=${viewerNotifications} browser_windows_may_remain_open`
+				: "";
 		return {
 			content: [{
 				type: "text",
-				text: (`${successPrefix}${pdf}${pdfId}${line}${handled}${closed}`.trim() || successPrefix) + sourceLine,
+				text: (`${successPrefix}${pdf}${pdfId}${viewerUrl}${line}${handled}${closeSummary}`.trim() || successPrefix) + sourceLine,
 			}],
 			details,
 		};
