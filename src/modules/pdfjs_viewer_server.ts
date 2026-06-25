@@ -598,12 +598,14 @@ export class PdfJsViewerServer {
 			for (const rawMessage of decoded.messages) {
 				const click = parseReverseSynctexClick(pdfId, rawMessage);
 				if (click === undefined || this.onReverseSynctex === undefined) continue;
-				void Promise.resolve(this.onReverseSynctex(click)).catch((error) => {
-					const message = error instanceof Error ? error.message : String(error);
-					if (socket.writable) {
-						socket.write(encodeWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex_error", pdf_id: pdfId, error: message })));
-					}
-				});
+				void Promise.resolve()
+					.then(() => this.onReverseSynctex!(click))
+					.catch((error) => {
+						const message = error instanceof Error ? error.message : String(error);
+						if (socket.writable) {
+							socket.write(encodeWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex_error", pdf_id: pdfId, error: message })));
+						}
+					});
 			}
 		});
 		socket.once("end", cleanup);

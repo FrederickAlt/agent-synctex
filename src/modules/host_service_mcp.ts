@@ -358,6 +358,12 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 }
 
 function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequest {
+	const allowedArgs = new Set(["pdf_file_path", "pdf_path", "callback", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
+	for (const key of Object.keys(args)) {
+		if (!allowedArgs.has(key)) {
+			throw new Error(`open_pdf unknown argument: ${key}`);
+		}
+	}
 	const pdfPath = parseOptionalStringArg(args, "pdf_file_path")
 		?? parseOptionalStringArg(args, "pdf_path");
 	if (pdfPath === undefined) {
@@ -385,6 +391,12 @@ function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequ
 }
 
 function parseJumpPdfRequest(args: Record<string, unknown>): HostServiceJumpRequest {
+	const allowedArgs = new Set(["pdf_id", "line", "source_file", "workspace_context"]);
+	for (const key of Object.keys(args)) {
+		if (!allowedArgs.has(key)) {
+			throw new Error(`jump_pdf unknown argument: ${key}`);
+		}
+	}
 	const pdfId = parsePositiveIntegerArg(args, "pdf_id");
 	const line = parsePositiveIntegerArg(args, "line");
 	const sourceFile = parseOptionalStringArg(args, "source_file");
@@ -404,6 +416,12 @@ function parseJumpPdfRequest(args: Record<string, unknown>): HostServiceJumpRequ
 	};
 }
 function parseClosePdfRequest(args: Record<string, unknown>): HostServiceCloseRequest {
+	const allowedArgs = new Set(["pdf_id"]);
+	for (const key of Object.keys(args)) {
+		if (!allowedArgs.has(key)) {
+			throw new Error(`close_pdf unknown argument: ${key}`);
+		}
+	}
 	const pdfId = parsePositiveIntegerArg(args, "pdf_id");
 	return {
 		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
@@ -711,8 +729,8 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 			inputSchema: {
 				type: "object",
 				properties: {
-					pdf_id: { type: "number", minimum: 1 },
-					line: { type: "number", minimum: 1 },
+					pdf_id: { type: "integer", minimum: 1 },
+					line: { type: "integer", minimum: 1 },
 					source_file: { type: "string", minLength: 1 },
 					workspace_context: workspaceContextSchema(),
 				},
@@ -726,7 +744,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 			inputSchema: {
 				type: "object",
 				properties: {
-					pdf_id: { type: "number", minimum: 1 },
+					pdf_id: { type: "integer", minimum: 1 },
 				},
 				required: ["pdf_id"],
 				additionalProperties: false,

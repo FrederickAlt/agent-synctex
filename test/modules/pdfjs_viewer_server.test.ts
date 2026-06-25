@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomBytes, createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -88,6 +88,29 @@ async function readWebSocketTextFrame(socket: Socket): Promise<string> {
 		offset += 8;
 	}
 	return chunk.subarray(offset, offset + payloadLength).toString("utf8");
+}
+
+function encodeClientWebSocketTextFrame(message: string): Buffer {
+	const payload = Buffer.from(message, "utf8");
+	const mask = Buffer.from([1, 2, 3, 4]);
+	const maskBit = 0x80;
+	if (payload.length < 126) {
+		const header = Buffer.from([0x81, maskBit | payload.length]);
+		const maskedPayload = Buffer.alloc(payload.length);
+		for (let index = 0; index < payload.length; index += 1) {
+			maskedPayload[index] = payload[index] ^ mask[index % 4];
+		}
+		return Buffer.concat([header, mask, maskedPayload]);
+	}
+	const header = Buffer.alloc(4);
+	header[0] = 0x81;
+	header[1] = maskBit | 126;
+	header.writeUInt16BE(payload.length, 2);
+	const maskedPayload = Buffer.alloc(payload.length);
+	for (let index = 0; index < payload.length; index += 1) {
+		maskedPayload[index] = payload[index] ^ mask[index % 4];
+	}
+	return Buffer.concat([header, mask, maskedPayload]);
 }
 
 test("PDF.js viewer server serves shell/config/assets and registered PDF bytes only", async () => {
@@ -279,6 +302,41 @@ test("PDF.js viewer WebSocket associates clients with requested pdf_id and deliv
 		socket.write(Buffer.from([0x88, 0x80, 0, 0, 0, 0]));
 		socket.end();
 		await waitFor(() => registry.clientCount(record.pdfId) === 0);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("PDF.js viewer server keeps reverse-synctex callback exceptions from crashing the websocket", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-ws-reverse-exception-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new PdfJsViewerRegistry({ makePdfId: () => 17 });
+	const failureText = "synthetic reverse synctex failure";
+	const server = new PdfJsViewerServer({
+		registry,
+		onReverseSynctex: () => {
+			throw new Error(failureText);
+		},
+	});
+	try {
+		await server.start();
+		const record = registry.registerPdf({ pdfPath, viewerUrl: server.viewerUrl(17) });
+		const wsUrl = new URL(`/ws?pdf_id=${record.pdfId}`, server.origin);
+		wsUrl.protocol = "ws:";
+		const socket = await connectRawWebSocket(wsUrl);
+		await waitFor(() => registry.clientCount(record.pdfId) === 1);
+
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 1, x: 11, y: 22 })));
+		const firstMessage = JSON.parse(await readWebSocketTextFrame(socket));
+		assert.deepEqual(firstMessage, { type: "reverse_synctex_error", pdf_id: record.pdfId, error: failureText });
+
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 2, x: 33, y: 44 })));
+		const secondMessage = JSON.parse(await readWebSocketTextFrame(socket));
+		assert.deepEqual(secondMessage, { type: "reverse_synctex_error", pdf_id: record.pdfId, error: failureText });
+
+		socket.end();
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });

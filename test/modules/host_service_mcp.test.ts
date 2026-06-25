@@ -364,22 +364,47 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.deepEqual(pingResponse.result, {});
 
 		const toolsListPayload = JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" });
-		const toolsListResponse = (await sendFramedRequest(socketPath, toolsListPayload)) as { jsonrpc: "2.0"; id: 3; result: { tools: Array<{ name: string; description?: string; inputSchema: { properties: Record<string, { type?: string; description?: string }> } }> } };
+		const toolsListResponse = (await sendFramedRequest(socketPath, toolsListPayload)) as {
+			jsonrpc: "2.0";
+			id: 3;
+			result: {
+				tools: Array<{
+					name: string;
+					description?: string;
+					inputSchema: {
+						properties: Record<string, { type?: string; description?: string }>;
+						additionalProperties?: boolean;
+					};
+				}>;
+			};
+		};
 		const names = toolsListResponse.result.tools.map((tool) => tool.name);
 		assert.deepEqual(names, HOST_TOOL_NAMES);
 
 		const byName = new Map(toolsListResponse.result.tools.map((tool) => [tool.name, tool]));
 		const showLatexTool = byName.get("show_latex");
 		const compileFileTool = byName.get("compile_latex_file");
+		const openPdfTool = byName.get("open_pdf");
+		const jumpPdfTool = byName.get("jump_pdf");
 		const closePdfTool = byName.get("close_pdf");
 		const setPreambleTool = byName.get("set_latex_preamble");
 		assert.ok(showLatexTool);
 		assert.ok(compileFileTool);
+		assert.ok(openPdfTool);
+		assert.ok(jumpPdfTool);
 		assert.ok(closePdfTool);
 		assert.ok(setPreambleTool);
 		assert.equal(typeof showLatexTool.inputSchema.properties.workspace_context, "object");
 		assert.equal(typeof compileFileTool.inputSchema.properties.workspace_context, "object");
+		assert.equal(typeof openPdfTool.inputSchema.properties.workspace_context, "object");
 		assert.equal(typeof setPreambleTool.inputSchema.properties.workspace_context, "object");
+		assert.equal(typeof jumpPdfTool.inputSchema.properties.workspace_context, "object");
+		assert.equal(openPdfTool.inputSchema.additionalProperties, false);
+		assert.equal(jumpPdfTool.inputSchema.properties.pdf_id?.type, "integer");
+		assert.equal(jumpPdfTool.inputSchema.properties.line?.type, "integer");
+		assert.equal(closePdfTool.inputSchema.properties.pdf_id?.type, "integer");
+		assert.equal(jumpPdfTool.inputSchema.additionalProperties, false);
+		assert.equal(closePdfTool.inputSchema.additionalProperties, false);
 		assert.ok(compileFileTool.inputSchema.properties.callback_target_id);
 		assert.ok(compileFileTool.inputSchema.properties.callback);
 		assert.ok(compileFileTool.inputSchema.properties.reuse_existing);
@@ -661,6 +686,113 @@ test("daemon rejects removed compile_latex_file continuous arguments", async () 
 	}
 });
 
+test("daemon validates open_pdf/jump_pdf/close_pdf argument schemas", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-open-jump-close-schema-args-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-jump-close-schema-args-"));
+	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
+	const socketPath = join(baseDir, "host-service.sock");
+	const pdfPath = join(workspaceDir, "paper.pdf");
+	writeFileSync(pdfPath, "%PDF-1.7\n");
+	const server = new HostServiceServer({ socketPath, viewerBackend: new FakeViewerBackend() });
+	await server.start();
+	try {
+		const openUnknownResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 101,
+			method: "tools/call",
+			params: {
+				name: "open_pdf",
+				arguments: {
+					pdf_file_path: "paper.pdf",
+					extra: "reject",
+					workspace_context: { cwd: workspaceDir },
+				},
+			},
+		}))) as { error: { code: number; message: string } };
+		assert.equal(openUnknownResponse.error.code, -32602);
+		assert.equal(openUnknownResponse.error.message, "open_pdf unknown argument: extra");
+
+		const openResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 102,
+			method: "tools/call",
+			params: {
+				name: "open_pdf",
+				arguments: {
+					pdf_file_path: "paper.pdf",
+					workspace_context: { cwd: workspaceDir },
+				},
+			},
+		}))) as { result?: { details?: { pdf_id?: number } } };
+		const pdfId = openResponse.result?.details?.pdf_id;
+		assert.equal(typeof pdfId, "number");
+
+		const jumpUnknownResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 103,
+			method: "tools/call",
+			params: {
+				name: "jump_pdf",
+				arguments: {
+					pdf_id: pdfId,
+					line: 1,
+					extra: true,
+				},
+			},
+		}))) as { error: { code: number; message: string } };
+		assert.equal(jumpUnknownResponse.error.code, -32602);
+		assert.equal(jumpUnknownResponse.error.message, "jump_pdf unknown argument: extra");
+
+		const jumpFractionalLineResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 104,
+			method: "tools/call",
+			params: {
+				name: "jump_pdf",
+				arguments: {
+					pdf_id: pdfId,
+					line: 1.5,
+				},
+			},
+		}))) as { error: { code: number; message: string } };
+		assert.equal(jumpFractionalLineResponse.error.code, -32602);
+		assert.equal(jumpFractionalLineResponse.error.message, "line must be a positive integer");
+
+		const closeUnknownResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 105,
+			method: "tools/call",
+			params: {
+				name: "close_pdf",
+				arguments: {
+					pdf_id: pdfId,
+					extra: true,
+				},
+			},
+		}))) as { error: { code: number; message: string } };
+		assert.equal(closeUnknownResponse.error.code, -32602);
+		assert.equal(closeUnknownResponse.error.message, "close_pdf unknown argument: extra");
+
+		const closeFractionalResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+			jsonrpc: "2.0",
+			id: 106,
+			method: "tools/call",
+			params: {
+				name: "close_pdf",
+				arguments: {
+					pdf_id: 1.5,
+				},
+			},
+		}))) as { error: { code: number; message: string } };
+		assert.equal(closeFractionalResponse.error.code, -32602);
+		assert.equal(closeFractionalResponse.error.message, "pdf_id must be a positive integer");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+		rmSync(runtime.dir, { recursive: true, force: true });
+		runtime.restore();
+	}
+});
 
 test("daemon returns MCP-style tool errors for unimplemented tools", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-tool-error-");
