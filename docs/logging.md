@@ -59,4 +59,4 @@ ls -lah ~/.local/state/pi-pdf-preview/logs
 tail -f ~/.local/state/pi-pdf-preview/logs/*.jsonl
 ```
 
-Log records are structured JSON. Sensitive fields such as raw LaTeX snippets, callback tokens, preambles, compiler output, and source-line contents are redacted before writing.
+Log records are structured JSON. Sensitive fields such as raw LaTeX snippets, secrets or tokens, preambles, compiler output, and source-line contents are redacted before writing.

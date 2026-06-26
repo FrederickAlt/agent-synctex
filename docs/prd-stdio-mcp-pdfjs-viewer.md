@@ -58,7 +58,7 @@ The MCP server starts when the agent loads the server. Runtime state, including 
 
 The MCP server uses the process working directory it was launched from as the workspace base. Relative paths passed to tools are resolved relative to that launch cwd. Absolute paths are used as provided after normal path normalization.
 
-The daemon must not infer paths from browser URLs or from arbitrary HTTP request paths. HTTP PDF serving is by registered `pdf_id` only.
+The MCP process must not infer paths from browser URLs or from arbitrary HTTP request paths. HTTP PDF serving is by registered `pdf_id` only.
 
 ## Runtime preamble behavior
 
