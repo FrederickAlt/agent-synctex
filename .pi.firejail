@@ -1,11 +1,6 @@
 # Project-local grants for the PDF preview extension.
-whitelist ${HOME}/.local/bin/pdf-preview-servicectl
-read-only ${HOME}/.local/bin/pdf-preview-servicectl
 
-whitelist ${HOME}/.cache/pdf-preview-servicectl
-read-write ${HOME}/.cache/pdf-preview-servicectl
-
-# Runtime scratch and socket directories used by host-service-backed preview flows.
+# Runtime scratch and artifact directories used by the stdio MCP + browser preview runtime.
 mkdir ${RUNUSER}/tex-actions
 whitelist ${RUNUSER}/tex-actions
 read-write ${RUNUSER}/tex-actions

@@ -1,6 +1,6 @@
 # Logging
 
-TeX Actions can write local diagnostic logs so normal extension and host-service usage leaves enough context to debug later failures.
+TeX Actions can write local diagnostic logs so normal stdio MCP runtime usage leaves enough context to debug later failures.
 
 ## Defaults
 
@@ -12,7 +12,7 @@ When enabled, logs are written to:
 ${XDG_STATE_HOME:-~/.local/state}/pi-pdf-preview/logs/
 ```
 
-Each process writes JSON Lines (`*.jsonl`) records to its own file. The Pi extension and the host-service daemon both read the same configuration source.
+Each process writes JSON Lines (`*.jsonl`) records to its own file. Local tooling and the stdio MCP runtime read the same configuration source.
 
 ## Shared config file
 
@@ -30,11 +30,7 @@ cat > ~/.config/pi-pdf-preview/config.json <<'JSON'
 JSON
 ```
 
-Restart the Pi session and the host service after changing the file:
-
-```bash
-systemctl --user restart show-latex.service
-```
+Restart the MCP client/runtime process after changing the file (for local development, rerun `node scripts/tex-actions-mcp.ts`; MCP client configurations should relaunch the installed `tex-actions-mcp` bin).
 
 Supported levels are:
 
@@ -54,7 +50,7 @@ PDF_PREVIEW_LOG_DIR=/tmp/pi-pdf-preview-logs
 PDF_PREVIEW_CONFIG=/path/to/config.json
 ```
 
-For normal local debugging on one machine, prefer the shared config file so the Pi extension and daemon use the same source of truth.
+For normal local debugging on one machine, prefer the shared config file so local tooling and the stdio runtime use the same source of truth.
 
 ## Inspect logs
 

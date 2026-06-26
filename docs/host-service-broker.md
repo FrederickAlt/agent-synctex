@@ -1,124 +1,25 @@
-# Host-Service broker migration notes (Issue #55, updated after #71)
+# Host-service broker notes (legacy)
 
-This file captures the parts of the migration that remain outside this repo and the exact checks this repo can still run.
+This repository has transitioned to the in-process stdio MCP runtime (`scripts/tex-actions-mcp.ts`) and PDF.js viewer backend.
+A host-service broker remains out-of-scope for active runtime.
 
-## Scope and trust boundary
+## Status
 
-Issue #55 replaced callback-command/Python viewer tooling with the TypeScript Host Service.
-Issue #66 and post-#66 runtime now run the TeX Actions host service end-to-end from this repo's unit definition.
-Codex relay support now exists as a thin stdio/daemon-MCP transport wrapper over the daemon MCP endpoint. It does not add a separate tool host or broaden the broker; any Codex-facing path should continue to target `tex-actions-host-service` through that relay.
+- Legacy broker/daemon entrypoints are no longer used by production runtime.
+- Legacy artifacts that should not exist in active runtime:
+  - `systemd/show-latex.service`
+  - `scripts/tex-actionsctl.ts`
+  - `scripts/agent-synctex-host-service.ts`
+  - `scripts/pi_synctex_callback.mjs`
 
-This repository assumes the following host broker and environment files are maintained by the user-side installation and are not tracked here:
+## Current contract
 
-- `~/.local/bin/pdf-preview-servicectl-broker`
-- `~/.config/systemd/user/pdf-preview-servicectl-broker.service`
-- `~/.config/firejail/pi-jail.profile`
-- `~/.local/bin/pi-jail` (sets `MCP_TMPDIR`)
+- Runtime starts from stdio MCP:
+  - local development: `node scripts/tex-actions-mcp.ts`
+  - MCP client configuration: installed `tex-actions-mcp` bin
+- MCP tool surface remains: `show_latex`, `compile_latex_file`, `open_pdf`, `jump_pdf`, `close_pdf`, `set_latex_preamble`.
+- Viewer behavior is provided by the in-repo PDF.js runtime (`src/modules/pdfjs_viewer_mcp_service.ts`) and `src/modules/pdfjs_viewer_server.ts`.
 
-This repo can still verify that those externals target the expected service contract:
-`show-latex.service` + TypeScript Host Service + `tex-actions-host-service` identity + `zathura` backend.
+## Validation
 
-## Expected service contract
-
-- **Unit/service name:** `show-latex.service`
-- **Repo unit source:** `systemd/show-latex.service`
-- **Host service executable contract:** TypeScript Host Service, service name `tex-actions-host-service`
-  - single runtime MCP socket (no alternate/legacy socket): `${XDG_RUNTIME_DIR}/tex-actions/host-service.sock`
-  - started from `scripts/tex-actionsctl.ts daemon`
-  - default viewer backend reported as `zathura`
-  - expected MCP tools: `show_latex`, `compile_latex_file`, `open_pdf`, `jump_pdf`, `close_pdf`, `set_latex_preamble`
-  - expected protocol methods: `initialize`, `ping`, `tools/list`
-- **Runtime contract:** host-service operations resolve relative paths from caller-provided `workspace_context.cwd`; absolute paths may be used as-is. Callback metadata (`kind`, `transport`, `socket_path`, `token`) is optional.
-
-## Expected runtime/socket directories
-
-- Host service socket: `${XDG_RUNTIME_DIR}/tex-actions/host-service.sock`
-- Host service artifacts/logs: `${XDG_RUNTIME_DIR}/tex-actions`
-- Inline artifacts: `${XDG_RUNTIME_DIR}/tex-actions/inline`
-- External broker cache socket: `${HOME}/.cache/pdf-preview-servicectl/broker.sock`
-
-Runtime PDF IDs are created by the daemon on this channel and are service-owned; reopening is required after daemon restart.
-
-The runtime now has no legacy socket fallback path.
-
-## Concrete verification commands
-
-### 1) `pdf-preview-servicectl status`
-
-Expected to confirm the broker is managing the host daemon and not a legacy Python path. At minimum, the output should reference:
-
-- `show-latex.service`
-- `tex-actions-host-service`
-- `TypeScript Host Service` (or equivalent wording)
-- no stale `agent-synctex` service name in normal output
-
-Useful maintenance commands are:
-
-```bash
-pdf-preview-servicectl sync
-pdf-preview-servicectl restart
-pdf-preview-servicectl status
-pdf-preview-servicectl logs
-```
-
-### 2) `systemctl` host unit checks
-
-Use `status` for active/loaded state:
-
-```bash
-systemctl --user status show-latex.service
-```
-
-Expected host daemon status shape:
-
-- `Loaded: loaded` for `show-latex.service`
-- `Active: active (running)`
-- no stale/legacy Python viewer-command process ownership in the host-service path
-
-Use `show` or `cat` for the exact `ExecStart` assertion, because `status` output is not guaranteed to include it:
-
-```bash
-systemctl --user show -p ExecStart show-latex.service
-systemctl --user cat show-latex.service
-```
-
-Expected unit definition includes `ExecStart=.../scripts/tex-actionsctl.ts daemon` (or equivalent wrapper path) and shows `NoNewPrivileges=true` behavior.
-
-### 3) `journalctl --user -u show-latex.service -n 100 --no-pager`
-
-Expected logs should include currently emitted TypeScript host-service startup/status/error signals, such as `tex-actions daemon: started at ...` or `TeX Actions host service running on ...`, and should not be tied to the old Python viewer service.
-
-### 4) `npm run host-service:status` (executed in Firejail context)
-
-Expected JSON payload includes at least:
-
-```json
-{
-  "service_available": true,
-  "service_name": "tex-actions-host-service",
-  "viewer_backend_name": "zathura"
-}
-```
-
-`service_available: true` is the key signal that the in-sandbox request path can talk to the host daemon.
-
-## Runtime-only CLI for operations
-
-The canonical in-repo runtime command remains `tex-actionsctl`, including:
-
-```bash
-npm run tex-actionsctl -- setup
-npm run tex-actionsctl -- uninstall
-npm run tex-actionsctl -- doctor
-```
-
-These commands are independent of viewer/broker paths and do not replace `systemctl --user` status.
-
-## Historical evidence retained
-
-Older legacy command/output examples from Issue #56 are still useful but may not reflect current runtime names. Keep them in `docs/hitl-56-host-service-smoke.md` as historical notes, especially around
-legacy smoke traces and shim naming.
-
-## Suggested closing comment for GitHub issue tracking
-
-> Issue #55/#56 migration notes are current through #71 for runtime naming: the repository docs, service contract, and broker verification paths are now aligned with the `tex-actions` runtime identity and `tex-actions-host-service` service name. This file keeps stale legacy references only in clearly labeled historical notes.
+`test/viewer_guardrails.test.ts` enforces that deprecated daemon/service artifacts and callback scripts are absent from active runtime paths.

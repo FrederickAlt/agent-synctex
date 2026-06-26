@@ -5,7 +5,6 @@ import { resolveTexActionsAgentRuntimeDir } from "./agent_runtime_context.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
 import type { GetPdfEventsRequest, PdfEvent } from "./pdf_events.ts";
 import type {
-	HostServiceCallbackTarget,
 	HostServiceCloseRequest,
 	HostServiceCloseResponseEnvelope,
 	HostServiceCompileRequest,
@@ -40,11 +39,6 @@ export interface HostServiceMcpPdfOperations {
 	closePdf?: (request: HostServiceCloseRequest) => Promise<HostServiceCloseResponseEnvelope>;
 	getPdfEvents?: (request: GetPdfEventsRequest) => PdfEvent[] | Promise<PdfEvent[]>;
 	markTrackedPdfUpdated?: (pdfPath: string) => Promise<unknown>;
-	resolveManagedOpenCallback?: (
-		workspaceContext: HostServiceWorkspaceContext,
-		callbackTargetId: string | undefined,
-		callbackTarget: HostServiceCallbackTarget | undefined,
-	) => Promise<HostServiceCallbackTarget | undefined>;
 	compileService?: HostServiceCompileService;
 }
 
@@ -57,16 +51,13 @@ function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): Ho
 		managedViewerService: {
 			async openViewer(openRequest) {
 				if (!pdfOperations.openPdf) {
-					throw new Error("open_pdf is not implemented by the daemon");
+					throw new Error("open_pdf is not implemented by the runtime");
 				}
 				return pdfOperations.openPdf(openRequest);
 			},
 			markPdfUpdated: pdfOperations.markTrackedPdfUpdated,
 		},
-		resolveManagedOpenCallback: async (workspaceContext, callbackTargetId, callbackTarget) =>
-			pdfOperations.resolveManagedOpenCallback
-				? pdfOperations.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget)
-				: callbackTarget,
+		resolveManagedOpenCallback: async () => undefined,
 	});
 }
 
@@ -254,47 +245,6 @@ function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompil
 	};
 }
 
-function parseCallbackTargetArg(args: Record<string, unknown>): HostServiceCallbackTarget | undefined {
-	const rawCallback = args.callback;
-	if (rawCallback === undefined) {
-		return;
-	}
-	if (!isRecord(rawCallback)) {
-		throw new Error("callback must be an object");
-	}
-	for (const key of Object.keys(rawCallback)) {
-		if (!["kind", "transport", "socket_path", "token"].includes(key)) {
-			throw new Error(`callback unknown argument: ${key}`);
-		}
-	}
-	if (typeof rawCallback.kind !== "string" || !rawCallback.kind.trim()) {
-		throw new Error("callback.kind must be a non-empty string");
-	}
-	if (typeof rawCallback.transport !== "string" || !rawCallback.transport.trim()) {
-		throw new Error("callback.transport must be a non-empty string");
-	}
-	if (typeof rawCallback.socket_path !== "string" || !rawCallback.socket_path.trim()) {
-		throw new Error("callback.socket_path must be a non-empty string");
-	}
-	if (typeof rawCallback.token !== "string" || !rawCallback.token.trim()) {
-		throw new Error("callback.token must be a non-empty string");
-	}
-	const kind = rawCallback.kind;
-	const transport = rawCallback.transport;
-	if (kind !== "pi-synctex-callback-v1") {
-		throw new Error("callback.kind must be pi-synctex-callback-v1");
-	}
-	if (transport !== "unix") {
-		throw new Error("callback.transport must be unix");
-	}
-	return {
-		kind,
-		transport,
-		socket_path: rawCallback.socket_path,
-		token: rawCallback.token,
-	};
-}
-
 function parseOpenWorkspaceContext(pdfPath: string, rawWorkspaceContext: unknown): HostServiceWorkspaceContext {
 	if (rawWorkspaceContext === undefined) {
 		if (!isAbsolute(pdfPath)) {
@@ -324,7 +274,7 @@ function parseJumpWorkspaceContext(rawWorkspaceContext: unknown, sourceFile?: st
 }
 
 function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileRequest: HostServiceCompileRequest; hideWarnings: boolean } {
-	const allowedArgs = new Set(["latex_file_path", "compiler", "clean", "open_pdf", "hide_warnings", "callback", "callback_target_id", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
+	const allowedArgs = new Set(["latex_file_path", "compiler", "clean", "open_pdf", "hide_warnings", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
 	for (const key of Object.keys(args)) {
 		if (!allowedArgs.has(key)) {
 			throw new Error(`compile_latex_file unknown argument: ${key}`);
@@ -335,8 +285,6 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 	const clean = parseBooleanArg(args, "clean");
 	const openPdf = parseBooleanArg(args, "open_pdf");
 	const hideWarnings = parseBooleanArg(args, "hide_warnings") ?? true;
-	const callback = openPdf ? parseCallbackTargetArg(args) : undefined;
-	const callbackTargetId = openPdf ? parseOptionalStringArg(args, "callback_target_id") : undefined;
 	const reuseExisting = openPdf ? parseBooleanArg(args, "reuse_existing") : undefined;
 	const requirePersistentViewer = openPdf ? parseBooleanArg(args, "require_persistent_viewer") : undefined;
 	const workspaceContext = parseCompileWorkspaceContext(latexFilePath, args.workspace_context);
@@ -352,8 +300,6 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 				...(compiler === undefined ? {} : { compiler }),
 				...(clean === undefined ? {} : { clean }),
 				...(openPdf === undefined ? {} : { open_pdf: openPdf }),
-				...(callback === undefined ? {} : { callback }),
-				...(callbackTargetId === undefined ? {} : { callback_target_id: callbackTargetId }),
 				...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
 				...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
 			},
@@ -363,7 +309,7 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 }
 
 function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequest {
-	const allowedArgs = new Set(["pdf_file_path", "callback", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
+	const allowedArgs = new Set(["pdf_file_path", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
 	for (const key of Object.keys(args)) {
 		if (!allowedArgs.has(key)) {
 			throw new Error(`open_pdf unknown argument: ${key}`);
@@ -376,7 +322,6 @@ function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequ
 	const rawWorkspaceContext = args.workspace_context;
 	const workspaceContext = parseOpenWorkspaceContext(pdfPath, rawWorkspaceContext);
 	const resolvedPdfPath = isAbsolute(pdfPath) ? pdfPath : resolve(workspaceContext.cwd, pdfPath);
-	const callback = parseCallbackTargetArg(args);
 	const reuseExisting = parseBooleanArg(args, "reuse_existing");
 	const requirePersistentViewer = parseBooleanArg(args, "require_persistent_viewer");
 	return {
@@ -387,7 +332,6 @@ function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequ
 		workspace_context: workspaceContext,
 		details: {
 			pdf_path: resolvedPdfPath,
-			...(callback === undefined ? {} : { callback }),
 			...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
 			...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
 		},
@@ -681,18 +625,6 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 					clean: { type: "boolean" },
 					open_pdf: { type: "boolean" },
 					hide_warnings: { type: "boolean", default: true, description: "Defaults to true. When true, successful compiles keep warning_count metadata but hide warning message details from text and omit details.warnings. Set hide_warnings=false to show warning summaries and details.warnings." },
-					callback_target_id: { type: "string", minLength: 1 },
-					callback: {
-						type: "object",
-						properties: {
-							kind: { type: "string", const: "pi-synctex-callback-v1" },
-							transport: { type: "string", const: "unix" },
-							socket_path: { type: "string", minLength: 1 },
-							token: { type: "string", minLength: 1 },
-						},
-						required: ["kind", "transport", "socket_path", "token"],
-						additionalProperties: false,
-					},
 					reuse_existing: { type: "boolean" },
 					require_persistent_viewer: { type: "boolean" },
 					workspace_context: workspaceContextSchema(),
@@ -703,22 +635,11 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "open_pdf",
-			description: "Open a PDF through the host-service viewer and return a daemon-owned PDF id.",
+			description: "Open a PDF through the browser PDF.js viewer and return a runtime PDF id.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					pdf_file_path: { type: "string", minLength: 1 },
-					callback: {
-						type: "object",
-						properties: {
-							kind: { type: "string", const: "pi-synctex-callback-v1" },
-							transport: { type: "string", const: "unix" },
-							socket_path: { type: "string", minLength: 1 },
-							token: { type: "string", minLength: 1 },
-						},
-						required: ["kind", "transport", "socket_path", "token"],
-						additionalProperties: false,
-					},
 					reuse_existing: { type: "boolean" },
 					require_persistent_viewer: { type: "boolean" },
 					workspace_context: workspaceContextSchema(),
@@ -756,7 +677,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "set_latex_preamble",
-			description: "Set the active LaTeX preview preamble in the provided workspace runtime, or the daemon runtime for legacy callers.",
+			description: "Set the active LaTeX preview preamble in the provided workspace runtime.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -880,7 +801,7 @@ async function handleOpenPdfTool(
 	if (!pdfOperations.openPdf) {
 		return buildSuccess(requestId, {
 			isError: true,
-			content: [{ type: "text", text: "open_pdf is not yet implemented by the daemon" }],
+			content: [{ type: "text", text: "open_pdf is not yet implemented by the runtime" }],
 		});
 	}
 	try {
@@ -914,7 +835,7 @@ async function handleJumpPdfTool(
 	if (!pdfOperations.jumpPdf) {
 		return buildSuccess(requestId, {
 			isError: true,
-			content: [{ type: "text", text: "jump_pdf is not yet implemented by the daemon" }],
+			content: [{ type: "text", text: "jump_pdf is not yet implemented by the runtime" }],
 		});
 	}
 	try {
@@ -948,7 +869,7 @@ async function handleClosePdfTool(
 	if (!pdfOperations.closePdf) {
 		return buildSuccess(requestId, {
 			isError: true,
-			content: [{ type: "text", text: "close_pdf is not yet implemented by the daemon" }],
+			content: [{ type: "text", text: "close_pdf is not yet implemented by the runtime" }],
 		});
 	}
 	try {
@@ -1100,7 +1021,7 @@ export async function handleMcpRequest(
 			if (!HOST_SERVICE_TOOL_NAMES.includes(call.name as typeof HOST_SERVICE_TOOL_NAMES[number])) {
 				return buildSuccess(request.id, {
 					isError: true,
-					content: [{ type: "text", text: `Tool not implemented by daemon: ${call.name}` }],
+					content: [{ type: "text", text: `Tool not implemented by runtime: ${call.name}` }],
 				});
 			}
 
@@ -1118,7 +1039,7 @@ export async function handleMcpRequest(
 			if (handler === null) {
 				return buildSuccess(request.id, {
 					isError: true,
-					content: [{ type: "text", text: `${call.name} is not yet implemented by the daemon` }],
+					content: [{ type: "text", text: `${call.name} is not yet implemented by the runtime` }],
 				});
 			}
 
