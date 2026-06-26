@@ -33,11 +33,7 @@ const STDIO_WORKSPACE_CONTEXT_TOOL_NAMES = new Set([
 ]);
 
 function sanitizeToolForV1(tool: unknown): unknown {
-	const omitted = ["workspace_context"];
-	if (isRecord(tool) && tool.name === "show_latex") {
-		omitted.push("inline");
-	}
-	return omitToolInputSchemaProperties(tool, omitted);
+	return omitToolInputSchemaProperties(tool, ["workspace_context"]);
 }
 
 function rewriteToolsListForV1(response: unknown): unknown {
@@ -122,9 +118,6 @@ export class TexActionsStdioMcpRuntime {
 			const currentArguments = isRecord(parsed.params.arguments) ? parsed.params.arguments : {};
 			const nextArguments = { ...currentArguments };
 			delete nextArguments.workspace_context;
-			if (parsed.params.name === "show_latex") {
-				delete nextArguments.inline;
-			}
 			return JSON.stringify({
 				...parsed,
 				params: {

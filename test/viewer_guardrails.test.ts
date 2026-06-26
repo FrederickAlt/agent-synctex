@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, extname, join, relative, resolve } from "node:path";
 import ts from "typescript";
 
 interface GuardrailViolation {
@@ -29,8 +29,79 @@ const FORBIDDEN_LEGACY_IDENTIFIERS = new Map<string, string>([
 	["zathuraPidsForPdf", "legacy direct viewer PID discovery helper"],
 ]);
 
+const EXPECTED_ACTIVE_RUNTIME_ENTRYPOINTS = new Set<string>([
+	"scripts/tex-actions-mcp.ts",
+	"scripts/pdf-preview-mcp.ts",
+]);
+
+const FORBIDDEN_RUNTIME_IMPORT_SYMBOLS = new Map<string, string>([
+	["HostServiceClient", "legacy HostService client API should not be imported"],
+	["HostServiceServer", "legacy HostService server API should not be imported"],
+	["ZathuraViewerBackend", "legacy zathura backend should not be imported"],
+	["requestRasterizePdf", "legacy rasterize request API should not be imported"],
+	["rasterizePdfPage", "inline raster preview API should not be imported by active MCP runtime"],
+	["rasterizePdfPages", "inline raster preview API should not be imported by active MCP runtime"],
+	["createInlinePreviewRenderer", "inline renderer should not be imported by active MCP runtime"],
+	["KittyPreviewInvalidationRegistry", "Kitty inline preview runtime should not be imported by active MCP runtime"],
+	["buildKittyPlaceholderImageRender", "Kitty inline preview runtime should not be imported by active MCP runtime"],
+]);
+
+const FORBIDDEN_RUNTIME_LITERAL_MARKERS = new Map<string, string>([
+	["agent-synctex-host-service.ts", "legacy daemon shim should not be imported/referenced"],
+	["tex-actionsctl.ts", "legacy tex-actionsctl command path should not be referenced"],
+	["pi_synctex_callback.mjs", "legacy callback script path should not be referenced"],
+	["show-latex.service", "legacy systemd unit should not be referenced"],
+	["codex-show-latex-viewer.service", "legacy systemd unit should not be referenced"],
+	["pi-synctex-callback-v1", "legacy callback transport marker should not be in active MCP runtime graph"],
+	["session_heartbeat", "legacy session heartbeat protocol field should not be in MCP runtime graph"],
+	["get_pending_notifications", "legacy pending-notification protocol field should not be in MCP runtime graph"],
+	["register_callback_target", "legacy callback registration operation should not be in active MCP runtime graph"],
+	["resolve_callback_target", "legacy callback resolution operation should not be in active MCP runtime graph"],
+	["unregister_callback_target", "legacy callback unregister operation should not be in active MCP runtime graph"],
+	["tex-actions-host-service", "legacy host-service runtime metadata should not be in active graph"],
+]);
+
+const FORBIDDEN_RUNTIME_SCHEMA_FIELDS = new Set(["inline", "continuous", "callback_target_id"]);
+
+const FORBIDDEN_ACTIVE_HANDLER_STRING_FIELDS_BY_FILE = new Map<string, Map<string, string>>([
+	["host_service_mcp.ts", new Map([
+		["callback", "v1 MCP handler must not accept or expose callback arguments"],
+		["callback_target_id", "v1 MCP handler must not accept or expose callback_target_id arguments"],
+	])],
+	["stdio_mcp_runtime.ts", new Map([
+		["inline", "stdio MCP runtime must not strip or accept legacy inline compatibility arguments"],
+	])],
+]);
+
+const FORBIDDEN_ACTIVE_RUNTIME_IDENTIFIERS = new Map<string, string>([
+	["parseCallbackTargetArg", "v1 MCP handler must not parse legacy callback targets"],
+	["requestRasterizePdf", "active MCP runtime must not call legacy rasterization API"],
+	["rasterizePdfPage", "active MCP runtime must not call inline raster preview API"],
+	["rasterizePdfPages", "active MCP runtime must not call inline raster preview API"],
+	["KittyPreviewInvalidationRegistry", "active MCP runtime must not use Kitty inline preview state"],
+]);
+
 const FORBIDDEN_VIEWER_COMMAND = /\b(?:zathura|evince|okular|mupdf|sioyek|xreader|xdg-open|xpdf|atril)\b/i;
 const FORBIDDEN_ENV_PROBES = new Set(["DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "XAUTHORITY", "DISPLAY"]);
+const PACKAGE_STALE_METADATA_TOKENS = [
+	"agent-synctex-host-service.ts",
+	"tex-actionsctl.ts",
+	"pi_synctex_callback.mjs",
+	"show-latex.service",
+	"codex-show-latex-viewer.service",
+];
+const ACTIVE_DOC_PATHS = [
+	"README.md",
+	"CONTEXT.md",
+	"docs/logging.md",
+	"docs/testing-preview-framework.md",
+	"docs/host-service-broker.md",
+] as const;
+const STALE_PI_EXTENSION_BRANDING_PATTERNS: Array<[RegExp, string]> = [
+	[/\bPi extension\b/gi, "stale Pi extension branding"],
+	[/\bpi-extension\b/gi, "stale pi-extension keyword branding"],
+];
+const NPM_MCP_SCRIPT = "npm run tex-actions:mcp";
 
 function collectProductionTypeScriptFiles(directory = REPO_ROOT): string[] {
 	const collected: string[] = [];
@@ -220,10 +291,313 @@ function collectForbiddenSpawnViolations(file: string, source: string): Guardrai
 }
 
 function collectForbiddenViolations(file: string, source: string): GuardrailViolation[] {
+	return [...collectForbiddenIdentifierViolations(file, source), ...collectForbiddenSpawnViolations(file, source)];
+}
+
+function collectProductionEntrypointPathsFromCommand(command: string): string[] {
+	const normalized = command.replace(/\n+/g, " ");
+	const matches = normalized.matchAll(/(?:^|[\s'"`(;|&])(?:\.\/)?(scripts\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\.ts)(?=\b|$)/g);
+	const paths = new Set<string>();
+	for (const match of matches) {
+		const candidate = (match[1] ?? "").replace(/^\.\//, "");
+		if (!candidate) continue;
+		paths.add(candidate);
+	}
+	return Array.from(paths);
+}
+
+function collectPackageMetadataEntrypoints(pkg: unknown): Set<string> {
+	const result = new Set<string>();
+	if (typeof pkg !== "object" || pkg === null) return result;
+
+	const metadata = pkg as Record<string, unknown>;
+	if (typeof metadata.bin === "string") {
+		for (const candidate of collectProductionEntrypointPathsFromCommand(metadata.bin)) {
+			result.add(candidate);
+		}
+	} else if (typeof metadata.bin === "object" && metadata.bin !== null) {
+		for (const binValue of Object.values(metadata.bin as Record<string, string>)) {
+			if (typeof binValue !== "string") continue;
+			for (const candidate of collectProductionEntrypointPathsFromCommand(binValue)) {
+				result.add(candidate);
+			}
+		}
+	}
+
+	if (typeof metadata.scripts === "object" && metadata.scripts !== null) {
+		for (const scriptValue of Object.values(metadata.scripts as Record<string, unknown>)) {
+			if (typeof scriptValue !== "string") continue;
+			for (const candidate of collectProductionEntrypointPathsFromCommand(scriptValue)) {
+				result.add(candidate);
+			}
+		}
+	}
+
+	return result;
+}
+
+function collectStalePiExtensionBrandingViolations(file: string, source: string): GuardrailViolation[] {
+	const violations: GuardrailViolation[] = [];
+
+	for (const [pattern, detail] of STALE_PI_EXTENSION_BRANDING_PATTERNS) {
+		const re = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+		for (const match of source.matchAll(re)) {
+			if (match.index === undefined) continue;
+			addViolation(violations, source, file, match.index, detail);
+		}
+	}
+
+	return violations;
+}
+
+function collectUnsafeNpmMcpStartupGuidanceViolations(file: string, source: string): GuardrailViolation[] {
+	const violations: GuardrailViolation[] = [];
+	const escapedScript = NPM_MCP_SCRIPT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const lines = source.split(/\r?\n/);
+	const scriptPattern = new RegExp(escapedScript, "g");
+
+	for (const match of source.matchAll(scriptPattern)) {
+		if (match.index === undefined) continue;
+		const lineIndex = source.slice(0, match.index).split(/\r?\n/).length - 1;
+		const context = lines.slice(Math.max(0, lineIndex - 3), Math.min(lines.length, lineIndex + 4)).join("\n").toLowerCase();
+		const isManualConvenience = /manual|convenience|developer|development|dev/.test(context);
+		if (isManualConvenience) continue;
+		addViolation(
+			violations,
+			source,
+			file,
+			match.index,
+			`${NPM_MCP_SCRIPT} must not be recommended for MCP client startup because npm output can corrupt stdio framing`,
+		);
+	}
+
+	return violations;
+}
+
+function collectActiveDocRuntimeGuidanceViolations(file: string, source: string): GuardrailViolation[] {
 	return [
-		...collectForbiddenIdentifierViolations(file, source),
-		...collectForbiddenSpawnViolations(file, source),
+		...collectStalePiExtensionBrandingViolations(file, source),
+		...collectUnsafeNpmMcpStartupGuidanceViolations(file, source),
 	];
+}
+
+function collectMetadataReferenceViolations(metadataSource: string, file: string, pkg: unknown): GuardrailViolation[] {
+	const violations: GuardrailViolation[] = [];
+	violations.push(...collectStalePiExtensionBrandingViolations(file, metadataSource));
+	if (typeof pkg !== "object" || pkg === null) return violations;
+
+	const metadata = pkg as Record<string, unknown>;
+	const checkStringValue = (value: unknown, source: string): void => {
+		if (typeof value !== "string") return;
+		for (const token of PACKAGE_STALE_METADATA_TOKENS) {
+			const pattern = new RegExp(`${token.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}`);
+			if (pattern.test(value)) {
+				addViolation(
+					violations,
+					source,
+					file,
+					source.indexOf(token),
+					`pi runtime metadata references stale path/daemon entry: ${token}`,
+				);
+			}
+		}
+	};
+
+	if (typeof metadata.scripts === "object" && metadata.scripts !== null) {
+		for (const script of Object.values(metadata.scripts as Record<string, unknown>)) {
+			checkStringValue(script, metadataSource);
+		}
+	}
+	if (typeof metadata.bin === "string") {
+		checkStringValue(metadata.bin, metadataSource);
+	}
+	if (typeof metadata.bin === "object" && metadata.bin !== null) {
+		for (const bin of Object.values(metadata.bin as Record<string, unknown>)) {
+			checkStringValue(bin, metadataSource);
+		}
+	}
+	if (typeof metadata.description === "string") {
+		for (const token of PACKAGE_STALE_METADATA_TOKENS) {
+			if (metadata.description.includes(token)) {
+				addViolation(
+					violations,
+					metadataSource,
+					file,
+					metadataSource.indexOf(token),
+					`package.json text references stale path token: ${token}`,
+				);
+			}
+		}
+	}
+
+	const pi = metadata.pi as Record<string, unknown> | undefined;
+	if (pi && typeof pi === "object" && Object.hasOwn(pi, "extensions")) {
+		const marker = "\"extensions\"";
+		const token = marker;
+		addViolation(
+			violations,
+			metadataSource,
+			file,
+			Math.max(metadataSource.indexOf(token), 0),
+			"package.json must not declare pi.extensions for active production",
+		);
+	}
+
+	return violations;
+}
+
+function collectActiveProductionRuntimeFiles(entrypoints: string[]): string[] {
+	const queue = [...entrypoints.map((entry) => resolve(REPO_ROOT, entry))];
+	const seen = new Set<string>();
+
+	const resolveImportTarget = (moduleSpecifier: string, sourcePath: string): string | undefined => {
+		if (!moduleSpecifier.startsWith(".")) return;
+		const base = resolve(dirname(sourcePath), moduleSpecifier);
+		if (extname(base) === ".ts" && existsSync(base)) {
+			return base;
+		}
+		const tsTarget = `${base}.ts`;
+		if (existsSync(tsTarget)) {
+			return tsTarget;
+		}
+		const indexTarget = resolve(base, "index.ts");
+		if (existsSync(indexTarget)) {
+			return indexTarget;
+		}
+		return undefined;
+	};
+
+	for (let index = 0; index < queue.length; index += 1) {
+		const file = queue[index];
+		if (seen.has(file)) continue;
+		if (!existsSync(file) || !file.endsWith(".ts")) continue;
+		seen.add(file);
+
+		const source = readFileSync(file, "utf8");
+		const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.ES2024, true, ts.ScriptKind.TS);
+
+		const visit = (node: ts.Node): void => {
+			if (ts.isImportDeclaration(node)) {
+				if (node.importClause?.isTypeOnly) {
+					return;
+				}
+				if (ts.isStringLiteral(node.moduleSpecifier)) {
+					const resolved = resolveImportTarget(node.moduleSpecifier.text, file);
+					if (resolved) queue.push(resolved);
+				}
+				return;
+			}
+			if (ts.isExportDeclaration(node) && node.moduleSpecifier && !node.isTypeOnly) {
+				if (ts.isStringLiteral(node.moduleSpecifier)) {
+					const resolved = resolveImportTarget(node.moduleSpecifier.text, file);
+					if (resolved) queue.push(resolved);
+				}
+			}
+			ts.forEachChild(node, visit);
+		};
+
+		visit(sourceFile);
+	}
+
+	return Array.from(seen);
+}
+
+function collectRuntimeActiveGraphViolations(file: string, source: string): GuardrailViolation[] {
+	const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.ES2024, true, ts.ScriptKind.TS);
+	const violations: GuardrailViolation[] = [];
+	const fileName = file.split(/[\\/]/).at(-1) ?? file;
+	const forbiddenHandlerStrings = FORBIDDEN_ACTIVE_HANDLER_STRING_FIELDS_BY_FILE.get(fileName);
+
+	const propertyNameText = (name: ts.PropertyName): string | undefined => {
+		if (ts.isIdentifier(name)) return name.text;
+		if (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
+		return undefined;
+	};
+
+	const visit = (node: ts.Node): void => {
+		if (ts.isImportDeclaration(node)) {
+			if (node.importClause?.isTypeOnly) {
+				return;
+			}
+			if (node.importClause?.name && FORBIDDEN_RUNTIME_IMPORT_SYMBOLS.has(node.importClause.name.text)) {
+				addViolation(
+					violations,
+					source,
+					file,
+					node.importClause.name.getStart(sourceFile),
+					FORBIDDEN_RUNTIME_IMPORT_SYMBOLS.get(node.importClause.name.text)!,
+				);
+			}
+			const namedBindings = node.importClause?.namedBindings;
+			if (namedBindings && ts.isNamedImports(namedBindings)) {
+				for (const binding of namedBindings.elements) {
+					const importedName = binding.propertyName?.text ?? binding.name.text;
+					if (FORBIDDEN_RUNTIME_IMPORT_SYMBOLS.has(importedName)) {
+						addViolation(
+							violations,
+							source,
+							file,
+							binding.name.getStart(sourceFile),
+							FORBIDDEN_RUNTIME_IMPORT_SYMBOLS.get(importedName)!,
+						);
+					}
+				}
+			}
+		}
+
+		if (ts.isExportDeclaration(node) && node.exportClause && ts.isNamedExports(node.exportClause)) {
+			if (node.moduleSpecifier) {
+				for (const exportSpecifier of node.exportClause.elements) {
+					const exportedName = exportSpecifier.propertyName?.text ?? exportSpecifier.name.text;
+					if (FORBIDDEN_RUNTIME_IMPORT_SYMBOLS.has(exportedName)) {
+						addViolation(
+							violations,
+							source,
+							file,
+							exportSpecifier.name.getStart(sourceFile),
+							FORBIDDEN_RUNTIME_IMPORT_SYMBOLS.get(exportedName)!,
+						);
+					}
+				}
+			}
+		}
+
+		if ((ts.isPropertyAssignment(node) || ts.isPropertySignature(node) || ts.isPropertyDeclaration(node) || ts.isShorthandPropertyAssignment(node)) && node.name) {
+			const nameText = propertyNameText(node.name);
+			if (nameText && FORBIDDEN_RUNTIME_SCHEMA_FIELDS.has(nameText)) {
+				addViolation(
+					violations,
+					source,
+					file,
+					node.name.getStart(sourceFile),
+					`active runtime source exports forbidden schema/request field: ${nameText}`,
+				);
+			}
+		}
+
+		if (ts.isIdentifier(node)) {
+			const detail = FORBIDDEN_ACTIVE_RUNTIME_IDENTIFIERS.get(node.text);
+			if (detail) {
+				addViolation(violations, source, file, node.getStart(sourceFile), `${detail}: ${node.text}`);
+			}
+		}
+
+		if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+			for (const [marker, detail] of FORBIDDEN_RUNTIME_LITERAL_MARKERS) {
+				if (!node.text.includes(marker)) continue;
+				addViolation(violations, source, file, node.getStart(sourceFile), `${detail}: ${marker}`);
+			}
+			const handlerDetail = forbiddenHandlerStrings?.get(node.text);
+			if (handlerDetail) {
+				addViolation(violations, source, file, node.getStart(sourceFile), handlerDetail);
+			}
+		}
+
+		ts.forEachChild(node, visit);
+	};
+
+	visit(sourceFile);
+	return violations;
 }
 
 function formatViolations(violations: GuardrailViolation[]): string {
@@ -234,6 +608,15 @@ function formatViolations(violations: GuardrailViolation[]): string {
 			return `- ${file}:${violation.line}:${violation.column} ${violation.detail}`;
 		})
 		.join("\n");
+}
+
+function sortAndStringifyViolations(violations: GuardrailViolation[]): string {
+	const sorted = [...violations].sort((left, right) => {
+		if (left.file !== right.file) return left.file.localeCompare(right.file);
+		if (left.line !== right.line) return left.line - right.line;
+		return left.column - right.column;
+	});
+	return formatViolations(sorted);
 }
 
 test("guardrail fixtures catch forbidden direct viewer patterns", () => {
@@ -278,23 +661,103 @@ test("Production extension TypeScript rejects direct viewer-control regressions"
 	assert.equal(violations.length, 0, `Forbidden production GUI-regression patterns were found:\n${formatViolations(violations)}`);
 });
 
-test("Systemd host service unit is named and configured for TeX Actions", () => {
-	const unitPath = join(REPO_ROOT, "systemd", "show-latex.service");
-	const legacyUnitPath = join(REPO_ROOT, "systemd", "codex-show-latex-viewer.service");
-	const unitSource = readFileSync(unitPath, "utf8");
 
-	assert.equal(existsSync(legacyUnitPath), false, "Legacy systemd unit filename should be removed");
-	assert.equal(unitSource.includes("{{") || unitSource.includes("}}"), false, "systemd unit should not contain unresolved template placeholders");
-	assert.match(unitSource, /WorkingDirectory=/);
-	assert.match(unitSource, /ExecStart=.*tex-actionsctl\.ts daemon/);
-	assert.match(unitSource, /DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=%t\/bus}"/);
-	assert.match(unitSource, /Environment=MCP_TMPDIR=%t\/tex-actions/);
-	assert.match(unitSource, /Restart=on-failure/);
-	assert.match(unitSource, /PartOf=graphical-session\.target/);
-	assert.match(unitSource, /WantedBy=graphical-session\.target/);
+test("Package metadata keeps MCP-only production entrypoints", () => {
+	const packagePath = join(REPO_ROOT, "package.json");
+	const packageSource = readFileSync(packagePath, "utf8");
+	const packageJson = JSON.parse(packageSource) as Record<string, unknown>;
+	const metadataViolations = collectMetadataReferenceViolations(packageSource, packagePath, packageJson);
+
+	assert.equal(typeof packageJson.description, "string", "package.json must describe the active runtime");
+	assert.match(packageJson.description as string, /stdio MCP/i, "package.json description must identify stdio MCP runtime");
+	assert.match(packageJson.description as string, /PDF\.js/i, "package.json description must identify browser PDF.js viewing");
+	assert.deepEqual(
+		(packageJson.keywords as unknown[] | undefined)?.filter((keyword): keyword is string => typeof keyword === "string").sort(),
+		["latex", "mcp", "pdfjs", "tex-actions"],
+		"package.json keywords must use active MCP/PDF.js runtime terms",
+	);
+
+	const declaredEntrypoints = collectPackageMetadataEntrypoints(packageJson);
+	for (const entrypoint of EXPECTED_ACTIVE_RUNTIME_ENTRYPOINTS) {
+		assert.equal(
+			declaredEntrypoints.has(entrypoint),
+			true,
+			`package.json must declare ${entrypoint} in active runtime entrypoints`,
+		);
+	}
+	for (const entrypoint of declaredEntrypoints) {
+		assert.equal(
+			EXPECTED_ACTIVE_RUNTIME_ENTRYPOINTS.has(entrypoint),
+			true,
+			`package.json declares unexpected active runtime entrypoint ${entrypoint}`,
+		);
+	}
+
+	assert.equal(metadataViolations.length, 0, `Package metadata contains stale legacy runtime references:\n${formatViolations(metadataViolations)}`);
 });
 
-test("Firejail profile keeps host service runtime paths macro-compatible", () => {
+
+test("Active docs describe stdio MCP PDF.js runtime and safe MCP startup commands", () => {
+	const violations: GuardrailViolation[] = [];
+	let combinedDocs = "";
+
+	for (const docPath of ACTIVE_DOC_PATHS) {
+		const file = join(REPO_ROOT, docPath);
+		const source = readFileSync(file, "utf8");
+		combinedDocs += `\n${source}`;
+		violations.push(...collectActiveDocRuntimeGuidanceViolations(file, source));
+	}
+
+	assert.match(combinedDocs, /stdio MCP/i, "active docs must identify the stdio MCP runtime");
+	assert.match(combinedDocs, /PDF\.js/i, "active docs must identify the browser PDF.js runtime");
+	assert.equal(
+		violations.length,
+		0,
+		`Active docs contain stale Pi-extension branding or unsafe MCP startup guidance:\n${formatViolations(violations)}`,
+	);
+
+	const readmeSource = readFileSync(join(REPO_ROOT, "README.md"), "utf8");
+	assert.match(readmeSource, /^node scripts\/tex-actions-mcp\.ts$/m, "README local-dev startup must use direct node entrypoint");
+	assert.match(readmeSource, /^tex-actions-mcp$/m, "README MCP client startup must use installed tex-actions-mcp bin");
+});
+
+
+test("Active MCP runtime import graph excludes legacy host-service/runtime protocol paths", () => {
+	const packageJson = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as unknown;
+	const entrypoints = collectPackageMetadataEntrypoints(packageJson);
+	const productionFiles = collectActiveProductionRuntimeFiles(Array.from(entrypoints));
+	const violations: GuardrailViolation[] = [];
+
+	for (const file of productionFiles) {
+		const source = readFileSync(file, "utf8");
+		violations.push(...collectRuntimeActiveGraphViolations(file, source));
+	}
+
+	assert.equal(productionFiles.length > 0, true, "active runtime graph should include production MCP entrypoints");
+	assert.equal(
+		violations.length,
+		0,
+		`Active MCP runtime files expose forbidden legacy symbols or paths:\n${sortAndStringifyViolations(violations)}`,
+	);
+});
+
+
+test("Legacy daemon entrypoints are removed", () => {
+	const hostServicePath = join(REPO_ROOT, "systemd", "show-latex.service");
+	const legacyHostServicePath = join(REPO_ROOT, "systemd", "codex-show-latex-viewer.service");
+	const texActionsCtlPath = join(REPO_ROOT, "scripts", "tex-actionsctl.ts");
+	const hostServiceShimPath = join(REPO_ROOT, "scripts", "agent-synctex-host-service.ts");
+	const callbackScriptPath = join(REPO_ROOT, "scripts", "pi_synctex_callback.mjs");
+
+	assert.equal(existsSync(hostServicePath), false, "systemd unit should be absent for stdio-hosted runtime");
+	assert.equal(existsSync(legacyHostServicePath), false, "legacy daemon unit filename should be removed");
+	assert.equal(existsSync(texActionsCtlPath), false, "tex-actionsctl entrypoint should be removed");
+	assert.equal(existsSync(hostServiceShimPath), false, "agent-synctex-host-service shim should be removed");
+	assert.equal(existsSync(callbackScriptPath), false, "legacy callback script should be removed");
+});
+
+
+test("Firejail profile keeps runtime paths macro-compatible", () => {
 	const firejailPath = join(REPO_ROOT, ".pi.firejail");
 	const firejailSource = readFileSync(firejailPath, "utf8");
 

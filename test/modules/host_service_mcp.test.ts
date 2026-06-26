@@ -405,8 +405,9 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.equal(closePdfTool.inputSchema.properties.pdf_id?.type, "integer");
 		assert.equal(jumpPdfTool.inputSchema.additionalProperties, false);
 		assert.equal(closePdfTool.inputSchema.additionalProperties, false);
-		assert.ok(compileFileTool.inputSchema.properties.callback_target_id);
-		assert.ok(compileFileTool.inputSchema.properties.callback);
+		assert.equal(compileFileTool.inputSchema.properties.callback_target_id, undefined);
+		assert.equal(compileFileTool.inputSchema.properties.callback, undefined);
+		assert.equal(openPdfTool.inputSchema.properties.callback, undefined);
 		assert.ok(compileFileTool.inputSchema.properties.reuse_existing);
 		assert.ok(compileFileTool.inputSchema.properties.require_persistent_viewer);
 		assert.equal(compileFileTool.inputSchema.properties.continuous, undefined);
@@ -1072,61 +1073,9 @@ test("daemon reuses managed PDF ID for repeated no-callback open of the same PDF
 	}
 });
 
-test("daemon accepts MCP open_pdf with valid callback metadata", async () => {
-	const runtime = allocateMcpTmpDir("host-service-mcp-open-callback-");
-	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-callback-"));
-	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
-	const pdfPath = join(workspaceDir, "paper.pdf");
-	const socketPath = join(baseDir, "host-service.sock");
-	writeFileSync(pdfPath, "%PDF-1.7\n%");
-	const backend = new TestManagedViewerBackend();
-	const callback = {
-		kind: "pi-synctex-callback-v1",
-		transport: "unix",
-		socket_path: "/tmp/callback.sock",
-		token: "token-abc",
-	};
-	const server = new HostServiceServer({
-		socketPath,
-		viewerBackend: backend,
-	});
-	await server.start();
-	try {
-		const openResponse = (await sendFramedRequest(socketPath, JSON.stringify({
-			jsonrpc: "2.0",
-			id: 30,
-			method: "tools/call",
-			params: {
-				name: "open_pdf",
-				arguments: {
-					pdf_file_path: pdfPath,
-					callback,
-				},
-			},
-		}))) as {
-			result: {
-				isError?: boolean;
-				details: {
-					managed_record?: { callback?: typeof callback };
-				};
-			};
-		};
-		assert.equal(openResponse.result.isError, undefined);
-		const lastOpen = backend.openRequests.at(-1);
-		assert.ok(lastOpen !== undefined);
-		assert.deepEqual(lastOpen?.details.callback, callback);
-		assert.deepEqual(openResponse.result.details.managed_record?.callback, callback);
-	} finally {
-		await server.stop();
-		rmSync(baseDir, { recursive: true, force: true });
-		rmSync(runtime.dir, { recursive: true, force: true });
-		runtime.restore();
-	}
-});
-
-test("daemon rejects MCP open_pdf with malformed callback metadata", async () => {
-	const runtime = allocateMcpTmpDir("host-service-mcp-open-callback-invalid-");
-	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-callback-invalid-"));
+test("daemon rejects removed MCP callback arguments", async () => {
+	const runtime = allocateMcpTmpDir("host-service-mcp-open-callback-rejected-");
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-callback-rejected-"));
 	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
 	const pdfPath = join(workspaceDir, "paper.pdf");
 	const socketPath = join(baseDir, "host-service.sock");
@@ -1134,7 +1083,7 @@ test("daemon rejects MCP open_pdf with malformed callback metadata", async () =>
 	const server = new HostServiceServer({ socketPath, viewerBackend: new TestManagedViewerBackend() });
 	await server.start();
 	try {
-		const response = (await sendFramedRequest(socketPath, JSON.stringify({
+		const openResponse = (await sendFramedRequest(socketPath, JSON.stringify({
 			jsonrpc: "2.0",
 			id: 31,
 			method: "tools/call",
@@ -1142,37 +1091,28 @@ test("daemon rejects MCP open_pdf with malformed callback metadata", async () =>
 				name: "open_pdf",
 				arguments: {
 					pdf_file_path: pdfPath,
-					callback: {
-						kind: "pi-synctex-callback-v1",
-						transport: "unix",
-						socket_path: "/tmp/callback.sock",
-					},
+					callback: { kind: "legacy" },
 				},
 			},
 		}))) as { error: { code: number; message: string } };
-		assert.equal(response.error.code, -32602);
-		assert.equal(response.error.message, "callback.token must be a non-empty string");
+		assert.equal(openResponse.error.code, -32602);
+		assert.equal(openResponse.error.message, "open_pdf unknown argument: callback");
 
-		const callbackUnknownArgResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+		const compileResponse = (await sendFramedRequest(socketPath, JSON.stringify({
 			jsonrpc: "2.0",
 			id: 32,
 			method: "tools/call",
 			params: {
-				name: "open_pdf",
+				name: "compile_latex_file",
 				arguments: {
-					pdf_file_path: pdfPath,
-					callback: {
-						kind: "pi-synctex-callback-v1",
-						transport: "unix",
-						socket_path: "/tmp/callback.sock",
-						token: "token-abc",
-						other: "reject",
-					},
+					latex_file_path: "paper.tex",
+					callback_target_id: "legacy-target",
+					workspace_context: { cwd: workspaceDir },
 				},
 			},
 		}))) as { error: { code: number; message: string } };
-		assert.equal(callbackUnknownArgResponse.error.code, -32602);
-		assert.equal(callbackUnknownArgResponse.error.message, "callback unknown argument: other");
+		assert.equal(compileResponse.error.code, -32602);
+		assert.equal(compileResponse.error.message, "compile_latex_file unknown argument: callback_target_id");
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });

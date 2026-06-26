@@ -1266,8 +1266,6 @@ export class HostServiceServer {
 				openPdf: (request) => this.managedViewerService.openViewer(request),
 				jumpPdf: (request) => this.managedViewerService.jumpViewer(request),
 				closePdf: (request) => this.managedViewerService.closeViewer(request),
-				resolveManagedOpenCallback: (workspaceContext, callbackTargetId, callbackTarget) =>
-					this.resolveManagedOpenCallback(workspaceContext, callbackTargetId, callbackTarget),
 				compileService: this.compileService,
 			});
 			if (response === null) {

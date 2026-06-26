@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
-import { readSourceLine } from "./synctex.ts";
+import { readSourceLine } from "./source_line.ts";
 
 // Self-authored forward SyncTeX mapper for PDF.js jumps. It intentionally does not copy
 // LaTeX-Workshop code; the parser below implements the subset of SyncTeX semantics this
