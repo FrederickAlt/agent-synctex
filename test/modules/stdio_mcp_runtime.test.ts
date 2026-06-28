@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
+import { PdfJsViewerBrokerClient } from "../../src/modules/pdfjs_viewer_broker.ts";
 import { TexActionsStdioMcpRuntime } from "../../src/modules/stdio_mcp_runtime.ts";
 import type { HostServiceCompileRequest, HostServiceCompileResponseEnvelope, HostServiceCompileSnippetRequest, HostServiceCompileSnippetResponseEnvelope, HostServiceOpenRequest, HostServiceOpenResponseEnvelope } from "../../src/modules/host_service_protocol.ts";
 import { collectMcpFrames, encodeMcpFrame } from "../helpers/mcp_frames.ts";
@@ -69,6 +70,75 @@ test("actual tex-actions-mcp entrypoint answers initialize and tools/list over s
 	assert.doesNotMatch(stderr, /daemon is unavailable|ENOENT|ECONNREFUSED/i);
 });
 
+test("stdio viewer URL survives MCP transport shutdown after open_pdf", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-viewer-linger-"));
+	const cwd = join(baseDir, "project");
+	const runtimeRoot = join(baseDir, "runtime");
+	const binDir = join(baseDir, "bin");
+	const pdfPath = join(baseDir, "paper.pdf");
+	mkdirSync(cwd, { recursive: true });
+	mkdirSync(binDir, { recursive: true });
+	writeFileSync(pdfPath, "%PDF-1.4\n% entrypoint viewer linger test\n%%EOF\n");
+	writeFileSync(join(binDir, "xdg-open"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+	const scriptPath = resolve(process.cwd(), "scripts", "tex-actions-mcp.ts");
+	const child = spawn(process.execPath, [scriptPath], {
+		cwd,
+		env: {
+			...process.env,
+			MCP_TMPDIR: runtimeRoot,
+			TEX_ACTIONS_AGENT_ID: "entrypoint-viewer-linger-test-agent",
+			PATH: `${binDir}:${process.env.PATH ?? ""}`,
+		},
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+	let stderr = "";
+	child.stderr.on("data", (chunk) => {
+		stderr += String(chunk);
+	});
+	const exitPromise = new Promise<void>((resolve) => {
+		child.once("exit", () => resolve());
+		child.once("error", () => resolve());
+	});
+
+	try {
+		const output = collectMcpFrames(child.stdout as PassThrough, 2, 5_000);
+		child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+		child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "open_pdf", arguments: { pdf_file_path: pdfPath } } }));
+		const frames = await output;
+		const openResponse = frames[1] as { id: number; result?: { details?: { viewer_url?: unknown; pdf_id?: unknown } }; error?: unknown };
+		assert.equal(openResponse.id, 2);
+		assert.equal(openResponse.error, undefined);
+		const viewerUrl = openResponse.result?.details?.viewer_url;
+		const pdfId = openResponse.result?.details?.pdf_id;
+		assert.equal(typeof viewerUrl, "string");
+		assert.equal(typeof pdfId, "number");
+
+		child.stdin.end();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		if (child.exitCode === null) child.kill("SIGTERM");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await Promise.race([exitPromise, new Promise((resolve) => setTimeout(resolve, 300))]);
+
+		try {
+			const viewerResponse = await fetch(viewerUrl as string);
+			assert.equal(viewerResponse.status, 200);
+			assert.match(await viewerResponse.text(), /PDF\.js viewer/);
+			const pdfResponse = await fetch((viewerUrl as string).replace(`/viewer/${pdfId}`, `/pdf/${pdfId}`));
+			assert.equal(pdfResponse.status, 200);
+			assert.match(pdfResponse.headers.get("content-type") ?? "", /application\/pdf/);
+		} catch (error) {
+			assert.fail(`returned viewer_url became unreachable after MCP transport shutdown: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	} finally {
+		child.kill("SIGKILL");
+		await Promise.race([exitPromise, new Promise((resolve) => setTimeout(resolve, 300))]);
+		await new PdfJsViewerBrokerClient({ socketPath: join(runtimeRoot, "pdfjs-viewer-broker.sock") }).shutdown().catch(() => undefined);
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.doesNotMatch(stderr, /daemon is unavailable|ENOENT|ECONNREFUSED/i);
+});
+
 test("actual tex-actions-mcp entrypoint keeps returned PDF.js viewer URL reachable while process remains alive", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-viewer-"));
 	const cwd = join(baseDir, "project");
@@ -124,6 +194,7 @@ test("actual tex-actions-mcp entrypoint keeps returned PDF.js viewer URL reachab
 		child.kill("SIGTERM");
 		await Promise.race([exitPromise, new Promise((resolve) => setTimeout(resolve, 300))]);
 		child.kill("SIGKILL");
+		await new PdfJsViewerBrokerClient({ socketPath: join(runtimeRoot, "pdfjs-viewer-broker.sock") }).shutdown().catch(() => undefined);
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 	assert.doesNotMatch(stderr, /daemon is unavailable|ENOENT|ECONNREFUSED/i);

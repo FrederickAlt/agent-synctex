@@ -9,6 +9,7 @@
     "test": "node --test --test-reporter=./scripts/fail-only-test-reporter.ts \"test/**/*.test.ts\"",
     "test:verbose": "node --test \"test/**/*.test.ts\"",
     "test:real-tex-smoke": "AGENT_SYNCTEX_REAL_TEX_SMOKE=1 node --test test/modules/host_service_real_latexmk_smoke.test.ts",
+    "smoke:stdio-viewer": "node --test --test-reporter=spec --test-name-pattern=\"stdio viewer URL survives MCP transport shutdown\" test/modules/stdio_mcp_runtime.test.ts",
     "verify": "npm run check && npm test",
     "tex-actions:mcp": "node scripts/tex-actions-mcp.ts",
     "pdf-preview-mcp": "node scripts/pdf-preview-mcp.ts"

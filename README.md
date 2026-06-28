@@ -31,7 +31,7 @@ The active v1 runtime is stdio MCP plus PDF.js in the browser. It does not requi
 - Browser/PDF.js viewer: `src/modules/pdfjs_viewer_mcp_service.ts` and `src/modules/pdfjs_viewer_server.ts`.
 - Compile orchestration: `src/modules/host_service_compile.ts` with LaTeX primitives in `src/modules/latex/`.
 
-The runtime seeds a process-owned workspace under `${MCP_TMPDIR:-$XDG_RUNTIME_DIR/tex-actions}/agents/<agent-id>` and stores temporary snippet/preamble artifacts there.
+The runtime seeds a process-owned workspace under `${MCP_TMPDIR:-$XDG_RUNTIME_DIR/tex-actions}/agents/<agent-id>` and stores temporary snippet/preamble artifacts there. PDF.js HTTP serving is delegated to a lightweight local viewer broker at `${MCP_TMPDIR:-$XDG_RUNTIME_DIR/tex-actions}/pdfjs-viewer-broker.sock` so returned `viewer_url` values remain reachable even when a stdio MCP client tears down the short-lived tool transport after a call.
 
 ## Start the runtime
 
@@ -47,7 +47,7 @@ For MCP client configuration after installation, use the package bin:
 tex-actions-mcp
 ```
 
-Because `viewer_url` points at an HTTP server owned by the stdio MCP process, MCP clients must keep the server process alive for as long as returned PDF.js viewer URLs should work. In Pi agent MCP config, use a persistent lifecycle for `tex-actions`:
+Pi's local MCP config supports `lifecycle` values `"lazy"`, `"eager"`, and `"keep-alive"`. Use `"keep-alive"` for `tex-actions` so process-local tool state survives between calls; the viewer broker also keeps returned PDF.js `viewer_url` values reachable if a client still tears down the stdio transport after a call.
 
 ```json
 {
@@ -66,6 +66,7 @@ Because `viewer_url` points at an HTTP server owned by the stdio MCP process, MC
 ```bash
 npm run check
 npm test
+npm run smoke:stdio-viewer
 ```
 
 `test/viewer_guardrails.test.ts` enforces that active package entrypoints remain stdio MCP/PDF.js-only and do not reintroduce removed callback schemas, legacy viewer commands, daemon entrypoints, or inline/raster compatibility paths.
