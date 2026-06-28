@@ -47,6 +47,20 @@ For MCP client configuration after installation, use the package bin:
 tex-actions-mcp
 ```
 
+Because `viewer_url` points at an HTTP server owned by the stdio MCP process, MCP clients must keep the server process alive for as long as returned PDF.js viewer URLs should work. In Pi agent MCP config, use a persistent lifecycle for `tex-actions`:
+
+```json
+{
+  "mcpServers": {
+    "tex-actions": {
+      "command": "tex-actions-mcp",
+      "lifecycle": "keep-alive",
+      "directTools": true
+    }
+  }
+}
+```
+
 ## Verification
 
 ```bash
