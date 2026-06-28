@@ -436,10 +436,6 @@ export class PdfJsViewerMcpService {
 		}
 	}
 
-	activePdfCount(): number {
-		return this.registry.activeCount;
-	}
-
 	async stop(): Promise<void> {
 		if (this.pdfRefreshTimer) {
 			clearInterval(this.pdfRefreshTimer);

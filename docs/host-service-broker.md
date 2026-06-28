@@ -19,7 +19,8 @@ A host-service broker remains out-of-scope for active runtime.
   - MCP client configuration: installed `tex-actions-mcp` bin
 - MCP tool surface remains: `show_latex`, `compile_latex_file`, `open_pdf`, `jump_pdf`, `close_pdf`, `set_latex_preamble`, `get_pdf_events`.
 - `get_pdf_events` requires `max_events`; optional `pdf_id` filters events for a single PDF. Reads are non-destructive: the runtime selects the last `max_events` matching events and returns them in chronological order.
-- Viewer behavior is provided by the in-repo PDF.js runtime (`src/modules/pdfjs_viewer_mcp_service.ts`) and `src/modules/pdfjs_viewer_server.ts`.
+- Viewer behavior is provided by the in-process PDF.js runtime (`src/modules/pdfjs_viewer_mcp_service.ts`) and `src/modules/pdfjs_viewer_server.ts`.
+- Returned `viewer_url` values require the stdio MCP process to remain alive; no detached broker keeps them reachable after MCP process exit.
 
 ## Validation
 

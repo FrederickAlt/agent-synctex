@@ -3,7 +3,7 @@ import type { Readable, Writable } from "node:stream";
 import { MCP_ERROR_PARSE_ERROR, buildMcpErrorResponse, handleMcpRequest } from "./host_service_mcp.ts";
 import { resolveAgentWorkspaceContext } from "./agent_runtime_context.ts";
 import { initializeLatexPreambleFile } from "./pi_extension/latex_preamble_manager.ts";
-import { PdfJsViewerBrokerClient } from "./pdfjs_viewer_broker.ts";
+import { PdfJsViewerMcpService } from "./pdfjs_viewer_mcp_service.ts";
 import {
 	frameClientPayload,
 	isRecord,
@@ -14,11 +14,6 @@ import {
 } from "./mcp_stdio_transport.ts";
 
 type StdioMcpPdfOperations = NonNullable<Parameters<typeof handleMcpRequest>[1]>;
-type DefaultPdfOperationsService = {
-	readonly pdfOperations: StdioMcpPdfOperations;
-	close(): Promise<void>;
-	activePdfCount?(): number;
-};
 
 export interface TexActionsStdioMcpRuntimeOptions {
 	stdin?: Readable;
@@ -27,14 +22,7 @@ export interface TexActionsStdioMcpRuntimeOptions {
 	launchCwd?: string;
 	maxPayloadBytes?: number;
 	pdfOperations?: StdioMcpPdfOperations;
-	viewerLingerMs?: number;
 }
-
-export interface TexActionsStdioMcpRuntimeCloseOptions {
-	lingerViewerService?: boolean;
-}
-
-const DEFAULT_VIEWER_LINGER_MS = 10 * 60 * 1_000;
 
 const STDIO_WORKSPACE_CONTEXT_TOOL_NAMES = new Set([
 	"show_latex",
@@ -66,17 +54,14 @@ export class TexActionsStdioMcpRuntime {
 	private readonly launchCwd: string;
 	private readonly frameLoop: McpStdioFrameLoop;
 	private readonly pdfOperations: StdioMcpPdfOperations;
-	private readonly defaultPdfService?: DefaultPdfOperationsService;
-	private readonly viewerLingerMs: number;
-	private viewerLingerTimer: ReturnType<typeof setTimeout> | undefined;
+	private readonly defaultPdfService?: PdfJsViewerMcpService;
 	private closed = false;
 
 	constructor(options: TexActionsStdioMcpRuntimeOptions = {}) {
 		const stderr = options.stderr ?? processStderr;
 		this.stdout = options.stdout ?? processStdout;
 		this.launchCwd = options.launchCwd ?? process.cwd();
-		this.defaultPdfService = options.pdfOperations === undefined ? new PdfJsViewerBrokerClient() : undefined;
-		this.viewerLingerMs = options.viewerLingerMs ?? DEFAULT_VIEWER_LINGER_MS;
+		this.defaultPdfService = options.pdfOperations === undefined ? new PdfJsViewerMcpService() : undefined;
 		this.pdfOperations = options.pdfOperations ?? this.defaultPdfService?.pdfOperations ?? {};
 		this.frameLoop = new McpStdioFrameLoop({
 			stdin: options.stdin ?? processStdin,
@@ -93,44 +78,12 @@ export class TexActionsStdioMcpRuntime {
 		this.frameLoop.start();
 	}
 
-	readonly close = (options: TexActionsStdioMcpRuntimeCloseOptions = {}): void => {
+	readonly close = (): void => {
 		if (this.closed) return;
 		this.closed = true;
 		this.frameLoop.close();
-		if (options.lingerViewerService === true && this.shouldLingerViewerService()) {
-			this.scheduleViewerServiceStop();
-			return;
-		}
-		void this.stopDefaultPdfService();
+		void this.defaultPdfService?.stop();
 	};
-
-	readonly forceClose = (): void => {
-		this.closed = true;
-		this.frameLoop.close();
-		void this.stopDefaultPdfService();
-	};
-
-	private shouldLingerViewerService(): boolean {
-		return this.defaultPdfService !== undefined
-			&& (this.defaultPdfService.activePdfCount?.() ?? 0) > 0
-			&& this.viewerLingerMs > 0;
-	}
-
-	private scheduleViewerServiceStop(): void {
-		if (this.viewerLingerTimer) return;
-		this.viewerLingerTimer = setTimeout(() => {
-			void this.stopDefaultPdfService();
-		}, this.viewerLingerMs);
-		this.viewerLingerTimer.unref?.();
-	}
-
-	private async stopDefaultPdfService(): Promise<void> {
-		if (this.viewerLingerTimer) {
-			clearTimeout(this.viewerLingerTimer);
-			this.viewerLingerTimer = undefined;
-		}
-		await this.defaultPdfService?.close();
-	}
 
 	private workspaceContext() {
 		return resolveAgentWorkspaceContext({ cwd: this.launchCwd });

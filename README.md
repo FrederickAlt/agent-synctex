@@ -31,7 +31,7 @@ The active v1 runtime is stdio MCP plus PDF.js in the browser. It does not requi
 - Browser/PDF.js viewer: `src/modules/pdfjs_viewer_mcp_service.ts` and `src/modules/pdfjs_viewer_server.ts`.
 - Compile orchestration: `src/modules/host_service_compile.ts` with LaTeX primitives in `src/modules/latex/`.
 
-The runtime seeds a process-owned workspace under `${MCP_TMPDIR:-$XDG_RUNTIME_DIR/tex-actions}/agents/<agent-id>` and stores temporary snippet/preamble artifacts there. PDF.js HTTP serving is delegated to a lightweight local viewer broker at `${MCP_TMPDIR:-$XDG_RUNTIME_DIR/tex-actions}/pdfjs-viewer-broker.sock` so returned `viewer_url` values remain reachable even when a stdio MCP client tears down the short-lived tool transport after a call.
+The runtime seeds a process-owned workspace under `${MCP_TMPDIR:-$XDG_RUNTIME_DIR/tex-actions}/agents/<agent-id>` and stores temporary snippet/preamble artifacts there. PDF.js HTTP serving is process-local: returned `viewer_url` values require the `tex-actions-mcp` stdio process to remain alive and are not expected to survive MCP process exit.
 
 ## Start the runtime
 
@@ -47,7 +47,7 @@ For MCP client configuration after installation, use the package bin:
 tex-actions-mcp
 ```
 
-Pi's local MCP config supports `lifecycle` values `"lazy"`, `"eager"`, and `"keep-alive"`. Use `"keep-alive"` for `tex-actions` so process-local tool state survives between calls; the viewer broker also keeps returned PDF.js `viewer_url` values reachable if a client still tears down the stdio transport after a call.
+Pi's local MCP config supports `lifecycle` values `"lazy"`, `"eager"`, and `"keep-alive"`. Use `"keep-alive"` for `tex-actions` so process-local tool state and active PDF.js viewer URLs survive between calls while the MCP stdio process remains alive. Do not configure MCP clients with `npm run tex-actions:mcp`; npm output can corrupt stdio framing. Use the installed `tex-actions-mcp` bin or the direct `node scripts/tex-actions-mcp.ts` command for local development only.
 
 ```json
 {

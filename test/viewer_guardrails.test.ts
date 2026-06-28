@@ -748,12 +748,16 @@ test("Legacy daemon entrypoints are removed", () => {
 	const texActionsCtlPath = join(REPO_ROOT, "scripts", "tex-actionsctl.ts");
 	const hostServiceShimPath = join(REPO_ROOT, "scripts", "agent-synctex-host-service.ts");
 	const callbackScriptPath = join(REPO_ROOT, "scripts", "pi_synctex_callback.mjs");
+	const pdfjsViewerBrokerScriptPath = join(REPO_ROOT, "scripts", "pdfjs-viewer-broker.ts");
+	const pdfjsViewerBrokerModulePath = join(REPO_ROOT, "src", "modules", "pdfjs_viewer_broker.ts");
 
 	assert.equal(existsSync(hostServicePath), false, "systemd unit should be absent for stdio-hosted runtime");
 	assert.equal(existsSync(legacyHostServicePath), false, "legacy daemon unit filename should be removed");
 	assert.equal(existsSync(texActionsCtlPath), false, "tex-actionsctl entrypoint should be removed");
 	assert.equal(existsSync(hostServiceShimPath), false, "agent-synctex-host-service shim should be removed");
 	assert.equal(existsSync(callbackScriptPath), false, "legacy callback script should be removed");
+	assert.equal(existsSync(pdfjsViewerBrokerScriptPath), false, "detached PDF.js viewer broker entrypoint should be removed");
+	assert.equal(existsSync(pdfjsViewerBrokerModulePath), false, "detached PDF.js viewer broker module should be removed");
 });
 
 

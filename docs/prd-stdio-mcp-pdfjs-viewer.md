@@ -52,7 +52,7 @@ tex-actions-mcp process
         └─ browser tab/window running PDF.js viewer
 ```
 
-The MCP server starts when the agent loads the server. Runtime state, including `pdf_id`s, connected viewers, file-change snapshots, and stored PDF events, is in memory and ends when the MCP process exits.
+The MCP server starts when the agent loads the server. Runtime state, including `pdf_id`s, connected viewers, file-change snapshots, stored PDF events, and the loopback PDF.js HTTP/WebSocket server, is in memory and ends when the MCP process exits. A returned `viewer_url` is valid only while that same stdio MCP process remains alive; clients that need active viewers across tool calls must keep the MCP server process alive. MCP client configuration must launch the installed `tex-actions-mcp` bin or another direct Node command, not `npm run ...`, because npm output can corrupt stdio framing.
 
 ## Workspace and path resolution
 
