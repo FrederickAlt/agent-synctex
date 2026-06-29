@@ -32,6 +32,7 @@ const FORBIDDEN_LEGACY_IDENTIFIERS = new Map<string, string>([
 const EXPECTED_ACTIVE_RUNTIME_ENTRYPOINTS = new Set<string>([
 	"scripts/tex-actions-mcp.ts",
 	"scripts/pdf-preview-mcp.ts",
+	"scripts/viewer-host-server.ts",
 ]);
 
 const FORBIDDEN_RUNTIME_IMPORT_SYMBOLS = new Map<string, string>([
@@ -666,7 +667,7 @@ test("Production extension TypeScript rejects direct viewer-control regressions"
 });
 
 
-test("Package metadata keeps MCP-only production entrypoints", () => {
+test("Package metadata keeps approved production entrypoints", () => {
 	const packagePath = join(REPO_ROOT, "package.json");
 	const packageSource = readFileSync(packagePath, "utf8");
 	const packageJson = JSON.parse(packageSource) as Record<string, unknown>;

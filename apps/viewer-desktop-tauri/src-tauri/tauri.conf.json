@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PDF Preview Viewer",
+  "version": "0.1.0",
+  "identifier": "dev.pdf-preview.viewer",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "frontendDist": "../empty-dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg", "deb", "appimage"],
+    "category": "DeveloperTool",
+    "shortDescription": "Thin desktop wrapper for the PDF Preview Viewer Host",
+    "longDescription": "Starts the local Viewer Host Server and loads its /app Viewer Client in a desktop window. Windows packaging is best-effort and not part of the required target set for issue 114."
+  }
+}
