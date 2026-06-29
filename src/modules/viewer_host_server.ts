@@ -8,7 +8,7 @@ import { basename, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { URL } from "node:url";
 import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
-import type { ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
+import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
 
 const LOCAL_HOST = "127.0.0.1";
 const DEFAULT_PORT = 0;
@@ -283,6 +283,19 @@ export interface ViewerHostControlStatus {
 	protocolVersion?: number;
 }
 
+export interface ViewerHostPdfChangeDetectionOptions {
+	debounceMs?: number;
+	pollIntervalMs?: number;
+	nowMs?: () => number;
+}
+
+export interface ViewerHostPdfRefreshDiagnostic {
+	pdf_id: number;
+	status: "error";
+	code: "pdf_not_readable" | "pdf_not_regular_file";
+	message: string;
+}
+
 interface ViewerClientTabEvent {
 	type: "open_pdf" | "focus_pdf";
 	pdf_id: number;
@@ -299,6 +312,11 @@ interface ViewerSocketConnection {
 	closed: boolean;
 }
 
+interface PendingPdfRefreshSnapshot {
+	snapshot: ViewerHostFileSnapshot;
+	observedAtMs: number;
+}
+
 export interface ViewerHostServerOptions {
 	registry: ViewerHostPdfRegistry;
 	port?: number;
@@ -306,6 +324,7 @@ export interface ViewerHostServerOptions {
 	viewerDispatch?: ViewerHostViewerDispatch;
 	verifyPdfMaybeUpdated?: (record: ViewerHostPdfRecord) => Promise<void> | void;
 	mcpEventSink?: (message: ViewerHostToMcpMessage) => Promise<void> | void;
+	pdfChangeDetection?: ViewerHostPdfChangeDetectionOptions;
 }
 
 export interface ViewerHostServerAddress {
@@ -320,6 +339,9 @@ export class ViewerHostServer {
 	private readonly viewerDispatch: ViewerHostViewerDispatch;
 	private readonly verifyPdfMaybeUpdated: (record: ViewerHostPdfRecord) => Promise<void> | void;
 	private readonly mcpEventSink: (message: ViewerHostToMcpMessage) => Promise<void> | void;
+	private readonly pdfChangeDebounceMs: number;
+	private readonly pdfChangePollIntervalMs: number;
+	private readonly nowMs: () => number;
 	private controlReady = false;
 	private controlProtocolVersion: number | undefined;
 	private server: Server | undefined;
@@ -328,6 +350,10 @@ export class ViewerHostServer {
 	private viewerSocketClientsByPdfId = new Map<number, Set<ViewerSocketConnection>>();
 	private viewerSocketTokensByPdfId = new Map<number, string>();
 	private visibleViewerClientTabs = new Map<number, ViewerClientTabEvent>();
+	private pendingPdfRefreshSnapshots = new Map<number, PendingPdfRefreshSnapshot>();
+	private pdfRefreshDiagnostics = new Map<number, ViewerHostPdfRefreshDiagnostic>();
+	private pdfChangePollTimer: ReturnType<typeof setInterval> | undefined;
+	private pdfChangePollInFlight = false;
 	private nextVisibleTabToken = 1;
 	private originValue: string | undefined;
 	private addressValue: ViewerHostServerAddress | undefined;
@@ -339,6 +365,9 @@ export class ViewerHostServer {
 		this.viewerDispatch = options.viewerDispatch ?? NOOP_VIEWER_DISPATCH;
 		this.verifyPdfMaybeUpdated = options.verifyPdfMaybeUpdated ?? (() => undefined);
 		this.mcpEventSink = options.mcpEventSink ?? (() => undefined);
+		this.pdfChangeDebounceMs = nonNegativeNumber(options.pdfChangeDetection?.debounceMs, 250);
+		this.pdfChangePollIntervalMs = nonNegativeNumber(options.pdfChangeDetection?.pollIntervalMs, 1_000);
+		this.nowMs = options.pdfChangeDetection?.nowMs ?? (() => Date.now());
 	}
 
 	get origin(): string {
@@ -370,6 +399,19 @@ export class ViewerHostServer {
 	sendPdfRefresh(pdfId: number): number {
 		const record = this.registry.getPdf(pdfId);
 		return this.broadcastViewerSocketMessage(record.pdfId, { type: "pdf_refresh", pdf_id: record.pdfId, revision: record.revision, pdf_url: this.pdfUrl(record.pdfId, record.revision) });
+	}
+
+	getPdfRefreshDiagnostic(pdfId: number): ViewerHostPdfRefreshDiagnostic | undefined {
+		this.registry.getPdf(pdfId);
+		const diagnostic = this.pdfRefreshDiagnostics.get(pdfId);
+		return diagnostic ? { ...diagnostic } : undefined;
+	}
+
+	async verifyPdfChangesNow(pdfId?: number): Promise<void> {
+		const records = pdfId === undefined ? this.registry.listPdfs() : [this.registry.getPdf(pdfId)];
+		for (const record of records) {
+			await this.verifyPdfRecordSnapshot(record);
+		}
 	}
 
 	async start(): Promise<void> {
@@ -412,6 +454,7 @@ export class ViewerHostServer {
 		}
 		this.addressValue = { host: LOCAL_HOST, port: address.port };
 		this.originValue = `http://${LOCAL_HOST}:${address.port}`;
+		this.startPdfChangePolling();
 	}
 
 	async stop(): Promise<void> {
@@ -422,6 +465,9 @@ export class ViewerHostServer {
 		this.controlReady = false;
 		this.controlProtocolVersion = undefined;
 		this.visibleViewerClientTabs.clear();
+		this.pendingPdfRefreshSnapshots.clear();
+		this.pdfRefreshDiagnostics.clear();
+		this.stopPdfChangePolling();
 		this.viewerSocketClientsByPdfId.clear();
 		this.viewerSocketTokensByPdfId.clear();
 		for (const socket of this.activeSockets) {
@@ -720,6 +766,8 @@ iframe{width:100%;height:100%;border:0;background:white}
 					revision,
 					fileSnapshot: snapshot,
 				});
+				this.pendingPdfRefreshSnapshots.delete(record.pdfId);
+				this.pdfRefreshDiagnostics.delete(record.pdfId);
 				await this.viewerDispatch.openPdf(record);
 				this.broadcastViewerClientTabEvent("open_pdf", record);
 				return { ok: true, result: { type: "open_pdf", pdf_id: record.pdfId, revision: record.revision } };
@@ -738,6 +786,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 			}
 			case "pdf_maybe_updated": {
 				const record = this.registry.getPdf(message.pdf_id);
+				await this.verifyPdfChangesNow(record.pdfId);
 				await this.verifyPdfMaybeUpdated(record);
 				return { ok: true, result: { type: "pdf_maybe_updated", pdf_id: record.pdfId } };
 			}
@@ -912,6 +961,61 @@ iframe{width:100%;height:100%;border:0;background:white}
 		}
 	}
 
+	private startPdfChangePolling(): void {
+		if (this.pdfChangePollIntervalMs <= 0 || this.pdfChangePollTimer) return;
+		this.pdfChangePollTimer = setInterval(() => {
+			if (this.pdfChangePollInFlight) return;
+			this.pdfChangePollInFlight = true;
+			void this.verifyPdfChangesNow()
+				.catch(() => undefined)
+				.finally(() => { this.pdfChangePollInFlight = false; });
+		}, this.pdfChangePollIntervalMs);
+		this.pdfChangePollTimer.unref?.();
+	}
+
+	private stopPdfChangePolling(): void {
+		if (!this.pdfChangePollTimer) return;
+		clearInterval(this.pdfChangePollTimer);
+		this.pdfChangePollTimer = undefined;
+		this.pdfChangePollInFlight = false;
+	}
+
+	private async verifyPdfRecordSnapshot(record: ViewerHostPdfRecord): Promise<void> {
+		let snapshot: ViewerHostFileSnapshot;
+		try {
+			snapshot = await snapshotRegisteredPdf(this.fileSystem, record.pdfPath);
+			await assertRegisteredPdfReadable(this.fileSystem, record.pdfPath);
+		} catch (error) {
+			this.pendingPdfRefreshSnapshots.delete(record.pdfId);
+			this.pdfRefreshDiagnostics.set(record.pdfId, diagnosticForSnapshotError(record.pdfId, error));
+			return;
+		}
+
+		this.pdfRefreshDiagnostics.delete(record.pdfId);
+		if (isSnapshotMatch(record.fileSnapshot, snapshot)) {
+			this.pendingPdfRefreshSnapshots.delete(record.pdfId);
+			return;
+		}
+
+		const pending = this.pendingPdfRefreshSnapshots.get(record.pdfId);
+		const now = this.nowMs();
+		if (!pending || !isSnapshotMatch(pending.snapshot, snapshot)) {
+			this.pendingPdfRefreshSnapshots.set(record.pdfId, { snapshot, observedAtMs: now });
+			return;
+		}
+		if (now - pending.observedAtMs < this.pdfChangeDebounceMs) return;
+
+		this.pendingPdfRefreshSnapshots.delete(record.pdfId);
+		this.registry.registerPdf({
+			pdfId: record.pdfId,
+			pdfPath: record.pdfPath,
+			title: record.title,
+			revision: record.revision + 1,
+			fileSnapshot: snapshot,
+		});
+		this.sendPdfRefresh(record.pdfId);
+	}
+
 	private async servePdf(response: ServerResponse, pdfId: number, revision: number, headOnly: boolean): Promise<void> {
 		let record: ViewerHostPdfRecord;
 		try {
@@ -1062,13 +1166,60 @@ async function snapshotRegisteredPdf(fileSystem: ViewerHostFileSystem, pdfPath: 
 	let fileStatus: Awaited<ReturnType<ViewerHostFileSystem["stat"]>>;
 	try {
 		fileStatus = await fileSystem.stat(pdfPath);
-	} catch {
-		throw new Error("registered PDF is not readable");
+	} catch (error) {
+		throw new ViewerHostSnapshotError("pdf_not_readable", "registered PDF is not readable", error);
 	}
 	if (!fileStatus.isFile()) {
-		throw new Error("registered PDF is not a regular file");
+		throw new ViewerHostSnapshotError("pdf_not_regular_file", "registered PDF is not a regular file");
 	}
 	return { size: fileStatus.size, mtimeMs: fileStatus.mtimeMs };
+}
+
+async function assertRegisteredPdfReadable(fileSystem: ViewerHostFileSystem, pdfPath: string): Promise<void> {
+	let stream: Readable;
+	try {
+		stream = fileSystem.createReadStream(pdfPath);
+	} catch (error) {
+		throw new ViewerHostSnapshotError("pdf_not_readable", "registered PDF is not readable", error);
+	}
+	try {
+		await waitForReadablePdfOpen(stream);
+	} catch (error) {
+		throw new ViewerHostSnapshotError("pdf_not_readable", "registered PDF is not readable", error);
+	}
+}
+
+async function waitForReadablePdfOpen(stream: Readable): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		let settled = false;
+		const cleanup = () => {
+			stream.off("open", succeed);
+			stream.off("readable", succeed);
+			stream.off("data", succeed);
+			stream.off("end", succeed);
+			stream.off("error", fail);
+		};
+		const settle = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			callback();
+		};
+		const succeed = () => settle(() => {
+			stream.destroy();
+			resolve();
+		});
+		const fail = (error: Error) => settle(() => {
+			stream.destroy();
+			reject(error);
+		});
+		stream.once("open", succeed);
+		stream.once("readable", succeed);
+		stream.once("data", succeed);
+		stream.once("end", succeed);
+		stream.once("error", fail);
+		stream.resume();
+	});
 }
 
 function writeAppEvent(response: ServerResponse, event: ViewerClientTabEvent | { type: "ready" }): void {
@@ -1114,6 +1265,31 @@ function jsonResponse(response: ServerResponse, status: number, body: ViewerHost
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+class ViewerHostSnapshotError extends Error {
+	readonly diagnosticCode: ViewerHostPdfRefreshDiagnostic["code"];
+
+	constructor(diagnosticCode: ViewerHostPdfRefreshDiagnostic["code"], message: string, cause?: unknown) {
+		super(message, cause === undefined ? undefined : { cause });
+		this.name = "ViewerHostSnapshotError";
+		this.diagnosticCode = diagnosticCode;
+	}
+}
+
+function diagnosticForSnapshotError(pdfId: number, error: unknown): ViewerHostPdfRefreshDiagnostic {
+	return {
+		pdf_id: pdfId,
+		status: "error",
+		code: error instanceof ViewerHostSnapshotError ? error.diagnosticCode : "pdf_not_readable",
+		message: errorMessage(error),
+	};
+}
+
+function nonNegativeNumber(value: number | undefined, fallback: number): number {
+	if (value === undefined) return fallback;
+	if (!Number.isFinite(value) || value < 0) throw new Error("PDF change detection timing values must be finite non-negative numbers");
+	return value;
 }
 
 function parsePositiveInteger(value: string | undefined): number | undefined {
