@@ -221,8 +221,9 @@ function aggregateLinePositions(positions: SynctexPositionRecord[], matchingTags
 		const depth = Math.max(0, position.depth);
 		const minX = position.x;
 		const maxX = position.x + width;
-		const minY = position.y;
-		const maxY = position.y + height + depth;
+		// SyncTeX Y is a top-origin baseline; height extends above it and depth below it.
+		const minY = position.y - height;
+		const maxY = position.y + depth;
 		const aggregate = byLine.get(position.line);
 		if (!aggregate) {
 			byLine.set(position.line, {
@@ -336,12 +337,18 @@ export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; 
 		throw new Error(`No SyncTeX mapping found for ${sourcePathLabel(sourceFile)}:${input.line}`);
 	}
 
+	const verticalPosition = allowExact
+		? (fallbackLinePositions.find((candidate) => candidate.page === position.page && candidate.line === position.line) ?? position)
+		: position;
+	const rawHeight = Math.max(0, verticalPosition.maxY - verticalPosition.minY);
+	const height = Math.max(FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS, rawHeight);
+
 	return {
 		page: position.page,
 		x: position.x,
-		y: position.y,
+		y: rawHeight > 0 ? verticalPosition.minY : position.y - height,
 		width: Math.max(0, position.maxX - position.minX),
-		height: Math.max(FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS, position.maxY - position.minY),
+		height,
 		sourceFile,
 		line: input.line,
 		sourceLine,

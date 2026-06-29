@@ -466,7 +466,7 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 		assert.equal(jump.status_details.source_line, "Jump target text.");
 		assert.equal(jump.status_details.page, 1);
 		assert.equal(jump.status_details.x, 110);
-		assert.equal(jump.status_details.y, 220);
+		assert.equal(jump.status_details.y, 212.371);
 		assert.equal(jump.status_details.viewer_notifications, 1);
 		assert.equal(jump.status_details.reason, "notified_viewers=1");
 		assert.deepEqual(JSON.parse(notifications[0]), {
@@ -474,7 +474,7 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 			pdf_id: pdfId,
 			page: 1,
 			x: 110,
-			y: 220,
+			y: 212.371,
 			width: 15.259,
 			height: 10,
 			source_file: sourcePath,

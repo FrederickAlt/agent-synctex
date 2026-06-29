@@ -28,7 +28,7 @@ test("forward SyncTeX mapper reads realistic .synctex fixtures and maps source l
 		assert.equal(jump.sourceLine, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(jump.page, 1);
 		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 155.27);
+		assert.equal(jump.y, 145.27);
 		assert.equal((jump as { width?: number }).width !== undefined && (jump as { width?: number }).width! > 250, true);
 		assert.equal((jump as { height?: number }).height !== undefined && (jump as { height?: number }).height! >= 10, true);
 	} finally {
@@ -74,7 +74,7 @@ test("forward SyncTeX mapper reads realistic .synctex.gz fixtures", () => {
 		assert.equal(jump.sourceLine, "Second paragraph text on a different source line for SyncTeX mapping.");
 		assert.equal(jump.page, 1);
 		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 167.27);
+		assert.equal(jump.y, 157.27);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -109,7 +109,7 @@ test("forward SyncTeX mapper resolves relative Input records against cwd for out
 		assert.equal(jump.sourceFile, project.sourcePath);
 		assert.equal(jump.page, 1);
 		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 155.27);
+		assert.equal(jump.y, 145.27);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -123,7 +123,7 @@ test("forward SyncTeX mapper interpolates non-exact lines instead of treating st
 		assert.equal(jump.sourceLine, "");
 		assert.equal(jump.page, 1);
 		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 161.27);
+		assert.equal(jump.y, 151.27);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -135,7 +135,7 @@ test("forward SyncTeX mapper applies X/Y offsets from realistic SyncTeX fixtures
 		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir });
 
 		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 155.27);
+		assert.equal(jump.y, 145.27);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

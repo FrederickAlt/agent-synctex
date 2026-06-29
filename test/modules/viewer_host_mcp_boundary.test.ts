@@ -273,7 +273,7 @@ test("jump_pdf maps SyncTeX in MCP and sends synctex_forward through Viewer Host
 			pdf_id: 5,
 			page: 1,
 			x: 110,
-			y: 220,
+			y: 212.371,
 			width: 15.259,
 			height: 10,
 			source_file: sourcePath,
