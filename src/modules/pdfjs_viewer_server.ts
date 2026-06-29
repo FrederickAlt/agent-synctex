@@ -14,8 +14,8 @@ const DEFAULT_PORT = 0;
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const require = createRequire(import.meta.url);
 const LOCAL_PDFJS_ASSETS = new Map<string, string>([
-	["/assets/pdf.mjs", require.resolve("pdfjs-dist/build/pdf.mjs")],
-	["/assets/pdf.worker.mjs", require.resolve("pdfjs-dist/build/pdf.worker.mjs")],
+	["/assets/pdf.mjs", require.resolve("pdfjs-dist/legacy/build/pdf.mjs")],
+	["/assets/pdf.worker.mjs", require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs")],
 ]);
 
 const VIEWER_SCRIPT = `
@@ -28,6 +28,18 @@ let activeSynctexMarker;
 function setStatus(message) {
 	if (status) status.textContent = message;
 }
+
+function reportViewerError(error) {
+	const message = error && error.message ? error.message : String(error || "unknown viewer error");
+	setStatus("Unable to render via PDF.js: " + message + ". Use the direct PDF link below.");
+}
+
+window.addEventListener("error", (event) => {
+	reportViewerError(event.error || event.message || "viewer script failed to load");
+});
+window.addEventListener("unhandledrejection", (event) => {
+	reportViewerError(event.reason || "unhandled viewer promise rejection");
+});
 
 function wsUrlFromConfig(config) {
 	return config.ws_url;
@@ -55,6 +67,7 @@ async function renderPdf(config, options = {}) {
 	const state = options.preserveState ? captureViewerState() : undefined;
 	fallback.href = pdfUrlForRevision(config);
 	pages.replaceChildren();
+	setStatus("Loading PDF " + config.pdf_id + " revision " + config.revision + " through PDF.js…");
 	const pdfjsLib = await import("/assets/pdf.mjs");
 	pdfjsLib.GlobalWorkerOptions.workerSrc = "/assets/pdf.worker.mjs";
 	const pdf = await pdfjsLib.getDocument(pdfUrlForRevision(config)).promise;
@@ -120,8 +133,8 @@ function connectViewerSocket(config) {
 				setStatus("This PDF was closed/untracked by the MCP runtime. The browser tab remains open.");
 				return;
 			}
-			if (message.type === "pdf_refresh" && message.pdf_id === activeConfig?.pdf_id) {
-				const refreshedConfig = { ...activeConfig, revision: message.revision, pdf_url: message.pdf_url };
+			if (message.type === "pdf_refresh" && activeConfig && message.pdf_id === activeConfig.pdf_id) {
+				const refreshedConfig = Object.assign({}, activeConfig, { revision: message.revision, pdf_url: message.pdf_url });
 				setStatus(\`Refreshing PDF \${message.pdf_id} revision \${message.revision}…\`);
 				void renderPdf(refreshedConfig, { preserveState: true }).catch((error) => {
 					setStatus(\`Unable to refresh PDF \${message.pdf_id}: \${error.message}\`);
@@ -151,7 +164,7 @@ fetch(configUrl)
 		return renderPdf(config);
 	})
 	.catch((error) => {
-		setStatus(\`Unable to render via PDF.js: \${error.message}. Use the direct PDF link below.\`);
+		reportViewerError(error);
 	});
 `;
 
@@ -495,7 +508,25 @@ export class PdfJsViewerServer {
 <p id="status">Loading PDF.js viewer for pdf_id=${pdfId}…</p>
 <p><a id="fallback-link" href="/pdf/${pdfId}">Open registered PDF bytes directly</a></p>
 <div id="pages"></div>
-<script type="module" src="/assets/viewer.js"></script>
+<script>
+(function () {
+	function setFailure(message) {
+		var status = document.getElementById("status");
+		if (status) status.textContent = message + " Use the direct PDF link below.";
+	}
+	window.addEventListener("error", function (event) {
+		if (event.target && event.target.tagName === "SCRIPT") {
+			setFailure("Unable to load PDF.js viewer script: viewer script failed to load.");
+		}
+	});
+	window.addEventListener("unhandledrejection", function (event) {
+		var reason = event.reason && event.reason.message ? event.reason.message : String(event.reason || "unhandled viewer promise rejection");
+		setFailure("Unable to load PDF.js viewer script: " + reason + ".");
+	});
+}());
+</script>
+<script type="module" src="/assets/viewer.js" onerror="document.getElementById('status').textContent='Unable to load PDF.js viewer script: viewer script failed to load. Use the direct PDF link below.'"></script>
+<script nomodule>document.getElementById("status").textContent = "Unable to load PDF.js viewer script: this browser does not support JavaScript modules. Use the direct PDF link below.";</script>
 </body>
 </html>`;
 		textResponse(response, 200, "text/html; charset=utf-8", headOnly ? "" : body);

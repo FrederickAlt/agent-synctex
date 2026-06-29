@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -9,6 +10,8 @@ import { Readable } from "node:stream";
 import { test } from "node:test";
 import { PdfJsViewerRegistry } from "../../src/modules/pdfjs_viewer_registry.ts";
 import { PdfJsViewerServer } from "../../src/modules/pdfjs_viewer_server.ts";
+
+const require = createRequire(import.meta.url);
 
 function writeFakePdf(path: string, suffix = "body"): Buffer {
 	const bytes = Buffer.from(`%PDF-1.4\n${suffix}\n%%EOF\n`, "utf8");
@@ -126,8 +129,10 @@ test("PDF.js viewer server serves shell/config/assets and registered PDF bytes o
 		const shell = await readHttp(record.viewerUrl);
 		assert.equal(shell.status, 200);
 		assert.match(shell.contentType, /text\/html/);
-		assert.match(shell.body.toString("utf8"), /PDF\.js/);
-		assertNoExternalUrls("viewer shell", shell.body.toString("utf8"));
+		const shellHtml = shell.body.toString("utf8");
+		assert.match(shellHtml, /PDF\.js/);
+		assert.match(shellHtml, /viewer script failed to load/i);
+		assertNoExternalUrls("viewer shell", shellHtml);
 
 		const config = await readHttp(`${server.origin}/config/${record.pdfId}.json`);
 		assert.equal(config.status, 200);
@@ -147,9 +152,11 @@ test("PDF.js viewer server serves shell/config/assets and registered PDF bytes o
 		const pdfJs = await readHttp(`${server.origin}/assets/pdf.mjs`);
 		assert.equal(pdfJs.status, 200);
 		assert.match(pdfJs.contentType, /javascript/);
+		assert.equal(pdfJs.body.toString("utf8"), readFileSync(require.resolve("pdfjs-dist/legacy/build/pdf.mjs"), "utf8"));
 		const pdfWorker = await readHttp(`${server.origin}/assets/pdf.worker.mjs`);
 		assert.equal(pdfWorker.status, 200);
 		assert.match(pdfWorker.contentType, /javascript/);
+		assert.equal(pdfWorker.body.toString("utf8"), readFileSync(require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs"), "utf8"));
 
 		const pdf = await readHttp(`${server.origin}/pdf/${record.pdfId}`);
 		assert.equal(pdf.status, 200);
