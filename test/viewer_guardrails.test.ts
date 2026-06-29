@@ -93,9 +93,10 @@ const PACKAGE_STALE_METADATA_TOKENS = [
 const ACTIVE_DOC_PATHS = [
 	"README.md",
 	"CONTEXT.md",
-	"docs/logging.md",
-	"docs/testing-preview-framework.md",
-	"docs/host-service-broker.md",
+	"docs/prd-desktop-viewer-host-v1.md",
+	"docs/tdd-desktop-viewer-host-v1.md",
+	"docs/prd-viewer-client-ux-followups.md",
+	"docs/tdd-viewer-client-ux-followups.md",
 ] as const;
 const STALE_PI_EXTENSION_BRANDING_PATTERNS: Array<[RegExp, string]> = [
 	[/\bPi extension\b/gi, "stale Pi extension branding"],
@@ -697,7 +698,7 @@ test("Package metadata keeps MCP-only production entrypoints", () => {
 });
 
 
-test("Active docs describe stdio MCP PDF.js runtime and safe MCP startup commands", () => {
+test("Active docs describe the MCP/PDF.js roadmap and safe MCP startup commands", () => {
 	const violations: GuardrailViolation[] = [];
 	let combinedDocs = "";
 

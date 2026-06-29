@@ -15,9 +15,12 @@ npm run verify
 
 If `npm run verify` fails with `tsc: not found` or `ERR_MODULE_NOT_FOUND: typescript`, the worktree dependencies are incomplete; run the install command above and retry.
 
-Before changing any preview rendering, refresh policy, or image output paths in this repo, read:
+Before changing viewer architecture, refresh policy, SyncTeX behavior, or PDF.js UI behavior in this repo, read the forward-looking docs:
 
-- docs/testing-preview-framework.md
+- docs/prd-desktop-viewer-host-v1.md
+- docs/tdd-desktop-viewer-host-v1.md
+- docs/prd-viewer-client-ux-followups.md
+- docs/tdd-viewer-client-ux-followups.md
 
 For extension composition and transport, keep `index.ts` as the composition root:
 - `src/modules/pi_adapter/pi_adapter.ts` should remain the thin Pi dispatch adapter.
