@@ -17,6 +17,7 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg", "deb", "appimage"],
+    "icon": ["icons/icon.png"],
     "category": "DeveloperTool",
     "shortDescription": "Thin desktop wrapper for the PDF Preview Viewer Host",
     "longDescription": "Starts the local Viewer Host Server and loads its /app Viewer Client in a desktop window. Windows packaging is best-effort and not part of the required target set for issue 114."

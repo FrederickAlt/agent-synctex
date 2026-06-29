@@ -148,22 +148,36 @@ test("desktop app process launcher passes the Host /app target through a configu
 test("default desktop app binary discovery uses the package root, not the user's LaTeX cwd", () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-package-root-discovery-"));
 	const userLatexCwd = join(baseDir, "latex-project");
-	const packageBinary = resolve(process.cwd(), "apps", "viewer-desktop-tauri", "src-tauri", "target", "debug", process.platform === "win32" ? "pdf-preview-viewer.exe" : "pdf-preview-viewer");
+	const packageRoot = join(baseDir, "package-root");
+	const packageBinary = resolve(packageRoot, "apps", "viewer-desktop-tauri", "src-tauri", "target", "debug", process.platform === "win32" ? "pdf-preview-viewer.exe" : "pdf-preview-viewer");
 	mkdirSync(userLatexCwd, { recursive: true });
 	mkdirSync(resolve(packageBinary, ".."), { recursive: true });
-	const hadExistingBinary = existsSync(packageBinary);
-	if (!hadExistingBinary) {
-		writeFileSync(packageBinary, "#!/usr/bin/env sh\nexit 0\n");
-		chmodSync(packageBinary, 0o700);
-	}
+	writeFileSync(packageBinary, "#!/usr/bin/env sh\nexit 0\n");
+	chmodSync(packageBinary, 0o700);
 	const env = { ...process.env };
 	delete env.PDF_PREVIEW_VIEWER_APP_COMMAND;
 	delete env.PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK;
 	try {
-		const config = resolveDefaultDesktopViewerAppLaunchConfig(env, userLatexCwd);
+		const config = resolveDefaultDesktopViewerAppLaunchConfig(env, userLatexCwd, packageRoot);
 		assert.equal(config.command, packageBinary);
 	} finally {
-		if (!hadExistingBinary) rmSync(packageBinary, { force: true });
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("default desktop app dev fallback runs npm from the package root", () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-dev-fallback-cwd-"));
+	const userLatexCwd = join(baseDir, "latex-project");
+	const packageRoot = join(baseDir, "package-root");
+	mkdirSync(userLatexCwd, { recursive: true });
+	mkdirSync(packageRoot, { recursive: true });
+	const env = { ...process.env };
+	delete env.PDF_PREVIEW_VIEWER_APP_COMMAND;
+	env.PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK = "1";
+	try {
+		const config = resolveDefaultDesktopViewerAppLaunchConfig(env, userLatexCwd, packageRoot);
+		assert.deepEqual(config, { command: "npm", args: ["run", "tauri:viewer:dev"], cwd: packageRoot });
+	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });

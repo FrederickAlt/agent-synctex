@@ -127,7 +127,7 @@ export function resolveDefaultDesktopViewerAppLaunchConfig(env: NodeJS.ProcessEn
 	}
 
 	if (env.PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK === "1") {
-		return { command: "npm", args: ["run", "tauri:viewer:dev"], cwd };
+		return { command: "npm", args: ["run", "tauri:viewer:dev"], cwd: packageRoot };
 	}
 
 	throw new Error("Desktop Viewer app command is not configured. Build the Tauri app with npm run tauri:viewer:build, or set PDF_PREVIEW_VIEWER_APP_COMMAND to the desktop app executable. Set PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK=1 only for explicit development fallback.");

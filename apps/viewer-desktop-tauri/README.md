@@ -57,12 +57,12 @@ From the repository root:
 npm run viewer-host:desktop
 ```
 
-From `apps/viewer-desktop-tauri/src-tauri`, with Rust, Cargo, Tauri CLI, and Tauri system dependencies installed:
+From the repository root, with Rust, Cargo, and Tauri system dependencies installed. The Tauri CLI is a repo-local npm dev dependency:
 
 ```bash
-cargo tauri dev
-cargo tauri build
-PDF_PREVIEW_VIEWER_HOST_COMMAND=/path/to/viewer-host-server ./target/release/pdf-preview-viewer
+npm run tauri:viewer:dev
+npm run tauri:viewer:build
+PDF_PREVIEW_VIEWER_HOST_COMMAND=/path/to/viewer-host-server ./apps/viewer-desktop-tauri/src-tauri/target/release/pdf-preview-viewer
 ```
 
 Current verification gap: this worktree does not configure the Rust toolchain itself. If `cargo` reports that rustup has no default toolchain, run `rustup default stable` before attempting Tauri builds.

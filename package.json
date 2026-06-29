@@ -12,8 +12,8 @@
     "smoke:stdio-viewer": "node --test --test-reporter=spec --test-name-pattern=\"routes open_pdf to the Viewer Host boundary without owning PDF serving\" test/modules/stdio_mcp_runtime.test.ts",
     "verify": "npm run check && npm test",
     "viewer-host:desktop": "node scripts/viewer-host-server.ts",
-    "tauri:viewer:dev": "cd apps/viewer-desktop-tauri/src-tauri && cargo tauri dev",
-    "tauri:viewer:build": "cd apps/viewer-desktop-tauri/src-tauri && cargo tauri build",
+    "tauri:viewer:dev": "cd apps/viewer-desktop-tauri/src-tauri && tauri dev",
+    "tauri:viewer:build": "cd apps/viewer-desktop-tauri/src-tauri && REAL_HOME=$HOME && HOME=$PWD/target/tauri-home CARGO_HOME=${CARGO_HOME:-$REAL_HOME/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-$REAL_HOME/.rustup} tauri build",
     "tex-actions:mcp": "node scripts/tex-actions-mcp.ts",
     "pdf-preview-mcp": "node scripts/pdf-preview-mcp.ts"
   },
@@ -32,6 +32,7 @@
     "typebox": "^1.1.39"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^22.19.19",
     "playwright": "^1.61.1",
     "typescript": "^6.0.3"

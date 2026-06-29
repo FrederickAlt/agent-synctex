@@ -82,6 +82,11 @@ test("Tauri desktop bundle is a thin wrapper that loads Host-served /app and doc
 	assert.ok(config.bundle?.targets?.includes("deb"), "Linux deb build target should exist");
 	assert.ok(config.bundle?.targets?.includes("appimage"), "Linux AppImage build target should exist");
 
+	const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { scripts?: Record<string, string> };
+	const buildScript = packageJson.scripts?.["tauri:viewer:build"] ?? "";
+	assert.match(buildScript, /REAL_HOME=\$HOME && HOME=/, "Tauri build script must assign REAL_HOME before using it in CARGO_HOME/RUSTUP_HOME expansions");
+	assert.doesNotMatch(buildScript, /REAL_HOME=\$HOME HOME=.*CARGO_HOME=\$\{CARGO_HOME:-\$REAL_HOME\/\.cargo\}/, "REAL_HOME must not be assigned in the same command prefix that expands it");
+
 	const cargo = readFileSync(cargoPath, "utf8");
 	const libRsPath = join(root, "src-tauri", "src", "lib.rs");
 	assert.ok(existsSync(join(root, "src-tauri", "src", "main.rs")), "binary main.rs should exist");
