@@ -1,5 +1,6 @@
 node_modules/
 .ms-playwright/
+.codegraph/
 
 /tmp/
 /host-service-snippets/
