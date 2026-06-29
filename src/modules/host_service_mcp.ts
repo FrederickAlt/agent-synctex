@@ -941,6 +941,19 @@ function parseGetPdfEventsRequest(args: Record<string, unknown>): GetPdfEventsRe
 	};
 }
 
+function formatPdfEventForTool(event: PdfEvent): string {
+	const fields = [
+		`type=${event.type}`,
+		`pdf_id=${event.pdf_id}`,
+		`source_file=${event.source_file}`,
+		`line=${event.line}`,
+	];
+	if (event.source_line !== undefined) {
+		fields.push(`source_line=${event.source_line}`);
+	}
+	return fields.join(", ");
+}
+
 async function handleGetPdfEventsTool(
 	requestId: ParsedMcpRequestId,
 	args: Record<string, unknown>,
@@ -955,8 +968,10 @@ async function handleGetPdfEventsTool(
 	}
 	const events = await pdfOperations.getPdfEvents?.(request) ?? [];
 	const filterText = request.pdf_id === undefined ? "" : ` for pdf_id=${request.pdf_id}`;
+	const summary = events.length === 0 ? `No PDF events found${filterText}.` : `Returned ${events.length} PDF event(s)${filterText}.`;
+	const eventDetails = events.map(formatPdfEventForTool);
 	return buildSuccess(requestId, {
-		content: [{ type: "text", text: events.length === 0 ? `No PDF events found${filterText}.` : `Returned ${events.length} PDF event(s)${filterText}.` }],
+		content: [{ type: "text", text: [summary, ...eventDetails].join("\n") }],
 		details: { events },
 	});
 }
