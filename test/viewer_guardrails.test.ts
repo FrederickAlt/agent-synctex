@@ -44,6 +44,9 @@ const FORBIDDEN_RUNTIME_IMPORT_SYMBOLS = new Map<string, string>([
 	["createInlinePreviewRenderer", "inline renderer should not be imported by active MCP runtime"],
 	["KittyPreviewInvalidationRegistry", "Kitty inline preview runtime should not be imported by active MCP runtime"],
 	["buildKittyPlaceholderImageRender", "Kitty inline preview runtime should not be imported by active MCP runtime"],
+	["PdfJsViewerMcpService", "active MCP runtime must route viewer operations through ViewerHostClient, not own the PDF.js server"],
+	["PdfJsViewerServer", "active MCP runtime must not own the PDF.js HTTP/WebSocket server"],
+	["DefaultBrowserLauncher", "active MCP runtime must not launch browser/PDF.js viewer windows directly"],
 ]);
 
 const FORBIDDEN_RUNTIME_LITERAL_MARKERS = new Map<string, string>([
@@ -671,11 +674,11 @@ test("Package metadata keeps MCP-only production entrypoints", () => {
 
 	assert.equal(typeof packageJson.description, "string", "package.json must describe the active runtime");
 	assert.match(packageJson.description as string, /stdio MCP/i, "package.json description must identify stdio MCP runtime");
-	assert.match(packageJson.description as string, /PDF\.js/i, "package.json description must identify browser PDF.js viewing");
+	assert.match(packageJson.description as string, /Viewer Host/i, "package.json description must identify the Viewer Host boundary");
 	assert.deepEqual(
 		(packageJson.keywords as unknown[] | undefined)?.filter((keyword): keyword is string => typeof keyword === "string").sort(),
-		["latex", "mcp", "pdfjs", "tex-actions"],
-		"package.json keywords must use active MCP/PDF.js runtime terms",
+		["latex", "mcp", "tex-actions", "viewer-host"],
+		"package.json keywords must use active MCP/Viewer Host boundary terms",
 	);
 
 	const declaredEntrypoints = collectPackageMetadataEntrypoints(packageJson);
@@ -698,7 +701,7 @@ test("Package metadata keeps MCP-only production entrypoints", () => {
 });
 
 
-test("Active docs describe the MCP/PDF.js roadmap and safe MCP startup commands", () => {
+test("Active docs describe the MCP/Viewer Host boundary and safe MCP startup commands", () => {
 	const violations: GuardrailViolation[] = [];
 	let combinedDocs = "";
 
@@ -710,7 +713,8 @@ test("Active docs describe the MCP/PDF.js roadmap and safe MCP startup commands"
 	}
 
 	assert.match(combinedDocs, /stdio MCP/i, "active docs must identify the stdio MCP runtime");
-	assert.match(combinedDocs, /PDF\.js/i, "active docs must identify the browser PDF.js runtime");
+	assert.match(combinedDocs, /Viewer Host/i, "active docs must identify the Viewer Host boundary");
+	assert.doesNotMatch(readFileSync(join(REPO_ROOT, "README.md"), "utf8"), /reachable browser\/PDF\.js|browser-hosted PDF\.js|process-local PDF\.js HTTP serving/i, "README must not promise old reachable in-process PDF.js behavior");
 	assert.equal(
 		violations.length,
 		0,

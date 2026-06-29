@@ -295,7 +295,6 @@ const HOST_TOOL_NAMES = [
 	"compile_latex_file",
 	"open_pdf",
 	"jump_pdf",
-	"close_pdf",
 	"set_latex_preamble",
 	"get_pdf_events",
 ];
@@ -386,13 +385,12 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		const compileFileTool = byName.get("compile_latex_file");
 		const openPdfTool = byName.get("open_pdf");
 		const jumpPdfTool = byName.get("jump_pdf");
-		const closePdfTool = byName.get("close_pdf");
 		const setPreambleTool = byName.get("set_latex_preamble");
 		assert.ok(showLatexTool);
 		assert.ok(compileFileTool);
 		assert.ok(openPdfTool);
 		assert.ok(jumpPdfTool);
-		assert.ok(closePdfTool);
+		assert.equal(byName.has("close_pdf"), false);
 		assert.ok(setPreambleTool);
 		assert.equal(typeof showLatexTool.inputSchema.properties.workspace_context, "object");
 		assert.equal(typeof compileFileTool.inputSchema.properties.workspace_context, "object");
@@ -402,9 +400,7 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.equal(openPdfTool.inputSchema.additionalProperties, false);
 		assert.equal(jumpPdfTool.inputSchema.properties.pdf_id?.type, "integer");
 		assert.equal(jumpPdfTool.inputSchema.properties.line?.type, "integer");
-		assert.equal(closePdfTool.inputSchema.properties.pdf_id?.type, "integer");
 		assert.equal(jumpPdfTool.inputSchema.additionalProperties, false);
-		assert.equal(closePdfTool.inputSchema.additionalProperties, false);
 		assert.equal(compileFileTool.inputSchema.properties.callback_target_id, undefined);
 		assert.equal(compileFileTool.inputSchema.properties.callback, undefined);
 		assert.equal(openPdfTool.inputSchema.properties.callback, undefined);
@@ -419,7 +415,6 @@ test("daemon serves MCP initialize, ping, tools/list, and set_latex_preamble", a
 		assert.match(compileFileTool.description ?? "", /clean=true/);
 		assert.match(compileFileTool.inputSchema.properties.hide_warnings?.description ?? "", /default/i);
 		assert.match(compileFileTool.inputSchema.properties.hide_warnings?.description ?? "", /hide_warnings=false/);
-		assert.doesNotMatch(closePdfTool.description ?? "", /continuous/);
 		assert.deepEqual(Object.keys(showLatexTool.inputSchema.properties).sort(), ["compiler", "source", "workspace_context"]);
 		assert.equal(showLatexTool.inputSchema.properties.inline, undefined);
 		assert.equal(showLatexTool.inputSchema.properties.fixed_preview_pdf_path, undefined);
@@ -687,7 +682,7 @@ test("daemon rejects removed compile_latex_file continuous arguments", async () 
 	}
 });
 
-test("daemon validates open_pdf/jump_pdf/close_pdf argument schemas", async () => {
+test("daemon validates open_pdf/jump_pdf argument schemas and rejects removed close_pdf", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-open-jump-close-schema-args-");
 	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-open-jump-close-schema-args-"));
 	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
@@ -774,7 +769,7 @@ test("daemon validates open_pdf/jump_pdf/close_pdf argument schemas", async () =
 		assert.equal(jumpFractionalLineResponse.error.code, -32602);
 		assert.equal(jumpFractionalLineResponse.error.message, "line must be a positive integer");
 
-		const closeUnknownResponse = (await sendFramedRequest(socketPath, JSON.stringify({
+		const closeUnsupportedResponse = (await sendFramedRequest(socketPath, JSON.stringify({
 			jsonrpc: "2.0",
 			id: 105,
 			method: "tools/call",
@@ -785,23 +780,9 @@ test("daemon validates open_pdf/jump_pdf/close_pdf argument schemas", async () =
 					extra: true,
 				},
 			},
-		}))) as { error: { code: number; message: string } };
-		assert.equal(closeUnknownResponse.error.code, -32602);
-		assert.equal(closeUnknownResponse.error.message, "close_pdf unknown argument: extra");
-
-		const closeFractionalResponse = (await sendFramedRequest(socketPath, JSON.stringify({
-			jsonrpc: "2.0",
-			id: 106,
-			method: "tools/call",
-			params: {
-				name: "close_pdf",
-				arguments: {
-					pdf_id: 1.5,
-				},
-			},
-		}))) as { error: { code: number; message: string } };
-		assert.equal(closeFractionalResponse.error.code, -32602);
-		assert.equal(closeFractionalResponse.error.message, "pdf_id must be a positive integer");
+		}))) as { result: { isError?: boolean; content: Array<{ text: string }> } };
+		assert.equal(closeUnsupportedResponse.result.isError, true);
+		assert.match(closeUnsupportedResponse.result.content[0].text, /Tool not implemented by runtime: close_pdf/);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -918,7 +899,7 @@ test("daemon resolves relative open_pdf and jump_pdf paths against workspace_con
 	}
 });
 
-test("daemon supports MCP managed open/jump/close without callback", async () => {
+test("daemon supports MCP managed open/jump without public close deleting MCP state", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-managed-open-jump-close-");
 	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-managed-open-jump-close-"));
 	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
@@ -983,11 +964,10 @@ test("daemon supports MCP managed open/jump/close without callback", async () =>
 			},
 		});
 		const closeResponse = (await sendFramedRequest(socketPath, closePayload)) as {
-			result: { isError?: boolean; details: { closed?: boolean; pdf_id?: number } };
+			result: { isError?: boolean; content: Array<{ text: string }> };
 		};
-		assert.equal(closeResponse.result.isError, undefined);
-		assert.equal(closeResponse.result.details.closed, true);
-		assert.equal(closeResponse.result.details.pdf_id, pdfId);
+		assert.equal(closeResponse.result.isError, true);
+		assert.match(closeResponse.result.content[0].text, /Tool not implemented by runtime: close_pdf/);
 
 		const reopenedJumpPayload = JSON.stringify({
 			jsonrpc: "2.0",
@@ -1008,7 +988,7 @@ test("daemon supports MCP managed open/jump/close without callback", async () =>
 		assert.equal(reopenedJumpResponse.result.isError, undefined);
 		assert.equal(reopenedJumpResponse.result.details.pdf_id, pdfId);
 		assert.equal(reopenedJumpResponse.result.details.handled, true);
-		assert.equal(reopenedJumpResponse.result.details.reopened, true);
+		assert.equal(reopenedJumpResponse.result.details.reopened, false);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -1157,7 +1137,7 @@ test("daemon surfaces managed open backend failures in MCP tool responses", asyn
 	}
 });
 
-test("daemon surfaces managed jump and close backend errors in MCP responses", async () => {
+test("daemon surfaces managed jump errors and rejects removed close_pdf in MCP responses", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-jump-close-backend-fail-");
 	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-jump-close-backend-fail-"));
 	const workspaceDir = mkdtempSync(join(baseDir, "workspace-"));
@@ -1228,11 +1208,10 @@ test("daemon surfaces managed jump and close backend errors in MCP responses", a
 		}
 
 		const closeResponse = (await sendFramedRequest(socketPath, closePayload(pdfId))) as {
-			result: { isError?: boolean; content: Array<{ text: string }>; details: { error_code?: string } };
+			result: { isError?: boolean; content: Array<{ text: string }> };
 		};
 		assert.equal(closeResponse.result.isError, true);
-		assert.equal(closeResponse.result.details.error_code, "backend_unavailable");
-		assert.match(closeResponse.result.content[0].text, /close unavailable/);
+		assert.match(closeResponse.result.content[0].text, /Tool not implemented by runtime: close_pdf/);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });

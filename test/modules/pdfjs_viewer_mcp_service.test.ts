@@ -752,7 +752,7 @@ test("MCP jump_pdf resolves relative source_file against workspace_context.cwd",
 	}
 });
 
-test("MCP close_pdf tool reports PDF.js untrack/notify semantics without claiming browser closure", async () => {
+test("MCP close_pdf tool is removed even when PDF.js service has an internal close operation", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-close-tool-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFakePdf(pdfPath);
@@ -772,7 +772,6 @@ test("MCP close_pdf tool reports PDF.js untrack/notify semantics without claimin
 			details: { pdf_path: pdfPath },
 		});
 		const pdfId = open.status_details.pdf_id ?? 0;
-		registry.addClient(pdfId, { send: () => undefined });
 
 		const response = await handleMcpRequest(JSON.stringify({
 			jsonrpc: "2.0",
@@ -782,12 +781,9 @@ test("MCP close_pdf tool reports PDF.js untrack/notify semantics without claimin
 		}), service.pdfOperations);
 
 		assert.ok(response && "result" in response);
-		const result = response.result as { details: { viewer_notifications: number }; content: Array<{ text: string }> };
-		assert.equal(result.details.viewer_notifications, 1);
-		assert.match(result.content[0].text, /untracked/);
-		assert.match(result.content[0].text, /notified_viewers=1/);
-		assert.match(result.content[0].text, /browser_windows_may_remain_open/);
-		assert.doesNotMatch(result.content[0].text, /\bclosed\b/);
+		const result = response.result as { isError?: boolean; content: Array<{ text: string }> };
+		assert.equal(result.isError, true);
+		assert.match(result.content[0].text, /Tool not implemented by runtime: close_pdf/);
 	} finally {
 		await service.stop();
 		rmSync(baseDir, { recursive: true, force: true });

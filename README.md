@@ -1,37 +1,38 @@
 # TeX Actions
 
-TeX Actions is a local stdio MCP server for LaTeX snippet rendering, file compilation, and PDF navigation through a browser-hosted PDF.js viewer.
+TeX Actions is a local stdio MCP server for LaTeX snippet rendering, file compilation, and PDF navigation through the Desktop Viewer Host boundary.
 
-The active v1 runtime is stdio MCP plus PDF.js in the browser. It does not require a socket daemon, systemd unit, direct desktop PDF viewer integration, or callback transport from the browser.
+The active #107 runtime defines the MCP → Viewer Host Client boundary. It does not launch or serve a real Desktop Viewer Host yet; until the #108+ Host Server/client slices exist, the default runtime uses a fake/test Viewer Host Client that records boundary messages and returns MCP-owned `pdf_id`s.
 
 ## Exposed MCP tools
 
 - `show_latex`
-  - Compile LaTeX source and open the generated PDF in the browser PDF.js viewer.
-  - Returns compile metadata, `pdf_id`, and `viewer_url`.
+  - Compile LaTeX source and route the generated PDF open request through the Viewer Host Client boundary.
+  - Returns compile metadata and a runtime `pdf_id` when opening succeeds.
 - `compile_latex_file`
   - Compile an existing `.tex` source file.
-  - Optional `open_pdf=true` registers/opens the generated PDF in the PDF.js viewer and returns a runtime `pdf_id`.
+  - Optional `open_pdf=true` routes the generated PDF open request through the Viewer Host Client boundary and returns a runtime `pdf_id`.
 - `open_pdf`
-  - Open an existing PDF in the PDF.js viewer and register it in runtime state.
+  - Register an existing PDF in MCP runtime state and send an `open_pdf` or `focus_pdf` message to the Viewer Host Client boundary.
 - `jump_pdf`
-  - Forward-search a tracked PDF by `pdf_id` and source line.
-- `close_pdf`
-  - Untrack a runtime PDF id and notify connected PDF.js viewers.
+  - Forward-search a tracked PDF by `pdf_id` and source line; MCP computes SyncTeX coordinates and sends `synctex_forward` to the Viewer Host Client boundary.
 - `set_latex_preamble`
   - Set the runtime preamble used by snippet compilation.
 - `get_pdf_events`
-  - Fetch recent process-local PDF.js reverse SyncTeX events.
+  - Fetch recent process-local viewer events.
+
+`close_pdf` is intentionally not a public MCP tool in this boundary slice. Viewer/tab close is a Viewer Client concern and does not delete MCP-owned `pdf_id` state.
 
 ## Runtime architecture
 
 - Entry point: `scripts/tex-actions-mcp.ts` (alias: `scripts/pdf-preview-mcp.ts`).
 - Runtime host: `src/modules/stdio_mcp_runtime.ts`.
 - MCP tool handling: `src/modules/host_service_mcp.ts`.
-- Browser/PDF.js viewer: `src/modules/pdfjs_viewer_mcp_service.ts` and `src/modules/pdfjs_viewer_server.ts`.
+- Viewer Host Client boundary: `src/modules/viewer_host_client.ts`.
+- Typed Viewer Host protocol: `src/modules/viewer_host_protocol.ts`.
 - Compile orchestration: `src/modules/host_service_compile.ts` with LaTeX primitives in `src/modules/latex/`.
 
-The runtime seeds a process-owned workspace under `${MCP_TMPDIR:-$XDG_RUNTIME_DIR/tex-actions}/agents/<agent-id>` and stores temporary snippet/preamble artifacts there. PDF.js HTTP serving is process-local: returned `viewer_url` values require the `tex-actions-mcp` stdio process to remain alive and are not expected to survive MCP process exit.
+Returned `viewer_url` values in #107 are boundary handles only. Do not treat them as reachable viewer pages until the real Viewer Host Server/client is implemented.
 
 ## Start the runtime
 
@@ -47,7 +48,7 @@ For MCP client configuration after installation, use the package bin:
 tex-actions-mcp
 ```
 
-Pi's local MCP config supports `lifecycle` values `"lazy"`, `"eager"`, and `"keep-alive"`. Use `"keep-alive"` for `tex-actions` so process-local tool state and active PDF.js viewer URLs survive between calls while the MCP stdio process remains alive. Do not configure MCP clients with `npm run tex-actions:mcp`; npm output can corrupt stdio framing. Use the installed `tex-actions-mcp` bin or the direct `node scripts/tex-actions-mcp.ts` command for local development only.
+Pi's local MCP config supports `lifecycle` values `"lazy"`, `"eager"`, and `"keep-alive"`. Use `"keep-alive"` for `tex-actions` so process-local MCP state survives between calls while the MCP stdio process remains alive. Do not configure MCP clients with `npm run tex-actions:mcp`; npm output can corrupt stdio framing. Use the installed `tex-actions-mcp` bin or the direct `node scripts/tex-actions-mcp.ts` command for local development only.
 
 ```json
 {
@@ -69,8 +70,8 @@ npm test
 npm run smoke:stdio-viewer
 ```
 
-`test/viewer_guardrails.test.ts` enforces that active package entrypoints remain stdio MCP/PDF.js-only and do not reintroduce removed callback schemas, legacy viewer commands, daemon entrypoints, or inline/raster compatibility paths.
+`test/viewer_guardrails.test.ts` enforces that active package entrypoints remain stdio MCP plus Viewer Host boundary code and do not reintroduce removed callback schemas, direct viewer commands, daemon entrypoints, in-process PDF.js ownership, or inline/raster compatibility paths.
 
 ## Historical note
 
-Some internal module names still contain `host_service` because they define current v1 MCP DTOs or compile helpers. File names alone are not compatibility promises; active behavior is the stdio MCP + PDF.js path above.
+Some internal module names still contain `host_service` because they define current MCP DTOs or compile helpers. File names alone are not compatibility promises; active behavior is the stdio MCP + Viewer Host Client boundary path above.

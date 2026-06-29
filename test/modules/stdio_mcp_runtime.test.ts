@@ -56,7 +56,7 @@ test("actual tex-actions-mcp entrypoint answers initialize and tools/list over s
 		assert.equal(initialize.result.capabilities.tools.listChanged, false);
 		assert.equal(toolsList.id, 2);
 		const names = toolsList.result.tools.map((tool) => tool.name);
-		assert.deepEqual(names, ["show_latex", "compile_latex_file", "open_pdf", "jump_pdf", "close_pdf", "set_latex_preamble", "get_pdf_events"]);
+		assert.deepEqual(names, ["show_latex", "compile_latex_file", "open_pdf", "jump_pdf", "set_latex_preamble", "get_pdf_events"]);
 		const showLatexProperties = toolsList.result.tools.find((tool) => tool.name === "show_latex")?.inputSchema.properties ?? {};
 		assert.deepEqual(Object.keys(showLatexProperties).sort(), ["compiler", "source"]);
 		assert.equal(toolsList.result.tools.find((tool) => tool.name === "compile_latex_file")?.inputSchema.properties?.continuous, undefined);
@@ -69,16 +69,13 @@ test("actual tex-actions-mcp entrypoint answers initialize and tools/list over s
 	assert.doesNotMatch(stderr, /daemon is unavailable|ENOENT|ECONNREFUSED/i);
 });
 
-test("actual tex-actions-mcp entrypoint keeps returned PDF.js viewer URL reachable while process remains alive", async () => {
+test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host boundary without owning PDF serving", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-viewer-"));
 	const cwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
-	const binDir = join(baseDir, "bin");
 	const pdfPath = join(baseDir, "paper.pdf");
 	mkdirSync(cwd, { recursive: true });
-	mkdirSync(binDir, { recursive: true });
 	writeFileSync(pdfPath, "%PDF-1.4\n% entrypoint viewer test\n%%EOF\n");
-	writeFileSync(join(binDir, "xdg-open"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 	const scriptPath = resolve(process.cwd(), "scripts", "tex-actions-mcp.ts");
 	const child = spawn(process.execPath, [scriptPath], {
 		cwd,
@@ -86,7 +83,6 @@ test("actual tex-actions-mcp entrypoint keeps returned PDF.js viewer URL reachab
 			...process.env,
 			MCP_TMPDIR: runtimeRoot,
 			TEX_ACTIONS_AGENT_ID: "entrypoint-viewer-test-agent",
-			PATH: `${binDir}:${process.env.PATH ?? ""}`,
 		},
 		stdio: ["pipe", "pipe", "pipe"],
 	});
@@ -111,15 +107,9 @@ test("actual tex-actions-mcp entrypoint keeps returned PDF.js viewer URL reachab
 		const pdfId = openResponse.result?.details?.pdf_id;
 		assert.equal(typeof viewerUrl, "string");
 		assert.equal(typeof pdfId, "number");
-		assert.equal(child.exitCode, null, "MCP process must still be alive before probing returned viewer_url");
-
-		const viewerResponse = await fetch(viewerUrl as string);
-		assert.equal(viewerResponse.status, 200);
-		assert.match(await viewerResponse.text(), /PDF\.js viewer/);
-		const pdfResponse = await fetch((viewerUrl as string).replace(`/viewer/${pdfId}`, `/pdf/${pdfId}`));
-		assert.equal(pdfResponse.status, 200);
-		assert.match(pdfResponse.headers.get("content-type") ?? "", /application\/pdf/);
-		assert.equal(child.exitCode, null, "MCP process must remain alive after probing returned viewer_url");
+		assert.match(viewerUrl as string, /^http:\/\/127\.0\.0\.1:\d+\/viewer\/\d+$/);
+		assert.equal((viewerUrl as string).includes(pdfPath), false, "viewer URL must not expose raw PDF paths");
+		assert.equal(child.exitCode, null, "MCP process must remain alive after routing open_pdf through the Viewer Host boundary");
 	} finally {
 		child.kill("SIGTERM");
 		await Promise.race([exitPromise, new Promise((resolve) => setTimeout(resolve, 300))]);

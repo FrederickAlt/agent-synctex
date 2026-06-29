@@ -1,7 +1,7 @@
 {
   "name": "pdf-preview",
   "version": "0.1.0",
-  "description": "stdio MCP server for LaTeX compile actions with browser PDF.js viewing",
+  "description": "stdio MCP server for LaTeX compile actions with a Viewer Host boundary",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "test": "node --test --test-reporter=./scripts/fail-only-test-reporter.ts \"test/**/*.test.ts\"",
     "test:verbose": "node --test \"test/**/*.test.ts\"",
     "test:real-tex-smoke": "AGENT_SYNCTEX_REAL_TEX_SMOKE=1 node --test test/modules/host_service_real_latexmk_smoke.test.ts",
-    "smoke:stdio-viewer": "node --test --test-reporter=spec --test-name-pattern=\"keeps returned PDF.js viewer URL reachable while process remains alive\" test/modules/stdio_mcp_runtime.test.ts",
+    "smoke:stdio-viewer": "node --test --test-reporter=spec --test-name-pattern=\"routes open_pdf to the Viewer Host boundary without owning PDF serving\" test/modules/stdio_mcp_runtime.test.ts",
     "verify": "npm run check && npm test",
     "tex-actions:mcp": "node scripts/tex-actions-mcp.ts",
     "pdf-preview-mcp": "node scripts/pdf-preview-mcp.ts"
@@ -21,7 +21,7 @@
     "mcp",
     "tex-actions",
     "latex",
-    "pdfjs"
+    "viewer-host"
   ],
   "dependencies": {
     "@mariozechner/pi-tui": "^0.73.1",

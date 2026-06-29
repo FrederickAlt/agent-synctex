@@ -363,24 +363,6 @@ function parseJumpPdfRequest(args: Record<string, unknown>): HostServiceJumpRequ
 		...(resolvedSourceFile === undefined ? {} : { source_file: resolvedSourceFile }),
 	};
 }
-function parseClosePdfRequest(args: Record<string, unknown>): HostServiceCloseRequest {
-	const allowedArgs = new Set(["pdf_id"]);
-	for (const key of Object.keys(args)) {
-		if (!allowedArgs.has(key)) {
-			throw new Error(`close_pdf unknown argument: ${key}`);
-		}
-	}
-	const pdfId = parsePositiveIntegerArg(args, "pdf_id");
-	return {
-		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
-		request_id: nextHostServiceRequestId(),
-		operation: "close_pdf",
-		created_at_ns: Date.now() * 1_000_000,
-		workspace_context: MCP_DEFAULT_WORKSPACE_CONTEXT,
-		pdf_id: pdfId,
-	};
-}
-
 function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }, hideWarnings = false): string {
 	if (typeof details.warning_count !== "number" || details.warning_count <= 0) return "";
 	if (hideWarnings) return `\nWarnings: ${details.warning_count} warnings hidden.`;
@@ -430,7 +412,7 @@ function parseToolResult(
 }
 
 function parseManagedPdfToolResult(
-	response: HostServiceOpenResponseEnvelope | HostServiceJumpResponseEnvelope | HostServiceCloseResponseEnvelope,
+	response: HostServiceOpenResponseEnvelope | HostServiceJumpResponseEnvelope,
 	successPrefix: string,
 ): McpToolResult {
 	const details = response.status_details as unknown as Record<string, unknown>;
@@ -458,19 +440,10 @@ function parseManagedPdfToolResult(
 				typeof details.handled === "boolean" && details.handled
 					? " handled"
 					: "";
-		const viewerNotifications = typeof details.viewer_notifications === "number" && Number.isInteger(details.viewer_notifications)
-			? details.viewer_notifications
-			: undefined;
-		const closeSummary =
-			typeof details.closed === "boolean" && details.closed
-				? viewerNotifications === undefined
-					? " closed"
-					: ` untracked notified_viewers=${viewerNotifications} browser_windows_may_remain_open`
-				: "";
 		return {
 			content: [{
 				type: "text",
-				text: (`${successPrefix}${pdf}${pdfId}${viewerUrl}${line}${handled}${closeSummary}`.trim() || successPrefix) + sourceLine,
+				text: (`${successPrefix}${pdf}${pdfId}${viewerUrl}${line}${handled}`.trim() || successPrefix) + sourceLine,
 			}],
 			details,
 		};
@@ -602,7 +575,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 	return [
 		{
 			name: "show_latex",
-			description: "Render a LaTeX snippet as a temporary PDF.js viewer document.",
+			description: "Render a LaTeX snippet as a temporary PDF and route its viewer open request through the Viewer Host Client boundary.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -616,7 +589,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "compile_latex_file",
-			description: "Compile a LaTeX source file once with latexmk and optionally register/open the output PDF through the browser PDF.js viewer. The compiler option selects the TeX engine latexmk should run. Same-root requests are coordinated by the Host Service to avoid overlapping latexmk processes. Set clean=true to remove common same-basename artifacts before compiling. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
+			description: "Compile a LaTeX source file once with latexmk and optionally route the output PDF open request through the Viewer Host Client boundary. The compiler option selects the TeX engine latexmk should run. Same-root requests are coordinated by the Host Service to avoid overlapping latexmk processes. Set clean=true to remove common same-basename artifacts before compiling. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -635,7 +608,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "open_pdf",
-			description: "Open a PDF through the browser PDF.js viewer and return a runtime PDF id.",
+			description: "Register a PDF in MCP state, send an open/focus request through the Viewer Host Client boundary, and return a runtime PDF id.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -664,18 +637,6 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 			},
 		},
 		{
-			name: "close_pdf",
-			description: "Close a tracked PDF by id. This only affects viewer lifecycle.",
-			inputSchema: {
-				type: "object",
-				properties: {
-					pdf_id: { type: "integer", minimum: 1 },
-				},
-				required: ["pdf_id"],
-				additionalProperties: false,
-			},
-		},
-		{
 			name: "set_latex_preamble",
 			description: "Set the active LaTeX preview preamble in the provided workspace runtime.",
 			inputSchema: {
@@ -690,7 +651,7 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "get_pdf_events",
-			description: "Return the last N process-local PDF.js viewer events. Reads are non-destructive. Optionally filter by pdf_id.",
+			description: "Return the last N process-local viewer events. Reads are non-destructive. Optionally filter by pdf_id.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -709,7 +670,6 @@ export const HOST_SERVICE_TOOL_NAMES = [
 	"compile_latex_file",
 	"open_pdf",
 	"jump_pdf",
-	"close_pdf",
 	"set_latex_preamble",
 	"get_pdf_events",
 ] as const;
@@ -846,40 +806,6 @@ async function handleJumpPdfTool(
 		return buildSuccess(requestId, {
 			isError: true,
 			content: [{ type: "text", text: `jump_pdf failed: ${details}` }],
-		});
-	}
-}
-
-async function handleClosePdfTool(
-	requestId: ParsedMcpRequestId,
-	args: Record<string, unknown>,
-	pdfOperations: HostServiceMcpPdfOperations,
-	_mcpCompileService: HostServiceCompileService,
-): Promise<McpResponsePayload> {
-	let closeRequest: HostServiceCloseRequest;
-	try {
-		closeRequest = parseClosePdfRequest(args);
-	} catch (error) {
-		return buildMcpErrorResponse(
-			requestId,
-			MCP_ERROR_INVALID_PARAMS,
-			error instanceof Error ? error.message : String(error),
-		);
-	}
-	if (!pdfOperations.closePdf) {
-		return buildSuccess(requestId, {
-			isError: true,
-			content: [{ type: "text", text: "close_pdf is not yet implemented by the runtime" }],
-		});
-	}
-	try {
-		const closeResponse = await pdfOperations.closePdf(closeRequest);
-		return buildSuccess(requestId, parseManagedPdfToolResult(closeResponse, "close_pdf ok:"));
-	} catch (error) {
-		const details = error instanceof Error ? error.message : String(error);
-		return buildSuccess(requestId, {
-			isError: true,
-			content: [{ type: "text", text: `close_pdf failed: ${details}` }],
 		});
 	}
 }
@@ -1046,7 +972,6 @@ export async function handleMcpRequest(
 				compile_latex_file: handleCompileLatexFileTool,
 				open_pdf: handleOpenPdfTool,
 				jump_pdf: handleJumpPdfTool,
-				close_pdf: handleClosePdfTool,
 				set_latex_preamble: handleSetLatexPreambleTool,
 				get_pdf_events: handleGetPdfEventsTool,
 			};
