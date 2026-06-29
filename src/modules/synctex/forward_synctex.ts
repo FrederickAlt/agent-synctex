@@ -10,6 +10,8 @@ import { readSourceLine } from "./source_line.ts";
 const SCALED_POINTS_PER_POINT = 65_536;
 const MAX_NEAREST_LINE_DISTANCE = 2;
 const FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS = 10;
+const ROW_LOCAL_BASELINE_TOLERANCE_POINTS = 3;
+const ROW_LOCAL_SOURCE_LINE_WINDOW = 1;
 
 export interface ForwardSynctexTarget {
 	page: number;
@@ -211,41 +213,108 @@ function sourcePathLabel(sourceFile: string): string {
 	return basename(sourceFile) || sourceFile;
 }
 
+function positionBounds(position: SynctexPositionRecord): { minX: number; minY: number; maxX: number; maxY: number } {
+	const width = Math.max(0, position.width);
+	const height = Math.max(0, position.height);
+	const depth = Math.max(0, position.depth);
+	const minX = position.x;
+	const maxX = position.x + width;
+	// SyncTeX Y is a top-origin baseline; height extends above it and depth below it.
+	const minY = position.y - height;
+	const maxY = position.y + depth;
+	return { minX, minY, maxX, maxY };
+}
+
+function mergePositionIntoAggregate(aggregate: SynctexLineAggregate, position: SynctexPositionRecord): void {
+	const bounds = positionBounds(position);
+	aggregate.minX = Math.min(aggregate.minX, bounds.minX);
+	aggregate.minY = Math.min(aggregate.minY, bounds.minY);
+	aggregate.maxX = Math.max(aggregate.maxX, bounds.maxX);
+	aggregate.maxY = Math.max(aggregate.maxY, bounds.maxY);
+	aggregate.x = aggregate.minX;
+	aggregate.y = aggregate.minY;
+}
+
 function aggregateLinePositions(positions: SynctexPositionRecord[], matchingTags: Set<number>, primaryOnly: boolean): SynctexLineAggregate[] {
 	const byLine = new Map<number, SynctexLineAggregate>();
 	for (const position of positions) {
 		if (!matchingTags.has(position.tag)) continue;
 		if (primaryOnly && !position.primary) continue;
-		const width = Math.max(0, position.width);
-		const height = Math.max(0, position.height);
-		const depth = Math.max(0, position.depth);
-		const minX = position.x;
-		const maxX = position.x + width;
-		// SyncTeX Y is a top-origin baseline; height extends above it and depth below it.
-		const minY = position.y - height;
-		const maxY = position.y + depth;
+		const bounds = positionBounds(position);
 		const aggregate = byLine.get(position.line);
 		if (!aggregate) {
 			byLine.set(position.line, {
 				line: position.line,
 				page: position.page,
-				x: minX,
-				y: minY,
-				minX,
-				minY,
-				maxX,
-				maxY,
+				x: bounds.minX,
+				y: bounds.minY,
+				minX: bounds.minX,
+				minY: bounds.minY,
+				maxX: bounds.maxX,
+				maxY: bounds.maxY,
 			});
 			continue;
 		}
-		aggregate.minX = Math.min(aggregate.minX, minX);
-		aggregate.minY = Math.min(aggregate.minY, minY);
-		aggregate.maxX = Math.max(aggregate.maxX, maxX);
-		aggregate.maxY = Math.max(aggregate.maxY, maxY);
-		aggregate.x = aggregate.minX;
-		aggregate.y = aggregate.minY;
+		mergePositionIntoAggregate(aggregate, position);
 	}
 	return [...byLine.values()].sort((left, right) => left.line - right.line);
+}
+
+function isAlignedMathSourceLine(sourceLine: string): boolean {
+	return /(^|[^\\])&/.test(sourceLine) || /\\\\\s*$/.test(sourceLine);
+}
+
+function clusterBaseline(records: SynctexPositionRecord[]): number | undefined {
+	const sortedRecords = [...records].sort((left, right) => left.y - right.y);
+	let best: { y: number; count: number; width: number } | undefined;
+	let current: { y: number; count: number; width: number } | undefined;
+	for (const record of sortedRecords) {
+		const width = Math.max(0, record.width);
+		if (!current || Math.abs(record.y - current.y) > ROW_LOCAL_BASELINE_TOLERANCE_POINTS) {
+			if (!best || current && (current.count > best.count || current.count === best.count && current.width > best.width)) best = current;
+			current = { y: record.y, count: 1, width };
+			continue;
+		}
+		current.y = ((current.y * current.count) + record.y) / (current.count + 1);
+		current.count += 1;
+		current.width += width;
+	}
+	if (!best || current && (current.count > best.count || current.count === best.count && current.width > best.width)) best = current;
+	return best?.y;
+}
+
+function aggregateRowLocalPosition(positions: SynctexPositionRecord[], matchingTags: Set<number>, targetLine: number, page: number): SynctexLineAggregate | undefined {
+	const anchorY = clusterBaseline(positions.filter((position) =>
+		position.page === page
+		&& position.line === targetLine
+		&& position.primary
+		&& matchingTags.has(position.tag),
+	));
+	if (anchorY === undefined) return undefined;
+
+	let aggregate: SynctexLineAggregate | undefined;
+	for (const position of positions) {
+		if (position.page !== page) continue;
+		if (!matchingTags.has(position.tag)) continue;
+		if (Math.abs(position.line - targetLine) > ROW_LOCAL_SOURCE_LINE_WINDOW) continue;
+		if (Math.abs(position.y - anchorY) > ROW_LOCAL_BASELINE_TOLERANCE_POINTS) continue;
+		const bounds = positionBounds(position);
+		if (!aggregate) {
+			aggregate = {
+				line: targetLine,
+				page,
+				x: bounds.minX,
+				y: bounds.minY,
+				minX: bounds.minX,
+				minY: bounds.minY,
+				maxX: bounds.maxX,
+				maxY: bounds.maxY,
+			};
+			continue;
+		}
+		mergePositionIntoAggregate(aggregate, position);
+	}
+	return aggregate;
 }
 
 function interpolateLine(targetLine: number, lower: SynctexLineAggregate, upper: SynctexLineAggregate): SynctexLineAggregate {
@@ -340,14 +409,19 @@ export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; 
 	const verticalPosition = allowExact
 		? (fallbackLinePositions.find((candidate) => candidate.page === position.page && candidate.line === position.line) ?? position)
 		: position;
-	const rawHeight = Math.max(0, verticalPosition.maxY - verticalPosition.minY);
+	const rowLocalPosition = allowExact && isAlignedMathSourceLine(sourceLine)
+		? aggregateRowLocalPosition(parsed.positions, matchingTags, input.line, position.page)
+		: undefined;
+	const highlightPosition = rowLocalPosition ?? verticalPosition;
+	const horizontalPosition = rowLocalPosition ?? position;
+	const rawHeight = Math.max(0, highlightPosition.maxY - highlightPosition.minY);
 	const height = Math.max(FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS, rawHeight);
 
 	return {
 		page: position.page,
-		x: position.x,
-		y: rawHeight > 0 ? verticalPosition.minY : position.y - height,
-		width: Math.max(0, position.maxX - position.minX),
+		x: horizontalPosition.x,
+		y: rawHeight > 0 ? highlightPosition.minY : horizontalPosition.y - height,
+		width: Math.max(0, horizontalPosition.maxX - horizontalPosition.minX),
 		height,
 		sourceFile,
 		line: input.line,

@@ -72,7 +72,8 @@ const FIXTURE_LINES = [
 	"\\[",
 	"\\begin{aligned}",
 	"\\mbox{ORACLEALIGNONE} \\quad a+b &= c+d \\\\",
-	"\\mbox{ORACLEALIGNTWO} \\quad x+y &= z+w",
+	"\\mbox{ORACLEALIGNTWO} \\quad x+y &= z+w \\\\",
+	"\\mbox{ORACLEALIGNTHREE} \\quad p+q &= r+s",
 	"\\end{aligned}",
 	"\\]",
 	"ORACLEAFTEREEE after aligned block text line for SyncTeX oracle.",
@@ -86,6 +87,7 @@ const CASES: Array<{ label: string; kind: OracleCase["kind"] }> = [
 	{ label: "ORACLEEQCCC", kind: "equation-label" },
 	{ label: "ORACLEALIGNONE", kind: "equation-label" },
 	{ label: "ORACLEALIGNTWO", kind: "equation-label" },
+	{ label: "ORACLEALIGNTHREE", kind: "equation-label" },
 ];
 
 function commandExists(command: string): boolean {
@@ -245,9 +247,12 @@ test("forward SyncTeX markers overlap real PDF.js text boxes for a compiled LaTe
 				const overlap = intersectionArea(candidate.marker, candidate.textBox);
 				assert.ok(overlap > 0, `computed marker should overlap ${candidate.label} text box\n${formatCase(candidate)}`);
 
+				const verticalCenterDelta = Math.abs(centerY(candidate.marker) - centerY(candidate.textBox));
 				if (candidate.kind === "normal") {
-					const verticalCenterDelta = Math.abs(centerY(candidate.marker) - centerY(candidate.textBox));
 					assert.ok(verticalCenterDelta <= 3, `normal text marker center should be within 3pt of ${candidate.label}; delta=${verticalCenterDelta}\n${formatCase(candidate)}`);
+				} else {
+					assert.ok(verticalCenterDelta <= 6, `equation marker center should be within 6pt of ${candidate.label}; delta=${verticalCenterDelta}\n${formatCase(candidate)}`);
+					assert.ok(candidate.marker.height <= 18, `equation marker height should stay row-local for ${candidate.label}\n${formatCase(candidate)}`);
 				}
 			}
 		} catch (error) {
