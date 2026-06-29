@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Socket } from "node:net";
 import { test } from "node:test";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
+
+const require = createRequire(import.meta.url);
 
 function writeFakePdf(path: string, suffix = "body"): Buffer {
 	const bytes = Buffer.from(`%PDF-1.4\n${suffix}\n%%EOF\n`, "utf8");
@@ -28,6 +31,11 @@ async function readHttp(url: string, init?: RequestInit): Promise<{ status: numb
 		body: Buffer.from(await response.arrayBuffer()),
 		headers: response.headers,
 	};
+}
+
+function assertHostLoadedWebCode(label: string, body: string): void {
+	assert.doesNotMatch(body, /https?:\/\//, `${label} must not reference external URLs`);
+	assert.doesNotMatch(body, /__TAURI__|@tauri-apps|window\.require|require\(|node:fs|from\s+["']fs["']|from\s+["']node:fs["']|mcp/i, `${label} must not depend on Tauri, Node filesystem APIs, or MCP internals`);
 }
 
 async function assertPortCanBeRebound(port: number): Promise<void> {
@@ -65,6 +73,68 @@ test("Viewer Host Server binds to 127.0.0.1 only and serves registered PDF bytes
 		assert.equal(pdf.headers.get("content-length"), String(pdfBytes.length));
 		assert.equal(pdf.headers.get("cache-control"), "no-store");
 		assert.deepEqual(pdf.body, pdfBytes);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer config, and PDF.js assets", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-client-routes-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	try {
+		registry.registerPdf({ pdfId: 109, pdfPath, title: "paper.pdf", revision: 2, fileSnapshot: snapshotPdf(pdfPath) });
+		await server.start();
+
+		const app = await readHttp(`${server.origin}/app`);
+		assert.equal(app.status, 200);
+		assert.match(app.contentType, /text\/html/);
+		const appHtml = app.body.toString("utf8");
+		assert.match(appHtml, /Viewer Client/i);
+		assertHostLoadedWebCode("Viewer Client shell", appHtml);
+
+		const viewer = await readHttp(`${server.origin}/viewer/109`);
+		assert.equal(viewer.status, 200);
+		assert.match(viewer.contentType, /text\/html/);
+		const viewerHtml = viewer.body.toString("utf8");
+		assert.match(viewerHtml, /PDF\.js viewer/i);
+		assert.match(viewerHtml, /\/config\/109\.json/);
+		assert.match(viewerHtml, /href="\/pdf\/109\?revision=2"/);
+		assertHostLoadedWebCode("per-PDF viewer page", viewerHtml);
+
+		const configResponse = await readHttp(`${server.origin}/config/109.json`);
+		assert.equal(configResponse.status, 200);
+		assert.match(configResponse.contentType, /application\/json/);
+		const config = JSON.parse(configResponse.body.toString("utf8")) as Record<string, unknown>;
+		const viewerSocketUrl = `${server.origin.replace(/^http:/, "ws:")}/viewer-socket?pdf_id=109`;
+		assert.equal(config.pdf_id, 109);
+		assert.equal(config.revision, 2);
+		assert.equal(config.pdf_url, `${server.origin}/pdf/109?revision=2`);
+		assert.equal(config.viewer_socket_url, viewerSocketUrl);
+		assert.equal(config.ws_url, viewerSocketUrl);
+
+		const viewerScript = await readHttp(`${server.origin}/assets/viewer.js`);
+		assert.equal(viewerScript.status, 200);
+		assert.match(viewerScript.contentType, /javascript/);
+		const viewerScriptBody = viewerScript.body.toString("utf8");
+		assert.match(viewerScriptBody, /getDocument/);
+		assertHostLoadedWebCode("viewer script", viewerScriptBody);
+
+		const pdfJs = await readHttp(`${server.origin}/assets/pdf.mjs`);
+		assert.equal(pdfJs.status, 200);
+		assert.match(pdfJs.contentType, /javascript/);
+		assert.equal(pdfJs.body.toString("utf8"), readFileSync(require.resolve("pdfjs-dist/legacy/build/pdf.mjs"), "utf8"));
+
+		const worker = await readHttp(`${server.origin}/assets/pdf.worker.mjs`);
+		assert.equal(worker.status, 200);
+		assert.match(worker.contentType, /javascript/);
+		assert.equal(worker.body.toString("utf8"), readFileSync(require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs"), "utf8"));
+
+		assert.equal((await readHttp(`${server.origin}/viewer/999`)).status, 404);
+		assert.equal((await readHttp(`${server.origin}/config/999.json`)).status, 404);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
