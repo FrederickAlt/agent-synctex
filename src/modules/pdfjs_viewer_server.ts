@@ -70,7 +70,7 @@ async function renderPdf(config, options = {}) {
 	setStatus("Loading PDF " + config.pdf_id + " revision " + config.revision + " through PDF.js…");
 	const pdfjsLib = await import("/assets/pdf.mjs");
 	pdfjsLib.GlobalWorkerOptions.workerSrc = "/assets/pdf.worker.mjs";
-	const pdf = await pdfjsLib.getDocument(pdfUrlForRevision(config)).promise;
+	const pdf = await pdfjsLib.getDocument({ url: pdfUrlForRevision(config) }).promise;
 	if (sequence !== renderSequence) return;
 	setStatus(\`Loaded PDF \${config.pdf_id} revision \${config.revision}: \${pdf.numPages} page(s)\`);
 	for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
@@ -103,7 +103,7 @@ async function renderPdf(config, options = {}) {
 }
 
 function handleSynctexMessage(message) {
-	const page = document.querySelector("[data-page-number=\"" + message.page + "\"]");
+	const page = document.querySelector("[data-page-number='" + message.page + "']");
 	if (!page) return;
 	page.scrollIntoView({ block: "center" });
 	if (activeSynctexMarker) activeSynctexMarker.remove();
