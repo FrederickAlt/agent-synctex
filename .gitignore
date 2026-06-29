@@ -1,6 +1,8 @@
 node_modules/
 .ms-playwright/
 .codegraph/
+apps/viewer-desktop-tauri/src-tauri/target/
+apps/viewer-desktop-tauri/src-tauri/gen/
 
 /tmp/
 /host-service-snippets/

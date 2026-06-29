@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
-import { FakeViewerHostClient, ViewerHostMcpService, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import { createDefaultViewerHostClientFactory, DesktopViewerAppProcessLauncher, FakeViewerHostClient, resolveDefaultDesktopViewerAppLaunchConfig, ViewerHostMcpService, type DesktopViewerAppLaunchTarget, type DesktopViewerAppLauncher, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
 import type { McpToViewerHostMessage } from "../../src/modules/viewer_host_protocol.ts";
 
 function writeFakePdf(path: string, body = "1 0 obj"): void {
@@ -62,6 +62,41 @@ async function withPath<T>(pathValue: string, fn: () => Promise<T>): Promise<T> 
 	}
 }
 
+function writeFakeDesktopAppLauncher(baseDir: string): { command: string; logPath: string } {
+	const command = join(baseDir, "fake-desktop-viewer-app.js");
+	const logPath = join(baseDir, "desktop-app-launches.jsonl");
+	writeFileSync(command, `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({
+  appUrl: process.env.PDF_PREVIEW_VIEWER_HOST_APP_URL,
+  origin: process.env.PDF_PREVIEW_VIEWER_HOST_ORIGIN,
+  custom: process.env.CUSTOM_APP_ENV,
+  argv: process.argv.slice(2)
+}) + "\\n");
+setInterval(() => {}, 1000);
+`);
+	chmodSync(command, 0o700);
+	return { command, logPath };
+}
+
+function writeFailingDesktopAppLauncher(baseDir: string): string {
+	const command = join(baseDir, "failing-desktop-viewer-app.js");
+	writeFileSync(command, `#!/usr/bin/env node
+console.error("desktop app startup failed intentionally");
+process.exit(42);
+`);
+	chmodSync(command, 0o700);
+	return command;
+}
+
+async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
+	const started = Date.now();
+	while (!existsSync(path)) {
+		if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${path}`);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+}
+
 function callTool(id: number, name: string, args: Record<string, unknown>, service: ViewerHostMcpService) {
 	return handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }), service.pdfOperations);
 }
@@ -83,6 +118,110 @@ class ScriptedViewerHostClient implements ViewerHostClient {
 		this.messages.push(message);
 	}
 }
+
+class RecordingDesktopViewerAppLauncher implements DesktopViewerAppLauncher {
+	readonly calls: DesktopViewerAppLaunchTarget[] = [];
+
+	async launchOrFocus(target: DesktopViewerAppLaunchTarget): Promise<void> {
+		this.calls.push(target);
+	}
+}
+
+test("desktop app process launcher passes the Host /app target through a configurable app command", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-app-process-contract-"));
+	const fakeApp = writeFakeDesktopAppLauncher(baseDir);
+	const launcher = new DesktopViewerAppProcessLauncher({ command: fakeApp.command, args: ["--from-test"], env: { CUSTOM_APP_ENV: "set" } });
+	try {
+		await launcher.launchOrFocus({ origin: "http://127.0.0.1:49152", appUrl: "http://127.0.0.1:49152/app" });
+		await waitForFile(fakeApp.logPath);
+		const launch = JSON.parse(readFileSync(fakeApp.logPath, "utf8").trim()) as { appUrl?: unknown; origin?: unknown; argv?: unknown; custom?: unknown };
+		assert.equal(launch.origin, "http://127.0.0.1:49152");
+		assert.equal(launch.appUrl, "http://127.0.0.1:49152/app");
+		assert.deepEqual(launch.argv, ["--from-test"]);
+		assert.equal(launch.custom, "set");
+	} finally {
+		await launcher.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("default desktop app binary discovery uses the package root, not the user's LaTeX cwd", () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-package-root-discovery-"));
+	const userLatexCwd = join(baseDir, "latex-project");
+	const packageBinary = resolve(process.cwd(), "apps", "viewer-desktop-tauri", "src-tauri", "target", "debug", process.platform === "win32" ? "pdf-preview-viewer.exe" : "pdf-preview-viewer");
+	mkdirSync(userLatexCwd, { recursive: true });
+	mkdirSync(resolve(packageBinary, ".."), { recursive: true });
+	const hadExistingBinary = existsSync(packageBinary);
+	if (!hadExistingBinary) {
+		writeFileSync(packageBinary, "#!/usr/bin/env sh\nexit 0\n");
+		chmodSync(packageBinary, 0o700);
+	}
+	const env = { ...process.env };
+	delete env.PDF_PREVIEW_VIEWER_APP_COMMAND;
+	delete env.PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK;
+	try {
+		const config = resolveDefaultDesktopViewerAppLaunchConfig(env, userLatexCwd);
+		assert.equal(config.command, packageBinary);
+	} finally {
+		if (!hadExistingBinary) rmSync(packageBinary, { force: true });
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("open_pdf returns an app-launch error when the desktop app exits immediately", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-app-launch-fails-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const failingApp = writeFailingDesktopAppLauncher(baseDir);
+	const service = new ViewerHostMcpService({
+		clientFactory: createDefaultViewerHostClientFactory({
+			command: process.execPath,
+			args: [resolve(process.cwd(), "scripts", "viewer-host-server.ts")],
+			desktopAppLauncher: new DesktopViewerAppProcessLauncher({ command: failingApp }),
+		}),
+		makePdfId: () => 92,
+	});
+	try {
+		const response = await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { isError?: boolean; content?: Array<{ text?: string }>; details?: Record<string, unknown> } };
+		assert.equal(response.result?.isError, true);
+		assert.equal(response.result?.details?.error_code, "viewer_host_unavailable");
+		assert.equal(response.result?.details?.viewer_url, undefined, "failed app launch must not return an OK headless viewer handle");
+		assert.match(response.result?.content?.[0]?.text ?? "", /Desktop Viewer app exited during startup.*code 42.*desktop app startup failed intentionally/i);
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("default Viewer Host client factory launches/focuses the desktop app at Host /app before viewer operations", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-default-app-launch-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const appLauncher = new RecordingDesktopViewerAppLauncher();
+	const service = new ViewerHostMcpService({
+		clientFactory: createDefaultViewerHostClientFactory({
+			command: process.execPath,
+			args: [resolve(process.cwd(), "scripts", "viewer-host-server.ts")],
+			desktopAppLauncher: appLauncher,
+		}),
+		makePdfId: () => 91,
+	});
+	try {
+		const first = await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
+		const second = await callTool(2, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
+
+		assert.equal(first.result?.details?.pdf_id, 91);
+		assert.equal(second.result?.details?.pdf_id, 91);
+		assert.equal(appLauncher.calls.length, 2, "open and focus operations should invoke the desktop app launcher/focuser");
+		assert.deepEqual(appLauncher.calls.map((call) => call.appUrl), appLauncher.calls.map((call) => `${call.origin}/app`));
+		assert.match(appLauncher.calls[0]?.appUrl ?? "", /^http:\/\/127\.0\.0\.1:\d+\/app$/);
+		const config = await fetch(`${appLauncher.calls[0].origin}/config/91.json`);
+		assert.equal(config.status, 200, "returned viewer/config URL must remain reachable while the Host is alive");
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
 
 test("open_pdf uses an MCP-owned pdf_id and routes open/focus messages through Viewer Host Client", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-open-"));

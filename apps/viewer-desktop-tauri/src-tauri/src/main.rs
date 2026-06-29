@@ -80,6 +80,15 @@ fn host_command_config() -> Result<HostCommandConfig, String> {
     Err("PDF_PREVIEW_VIEWER_HOST_COMMAND is required for packaged builds; set it to an installed Viewer Host Server executable and optionally set PDF_PREVIEW_VIEWER_HOST_ARGS".to_string())
 }
 
+fn external_host_app_url_from_env() -> Result<Option<String>, String> {
+    match env::var("PDF_PREVIEW_VIEWER_HOST_APP_URL") {
+        Ok(value) if value.trim().is_empty() => Err("PDF_PREVIEW_VIEWER_HOST_APP_URL must not be empty".to_string()),
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("failed to read PDF_PREVIEW_VIEWER_HOST_APP_URL: {error}")),
+    }
+}
+
 fn spawn_host_process() -> Result<(HostProcess, String), String> {
     let host = host_command_config()?;
     let mut child = Command::new(&host.command)
@@ -165,6 +174,14 @@ fn setup_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
     std::io::Error::new(std::io::ErrorKind::Other, message.into()).into()
 }
 
+fn resolve_host_app_url() -> Result<(Option<HostProcess>, String), String> {
+    if let Some(app_url) = external_host_app_url_from_env()? {
+        return Ok((None, app_url));
+    }
+    let (host_process, app_url) = spawn_host_process()?;
+    Ok((Some(host_process), app_url))
+}
+
 fn validate_host_app_url(app_url: &str) -> Result<tauri::Url, String> {
     let url = tauri::Url::parse(app_url)
         .map_err(|error| format!("Viewer Host Server reported invalid app_url: {error}"))?;
@@ -223,12 +240,14 @@ mod tests {
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let (host_process, app_url) = spawn_host_process().map_err(setup_error)?;
+            let (host_process, app_url) = resolve_host_app_url().map_err(setup_error)?;
             let url = validate_host_app_url(&app_url).map_err(setup_error)?;
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("PDF Preview Viewer")
                 .build()?;
-            app.manage(host_process);
+            if let Some(host_process) = host_process {
+                app.manage(host_process);
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

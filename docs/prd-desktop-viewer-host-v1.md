@@ -4,7 +4,7 @@
 
 Draft / accepted direction from planning discussion.
 
-Implementation note for the #115 integrated branch: automated MCP tests and the default stdio runtime launch the loopback Viewer Host Server script directly, not the native Tauri Desktop Viewer Bundle window. The Tauri wrapper and packaged external-host contract exist, but direct MCP-driven Desktop Viewer Bundle launch/HITL smoke is deferred to #116 or explicit packaging configuration.
+Implementation note: automated MCP tests now verify that default viewer operations launch/focus a Desktop Viewer app launcher at the Host-served `/app` URL while keeping the loopback Viewer Host Server reachable. Full human-visible Tauri window smoke remains environment-dependent and requires a built/configured app plus a desktop display.
 
 ## Summary
 

@@ -1,7 +1,7 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { statSync } from "node:fs";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertReadablePdfFile, assertReadableSourceFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
 import { mapForwardSynctex, mapReverseSynctex } from "./synctex/forward_synctex.ts";
@@ -36,6 +36,8 @@ const MIN_PDF_ID = 1;
 const MAX_PDF_ID = 99_999_999;
 const DEFAULT_VIEWER_HOST_READY_TIMEOUT_MS = 10_000;
 const DEFAULT_VIEWER_HOST_SHUTDOWN_TIMEOUT_MS = 1_000;
+const DEFAULT_DESKTOP_APP_EARLY_EXIT_TIMEOUT_MS = 300;
+const PACKAGE_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
 interface TrackedViewerHostPdf {
 	pdfId: number;
@@ -56,6 +58,37 @@ export interface ViewerHostClient {
 
 export type ViewerHostClientFactory = () => ViewerHostClient | Promise<ViewerHostClient>;
 
+export interface DesktopViewerAppLaunchTarget {
+	origin: string;
+	appUrl: string;
+}
+
+export interface DesktopViewerAppLaunchHandle {
+	isRunning?(): boolean;
+	close?(): Promise<void> | void;
+}
+
+export interface DesktopViewerAppLauncher {
+	launchOrFocus(target: DesktopViewerAppLaunchTarget): Promise<DesktopViewerAppLaunchHandle | void> | DesktopViewerAppLaunchHandle | void;
+	close?(): Promise<void> | void;
+}
+
+export interface DesktopViewerAppProcessLauncherOptions {
+	command?: string;
+	args?: string[];
+	cwd?: string;
+	env?: NodeJS.ProcessEnv;
+	shutdownTimeoutMs?: number;
+	earlyExitTimeoutMs?: number;
+}
+
+export interface ResolvedDesktopViewerAppLaunchConfig {
+	command: string;
+	args: string[];
+	cwd?: string;
+	env?: NodeJS.ProcessEnv;
+}
+
 interface ActiveViewerHostSession {
 	client: ViewerHostClient;
 	generation: number;
@@ -74,11 +107,143 @@ export class FakeViewerHostClient implements ViewerHostClient {
 	}
 }
 
+export function resolveDefaultDesktopViewerAppLaunchConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd(), packageRoot = PACKAGE_ROOT): ResolvedDesktopViewerAppLaunchConfig {
+	const configuredCommand = env.PDF_PREVIEW_VIEWER_APP_COMMAND;
+	if (configuredCommand !== undefined) {
+		if (!configuredCommand.trim()) {
+			throw new Error("PDF_PREVIEW_VIEWER_APP_COMMAND must not be empty");
+		}
+		return {
+			command: configuredCommand,
+			args: splitLaunchArgs(env.PDF_PREVIEW_VIEWER_APP_ARGS),
+			cwd: env.PDF_PREVIEW_VIEWER_APP_CWD,
+		};
+	}
+
+	for (const candidate of defaultDesktopViewerAppCommandCandidates(packageRoot)) {
+		if (existsSync(candidate)) {
+			return { command: candidate, args: [] };
+		}
+	}
+
+	if (env.PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK === "1") {
+		return { command: "npm", args: ["run", "tauri:viewer:dev"], cwd };
+	}
+
+	throw new Error("Desktop Viewer app command is not configured. Build the Tauri app with npm run tauri:viewer:build, or set PDF_PREVIEW_VIEWER_APP_COMMAND to the desktop app executable. Set PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK=1 only for explicit development fallback.");
+}
+
+function splitLaunchArgs(value: string | undefined): string[] {
+	return value === undefined || value === "" ? [] : value.split(/\s+/).filter(Boolean);
+}
+
+function defaultDesktopViewerAppCommandCandidates(cwd: string): string[] {
+	const executable = process.platform === "win32" ? "pdf-preview-viewer.exe" : "pdf-preview-viewer";
+	const targetDir = resolve(cwd, "apps", "viewer-desktop-tauri", "src-tauri", "target");
+	return [
+		join(targetDir, "release", executable),
+		join(targetDir, "debug", executable),
+	];
+}
+
+export class DesktopViewerAppProcessLauncher implements DesktopViewerAppLauncher {
+	private readonly options: DesktopViewerAppProcessLauncherOptions;
+	private child: ChildProcess | undefined;
+	private activeAppUrl: string | undefined;
+
+	constructor(options: DesktopViewerAppProcessLauncherOptions = {}) {
+		this.options = options;
+	}
+
+	async launchOrFocus(target: DesktopViewerAppLaunchTarget): Promise<DesktopViewerAppLaunchHandle> {
+		if (this.isRunning() && this.activeAppUrl === target.appUrl) {
+			return this.handle();
+		}
+		await this.close();
+		const config = this.resolveConfig();
+		const child = spawn(config.command, config.args, {
+			cwd: config.cwd,
+			env: {
+				...process.env,
+				...config.env,
+				PDF_PREVIEW_VIEWER_HOST_ORIGIN: target.origin,
+				PDF_PREVIEW_VIEWER_HOST_APP_URL: target.appUrl,
+			},
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		let stderr = "";
+		child.stderr?.on("data", (chunk: Buffer) => {
+			stderr += String(chunk);
+			if (stderr.length > 4_096) stderr = stderr.slice(-4_096);
+		});
+		this.child = child;
+		this.activeAppUrl = target.appUrl;
+		child.once("exit", () => {
+			if (this.child === child) {
+				this.child = undefined;
+				this.activeAppUrl = undefined;
+			}
+		});
+		try {
+			await waitForSpawn(child, `failed to launch Desktop Viewer app ${config.command}`);
+			await waitForDesktopAppStartup(child, this.options.earlyExitTimeoutMs ?? DEFAULT_DESKTOP_APP_EARLY_EXIT_TIMEOUT_MS, () => stderr);
+		} catch (error) {
+			if (this.child === child) {
+				this.child = undefined;
+				this.activeAppUrl = undefined;
+			}
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			throw error;
+		}
+		return this.handle();
+	}
+
+	async close(): Promise<void> {
+		const child = this.child;
+		this.child = undefined;
+		this.activeAppUrl = undefined;
+		if (!child || child.exitCode !== null || child.signalCode !== null) return;
+		child.kill("SIGTERM");
+		await waitForProcessExitOrKill(child, this.options.shutdownTimeoutMs ?? DEFAULT_VIEWER_HOST_SHUTDOWN_TIMEOUT_MS);
+	}
+
+	private resolveConfig(): ResolvedDesktopViewerAppLaunchConfig {
+		if (this.options.command !== undefined) {
+			if (!this.options.command.trim()) throw new Error("Desktop Viewer app command must not be empty");
+			return {
+				command: this.options.command,
+				args: this.options.args ?? [],
+				cwd: this.options.cwd,
+				env: this.options.env,
+			};
+		}
+		const resolved = resolveDefaultDesktopViewerAppLaunchConfig();
+		return {
+			...resolved,
+			args: this.options.args ?? resolved.args,
+			cwd: this.options.cwd ?? resolved.cwd,
+			env: this.options.env ?? resolved.env,
+		};
+	}
+
+	private isRunning(): boolean {
+		return this.child !== undefined && this.child.exitCode === null && this.child.signalCode === null;
+	}
+
+	private handle(): DesktopViewerAppLaunchHandle {
+		return {
+			isRunning: () => this.isRunning(),
+			close: () => this.close(),
+		};
+	}
+}
+
 export interface ViewerHostProcessLauncherOptions {
 	command?: string;
 	args?: string[];
 	readyTimeoutMs?: number;
 	shutdownTimeoutMs?: number;
+	desktopAppLauncher?: DesktopViewerAppLauncher;
 }
 
 interface ViewerHostReadyLine {
@@ -91,18 +256,23 @@ class LocalViewerHostProcessClient implements ViewerHostClient {
 	readonly origin: string;
 	private readonly child: ChildProcessWithoutNullStreams;
 	private readonly shutdownTimeoutMs: number;
+	private readonly appUrl: string;
+	private readonly desktopAppLauncher: DesktopViewerAppLauncher;
 	private readonly controlClient: ViewerHostControlClient;
 	private closed = false;
 
-	constructor(child: ChildProcessWithoutNullStreams, ready: ViewerHostReadyLine, shutdownTimeoutMs: number) {
+	constructor(child: ChildProcessWithoutNullStreams, ready: ViewerHostReadyLine, shutdownTimeoutMs: number, desktopAppLauncher: DesktopViewerAppLauncher) {
 		this.child = child;
 		this.shutdownTimeoutMs = shutdownTimeoutMs;
 		this.origin = ready.origin.replace(/\/$/, "");
+		this.appUrl = ready.app_url;
+		this.desktopAppLauncher = desktopAppLauncher;
 		this.controlClient = new ViewerHostControlClient({ origin: this.origin });
 	}
 
 	async send(message: McpToViewerHostMessage): Promise<ViewerHostControlResponse> {
 		if (this.closed) throw new Error("Viewer Host process is closed");
+		await this.desktopAppLauncher.launchOrFocus({ origin: this.origin, appUrl: this.appUrl });
 		return this.controlClient.send(message);
 	}
 
@@ -119,6 +289,7 @@ class LocalViewerHostProcessClient implements ViewerHostClient {
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
+		await this.desktopAppLauncher.close?.();
 		this.child.stdin.write("shutdown\n");
 		await waitForProcessExitOrKill(this.child, this.shutdownTimeoutMs);
 	}
@@ -133,6 +304,7 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 	const args = options.args ?? [fileURLToPath(new URL("../../scripts/viewer-host-server.ts", import.meta.url))];
 	const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_VIEWER_HOST_READY_TIMEOUT_MS;
 	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_VIEWER_HOST_SHUTDOWN_TIMEOUT_MS;
+	const desktopAppLauncher = options.desktopAppLauncher ?? new DesktopViewerAppProcessLauncher({ shutdownTimeoutMs });
 	const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
 	let stderr = "";
 	child.stderr.on("data", (chunk: Buffer) => {
@@ -141,7 +313,7 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 	});
 	try {
 		const ready = await readViewerHostReadyLine(child, readyTimeoutMs, () => stderr);
-		return new LocalViewerHostProcessClient(child, ready, shutdownTimeoutMs);
+		return new LocalViewerHostProcessClient(child, ready, shutdownTimeoutMs, desktopAppLauncher);
 	} catch (error) {
 		child.kill("SIGKILL");
 		throw error;
@@ -187,7 +359,56 @@ async function readViewerHostReadyLine(child: ChildProcessWithoutNullStreams, ti
 	});
 }
 
-async function waitForProcessExitOrKill(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<void> {
+async function waitForSpawn(child: ChildProcess, errorPrefix: string): Promise<void> {
+	await new Promise<void>((resolveSpawn, rejectSpawn) => {
+		let settled = false;
+		const settle = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			child.off("spawn", onSpawn);
+			child.off("error", onError);
+			callback();
+		};
+		const onSpawn = () => settle(resolveSpawn);
+		const onError = (error: Error) => settle(() => rejectSpawn(new Error(`${errorPrefix}: ${error.message}`)));
+		child.once("spawn", onSpawn);
+		child.once("error", onError);
+	});
+}
+
+async function waitForDesktopAppStartup(child: ChildProcess, timeoutMs: number, stderrText: () => string): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) {
+		throw new Error(desktopAppExitMessage(child.exitCode, child.signalCode, stderrText()));
+	}
+	await new Promise<void>((resolveStartup, rejectStartup) => {
+		let settled = false;
+		const timer = setTimeout(() => settle(resolveStartup), timeoutMs);
+		const settle = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			child.off("exit", onExit);
+			child.off("error", onError);
+			callback();
+		};
+		const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+			settle(() => rejectStartup(new Error(desktopAppExitMessage(code, signal, stderrText()))));
+		};
+		const onError = (error: Error) => {
+			settle(() => rejectStartup(new Error(`Desktop Viewer app failed during startup: ${error.message}`)));
+		};
+		child.once("exit", onExit);
+		child.once("error", onError);
+	});
+}
+
+function desktopAppExitMessage(code: number | null, signal: NodeJS.Signals | null, stderr: string): string {
+	const status = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
+	const stderrSuffix = stderr.trim() ? `: ${stderr.trim()}` : "";
+	return `Desktop Viewer app exited during startup (${status})${stderrSuffix}`;
+}
+
+async function waitForProcessExitOrKill(child: ChildProcess, timeoutMs: number): Promise<void> {
 	if (child.exitCode !== null || child.signalCode !== null) return;
 	await new Promise<void>((resolveWait) => {
 		const timer = setTimeout(() => {

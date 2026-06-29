@@ -90,6 +90,7 @@ test("Tauri desktop bundle is a thin wrapper that loads Host-served /app and doc
 	const main = readFileSync(mainPath, "utf8");
 	assert.match(main, /PDF_PREVIEW_VIEWER_HOST_COMMAND/);
 	assert.match(main, /PDF_PREVIEW_VIEWER_HOST_ARGS/);
+	assert.match(main, /PDF_PREVIEW_VIEWER_HOST_APP_URL/, "Tauri app must be configurable to load an MCP-started external Host /app URL");
 	assert.match(main, /\/app/);
 	assert.match(main, /shutdown/);
 	assert.match(main, /debug_assertions/, "repo-relative node script fallback must be limited to development/debug builds");
@@ -126,6 +127,7 @@ test("Tauri desktop bundle is a thin wrapper that loads Host-served /app and doc
 	assert.match(readme, /Linux/i);
 	assert.match(readme, /Windows best-effort/i);
 	assert.match(readme, /PDF_PREVIEW_VIEWER_HOST_COMMAND.*required.*packaged/i, "README must document packaged external-host contract");
+	assert.match(readme, /PDF_PREVIEW_VIEWER_HOST_APP_URL/i, "README must document the MCP-started external Host app URL contract");
 	assert.match(readme, /http:\/\/127\.0\.0\.1:<non-zero-port>\/app/, "README must document the strict loopback app_url contract");
 	assert.match(readme, /PDF_PREVIEW_VIEWER_HOST_ARGS.*split on .*whitespace/i, "README must document the v1 host args splitting limitation");
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -52,6 +52,31 @@ function writeReverseSynctexFixture(baseDir: string): { pdfPath: string; sourceP
 		"",
 	].join("\n"));
 	return { pdfPath, sourcePath };
+}
+
+function writeFakeDesktopAppLauncher(baseDir: string): { command: string; logPath: string } {
+	const command = join(baseDir, "fake-desktop-viewer-app.js");
+	const logPath = join(baseDir, "desktop-app-launches.jsonl");
+	writeFileSync(command, `#!/usr/bin/env node
+const fs = require("node:fs");
+const logPath = ${JSON.stringify(logPath)};
+fs.appendFileSync(logPath, JSON.stringify({
+  appUrl: process.env.PDF_PREVIEW_VIEWER_HOST_APP_URL,
+  origin: process.env.PDF_PREVIEW_VIEWER_HOST_ORIGIN,
+  argv: process.argv.slice(2)
+}) + "\\n");
+setInterval(() => {}, 1000);
+`);
+	chmodSync(command, 0o700);
+	return { command, logPath };
+}
+
+async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
+	const started = Date.now();
+	while (!existsSync(path)) {
+		if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${path}`);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
 }
 
 async function withRuntimeEnv<T>(runtimeRoot: string, fn: () => Promise<T>): Promise<T> {
@@ -121,6 +146,7 @@ test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host bound
 	const pdfPath = join(baseDir, "paper.pdf");
 	mkdirSync(cwd, { recursive: true });
 	writeFileSync(pdfPath, "%PDF-1.4\n% entrypoint viewer test\n%%EOF\n");
+	const fakeDesktopApp = writeFakeDesktopAppLauncher(baseDir);
 	const scriptPath = resolve(process.cwd(), "scripts", "tex-actions-mcp.ts");
 	const child = spawn(process.execPath, [scriptPath], {
 		cwd,
@@ -128,6 +154,7 @@ test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host bound
 			...process.env,
 			MCP_TMPDIR: runtimeRoot,
 			TEX_ACTIONS_AGENT_ID: "entrypoint-viewer-test-agent",
+			PDF_PREVIEW_VIEWER_APP_COMMAND: fakeDesktopApp.command,
 		},
 		stdio: ["pipe", "pipe", "pipe"],
 	});
@@ -155,11 +182,17 @@ test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host bound
 		assert.match(viewerUrl as string, /^http:\/\/127\.0\.0\.1:\d+\/viewer\/\d+$/);
 		assert.equal((viewerUrl as string).includes(pdfPath), false, "viewer URL must not expose raw PDF paths");
 		const origin = new URL(viewerUrl as string).origin;
+		const viewer = await fetch(viewerUrl as string);
+		assert.equal(viewer.status, 200, "returned viewer URL should remain reachable while the Host is alive");
 		const config = await fetch(`${origin}/config/${pdfId}.json`);
 		assert.equal(config.status, 200, "default stdio runtime should launch a real Viewer Host control target, not use FakeViewerHostClient");
 		const configBody = await config.json() as { pdf_id?: unknown; pdf_url?: unknown };
 		assert.equal(configBody.pdf_id, pdfId);
 		assert.equal(typeof configBody.pdf_url, "string");
+		await waitForFile(fakeDesktopApp.logPath);
+		const appLaunches = readFileSync(fakeDesktopApp.logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { appUrl?: unknown; origin?: unknown });
+		assert.equal(appLaunches[0]?.origin, origin);
+		assert.equal(appLaunches[0]?.appUrl, `${origin}/app`, "default stdio runtime must launch/focus the desktop app at the Host /app UI");
 		assert.equal(child.exitCode, null, "MCP process must remain alive after routing open_pdf through the Viewer Host boundary");
 	} finally {
 		child.kill("SIGTERM");
@@ -176,6 +209,7 @@ test("actual tex-actions-mcp entrypoint bridges reverse SyncTeX events from the 
 	const runtimeRoot = join(baseDir, "runtime");
 	mkdirSync(cwd, { recursive: true });
 	const { pdfPath, sourcePath } = writeReverseSynctexFixture(baseDir);
+	const fakeDesktopApp = writeFakeDesktopAppLauncher(baseDir);
 	const scriptPath = resolve(process.cwd(), "scripts", "tex-actions-mcp.ts");
 	const child = spawn(process.execPath, [scriptPath], {
 		cwd,
@@ -183,6 +217,7 @@ test("actual tex-actions-mcp entrypoint bridges reverse SyncTeX events from the 
 			...process.env,
 			MCP_TMPDIR: runtimeRoot,
 			TEX_ACTIONS_AGENT_ID: "entrypoint-reverse-test-agent",
+			PDF_PREVIEW_VIEWER_APP_COMMAND: fakeDesktopApp.command,
 		},
 		stdio: ["pipe", "pipe", "pipe"],
 	});
