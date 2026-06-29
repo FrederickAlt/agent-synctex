@@ -94,7 +94,18 @@ test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer 
 		assert.match(app.contentType, /text\/html/);
 		const appHtml = app.body.toString("utf8");
 		assert.match(appHtml, /Viewer Client/i);
+		assert.match(appHtml, /id="tab-list"/);
+		assert.match(appHtml, /id="viewer-panels"/);
+		assert.match(appHtml, /\/assets\/viewer-client-tabs\.js/);
 		assertHostLoadedWebCode("Viewer Client shell", appHtml);
+
+		const tabShellScript = await readHttp(`${server.origin}/assets/viewer-client-tabs.js`);
+		assert.equal(tabShellScript.status, 200);
+		assert.match(tabShellScript.contentType, /javascript/);
+		const tabShellScriptBody = tabShellScript.body.toString("utf8");
+		assert.match(tabShellScriptBody, /EventSource\("\/app-events"\)/);
+		assert.match(tabShellScriptBody, /data-close-pdf-id/);
+		assertHostLoadedWebCode("tab shell script", tabShellScriptBody);
 
 		const viewer = await readHttp(`${server.origin}/viewer/109`);
 		assert.equal(viewer.status, 200);

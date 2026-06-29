@@ -69,6 +69,17 @@ export type ViewerHostToMcpMessage =
 	| ViewerHostViewerTabClosedMessage
 	| ViewerHostReverseSynctexMessage;
 
+export interface ViewerHostControlAcceptedResult {
+	type: McpToViewerHostMessage["type"];
+	pdf_id?: number;
+	revision?: number;
+}
+
+export type ViewerHostControlResponse =
+	| { ok: true; message: ViewerHostReadyMessage }
+	| { ok: true; result: ViewerHostControlAcceptedResult }
+	| { ok: false; error: { code: string; message: string } };
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
