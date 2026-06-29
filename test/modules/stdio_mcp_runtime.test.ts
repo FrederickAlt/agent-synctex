@@ -9,6 +9,51 @@ import { TexActionsStdioMcpRuntime } from "../../src/modules/stdio_mcp_runtime.t
 import type { HostServiceCompileRequest, HostServiceCompileResponseEnvelope, HostServiceCompileSnippetRequest, HostServiceCompileSnippetResponseEnvelope, HostServiceOpenRequest, HostServiceOpenResponseEnvelope } from "../../src/modules/host_service_protocol.ts";
 import { collectMcpFrames, encodeMcpFrame } from "../helpers/mcp_frames.ts";
 
+interface TestWebSocket {
+	readonly readyState: number;
+	send(data: string): void;
+	close(): void;
+	addEventListener(type: "open" | "message" | "error" | "close", listener: (event: { data?: unknown }) => void, options?: { once?: boolean }): void;
+}
+
+function socketCtor(): new (url: string) => TestWebSocket {
+	const ctor = (globalThis as { WebSocket?: new (url: string) => TestWebSocket }).WebSocket;
+	assert.ok(ctor, "global WebSocket must be available in the Node test runtime");
+	return ctor;
+}
+
+async function openViewerSocket(viewerSocketUrl: string): Promise<TestWebSocket> {
+	const WebSocket = socketCtor();
+	const socket = new WebSocket(viewerSocketUrl);
+	await new Promise<void>((resolveOpen, rejectOpen) => {
+		const timer = setTimeout(() => rejectOpen(new Error("timed out opening viewer socket")), 2_000);
+		socket.addEventListener("open", () => { clearTimeout(timer); resolveOpen(); }, { once: true });
+		socket.addEventListener("error", () => { clearTimeout(timer); rejectOpen(new Error("viewer socket errored before open")); }, { once: true });
+	});
+	return socket;
+}
+
+function writeReverseSynctexFixture(baseDir: string): { pdfPath: string; sourcePath: string } {
+	const pdfPath = join(baseDir, "paper.pdf");
+	const sourcePath = join(baseDir, "project", "main.tex");
+	writeFileSync(pdfPath, "%PDF-1.4\n% stdio reverse fixture\n%%EOF\n");
+	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nReverse target text.\n\\end{document}\n");
+	writeFileSync(join(baseDir, "paper.synctex"), [
+		"SyncTeX Version:1",
+		"Input:1:main.tex",
+		"Output:pdf",
+		"Unit:1",
+		"Content:",
+		"{1",
+		"h1,3:7208960,14417920:1000000,500000,0",
+		"}",
+		"Postamble:",
+		"Count:0",
+		"",
+	].join("\n"));
+	return { pdfPath, sourcePath };
+}
+
 async function withRuntimeEnv<T>(runtimeRoot: string, fn: () => Promise<T>): Promise<T> {
 	const previousMcpTmpdir = process.env.MCP_TMPDIR;
 	const previousAgentId = process.env.TEX_ACTIONS_AGENT_ID;
@@ -109,6 +154,12 @@ test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host bound
 		assert.equal(typeof pdfId, "number");
 		assert.match(viewerUrl as string, /^http:\/\/127\.0\.0\.1:\d+\/viewer\/\d+$/);
 		assert.equal((viewerUrl as string).includes(pdfPath), false, "viewer URL must not expose raw PDF paths");
+		const origin = new URL(viewerUrl as string).origin;
+		const config = await fetch(`${origin}/config/${pdfId}.json`);
+		assert.equal(config.status, 200, "default stdio runtime should launch a real Viewer Host control target, not use FakeViewerHostClient");
+		const configBody = await config.json() as { pdf_id?: unknown; pdf_url?: unknown };
+		assert.equal(configBody.pdf_id, pdfId);
+		assert.equal(typeof configBody.pdf_url, "string");
 		assert.equal(child.exitCode, null, "MCP process must remain alive after routing open_pdf through the Viewer Host boundary");
 	} finally {
 		child.kill("SIGTERM");
@@ -117,6 +168,73 @@ test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host bound
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 	assert.doesNotMatch(stderr, /daemon is unavailable|ENOENT|ECONNREFUSED/i);
+});
+
+test("actual tex-actions-mcp entrypoint bridges reverse SyncTeX events from the real Viewer Host process", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-reverse-"));
+	const cwd = join(baseDir, "project");
+	const runtimeRoot = join(baseDir, "runtime");
+	mkdirSync(cwd, { recursive: true });
+	const { pdfPath, sourcePath } = writeReverseSynctexFixture(baseDir);
+	const scriptPath = resolve(process.cwd(), "scripts", "tex-actions-mcp.ts");
+	const child = spawn(process.execPath, [scriptPath], {
+		cwd,
+		env: {
+			...process.env,
+			MCP_TMPDIR: runtimeRoot,
+			TEX_ACTIONS_AGENT_ID: "entrypoint-reverse-test-agent",
+		},
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+	let socket: TestWebSocket | undefined;
+	const exitPromise = new Promise<void>((resolveExit) => {
+		child.once("exit", () => resolveExit());
+		child.once("error", () => resolveExit());
+	});
+
+	try {
+		const initialOutput = collectMcpFrames(child.stdout as PassThrough, 2, 5_000);
+		child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+		child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "open_pdf", arguments: { pdf_file_path: pdfPath } } }));
+		const [, openFrame] = await initialOutput as Array<{ id: number; result?: { details?: { pdf_id?: unknown; viewer_url?: unknown } } }>;
+		const pdfId = openFrame.result?.details?.pdf_id;
+		const viewerUrl = openFrame.result?.details?.viewer_url;
+		assert.equal(typeof pdfId, "number");
+		assert.equal(typeof viewerUrl, "string");
+		const origin = new URL(viewerUrl as string).origin;
+		const configResponse = await fetch(`${origin}/config/${pdfId}.json`);
+		assert.equal(configResponse.status, 200);
+		const config = await configResponse.json() as { viewer_socket_url?: unknown };
+		assert.equal(typeof config.viewer_socket_url, "string");
+
+		socket = await openViewerSocket(config.viewer_socket_url as string);
+		socket.send(JSON.stringify({ type: "reverse_synctex", page: 1, x: 110, y: 220 }));
+
+		let event: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const output = collectMcpFrames(child.stdout as PassThrough, 1, 2_000);
+			child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 10 + attempt, method: "tools/call", params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } } }));
+			const [eventsFrame] = await output as Array<{ result?: { details?: { events?: Array<Record<string, unknown>> } } }>;
+			event = eventsFrame.result?.details?.events?.[0];
+			if (event) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+
+		assert.ok(event, "reverse SyncTeX event should be visible through get_pdf_events in the split-process default runtime");
+		assert.equal(event.pdf_id, pdfId);
+		assert.equal(event.source_file, sourcePath);
+		assert.equal(event.line, 3);
+		assert.equal(event.source_line, "Reverse target text.");
+		assert.equal(event.page, 1);
+		assert.equal(event.x, 110);
+		assert.equal(event.y, 220);
+	} finally {
+		socket?.close();
+		child.kill("SIGTERM");
+		await Promise.race([exitPromise, new Promise((resolve) => setTimeout(resolve, 300))]);
+		child.kill("SIGKILL");
+		rmSync(baseDir, { recursive: true, force: true });
+	}
 });
 
 test("stdio runtime rejects invalid get_pdf_events calls with normal JSON-RPC validation", async () => {

@@ -4,6 +4,8 @@
 
 Draft plan for `docs/prd-desktop-viewer-host-v1.md`.
 
+Implementation note for the #115 integrated branch: automated verification uses the headless loopback Viewer Host Server process launched from MCP. Native Tauri Desktop Viewer Bundle launch and HITL/manual desktop-window audit remain deferred to #116 or explicit configured packaging.
+
 ## Scope
 
 This TDD plan covers only the first computer-based version of the standalone viewer bundle:

@@ -347,6 +347,7 @@ export class ViewerHostServer {
 	private server: Server | undefined;
 	private activeSockets = new Set<Socket>();
 	private appEventClients = new Set<ServerResponse>();
+	private readonly mcpEventBacklog: ViewerHostToMcpMessage[] = [];
 	private viewerSocketClientsByPdfId = new Map<number, Set<ViewerSocketConnection>>();
 	private viewerSocketTokensByPdfId = new Map<number, string>();
 	private visibleViewerClientTabs = new Map<number, ViewerClientTabEvent>();
@@ -465,6 +466,7 @@ export class ViewerHostServer {
 		this.controlReady = false;
 		this.controlProtocolVersion = undefined;
 		this.visibleViewerClientTabs.clear();
+		this.mcpEventBacklog.splice(0);
 		this.pendingPdfRefreshSnapshots.clear();
 		this.pdfRefreshDiagnostics.clear();
 		this.stopPdfChangePolling();
@@ -492,6 +494,10 @@ export class ViewerHostServer {
 		}
 		if (requestUrl.pathname === "/app-tab-closed") {
 			await this.handleAppTabClosedRequest(request, response);
+			return;
+		}
+		if (requestUrl.pathname === "/mcp-events/drain") {
+			this.handleMcpEventsDrainRequest(request, response);
 			return;
 		}
 
@@ -597,6 +603,15 @@ export class ViewerHostServer {
 			this.visibleViewerClientTabs.delete(payload.pdf_id);
 		}
 		textResponse(response, 200, "application/json; charset=utf-8", JSON.stringify({ ok: true }), false);
+	}
+
+	private handleMcpEventsDrainRequest(request: IncomingMessage, response: ServerResponse): void {
+		if (request.method !== "POST") {
+			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "MCP event drain requires POST" } });
+			return;
+		}
+		const events = this.mcpEventBacklog.splice(0);
+		jsonResponse(response, 200, { ok: true, events });
 	}
 
 	private serveAppShell(response: ServerResponse, headOnly: boolean): void {
@@ -882,6 +897,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 				throw new Error(`reverse_synctex pdf_id=${String(payload.pdf_id)} does not match viewer socket pdf_id=${connection.pdfId}`);
 			}
 			const message = validateViewerHostToMcpMessage({ ...payload, pdf_id: connection.pdfId });
+			this.mcpEventBacklog.push(message);
 			void Promise.resolve(this.mcpEventSink(message)).catch((error: unknown) => {
 				if (!connection.closed) sendViewerSocketJson(connection, { type: "error", code: "reverse_synctex_failed", message: errorMessage(error) });
 			});
@@ -1253,7 +1269,7 @@ async function readRequestBody(request: IncomingMessage): Promise<string> {
 	return Buffer.concat(chunks).toString("utf8");
 }
 
-function jsonResponse(response: ServerResponse, status: number, body: ViewerHostControlResponse): void {
+function jsonResponse(response: ServerResponse, status: number, body: unknown): void {
 	const json = JSON.stringify(body);
 	response.writeHead(status, {
 		"content-type": "application/json; charset=utf-8",

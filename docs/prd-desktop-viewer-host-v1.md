@@ -4,6 +4,8 @@
 
 Draft / accepted direction from planning discussion.
 
+Implementation note for the #115 integrated branch: automated MCP tests and the default stdio runtime launch the loopback Viewer Host Server script directly, not the native Tauri Desktop Viewer Bundle window. The Tauri wrapper and packaged external-host contract exist, but direct MCP-driven Desktop Viewer Bundle launch/HITL smoke is deferred to #116 or explicit packaging configuration.
+
 ## Summary
 
 Build a desktop-only v1 standalone viewer bundle for the LaTeX MCP PDF.js workflow.

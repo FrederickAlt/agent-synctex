@@ -2,7 +2,7 @@
 
 TeX Actions is a local stdio MCP server for LaTeX snippet rendering, file compilation, and PDF navigation through the Desktop Viewer Host boundary.
 
-The active #107 runtime defines the MCP → Viewer Host Client boundary. It does not launch or serve a real Desktop Viewer Host yet; until the #108+ Host Server/client slices exist, the default runtime uses a fake/test Viewer Host Client that records boundary messages and returns MCP-owned `pdf_id`s.
+The active runtime launches a local loopback Viewer Host Server process on demand, registers PDFs with MCP-owned `pdf_id`s, serves the Host-loaded Viewer Client/PDF.js pages, forwards SyncTeX display requests, drains reverse SyncTeX events back into `get_pdf_events`, and re-registers known PDFs after Host restart. Fake Viewer Host clients are used only by tests or explicit injection.
 
 ## Exposed MCP tools
 
@@ -32,7 +32,11 @@ The active #107 runtime defines the MCP → Viewer Host Client boundary. It does
 - Typed Viewer Host protocol: `src/modules/viewer_host_protocol.ts`.
 - Compile orchestration: `src/modules/host_service_compile.ts` with LaTeX primitives in `src/modules/latex/`.
 
-Returned `viewer_url` values in #107 are boundary handles only. Do not treat them as reachable viewer pages until the real Viewer Host Server/client is implemented.
+Returned `viewer_url` values are reachable loopback Viewer Host pages while the MCP stdio process is alive. They do not expose raw filesystem PDF paths.
+
+### Desktop Viewer Bundle launch status
+
+The automated default MCP runtime currently launches the headless Host Server script (`scripts/viewer-host-server.ts`) and its Host-served web client. The Tauri Desktop Viewer Bundle wrapper is present under `apps/viewer-desktop-tauri/`, but native desktop-window launch and manual/HITL smoke are deferred to #116 or explicit configured packaging. This is the current v1 deviation from the full PRD wording that says MCP launches the Desktop Viewer Bundle directly.
 
 ## Start the runtime
 

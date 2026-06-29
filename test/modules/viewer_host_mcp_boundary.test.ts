@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
-import { FakeViewerHostClient, ViewerHostMcpService } from "../../src/modules/viewer_host_client.ts";
+import { FakeViewerHostClient, ViewerHostMcpService, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import type { McpToViewerHostMessage } from "../../src/modules/viewer_host_protocol.ts";
 
 function writeFakePdf(path: string, body = "1 0 obj"): void {
 	writeFileSync(path, `%PDF-1.4\n${body}\n%%EOF\n`);
@@ -65,6 +66,24 @@ function callTool(id: number, name: string, args: Record<string, unknown>, servi
 	return handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }), service.pdfOperations);
 }
 
+class ScriptedViewerHostClient implements ViewerHostClient {
+	readonly origin: string;
+	readonly messages: McpToViewerHostMessage[] = [];
+	failNextMessageType: McpToViewerHostMessage["type"] | undefined;
+
+	constructor(origin: string) {
+		this.origin = origin;
+	}
+
+	async send(message: McpToViewerHostMessage): Promise<void> {
+		if (this.failNextMessageType === message.type) {
+			this.failNextMessageType = undefined;
+			throw new Error(`control channel unavailable while sending ${message.type}`);
+		}
+		this.messages.push(message);
+	}
+}
+
 test("open_pdf uses an MCP-owned pdf_id and routes open/focus messages through Viewer Host Client", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-open-"));
 	const pdfPath = join(baseDir, "paper.pdf");
@@ -105,6 +124,211 @@ test("jump_pdf maps SyncTeX in MCP and sends synctex_forward through Viewer Host
 			source_file: sourcePath,
 			line: 3,
 		});
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("MCP relaunches and re-registers known PDFs before focusing after a Viewer Host control failure", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-relaunch-focus-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const clients = [
+		new ScriptedViewerHostClient("http://127.0.0.1:41001"),
+		new ScriptedViewerHostClient("http://127.0.0.1:41002"),
+	];
+	let launches = 0;
+	const service = new ViewerHostMcpService({
+		clientFactory: async () => clients[launches++] ?? (() => { throw new Error("unexpected relaunch"); })(),
+		makePdfId: () => 41,
+	});
+	try {
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+		clients[0].failNextMessageType = "focus_pdf";
+
+		const response = await callTool(2, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
+
+		assert.equal(response.result?.details?.pdf_id, 41);
+		assert.equal(response.result?.details?.reused, true);
+		assert.deepEqual(clients[0].messages.map((message) => message.type), ["open_pdf"]);
+		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "focus_pdf"]);
+		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 41, pdf_path: pdfPath, title: basename(pdfPath) });
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("jump_pdf relaunches, re-registers the existing pdf_id, then sends synctex_forward after Viewer Host restart", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-relaunch-jump-"));
+	const { pdfPath, sourcePath } = writeForwardSynctexFixture(baseDir);
+	const clients = [
+		new ScriptedViewerHostClient("http://127.0.0.1:42001"),
+		new ScriptedViewerHostClient("http://127.0.0.1:42002"),
+	];
+	let launches = 0;
+	const service = new ViewerHostMcpService({
+		clientFactory: async () => clients[launches++] ?? (() => { throw new Error("unexpected relaunch"); })(),
+		makePdfId: () => 52,
+	});
+	try {
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+		clients[0].failNextMessageType = "synctex_forward";
+
+		const response = await callTool(2, "jump_pdf", { pdf_id: 52, line: 3, source_file: sourcePath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
+
+		assert.equal(response.result?.details?.handled, true);
+		assert.equal(response.result?.details?.pdf_id, 52);
+		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "synctex_forward"]);
+		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 52, pdf_path: pdfPath, title: basename(pdfPath) });
+		assert.equal(clients[1].messages[1]?.type, "synctex_forward");
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("concurrent operations after Host failure share one relaunch and register before focus", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-concurrent-relaunch-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	class DeadAfterOpenClient extends ScriptedViewerHostClient {
+		async send(message: McpToViewerHostMessage): Promise<void> {
+			if (message.type === "focus_pdf") {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				throw new Error("dead host socket");
+			}
+			await super.send(message);
+		}
+	}
+	const clients = [
+		new DeadAfterOpenClient("http://127.0.0.1:42501"),
+		new ScriptedViewerHostClient("http://127.0.0.1:42502"),
+		new ScriptedViewerHostClient("http://127.0.0.1:42503"),
+	];
+	let launches = 0;
+	const service = new ViewerHostMcpService({
+		clientFactory: async () => clients[launches++] ?? (() => { throw new Error("unexpected relaunch"); })(),
+		makePdfId: () => 67,
+	});
+	try {
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+
+		const [first, second] = await Promise.all([
+			callTool(2, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as Promise<{ result?: { details?: Record<string, unknown> } }>,
+			callTool(3, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as Promise<{ result?: { details?: Record<string, unknown> } }>,
+		]);
+
+		assert.equal(first.result?.details?.pdf_id, 67);
+		assert.equal(second.result?.details?.pdf_id, 67);
+		assert.equal(launches, 2, "concurrent reconnects should coalesce onto one relaunched Host client");
+		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "focus_pdf", "focus_pdf"]);
+		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 67, pdf_path: pdfPath, title: basename(pdfPath) });
+		assert.deepEqual(clients[2].messages, []);
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("new open racing with reconnect joins the same Host generation and registers after re-register", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-reconnect-new-open-"));
+	const firstPdfPath = join(baseDir, "first.pdf");
+	const secondPdfPath = join(baseDir, "second.pdf");
+	writeFakePdf(firstPdfPath, "first");
+	writeFakePdf(secondPdfPath, "second");
+	class DeadOnFocusClient extends ScriptedViewerHostClient {
+		async send(message: McpToViewerHostMessage): Promise<void> {
+			if (message.type === "focus_pdf") throw new Error("dead host while focusing");
+			await super.send(message);
+		}
+	}
+	const clients = [
+		new DeadOnFocusClient("http://127.0.0.1:42601"),
+		new ScriptedViewerHostClient("http://127.0.0.1:42602"),
+		new ScriptedViewerHostClient("http://127.0.0.1:42603"),
+	];
+	let launches = 0;
+	let unblockReconnect: (() => void) | undefined;
+	const reconnectStarted = new Promise<void>((resolveStarted) => {
+		unblockReconnect = resolveStarted;
+	});
+	let releaseReconnect: (() => void) | undefined;
+	const reconnectMayFinish = new Promise<void>((resolveRelease) => {
+		releaseReconnect = resolveRelease;
+	});
+	const service = new ViewerHostMcpService({
+		clientFactory: async () => {
+			const launchIndex = launches++;
+			if (launchIndex === 1) {
+				unblockReconnect?.();
+				await reconnectMayFinish;
+			}
+			return clients[launchIndex] ?? (() => { throw new Error("unexpected relaunch"); })();
+		},
+		makePdfId: (() => {
+			let next = 70;
+			return () => next++;
+		})(),
+	});
+	try {
+		await callTool(1, "open_pdf", { pdf_file_path: firstPdfPath, workspace_context: { cwd: baseDir } }, service);
+		const focusExisting = callTool(2, "open_pdf", { pdf_file_path: firstPdfPath, workspace_context: { cwd: baseDir } }, service) as Promise<{ result?: { details?: Record<string, unknown> } }>;
+		await reconnectStarted;
+		const openSecond = callTool(3, "open_pdf", { pdf_file_path: secondPdfPath, workspace_context: { cwd: baseDir } }, service) as Promise<{ result?: { details?: Record<string, unknown> } }>;
+		await new Promise((resolve) => setImmediate(resolve));
+		releaseReconnect?.();
+
+		const [first, second] = await Promise.all([focusExisting, openSecond]);
+
+		assert.equal(first.result?.details?.pdf_id, 70);
+		assert.equal(second.result?.details?.pdf_id, 71);
+		assert.equal(second.result?.details?.viewer_url, "http://127.0.0.1:42602/viewer/71");
+		assert.equal(launches, 2, "new open must not launch a second Host while reconnect is in progress");
+		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "focus_pdf", "open_pdf"]);
+		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 70, pdf_path: firstPdfPath, title: basename(firstPdfPath) });
+		assert.deepEqual(clients[1].messages[2], { type: "open_pdf", pdf_id: 71, pdf_path: secondPdfPath, title: basename(secondPdfPath) });
+		assert.deepEqual(clients[2].messages, []);
+	} finally {
+		releaseReconnect?.();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("re-register failure returns a clear tool error without dropping the MCP-owned pdf_id", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-reregister-failure-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	class FailingRegisterClient extends ScriptedViewerHostClient {
+		async send(message: McpToViewerHostMessage): Promise<void> {
+			if (message.type === "open_pdf") throw new Error("registration rejected by restarted host");
+			await super.send(message);
+		}
+	}
+	const clients = [
+		new ScriptedViewerHostClient("http://127.0.0.1:43001"),
+		new FailingRegisterClient("http://127.0.0.1:43002"),
+		new ScriptedViewerHostClient("http://127.0.0.1:43003"),
+	];
+	let launches = 0;
+	let makePdfIdCalls = 0;
+	const service = new ViewerHostMcpService({
+		clientFactory: async () => clients[launches++] ?? (() => { throw new Error("unexpected relaunch"); })(),
+		makePdfId: () => {
+			makePdfIdCalls += 1;
+			return 88;
+		},
+	});
+	try {
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+		clients[0].failNextMessageType = "focus_pdf";
+
+		const failed = await callTool(2, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { isError?: boolean; content?: Array<{ text?: string }>; details?: Record<string, unknown> } };
+		assert.equal(failed.result?.isError, true);
+		assert.match(failed.result?.content?.[0]?.text ?? "", /Viewer Host unavailable.*registration rejected by restarted host/i);
+		assert.equal(failed.result?.details?.pdf_id, 88);
+
+		const recovered = await callTool(3, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
+		assert.equal(recovered.result?.details?.pdf_id, 88);
+		assert.equal(makePdfIdCalls, 1);
+		assert.deepEqual(clients[2].messages.map((message) => message.type), ["open_pdf", "focus_pdf"]);
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
