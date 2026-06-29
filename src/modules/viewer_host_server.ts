@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, readFileSync } from "node:fs";
 import { stat as statFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -6,11 +7,12 @@ import type { AddressInfo, Socket } from "node:net";
 import { basename, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { URL } from "node:url";
-import { validateMcpToViewerHostMessage, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage } from "./viewer_host_protocol.ts";
+import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
 import type { ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
 
 const LOCAL_HOST = "127.0.0.1";
 const DEFAULT_PORT = 0;
+const MAX_VIEWER_SOCKET_MESSAGE_BYTES = 64 * 1024;
 const require = createRequire(import.meta.url);
 const LOCAL_PDFJS_ASSETS = new Map<string, string>([
 	["/assets/pdf.mjs", require.resolve("pdfjs-dist/legacy/build/pdf.mjs")],
@@ -164,8 +166,24 @@ window.addEventListener("unhandledrejection", (event) => {
 	reportViewerError(event.reason || "unhandled viewer promise rejection");
 });
 
+let activeConfig;
+let viewerSocket;
+const pageViewports = new Map();
+
+function reverseSynctexPayloadFromViewportPoint(input) {
+	const point = input.viewport.convertToPdfPoint(input.viewportX, input.viewportY);
+	return { type: "reverse_synctex", page: input.page, x: point[0], y: point[1] };
+}
+
+function forwardSynctexMarkerFromPdfPoint(input) {
+	const point = input.viewport.convertToViewportPoint(input.pdfX, input.pdfY);
+	return { left: point[0], top: point[1] };
+}
+
 async function renderPdf(config) {
+	activeConfig = config;
 	if (fallback) fallback.href = config.pdf_url;
+	pageViewports.clear();
 	pages.replaceChildren();
 	setStatus("Loading PDF " + config.pdf_id + " revision " + config.revision + " through PDF.js…");
 	const pdfjsLib = await import("/assets/pdf.mjs");
@@ -174,10 +192,17 @@ async function renderPdf(config) {
 	for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
 		const page = await pdf.getPage(pageNumber);
 		const viewport = page.getViewport({ scale: 1.25 });
+		pageViewports.set(pageNumber, viewport);
 		const canvas = document.createElement("canvas");
 		canvas.width = viewport.width;
 		canvas.height = viewport.height;
 		canvas.dataset.pageNumber = String(pageNumber);
+		canvas.addEventListener("click", (event) => {
+			if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
+			const rect = canvas.getBoundingClientRect();
+			const payload = reverseSynctexPayloadFromViewportPoint({ page: pageNumber, viewportX: event.clientX - rect.left, viewportY: event.clientY - rect.top, viewport });
+			viewerSocket.send(JSON.stringify(payload));
+		});
 		const pageContainer = document.createElement("div");
 		pageContainer.style.position = "relative";
 		pageContainer.style.width = String(viewport.width) + "px";
@@ -191,12 +216,52 @@ async function renderPdf(config) {
 	setStatus("Loaded PDF " + config.pdf_id + " revision " + config.revision + ": " + pdf.numPages + " page(s)");
 }
 
+function showSynctexMarker(message) {
+	const pageNumber = Number(message.page);
+	const page = pages.querySelector("[data-page-number='" + String(pageNumber) + "']");
+	const viewport = pageViewports.get(pageNumber);
+	if (!page || !viewport) return;
+	let marker = page.querySelector("[data-synctex-marker]");
+	if (!marker) {
+		marker = document.createElement("div");
+		marker.dataset.synctexMarker = "true";
+		marker.style.position = "absolute";
+		marker.style.width = "1rem";
+		marker.style.height = "1rem";
+		marker.style.border = "2px solid #ef4444";
+		marker.style.background = "rgba(239,68,68,.18)";
+		marker.style.pointerEvents = "none";
+		page.appendChild(marker);
+	}
+	const position = forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, viewport });
+	marker.style.left = String(position.left) + "px";
+	marker.style.top = String(position.top) + "px";
+	marker.scrollIntoView({ block: "center", inline: "center" });
+}
+
+function connectViewerSocket(config) {
+	if (!config.viewer_socket_url || !("WebSocket" in window)) return;
+	viewerSocket = new WebSocket(config.viewer_socket_url);
+	viewerSocket.addEventListener("message", (event) => {
+		const message = JSON.parse(event.data);
+		if (message.type === "pdf_refresh") {
+			const nextConfig = { ...activeConfig, revision: message.revision, pdf_url: message.pdf_url };
+			void renderPdf(nextConfig).catch(reportViewerError);
+		} else if (message.type === "synctex_forward") {
+			showSynctexMarker(message);
+		}
+	});
+}
+
 fetch(configUrl)
 	.then((response) => {
 		if (!response.ok) throw new Error("config request failed: " + response.status);
 		return response.json();
 	})
-	.then((config) => renderPdf(config))
+	.then((config) => {
+		connectViewerSocket(config);
+		return renderPdf(config);
+	})
 	.catch((error) => {
 		reportViewerError(error);
 	});
@@ -227,12 +292,20 @@ interface ViewerClientTabEvent {
 	visible_tab_token: string;
 }
 
+interface ViewerSocketConnection {
+	pdfId: number;
+	socket: Socket;
+	buffer: Buffer;
+	closed: boolean;
+}
+
 export interface ViewerHostServerOptions {
 	registry: ViewerHostPdfRegistry;
 	port?: number;
 	fileSystem?: ViewerHostFileSystem;
 	viewerDispatch?: ViewerHostViewerDispatch;
 	verifyPdfMaybeUpdated?: (record: ViewerHostPdfRecord) => Promise<void> | void;
+	mcpEventSink?: (message: ViewerHostToMcpMessage) => Promise<void> | void;
 }
 
 export interface ViewerHostServerAddress {
@@ -246,11 +319,14 @@ export class ViewerHostServer {
 	private readonly fileSystem: ViewerHostFileSystem;
 	private readonly viewerDispatch: ViewerHostViewerDispatch;
 	private readonly verifyPdfMaybeUpdated: (record: ViewerHostPdfRecord) => Promise<void> | void;
+	private readonly mcpEventSink: (message: ViewerHostToMcpMessage) => Promise<void> | void;
 	private controlReady = false;
 	private controlProtocolVersion: number | undefined;
 	private server: Server | undefined;
 	private activeSockets = new Set<Socket>();
 	private appEventClients = new Set<ServerResponse>();
+	private viewerSocketClientsByPdfId = new Map<number, Set<ViewerSocketConnection>>();
+	private viewerSocketTokensByPdfId = new Map<number, string>();
 	private visibleViewerClientTabs = new Map<number, ViewerClientTabEvent>();
 	private nextVisibleTabToken = 1;
 	private originValue: string | undefined;
@@ -262,6 +338,7 @@ export class ViewerHostServer {
 		this.fileSystem = options.fileSystem ?? { stat: statFile, createReadStream };
 		this.viewerDispatch = options.viewerDispatch ?? NOOP_VIEWER_DISPATCH;
 		this.verifyPdfMaybeUpdated = options.verifyPdfMaybeUpdated ?? (() => undefined);
+		this.mcpEventSink = options.mcpEventSink ?? (() => undefined);
 	}
 
 	get origin(): string {
@@ -285,6 +362,16 @@ export class ViewerHostServer {
 		return `${this.origin}/pdf/${pdfId}?revision=${revision}`;
 	}
 
+	getConnectedViewerCount(pdfId: number): number {
+		this.registry.getPdf(pdfId);
+		return this.viewerSocketClientsByPdfId.get(pdfId)?.size ?? 0;
+	}
+
+	sendPdfRefresh(pdfId: number): number {
+		const record = this.registry.getPdf(pdfId);
+		return this.broadcastViewerSocketMessage(record.pdfId, { type: "pdf_refresh", pdf_id: record.pdfId, revision: record.revision, pdf_url: this.pdfUrl(record.pdfId, record.revision) });
+	}
+
 	async start(): Promise<void> {
 		if (this.server) return;
 		const server = createServer((request, response) => {
@@ -299,6 +386,9 @@ export class ViewerHostServer {
 		server.on("connection", (socket) => {
 			this.activeSockets.add(socket);
 			socket.once("close", () => this.activeSockets.delete(socket));
+		});
+		server.on("upgrade", (request, socket, head) => {
+			this.handleViewerSocketUpgrade(request, socket as Socket, head);
 		});
 		this.server = server;
 		try {
@@ -332,6 +422,8 @@ export class ViewerHostServer {
 		this.controlReady = false;
 		this.controlProtocolVersion = undefined;
 		this.visibleViewerClientTabs.clear();
+		this.viewerSocketClientsByPdfId.clear();
+		this.viewerSocketTokensByPdfId.clear();
 		for (const socket of this.activeSockets) {
 			socket.destroy();
 		}
@@ -548,13 +640,15 @@ iframe{width:100%;height:100%;border:0;background:white}
 			textResponse(response, 404, "application/json; charset=utf-8", JSON.stringify({ error: "unknown pdf_id" }), headOnly);
 			return;
 		}
-		const viewerSocketUrl = `${this.origin.replace(/^http:/, "ws:")}/viewer-socket?pdf_id=${record.pdfId}`;
+		const token = this.viewerSocketTokenForPdf(record.pdfId);
+		const viewerSocketUrl = `${this.origin.replace(/^http:/, "ws:")}/viewer-socket?pdf_id=${record.pdfId}&token=${encodeURIComponent(token)}`;
 		const body = JSON.stringify({
 			pdf_id: record.pdfId,
 			revision: record.revision,
 			pdf_url: this.pdfUrl(record.pdfId, record.revision),
 			viewer_socket_url: viewerSocketUrl,
 			ws_url: viewerSocketUrl,
+			viewer_socket_token: token,
 		});
 		textResponse(response, 200, "application/json; charset=utf-8", body, headOnly);
 	}
@@ -639,6 +733,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 			case "synctex_forward": {
 				const record = this.registry.getPdf(message.pdf_id);
 				await this.viewerDispatch.synctexForward(message, record);
+				this.broadcastViewerSocketMessage(record.pdfId, message);
 				return { ok: true, result: { type: "synctex_forward", pdf_id: record.pdfId } };
 			}
 			case "pdf_maybe_updated": {
@@ -647,6 +742,139 @@ iframe{width:100%;height:100%;border:0;background:white}
 				return { ok: true, result: { type: "pdf_maybe_updated", pdf_id: record.pdfId } };
 			}
 		}
+	}
+
+	private handleViewerSocketUpgrade(request: IncomingMessage, socket: Socket, head: Buffer): void {
+		const requestUrl = new URL(request.url ?? "/", this.originValue ?? `http://${LOCAL_HOST}`);
+		const pdfId = parsePositiveInteger(requestUrl.searchParams.get("pdf_id") ?? undefined);
+		if (requestUrl.pathname !== "/viewer-socket" || pdfId === undefined || !this.hasRegisteredPdf(pdfId)) {
+			rejectWebSocketUpgrade(socket, 404, "unknown pdf_id");
+			return;
+		}
+		if (!isAllowedViewerSocketOrigin(request.headers.origin, this.origin)) {
+			rejectWebSocketUpgrade(socket, 403, "forbidden origin");
+			return;
+		}
+		const token = requestUrl.searchParams.get("token") ?? "";
+		if (token !== this.viewerSocketTokenForPdf(pdfId)) {
+			rejectWebSocketUpgrade(socket, 403, "invalid viewer socket token");
+			return;
+		}
+		const headerError = validateWebSocketUpgradeHeaders(request);
+		if (headerError) {
+			rejectWebSocketUpgrade(socket, 400, headerError);
+			return;
+		}
+		const key = request.headers["sec-websocket-key"] as string;
+		const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+		socket.write([
+			"HTTP/1.1 101 Switching Protocols",
+			"Upgrade: websocket",
+			"Connection: Upgrade",
+			`Sec-WebSocket-Accept: ${accept}`,
+			"",
+			"",
+		].join("\r\n"));
+		const connection: ViewerSocketConnection = { pdfId, socket, buffer: Buffer.alloc(0), closed: false };
+		let clients = this.viewerSocketClientsByPdfId.get(pdfId);
+		if (!clients) {
+			clients = new Set<ViewerSocketConnection>();
+			this.viewerSocketClientsByPdfId.set(pdfId, clients);
+		}
+		clients.add(connection);
+		const cleanup = () => this.cleanupViewerSocket(connection);
+		socket.once("close", cleanup);
+		socket.once("end", cleanup);
+		socket.once("error", cleanup);
+		socket.on("data", (chunk) => this.handleViewerSocketData(connection, chunk));
+		if (head.length > 0) this.handleViewerSocketData(connection, head);
+	}
+
+	private handleViewerSocketData(connection: ViewerSocketConnection, chunk: Buffer): void {
+		if (connection.closed) return;
+		connection.buffer = Buffer.concat([connection.buffer, chunk]);
+		if (connection.buffer.length > MAX_VIEWER_SOCKET_MESSAGE_BYTES + 14) {
+			this.closeViewerSocket(connection);
+			return;
+		}
+		while (connection.buffer.length > 0) {
+			let frame: { fin: boolean; opcode: number; masked: boolean; payload: Buffer; bytesRead: number } | undefined;
+			try {
+				frame = readWebSocketFrame(connection.buffer);
+			} catch {
+				this.closeViewerSocket(connection);
+				return;
+			}
+			if (!frame) return;
+			connection.buffer = connection.buffer.subarray(frame.bytesRead);
+			if (!frame.fin || !frame.masked) {
+				this.closeViewerSocket(connection);
+				return;
+			}
+			if (frame.opcode === 0x8) {
+				this.closeViewerSocket(connection);
+				return;
+			}
+			if (frame.opcode === 0x9) {
+				sendWebSocketFrame(connection.socket, 0xA, frame.payload);
+				continue;
+			}
+			if (frame.opcode !== 0x1) continue;
+			this.handleViewerSocketText(connection, frame.payload.toString("utf8"));
+		}
+	}
+
+	private handleViewerSocketText(connection: ViewerSocketConnection, text: string): void {
+		let payload: unknown;
+		try {
+			payload = JSON.parse(text);
+			if (!isRecord(payload) || payload.type !== "reverse_synctex") return;
+			if (payload.pdf_id !== undefined && payload.pdf_id !== connection.pdfId) {
+				throw new Error(`reverse_synctex pdf_id=${String(payload.pdf_id)} does not match viewer socket pdf_id=${connection.pdfId}`);
+			}
+			const message = validateViewerHostToMcpMessage({ ...payload, pdf_id: connection.pdfId });
+			void Promise.resolve(this.mcpEventSink(message)).catch((error: unknown) => {
+				if (!connection.closed) sendViewerSocketJson(connection, { type: "error", code: "reverse_synctex_failed", message: errorMessage(error) });
+			});
+		} catch (error) {
+			sendViewerSocketJson(connection, { type: "error", code: "invalid_viewer_message", message: errorMessage(error) });
+		}
+	}
+
+	private closeViewerSocket(connection: ViewerSocketConnection): void {
+		if (!connection.closed) sendWebSocketFrame(connection.socket, 0x8, Buffer.alloc(0));
+		connection.socket.end();
+		this.cleanupViewerSocket(connection);
+	}
+
+	private cleanupViewerSocket(connection: ViewerSocketConnection): void {
+		if (connection.closed) return;
+		connection.closed = true;
+		const clients = this.viewerSocketClientsByPdfId.get(connection.pdfId);
+		clients?.delete(connection);
+		if (clients?.size === 0) this.viewerSocketClientsByPdfId.delete(connection.pdfId);
+	}
+
+	private broadcastViewerSocketMessage(pdfId: number, message: object): number {
+		const clients = this.viewerSocketClientsByPdfId.get(pdfId);
+		if (!clients) return 0;
+		let delivered = 0;
+		for (const connection of clients) {
+			if (connection.closed) continue;
+			sendViewerSocketJson(connection, message);
+			delivered += 1;
+		}
+		return delivered;
+	}
+
+	private viewerSocketTokenForPdf(pdfId: number): string {
+		this.registry.getPdf(pdfId);
+		let token = this.viewerSocketTokensByPdfId.get(pdfId);
+		if (!token) {
+			token = randomBytes(32).toString("base64url");
+			this.viewerSocketTokensByPdfId.set(pdfId, token);
+		}
+		return token;
 	}
 
 	private broadcastViewerClientTabEvent(type: ViewerClientTabEvent["type"], record: ViewerHostPdfRecord): void {
@@ -735,6 +963,100 @@ const NOOP_VIEWER_DISPATCH: ViewerHostViewerDispatch = {
 	focusPdf() {},
 	synctexForward() {},
 };
+
+function rejectWebSocketUpgrade(socket: Socket, status: number, message: string): void {
+	const body = `${message}\n`;
+	socket.write([
+		`HTTP/1.1 ${status} ${webSocketRejectReason(status)}`,
+		"Connection: close",
+		"Content-Type: text/plain; charset=utf-8",
+		`Content-Length: ${Buffer.byteLength(body, "utf8")}`,
+		"",
+		body,
+	].join("\r\n"));
+	socket.destroy();
+}
+
+function sendViewerSocketJson(connection: ViewerSocketConnection, message: object): void {
+	sendWebSocketFrame(connection.socket, 0x1, Buffer.from(JSON.stringify(message), "utf8"));
+}
+
+function sendWebSocketFrame(socket: Socket, opcode: number, payload: Buffer): void {
+	const length = payload.length;
+	let header: Buffer;
+	if (length < 126) {
+		header = Buffer.from([0x80 | opcode, length]);
+	} else if (length <= 0xffff) {
+		header = Buffer.alloc(4);
+		header[0] = 0x80 | opcode;
+		header[1] = 126;
+		header.writeUInt16BE(length, 2);
+	} else {
+		header = Buffer.alloc(10);
+		header[0] = 0x80 | opcode;
+		header[1] = 127;
+		header.writeBigUInt64BE(BigInt(length), 2);
+	}
+	socket.write(Buffer.concat([header, payload]));
+}
+
+function readWebSocketFrame(buffer: Buffer): { fin: boolean; opcode: number; masked: boolean; payload: Buffer; bytesRead: number } | undefined {
+	if (buffer.length < 2) return undefined;
+	const fin = (buffer[0] & 0x80) !== 0;
+	const opcode = buffer[0] & 0x0f;
+	const masked = (buffer[1] & 0x80) !== 0;
+	let length = buffer[1] & 0x7f;
+	let offset = 2;
+	if (length === 126) {
+		if (buffer.length < offset + 2) return undefined;
+		length = buffer.readUInt16BE(offset);
+		offset += 2;
+	} else if (length === 127) {
+		if (buffer.length < offset + 8) return undefined;
+		const bigLength = buffer.readBigUInt64BE(offset);
+		if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("WebSocket frame is too large");
+		length = Number(bigLength);
+		offset += 8;
+	}
+	if (length > MAX_VIEWER_SOCKET_MESSAGE_BYTES) throw new Error("WebSocket frame is too large");
+	const maskLength = masked ? 4 : 0;
+	if (buffer.length < offset + maskLength + length) return undefined;
+	let payload = buffer.subarray(offset + maskLength, offset + maskLength + length);
+	if (masked) {
+		const mask = buffer.subarray(offset, offset + 4);
+		const unmasked = Buffer.alloc(payload.length);
+		for (let index = 0; index < payload.length; index += 1) {
+			unmasked[index] = payload[index] ^ mask[index % 4];
+		}
+		payload = unmasked;
+	}
+	return { fin, opcode, masked, payload, bytesRead: offset + maskLength + length };
+}
+
+function validateWebSocketUpgradeHeaders(request: IncomingMessage): string | undefined {
+	if (String(request.headers.upgrade ?? "").toLowerCase() !== "websocket") return "invalid websocket upgrade";
+	const connection = String(request.headers.connection ?? "").toLowerCase().split(",").map((part) => part.trim());
+	if (!connection.includes("upgrade")) return "invalid websocket connection header";
+	if (request.headers["sec-websocket-version"] !== "13") return "unsupported websocket version";
+	const key = request.headers["sec-websocket-key"];
+	if (typeof key !== "string" || Buffer.from(key, "base64").length !== 16) return "invalid sec-websocket-key";
+	return undefined;
+}
+
+function isAllowedViewerSocketOrigin(origin: string | undefined, expectedOrigin: string): boolean {
+	return origin === undefined || origin === expectedOrigin;
+}
+
+function webSocketRejectReason(status: number): string {
+	if (status === 400) return "Bad Request";
+	if (status === 403) return "Forbidden";
+	if (status === 404) return "Not Found";
+	return "Rejected";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
 
 async function snapshotRegisteredPdf(fileSystem: ViewerHostFileSystem, pdfPath: string): Promise<{ size: number; mtimeMs: number }> {
 	let fileStatus: Awaited<ReturnType<ViewerHostFileSystem["stat"]>>;

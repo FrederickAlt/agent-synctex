@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { chromium, type Browser, type Page, type Request, type Response } from "playwright";
+import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
+import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
+import { ViewerHostMcpService, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import type { McpToViewerHostMessage, ViewerHostControlResponse } from "../../src/modules/viewer_host_protocol.ts";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
 
@@ -43,6 +47,50 @@ function makeOnePagePdf(): Buffer {
 function snapshotPdf(path: string): { size: number; mtimeMs: number } {
 	const status = statSync(path);
 	return { size: status.size, mtimeMs: status.mtimeMs };
+}
+
+function writeBrowserSynctexFixture(baseDir: string): { pdfPath: string; sourcePath: string } {
+	const pdfPath = join(baseDir, "paper.pdf");
+	const sourcePath = join(baseDir, "main.tex");
+	writeFileSync(pdfPath, makeOnePagePdf());
+	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nBrowser reverse target.\n\\end{document}\n");
+	writeFileSync(join(baseDir, "paper.synctex"), [
+		"SyncTeX Version:1",
+		"Input:1:main.tex",
+		"Output:pdf",
+		"Unit:1",
+		"Content:",
+		"{1",
+		"h1,3:7208960,14417920:1000000,500000,0",
+		"}",
+		"Postamble:",
+		"Count:0",
+		"",
+	].join("\n"));
+	return { pdfPath, sourcePath };
+}
+
+class HttpViewerHostClient implements ViewerHostClient {
+	readonly origin: string;
+	private readonly client: ViewerHostControlClient;
+
+	constructor(origin: string) {
+		this.origin = origin;
+		this.client = new ViewerHostControlClient({ origin });
+	}
+
+	async send(message: McpToViewerHostMessage): Promise<void> {
+		const response: ViewerHostControlResponse = await this.client.send(message);
+		if (!response.ok) throw new Error(response.error.message);
+	}
+}
+
+function callTool(id: number, name: string, args: Record<string, unknown>, service: ViewerHostMcpService) {
+	return handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }), service.pdfOperations);
+}
+
+function assertApproximatelyEqual(actual: number, expected: number, tolerance: number, label: string): void {
+	assert.ok(Math.abs(actual - expected) <= tolerance, `${label}: expected ${actual} to be within ${tolerance} of ${expected}`);
 }
 
 function projectLocalChromiumExecutable(): string | undefined {
@@ -86,6 +134,79 @@ async function waitForViewerOutcome(page: Page): Promise<{ rendered: boolean; st
 	}
 	return { rendered: false, status, timedOut: true };
 }
+
+test("Viewer Host-served Viewer Client connects viewer socket, sends reverse SyncTeX clicks, and renders forward markers", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-socket-"));
+	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	let service: ViewerHostMcpService | undefined;
+	const server = new ViewerHostServer({
+		registry,
+		mcpEventSink: (message) => service?.handleHostMessage(message),
+	});
+	let browser: Browser | undefined;
+	const consoleMessages: string[] = [];
+	const pageErrors: string[] = [];
+	const failedRequests: string[] = [];
+	try {
+		await server.start();
+		service = new ViewerHostMcpService({ client: new HttpViewerHostClient(server.origin), makePdfId: () => 209 });
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		page.on("console", (message) => consoleMessages.push(`${message.type()}: ${message.text()}`));
+		page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}`));
+		page.on("requestfailed", (request: Request) => failedRequests.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "request failed"}`));
+		page.on("response", (response: Response) => {
+			if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`);
+		});
+
+		await page.goto(`${server.origin}/viewer/209`, { waitUntil: "domcontentloaded" });
+		const outcome = await waitForViewerOutcome(page);
+		assert.equal(outcome.rendered, true, `viewer did not render first page; timedOut=${outcome.timedOut}; status=${JSON.stringify(outcome.status)}\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		await assert.doesNotReject(async () => {
+			for (let attempt = 0; attempt < 20; attempt += 1) {
+				if (server.getConnectedViewerCount(209) === 1) return;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			assert.equal(server.getConnectedViewerCount(209), 1);
+		});
+
+		const canvas = page.locator("#pages canvas[data-page-number='1']");
+		await canvas.click({ position: { x: 125, y: 50 } });
+
+		let event: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(2, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			event = response.result?.details?.events?.[0];
+			if (event) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(event, `reverse SyncTeX event was not stored\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		assert.equal(event.pdf_id, 209);
+		assert.equal(event.source_file, sourcePath);
+		assert.equal(event.line, 3);
+		assert.equal(event.source_line, "Browser reverse target.");
+		assert.equal(event.page, 1);
+		assertApproximatelyEqual(Number(event.x), 100, 1, "reverse x PDF coordinate");
+		assertApproximatelyEqual(Number(event.y), 160, 1, "reverse y PDF coordinate");
+
+		const control = new ViewerHostControlClient({ origin: server.origin });
+		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 209, page: 1, x: 100, y: 160, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 209 } });
+		await page.waitForSelector("[data-synctex-marker]", { state: "attached", timeout: 2_000 });
+		const marker = await page.locator("[data-synctex-marker]").evaluate((element) => ({
+			left: Number.parseFloat((element as HTMLElement).style.left),
+			top: Number.parseFloat((element as HTMLElement).style.top),
+		}));
+		assertApproximatelyEqual(marker.left, 125, 1, "forward marker left viewport coordinate");
+		assertApproximatelyEqual(marker.top, 50, 1, "forward marker top viewport coordinate");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
 
 test("Viewer Host-served Viewer Client renders a registered PDF canvas as normal web code", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-"));

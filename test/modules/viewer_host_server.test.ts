@@ -120,10 +120,11 @@ test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer 
 		assert.equal(configResponse.status, 200);
 		assert.match(configResponse.contentType, /application\/json/);
 		const config = JSON.parse(configResponse.body.toString("utf8")) as Record<string, unknown>;
-		const viewerSocketUrl = `${server.origin.replace(/^http:/, "ws:")}/viewer-socket?pdf_id=109`;
 		assert.equal(config.pdf_id, 109);
 		assert.equal(config.revision, 2);
 		assert.equal(config.pdf_url, `${server.origin}/pdf/109?revision=2`);
+		assert.equal(typeof config.viewer_socket_token, "string");
+		const viewerSocketUrl = `${server.origin.replace(/^http:/, "ws:")}/viewer-socket?pdf_id=109&token=${encodeURIComponent(String(config.viewer_socket_token))}`;
 		assert.equal(config.viewer_socket_url, viewerSocketUrl);
 		assert.equal(config.ws_url, viewerSocketUrl);
 
@@ -132,6 +133,8 @@ test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer 
 		assert.match(viewerScript.contentType, /javascript/);
 		const viewerScriptBody = viewerScript.body.toString("utf8");
 		assert.match(viewerScriptBody, /getDocument/);
+		assert.match(viewerScriptBody, /convertToPdfPoint/);
+		assert.match(viewerScriptBody, /convertToViewportPoint/);
 		assertHostLoadedWebCode("viewer script", viewerScriptBody);
 
 		const pdfJs = await readHttp(`${server.origin}/assets/pdf.mjs`);
