@@ -330,7 +330,10 @@ function collectPackageMetadataEntrypoints(pkg: unknown): Set<string> {
 	}
 
 	if (typeof metadata.scripts === "object" && metadata.scripts !== null) {
-		for (const scriptValue of Object.values(metadata.scripts as Record<string, unknown>)) {
+		for (const [scriptName, scriptValue] of Object.entries(metadata.scripts as Record<string, unknown>)) {
+			if (typeof scriptName === "string" && scriptName.startsWith("debug:")) {
+				continue;
+			}
 			if (typeof scriptValue !== "string") continue;
 			for (const candidate of collectProductionEntrypointPathsFromCommand(scriptValue)) {
 				result.add(candidate);

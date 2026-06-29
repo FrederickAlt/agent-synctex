@@ -66,6 +66,44 @@ Pi's local MCP config supports `lifecycle` values `"lazy"`, `"eager"`, and `"kee
 }
 ```
 
+## Agent forward SyncTeX debug
+
+For HITL/multiline alignment diagnosis, generate a raster + overlay for the same forward SyncTeX mapping `jump_pdf` uses:
+
+```bash
+npm run debug:forward-synctex -- --pdf /path/main.pdf --source /path/main.tex --line 123 --out /tmp/synctex-debug
+```
+
+`--pdf`, `--source`, `--line`, and `--out` are required. The `crop` PNG is always produced on successful runs.
+
+The script:
+
+- runs the production `mapForwardSynctex` path,
+- rasterizes the target PDF page and draws the computed highlight box,
+- writes a readable full-page overlay PNG,
+- writes an always-generated marker crop PNG around the highlight (primary diagnostic artifact),
+- writes a JSON metadata file with: input paths, line/page, resolved source/sidecar, mapping marker in PDF points and image pixels, scale (`dpi`, `px_per_point`), output file paths, and command warnings.
+
+Paths are printed in a machine-readable block:
+
+```text
+forward Synctex diagnostic artifacts:
+  metadata: /tmp/synctex-debug/forward-synctex-line-123-diagnostic.json
+  full-page: /tmp/synctex-debug/forward-synctex-page-1.png
+  overlay: /tmp/synctex-debug/forward-synctex-page-1-overlay.png
+  crop: /tmp/synctex-debug/forward-synctex-page-1-crop.png
+```
+
+Optional knobs are available:
+
+- `--dpi` for raster resolution (default 144)
+- `--crop-margin-points` for crop padding (default 72)
+
+Required external commands:
+
+- `pdftoppm` (or `pdftocairo` fallback)
+- ImageMagick `magick`
+
 ## Verification
 
 ```bash
