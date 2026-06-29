@@ -90,6 +90,29 @@ const CASES: Array<{ label: string; kind: OracleCase["kind"] }> = [
 	{ label: "ORACLEALIGNTHREE", kind: "equation-label" },
 ];
 
+const SIMPLE_ALIGN_LINES = [
+	"\\documentclass{article}",
+	"\\usepackage{amsmath}",
+	"\\usepackage[margin=1in]{geometry}",
+	"\\begin{document}",
+	"Some text before the equation.",
+	"",
+	"\\begin{align*}",
+	"\\text{ROWONEAAA}\\quad A &= B + C + D + E \\\\",
+	"\\text{ROWTWOAAA}\\quad F &= G + H + I + J \\\\",
+	"\\text{ROWTHREEAAA}\\quad K &= L + M + N + O",
+	"\\end{align*}",
+	"",
+	"Some text after the equation.",
+	"\\end{document}",
+];
+
+const SIMPLE_ALIGN_CASES = [
+	{ label: "ROWONEAAA", line: 8 },
+	{ label: "ROWTWOAAA", line: 9 },
+	{ label: "ROWTHREEAAA", line: 10 },
+];
+
 function commandExists(command: string): boolean {
 	const probe = spawnSync(command, ["--version"], { stdio: "ignore" });
 	return !probe.error && probe.status === 0;
@@ -102,11 +125,11 @@ function oracleSkipReason(): string | undefined {
 	return undefined;
 }
 
-function compileFixture(): { dir: string; texPath: string; pdfPath: string } {
+function compileFixture(lines = FIXTURE_LINES): { dir: string; texPath: string; pdfPath: string } {
 	const dir = mkdtempSync(join(tmpdir(), "forward-synctex-oracle-"));
 	const texPath = join(dir, "main.tex");
 	const pdfPath = join(dir, "main.pdf");
-	writeFileSync(texPath, `${FIXTURE_LINES.join("\n")}\n`);
+	writeFileSync(texPath, `${lines.join("\n")}\n`);
 
 	const compile = spawnSync(
 		"latexmk",
@@ -234,6 +257,44 @@ function drawVisualArtifacts(fixture: { pdfPath: string; texPath: string }, view
 }
 
 const skipReason = oracleSkipReason();
+
+test("forward SyncTeX markers follow each source row in a simple align* fixture", skipReason ? { skip: skipReason } : {}, async () => {
+	const fixture = compileFixture(SIMPLE_ALIGN_LINES);
+	try {
+		const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs") as unknown as PdfJsLibLike;
+		const pdfBytes = new Uint8Array(readFileSync(fixture.pdfPath));
+		const document = await pdfjsLib.getDocument({ data: pdfBytes, disableWorker: true }).promise;
+		try {
+			const page = await document.getPage(1);
+			const viewport = page.getViewport({ scale: 1 });
+			const textContent = await page.getTextContent();
+			const rows = SIMPLE_ALIGN_CASES.map(({ label, line }) => {
+				const item = textContent.items.find((candidate) => candidate.str.includes(label));
+				assert.ok(item, `PDF.js textContent should contain ${label}; extracted text was: ${textContent.items.map((candidate) => candidate.str).join(" | ")}`);
+				const textBox = textItemBox(pdfjsLib, viewport, item);
+				const jump = mapForwardSynctex({ pdfPath: fixture.pdfPath, sourceFile: fixture.texPath, line, cwd: fixture.dir });
+				const marker = forwardSynctexMarkerFromPdfPoint({ pdfX: jump.x, pdfY: jump.y, width: jump.width, height: jump.height, viewport });
+				return { label, line, jump, marker, textBox };
+			});
+
+			for (const row of rows) {
+				const verticalCenterDelta = Math.abs(centerY(row.marker) - centerY(row.textBox));
+				assert.ok(verticalCenterDelta <= 6, `marker center should be on ${row.label}; delta=${verticalCenterDelta}\n${JSON.stringify(row)}`);
+				assert.ok(row.marker.height <= 18, `marker should stay row-local for ${row.label}\n${JSON.stringify(row)}`);
+			}
+
+			const markerCenterDeltas = rows.slice(1).map((row, index) => centerY(row.marker) - centerY(rows[index].marker));
+			const textCenterDeltas = rows.slice(1).map((row, index) => centerY(row.textBox) - centerY(rows[index].textBox));
+			for (let index = 0; index < markerCenterDeltas.length; index += 1) {
+				assert.ok(Math.abs(markerCenterDeltas[index] - textCenterDeltas[index]) <= 3, `marker row spacing should match text row spacing; marker=${markerCenterDeltas.join(",")} text=${textCenterDeltas.join(",")}`);
+			}
+		} finally {
+			await document.destroy?.();
+		}
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
 
 test("forward SyncTeX markers overlap real PDF.js text boxes for a compiled LaTeX fixture", skipReason ? { skip: skipReason } : {}, async () => {
 	const fixture = compileFixture();

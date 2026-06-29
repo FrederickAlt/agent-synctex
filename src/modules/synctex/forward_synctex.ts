@@ -76,6 +76,12 @@ interface SynctexLineAggregate {
 	maxY: number;
 }
 
+interface AlignedMathRowContext {
+	rowIndex: number;
+	rowCount: number;
+	endLine: number;
+}
+
 interface ParsedSynctex {
 	inputs: Map<number, SynctexInputRecord>;
 	positions: SynctexPositionRecord[];
@@ -264,6 +270,46 @@ function isAlignedMathSourceLine(sourceLine: string): boolean {
 	return /(^|[^\\])&/.test(sourceLine) || /\\\\\s*$/.test(sourceLine);
 }
 
+function readSourceLines(filePath: string, cwd: string): string[] | undefined {
+	const sourceFile = isAbsolute(filePath) ? resolve(filePath) : resolve(cwd, filePath);
+	try {
+		return readFileSync(sourceFile, "utf8").split(/\r?\n/);
+	} catch {
+		return undefined;
+	}
+}
+
+function findAlignedMathRowContext(sourceLines: string[], targetLine: number): AlignedMathRowContext | undefined {
+	const targetIndex = targetLine - 1;
+	if (!sourceLines[targetIndex] || !isAlignedMathSourceLine(sourceLines[targetIndex])) return undefined;
+
+	let beginIndex: number | undefined;
+	for (let index = targetIndex; index >= 0; index -= 1) {
+		if (/\\begin\{(?:align\*?|aligned)\}/.test(sourceLines[index])) {
+			beginIndex = index;
+			break;
+		}
+		if (/\\end\{(?:align\*?|aligned)\}/.test(sourceLines[index])) return undefined;
+	}
+	if (beginIndex === undefined) return undefined;
+
+	let endIndex: number | undefined;
+	for (let index = beginIndex + 1; index < sourceLines.length; index += 1) {
+		if (/\\end\{(?:align\*?|aligned)\}/.test(sourceLines[index])) {
+			endIndex = index;
+			break;
+		}
+	}
+	if (endIndex === undefined || targetIndex >= endIndex) return undefined;
+
+	const rowLines = [];
+	for (let index = beginIndex + 1; index < endIndex; index += 1) {
+		if (isAlignedMathSourceLine(sourceLines[index])) rowLines.push(index + 1);
+	}
+	const rowIndex = rowLines.indexOf(targetLine);
+	return rowIndex === -1 ? undefined : { rowIndex, rowCount: rowLines.length, endLine: endIndex + 1 };
+}
+
 function clusterBaseline(records: SynctexPositionRecord[]): number | undefined {
 	const sortedRecords = [...records].sort((left, right) => left.y - right.y);
 	let best: { y: number; count: number; width: number } | undefined;
@@ -283,25 +329,13 @@ function clusterBaseline(records: SynctexPositionRecord[]): number | undefined {
 	return best?.y;
 }
 
-function aggregateRowLocalPosition(positions: SynctexPositionRecord[], matchingTags: Set<number>, targetLine: number, page: number): SynctexLineAggregate | undefined {
-	const anchorY = clusterBaseline(positions.filter((position) =>
-		position.page === page
-		&& position.line === targetLine
-		&& position.primary
-		&& matchingTags.has(position.tag),
-	));
-	if (anchorY === undefined) return undefined;
-
+function aggregateRecords(records: SynctexPositionRecord[], line: number, page: number): SynctexLineAggregate | undefined {
 	let aggregate: SynctexLineAggregate | undefined;
-	for (const position of positions) {
-		if (position.page !== page) continue;
-		if (!matchingTags.has(position.tag)) continue;
-		if (Math.abs(position.line - targetLine) > ROW_LOCAL_SOURCE_LINE_WINDOW) continue;
-		if (Math.abs(position.y - anchorY) > ROW_LOCAL_BASELINE_TOLERANCE_POINTS) continue;
+	for (const position of records) {
 		const bounds = positionBounds(position);
 		if (!aggregate) {
 			aggregate = {
-				line: targetLine,
+				line,
 				page,
 				x: bounds.minX,
 				y: bounds.minY,
@@ -315,6 +349,49 @@ function aggregateRowLocalPosition(positions: SynctexPositionRecord[], matchingT
 		mergePositionIntoAggregate(aggregate, position);
 	}
 	return aggregate;
+}
+
+function aggregateRowLocalPosition(positions: SynctexPositionRecord[], matchingTags: Set<number>, targetLine: number, page: number): SynctexLineAggregate | undefined {
+	const anchorY = clusterBaseline(positions.filter((position) =>
+		position.page === page
+		&& position.line === targetLine
+		&& position.primary
+		&& matchingTags.has(position.tag),
+	));
+	if (anchorY === undefined) return undefined;
+
+	return aggregateRecords(positions.filter((position) =>
+		position.page === page
+		&& matchingTags.has(position.tag)
+		&& Math.abs(position.line - targetLine) <= ROW_LOCAL_SOURCE_LINE_WINDOW
+		&& Math.abs(position.y - anchorY) <= ROW_LOCAL_BASELINE_TOLERANCE_POINTS,
+	), targetLine, page);
+}
+
+function aggregateAlignedMathRowPosition(positions: SynctexPositionRecord[], matchingTags: Set<number>, targetLine: number, page: number, context: AlignedMathRowContext): SynctexLineAggregate | undefined {
+	const candidateLines = [...new Set(positions
+		.filter((position) => position.page === page && position.primary && matchingTags.has(position.tag) && position.line >= targetLine && position.line <= context.endLine + 2)
+		.map((position) => position.line))]
+		.sort((left, right) => left - right);
+
+	for (const line of candidateLines) {
+		const sortedRecords = positions
+			.filter((position) => position.page === page && position.line === line && position.primary && matchingTags.has(position.tag))
+			.sort((left, right) => left.y - right.y);
+		const rowClusters: SynctexPositionRecord[][] = [];
+		for (const record of sortedRecords) {
+			const lastCluster = rowClusters.at(-1);
+			const lastY = lastCluster === undefined ? undefined : clusterBaseline(lastCluster);
+			if (lastCluster === undefined || lastY === undefined || Math.abs(record.y - lastY) > ROW_LOCAL_BASELINE_TOLERANCE_POINTS) {
+				rowClusters.push([record]);
+				continue;
+			}
+			lastCluster.push(record);
+		}
+		if (rowClusters.length < context.rowCount || rowClusters[context.rowIndex] === undefined) continue;
+		return aggregateRecords(rowClusters[context.rowIndex], targetLine, page);
+	}
+	return undefined;
 }
 
 function interpolateLine(targetLine: number, lower: SynctexLineAggregate, upper: SynctexLineAggregate): SynctexLineAggregate {
@@ -396,6 +473,8 @@ export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; 
 	if (sourceLine === undefined) {
 		throw new Error(`Cannot read source_file line ${sourceFile}:${input.line}`);
 	}
+	const sourceLines = readSourceLines(sourceFile, input.cwd);
+	const alignedMathRowContext = sourceLines === undefined ? undefined : findAlignedMathRowContext(sourceLines, input.line);
 
 	const allowExact = sourceLine.trim().length > 0;
 	const primaryLinePositions = aggregateLinePositions(parsed.positions, matchingTags, true);
@@ -410,7 +489,10 @@ export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; 
 		? (fallbackLinePositions.find((candidate) => candidate.page === position.page && candidate.line === position.line) ?? position)
 		: position;
 	const rowLocalPosition = allowExact && isAlignedMathSourceLine(sourceLine)
-		? aggregateRowLocalPosition(parsed.positions, matchingTags, input.line, position.page)
+		? (alignedMathRowContext === undefined
+			? aggregateRowLocalPosition(parsed.positions, matchingTags, input.line, position.page)
+			: aggregateAlignedMathRowPosition(parsed.positions, matchingTags, input.line, position.page, alignedMathRowContext)
+				?? aggregateRowLocalPosition(parsed.positions, matchingTags, input.line, position.page))
 		: undefined;
 	const highlightPosition = rowLocalPosition ?? verticalPosition;
 	const horizontalPosition = rowLocalPosition ?? position;
