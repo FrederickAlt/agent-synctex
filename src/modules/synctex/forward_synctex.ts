@@ -9,11 +9,14 @@ import { readSourceLine } from "./source_line.ts";
 // nearest/interpolated line lookup.
 const SCALED_POINTS_PER_POINT = 65_536;
 const MAX_NEAREST_LINE_DISTANCE = 2;
+const FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS = 10;
 
 export interface ForwardSynctexTarget {
 	page: number;
 	x: number;
 	y: number;
+	width?: number;
+	height?: number;
 	source_file: string;
 	line: number;
 }
@@ -22,6 +25,8 @@ export interface ForwardSynctexJump {
 	page: number;
 	x: number;
 	y: number;
+	width: number;
+	height: number;
 	sourceFile: string;
 	line: number;
 	sourceLine: string;
@@ -335,6 +340,8 @@ export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; 
 		page: position.page,
 		x: position.x,
 		y: position.y,
+		width: Math.max(0, position.maxX - position.minX),
+		height: Math.max(FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS, position.maxY - position.minY),
 		sourceFile,
 		line: input.line,
 		sourceLine,

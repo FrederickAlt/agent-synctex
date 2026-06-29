@@ -193,14 +193,18 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assertApproximatelyEqual(Number(event.y), 160, 1, "reverse y PDF coordinate");
 
 		const control = new ViewerHostControlClient({ origin: server.origin });
-		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 209, page: 1, x: 100, y: 160, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 209 } });
+		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 209, page: 1, x: 100, y: 40, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 209 } });
 		await page.waitForSelector("[data-synctex-marker]", { state: "attached", timeout: 2_000 });
 		const marker = await page.locator("[data-synctex-marker]").evaluate((element) => ({
 			left: Number.parseFloat((element as HTMLElement).style.left),
 			top: Number.parseFloat((element as HTMLElement).style.top),
+			width: Number.parseFloat((element as HTMLElement).style.width),
+			height: Number.parseFloat((element as HTMLElement).style.height),
 		}));
 		assertApproximatelyEqual(marker.left, 125, 1, "forward marker left viewport coordinate");
-		assertApproximatelyEqual(marker.top, 50, 1, "forward marker top viewport coordinate");
+		assertApproximatelyEqual(marker.top, 50, 1, "forward marker top-origin viewport coordinate");
+		assert.equal(marker.width >= 120, true, "forward marker should be snippet-sized, not a tiny fixed box");
+		assert.equal(marker.height >= 12, true, "forward marker should be line-height sized");
 	} finally {
 		await browser?.close();
 		await server.stop();

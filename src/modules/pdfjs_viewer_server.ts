@@ -109,14 +109,14 @@ function handleSynctexMessage(message) {
 	if (activeSynctexMarker) activeSynctexMarker.remove();
 	const marker = document.createElement("div");
 	marker.style.position = "absolute";
+	const width = Math.max(96, Number(message.width) || 0) * 1.25;
+	const height = Math.max(10, Number(message.height) || 0) * 1.25;
 	marker.style.left = String(Math.max(0, Number(message.x) || 0) * 1.25) + "px";
 	marker.style.top = String(Math.max(0, Number(message.y) || 0) * 1.25) + "px";
-	marker.style.width = "1.2rem";
-	marker.style.height = "1.2rem";
-	marker.style.border = "3px solid #d11";
-	marker.style.borderRadius = "50%";
+	marker.style.width = String(width) + "px";
+	marker.style.height = String(height) + "px";
+	marker.style.border = "2px solid #d11";
 	marker.style.background = "rgba(255,255,0,0.35)";
-	marker.style.transform = "translate(-50%, -50%)";
 	marker.style.pointerEvents = "none";
 	page.appendChild(marker);
 	activeSynctexMarker = marker;
@@ -425,7 +425,7 @@ export class PdfJsViewerServer {
 		}));
 	}
 
-	notifySynctex(pdfId: number, target: { page: number; x: number; y: number; source_file: string; line: number }): number {
+	notifySynctex(pdfId: number, target: { page: number; x: number; y: number; width?: number; height?: number; source_file: string; line: number }): number {
 		return this.registry.sendToClients(pdfId, JSON.stringify({ type: "synctex", pdf_id: pdfId, ...target }));
 	}
 

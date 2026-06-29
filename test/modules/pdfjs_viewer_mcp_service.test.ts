@@ -475,6 +475,8 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 			page: 1,
 			x: 110,
 			y: 220,
+			width: 15.259,
+			height: 10,
 			source_file: sourcePath,
 			line: 3,
 		});

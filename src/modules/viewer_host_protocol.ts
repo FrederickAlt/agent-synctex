@@ -23,6 +23,8 @@ export interface ViewerHostSynctexForwardMessage {
 	page: number;
 	x: number;
 	y: number;
+	width?: number;
+	height?: number;
 	source_file?: string;
 	line: number;
 }
@@ -105,6 +107,11 @@ function requireCoordinate(value: unknown, field: string): number {
 	return value;
 }
 
+function optionalCoordinate(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	return requireCoordinate(value, field);
+}
+
 function requireNonEmptyString(value: unknown, field: string): string {
 	if (typeof value !== "string" || !value.trim()) {
 		throw new Error(`${field} must be a non-empty string`);
@@ -156,12 +163,16 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
 		case "synctex_forward": {
 			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
+			const width = optionalCoordinate(message.width, "width");
+			const height = optionalCoordinate(message.height, "height");
 			return {
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
 				page: requirePositiveInteger(message.page, "page"),
 				x: requireCoordinate(message.x, "x"),
 				y: requireCoordinate(message.y, "y"),
+				...(width === undefined ? {} : { width }),
+				...(height === undefined ? {} : { height }),
 				...(sourceFile === undefined ? {} : { source_file: sourceFile }),
 				line: requirePositiveInteger(message.line, "line"),
 			};

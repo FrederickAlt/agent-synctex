@@ -515,6 +515,8 @@ export class ViewerHostMcpService {
 				page: jump.page,
 				x: jump.x,
 				y: jump.y,
+				width: jump.width,
+				height: jump.height,
 				source_file: jump.sourceFile,
 				line: jump.line,
 			}, { reregisterBeforeSend: true });
@@ -544,6 +546,8 @@ export class ViewerHostMcpService {
 					page: jump.page,
 					x: jump.x,
 					y: jump.y,
+					width: jump.width,
+					height: jump.height,
 					viewer_notifications: 0,
 					handle: record.viewerUrl,
 					reason: "sent synctex_forward to Viewer Host Client",

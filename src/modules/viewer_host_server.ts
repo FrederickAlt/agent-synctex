@@ -175,9 +175,19 @@ function reverseSynctexPayloadFromViewportPoint(input) {
 	return { type: "reverse_synctex", page: input.page, x: point[0], y: point[1] };
 }
 
+function viewportScale(input) {
+	const origin = input.viewport.convertToViewportPoint(0, 0);
+	const xUnit = input.viewport.convertToViewportPoint(1, 0);
+	const yUnit = input.viewport.convertToViewportPoint(0, 1);
+	return { x: Math.abs(xUnit[0] - origin[0]) || 1, y: Math.abs(yUnit[1] - origin[1]) || 1 };
+}
+
 function forwardSynctexMarkerFromPdfPoint(input) {
-	const point = input.viewport.convertToViewportPoint(input.pdfX, input.pdfY);
-	return { left: point[0], top: point[1] };
+	const scale = viewportScale(input);
+	const point = input.viewport.convertToViewportPoint(input.pdfX, 0);
+	const width = Math.max(Number(input.width) || 0, 96) * scale.x;
+	const height = Math.max(Number(input.height) || 0, 10) * scale.y;
+	return { left: point[0], top: input.pdfY * scale.y, width, height };
 }
 
 async function renderPdf(config) {
@@ -226,16 +236,16 @@ function showSynctexMarker(message) {
 		marker = document.createElement("div");
 		marker.dataset.synctexMarker = "true";
 		marker.style.position = "absolute";
-		marker.style.width = "1rem";
-		marker.style.height = "1rem";
 		marker.style.border = "2px solid #ef4444";
 		marker.style.background = "rgba(239,68,68,.18)";
 		marker.style.pointerEvents = "none";
 		page.appendChild(marker);
 	}
-	const position = forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, viewport });
+	const position = forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, width: message.width, height: message.height, viewport });
 	marker.style.left = String(position.left) + "px";
 	marker.style.top = String(position.top) + "px";
+	marker.style.width = String(position.width) + "px";
+	marker.style.height = String(position.height) + "px";
 	marker.scrollIntoView({ block: "center", inline: "center" });
 }
 

@@ -29,6 +29,8 @@ test("forward SyncTeX mapper reads realistic .synctex fixtures and maps source l
 		assert.equal(jump.page, 1);
 		assert.equal(jump.x, 144.27);
 		assert.equal(jump.y, 155.27);
+		assert.equal((jump as { width?: number }).width !== undefined && (jump as { width?: number }).width! > 250, true);
+		assert.equal((jump as { height?: number }).height !== undefined && (jump as { height?: number }).height! >= 10, true);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

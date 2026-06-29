@@ -439,6 +439,8 @@ export interface HostServiceJumpResponseDetails {
 	page?: number;
 	x?: number;
 	y?: number;
+	width?: number;
+	height?: number;
 	viewer_notifications?: number;
 	reason?: string;
 	handle?: string;
