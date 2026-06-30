@@ -160,11 +160,40 @@ function textItemBox(pdfjsLib: PdfJsLibLike, viewport: PdfViewportLike, item: Te
 	};
 }
 
-function centerY(box: Box | ForwardSynctexMarkerPosition): number {
-	return "bottom" in box ? (box.top + box.bottom) / 2 : box.top + (box.height / 2);
+function markerWidth(marker: ForwardSynctexMarkerPosition): number {
+	return marker.width ?? 0;
 }
 
-function intersectionArea(left: Box | ForwardSynctexMarkerPosition, right: Box): number {
+function markerHeight(marker: ForwardSynctexMarkerPosition): number {
+	return marker.height ?? 0;
+}
+
+function markerHasDimensions(marker: ForwardSynctexMarkerPosition): marker is ForwardSynctexMarkerPosition & { width: number; height: number } {
+	return marker.width !== undefined && marker.height !== undefined;
+}
+
+function centerY(box: Box | ForwardSynctexMarkerPosition): number {
+	return "bottom" in box ? (box.top + box.bottom) / 2 : box.top + (markerHeight(box) / 2);
+}
+
+function pointInsideBox(point: ForwardSynctexMarkerPosition, box: Box): boolean {
+	return point.left >= box.left && point.left <= box.right && point.top >= box.top && point.top <= box.bottom;
+}
+
+function pointDistanceToBox(point: ForwardSynctexMarkerPosition, box: Box): number {
+	const dx = point.left < box.left ? box.left - point.left : point.left > box.right ? point.left - box.right : 0;
+	const dy = point.top < box.top ? box.top - point.top : point.top > box.bottom ? point.top - box.bottom : 0;
+	return Math.hypot(dx, dy);
+}
+
+function assertPointMarkerNearBox(candidate: { marker: ForwardSynctexMarkerPosition; textBox: Box; label: string }): void {
+	assert.ok(
+		pointInsideBox(candidate.marker, candidate.textBox) || pointDistanceToBox(candidate.marker, candidate.textBox) <= 24,
+		`computed point marker should fall inside or near ${candidate.label} text box\n${JSON.stringify(candidate)}`,
+	);
+}
+
+function intersectionArea(left: Box | (ForwardSynctexMarkerPosition & { width: number; height: number }), right: Box): number {
 	const leftRight = "right" in left ? left.right : left.left + left.width;
 	const leftBottom = "bottom" in left ? left.bottom : left.top + left.height;
 	const width = Math.max(0, Math.min(leftRight, right.right) - Math.max(left.left, right.left));
@@ -235,8 +264,8 @@ function drawVisualArtifacts(fixture: { pdfPath: string; texPath: string }, view
 	const drawArgs = cases.flatMap((candidate) => {
 		const x0 = Math.round(candidate.marker.left * scale);
 		const y0 = Math.round(candidate.marker.top * scale);
-		const x1 = Math.round((candidate.marker.left + candidate.marker.width) * scale);
-		const y1 = Math.round((candidate.marker.top + candidate.marker.height) * scale);
+		const x1 = Math.round((candidate.marker.left + markerWidth(candidate.marker)) * scale);
+		const y1 = Math.round((candidate.marker.top + markerHeight(candidate.marker)) * scale);
 		return ["-fill", "rgba(255,255,0,0.35)", "-stroke", "#d11", "-strokewidth", "3", "-draw", `rectangle ${x0},${y0} ${x1},${y1}`];
 	});
 	const overlayPng = `${prefix}-overlay.png`;
@@ -247,8 +276,8 @@ function drawVisualArtifacts(fixture: { pdfPath: string; texPath: string }, view
 	for (const candidate of cases) {
 		const x = Math.max(0, Math.round((candidate.marker.left - marginPoints) * scale));
 		const y = Math.max(0, Math.round((candidate.marker.top - marginPoints) * scale));
-		const right = Math.min(viewport.width * scale, Math.round((candidate.marker.left + candidate.marker.width + marginPoints) * scale));
-		const bottom = Math.min(viewport.height * scale, Math.round((candidate.marker.top + candidate.marker.height + marginPoints) * scale));
+		const right = Math.min(viewport.width * scale, Math.round((candidate.marker.left + markerWidth(candidate.marker) + marginPoints) * scale));
+		const bottom = Math.min(viewport.height * scale, Math.round((candidate.marker.top + markerHeight(candidate.marker) + marginPoints) * scale));
 		const cropPng = `${prefix}-${candidate.label}-crop.png`;
 		spawnSync("magick", [overlayPng, "-crop", `${Math.max(1, right - x)}x${Math.max(1, bottom - y)}+${x}+${y}`, "+repage", cropPng], { encoding: "utf8" });
 	}
@@ -278,9 +307,13 @@ test("forward SyncTeX markers follow each source row in a simple align* fixture"
 			});
 
 			for (const row of rows) {
-				const verticalCenterDelta = Math.abs(centerY(row.marker) - centerY(row.textBox));
-				assert.ok(verticalCenterDelta <= 6, `marker center should be on ${row.label}; delta=${verticalCenterDelta}\n${JSON.stringify(row)}`);
-				assert.ok(row.marker.height <= 18, `marker should stay row-local for ${row.label}\n${JSON.stringify(row)}`);
+				if (markerHasDimensions(row.marker)) {
+					const verticalCenterDelta = Math.abs(centerY(row.marker) - centerY(row.textBox));
+					assert.ok(verticalCenterDelta <= 6, `marker center should be on ${row.label}; delta=${verticalCenterDelta}\n${JSON.stringify(row)}`);
+					assert.ok(markerHeight(row.marker) <= 18, `marker should stay row-local for ${row.label}\n${JSON.stringify(row)}`);
+				} else {
+					assertPointMarkerNearBox(row);
+				}
 			}
 
 			const markerCenterDeltas = rows.slice(1).map((row, index) => centerY(row.marker) - centerY(rows[index].marker));
@@ -305,15 +338,23 @@ test("forward SyncTeX markers overlap real PDF.js text boxes for a compiled LaTe
 
 		try {
 			for (const candidate of collected.cases) {
-				const overlap = intersectionArea(candidate.marker, candidate.textBox);
-				assert.ok(overlap > 0, `computed marker should overlap ${candidate.label} text box\n${formatCase(candidate)}`);
-
-				const verticalCenterDelta = Math.abs(centerY(candidate.marker) - centerY(candidate.textBox));
-				if (candidate.kind === "normal") {
-					assert.ok(verticalCenterDelta <= 3, `normal text marker center should be within 3pt of ${candidate.label}; delta=${verticalCenterDelta}\n${formatCase(candidate)}`);
+				if (markerHasDimensions(candidate.marker)) {
+					const overlap = intersectionArea(candidate.marker, candidate.textBox);
+					assert.ok(overlap > 0, `computed rectangle marker should overlap ${candidate.label} text box\n${formatCase(candidate)}`);
 				} else {
-					assert.ok(verticalCenterDelta <= 6, `equation marker center should be within 6pt of ${candidate.label}; delta=${verticalCenterDelta}\n${formatCase(candidate)}`);
-					assert.ok(candidate.marker.height <= 18, `equation marker height should stay row-local for ${candidate.label}\n${formatCase(candidate)}`);
+					assertPointMarkerNearBox(candidate);
+				}
+
+				if (markerHasDimensions(candidate.marker)) {
+					const verticalCenterDelta = Math.abs(centerY(candidate.marker) - centerY(candidate.textBox));
+					if (candidate.kind === "normal") {
+						assert.ok(verticalCenterDelta <= 3, `normal text marker center should be within 3pt of ${candidate.label}; delta=${verticalCenterDelta}\n${formatCase(candidate)}`);
+					} else {
+						assert.ok(verticalCenterDelta <= 6, `equation marker center should be within 6pt of ${candidate.label}; delta=${verticalCenterDelta}\n${formatCase(candidate)}`);
+						assert.ok(markerHeight(candidate.marker) <= 18, `equation marker height should stay row-local for ${candidate.label}\n${formatCase(candidate)}`);
+					}
+				} else {
+					assertPointMarkerNearBox(candidate);
 				}
 			}
 		} catch (error) {

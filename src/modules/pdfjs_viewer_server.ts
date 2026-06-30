@@ -48,6 +48,7 @@ function wsUrlFromConfig(config) {
 let activeConfig;
 let activeViewerSocket;
 let renderSequence = 0;
+const pageViewports = new Map();
 
 function pdfUrlForRevision(config) {
 	return config.pdf_url;
@@ -67,6 +68,7 @@ async function renderPdf(config, options = {}) {
 	const state = options.preserveState ? captureViewerState() : undefined;
 	fallback.href = pdfUrlForRevision(config);
 	pages.replaceChildren();
+	pageViewports.clear();
 	setStatus("Loading PDF " + config.pdf_id + " revision " + config.revision + " through PDF.js…");
 	const pdfjsLib = await import("/assets/pdf.mjs");
 	pdfjsLib.GlobalWorkerOptions.workerSrc = "/assets/pdf.worker.mjs";
@@ -76,6 +78,7 @@ async function renderPdf(config, options = {}) {
 	for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
 		const page = await pdf.getPage(pageNumber);
 		const viewport = page.getViewport({ scale: 1.25 });
+		pageViewports.set(pageNumber, viewport);
 		const canvas = document.createElement("canvas");
 		canvas.width = viewport.width;
 		canvas.height = viewport.height;
@@ -83,11 +86,12 @@ async function renderPdf(config, options = {}) {
 		canvas.addEventListener("click", (event) => {
 			if (!activeViewerSocket || activeViewerSocket.readyState !== WebSocket.OPEN) return;
 			const rect = canvas.getBoundingClientRect();
+			const point = viewport.convertToPdfPoint(event.clientX - rect.left, event.clientY - rect.top);
 			activeViewerSocket.send(JSON.stringify({
 				type: "reverse_synctex",
 				page: pageNumber,
-				x: (event.clientX - rect.left) / 1.25,
-				y: (event.clientY - rect.top) / 1.25,
+				x: point[0],
+				y: point[1],
 			}));
 		});
 		const pageContainer = document.createElement("div");
@@ -102,22 +106,36 @@ async function renderPdf(config, options = {}) {
 	if (state) restoreViewerState(state);
 }
 
+function viewportScale(viewport) {
+	const origin = viewport.convertToViewportPoint(0, 0);
+	const xUnit = viewport.convertToViewportPoint(1, 0);
+	const yUnit = viewport.convertToViewportPoint(0, 1);
+	return { x: Math.abs(xUnit[0] - origin[0]) || 1, y: Math.abs(yUnit[1] - origin[1]) || 1 };
+}
+
 function handleSynctexMessage(message) {
-	const page = document.querySelector("[data-page-number='" + message.page + "']");
-	if (!page) return;
+	const pageNumber = Number(message.page);
+	const page = document.querySelector("[data-page-number='" + pageNumber + "']");
+	const viewport = pageViewports.get(pageNumber);
+	if (!page || !viewport) return;
 	page.scrollIntoView({ block: "center" });
 	if (activeSynctexMarker) activeSynctexMarker.remove();
 	const marker = document.createElement("div");
 	marker.style.position = "absolute";
-	const width = Math.max(96, Number(message.width) || 0) * 1.25;
-	const height = Math.max(10, Number(message.height) || 0) * 1.25;
-	marker.style.left = String(Math.max(0, Number(message.x) || 0) * 1.25) + "px";
-	marker.style.top = String(Math.max(0, Number(message.y) || 0) * 1.25) + "px";
-	marker.style.width = String(width) + "px";
-	marker.style.height = String(height) + "px";
-	marker.style.border = "2px solid #d11";
-	marker.style.background = "rgba(255,255,0,0.35)";
 	marker.style.pointerEvents = "none";
+	marker.style.zIndex = "100000";
+	const point = viewport.convertToViewportPoint(Number(message.x) || 0, Number(message.y) || 0);
+	const scale = viewportScale(viewport);
+	const isCircle = message.width === undefined || message.height === undefined;
+	marker.style.left = String(point[0]) + "px";
+	marker.style.top = String(page.getBoundingClientRect().height - point[1]) + "px";
+	marker.style.width = isCircle ? "0.5em" : String(Number(message.width) * scale.x) + "px";
+	marker.style.height = isCircle ? "0.5em" : String(Number(message.height) * scale.y) + "px";
+	marker.style.border = isCircle ? "0.2em solid red" : "2px solid #d11";
+	marker.style.borderRadius = isCircle ? "50%" : "0";
+	marker.style.background = isCircle ? "rgba(255,0,0,0.4)" : "rgba(255,255,0,0.35)";
+	marker.style.transform = isCircle ? "translate(-50%, -50%)" : "";
+	marker.style.opacity = isCircle ? "0.8" : "";
 	page.appendChild(marker);
 	activeSynctexMarker = marker;
 	setStatus("SyncTeX jump: page " + message.page);

@@ -22,23 +22,21 @@ export interface ForwardSynctexMarkerInput {
 	pdfY: number;
 	width?: number;
 	height?: number;
+	pageHeight?: number;
 	viewport: PdfJsViewportCoordinateConverter;
 }
 
 export interface ForwardSynctexMarkerPosition {
 	left: number;
 	top: number;
-	width: number;
-	height: number;
+	width?: number;
+	height?: number;
 }
 
 export function reverseSynctexPayloadFromViewportPoint(input: ReverseSynctexViewportInput): ReverseSynctexSocketPayload {
 	const [x, y] = input.viewport.convertToPdfPoint(input.viewportX, input.viewportY);
 	return { type: "reverse_synctex", page: input.page, x, y };
 }
-
-const FALLBACK_FORWARD_HIGHLIGHT_WIDTH_POINTS = 96;
-const FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS = 10;
 
 function viewportScale(input: { viewport: PdfJsViewportCoordinateConverter }): { x: number; y: number } {
 	const [x0, y0] = input.viewport.convertToViewportPoint(0, 0);
@@ -49,13 +47,13 @@ function viewportScale(input: { viewport: PdfJsViewportCoordinateConverter }): {
 
 export function forwardSynctexMarkerFromPdfPoint(input: ForwardSynctexMarkerInput): ForwardSynctexMarkerPosition {
 	const scale = viewportScale(input);
-	const [left] = input.viewport.convertToViewportPoint(input.pdfX, 0);
-	const widthPoints = Math.max(input.width ?? 0, FALLBACK_FORWARD_HIGHLIGHT_WIDTH_POINTS);
-	const heightPoints = Math.max(input.height ?? 0, FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS);
+	const [left, viewportY] = input.viewport.convertToViewportPoint(input.pdfX, input.pdfY);
+	const pageHeight = input.pageHeight ?? input.viewport.convertToViewportPoint(0, 0)[1];
+	const base = { left, top: pageHeight - viewportY };
+	if (input.width === undefined || input.height === undefined) return base;
 	return {
-		left,
-		top: input.pdfY * scale.y,
-		width: widthPoints * scale.x,
-		height: heightPoints * scale.y,
+		...base,
+		width: input.width * scale.x,
+		height: input.height * scale.y,
 	};
 }
