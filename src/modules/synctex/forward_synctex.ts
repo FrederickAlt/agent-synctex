@@ -96,8 +96,6 @@ export function mapReverseSynctex(input: {
 	x: number;
 	y: number;
 	cwd: string;
-	textBeforeSelection?: string;
-	textAfterSelection?: string;
 }): ReverseSynctexLocation {
 	if (!Number.isInteger(input.page) || input.page < 1) {
 		throw new Error("page must be a positive integer");

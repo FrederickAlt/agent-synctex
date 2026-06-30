@@ -27,8 +27,8 @@ interface WarningEntry {
 interface MarkerPoints {
 	readonly x: number;
 	readonly y: number;
-	readonly width: number;
-	readonly height: number;
+	readonly width?: number;
+	readonly height?: number;
 }
 
 interface MarkerImage {
@@ -288,6 +288,7 @@ function drawOverlay(input: {
 	fullPagePng: string;
 	overlayPng: string;
 	markerPx: MarkerImage;
+	pointMarker: boolean;
 }): void {
 	requireCommand("magick", "ImageMagick");
 	const [x0, y0] = [Math.round(input.markerPx.x), Math.round(input.markerPx.y)];
@@ -295,7 +296,9 @@ function drawOverlay(input: {
 		Math.round(input.markerPx.x + Math.max(1, input.markerPx.width)),
 		Math.round(input.markerPx.y + Math.max(1, input.markerPx.height)),
 	];
-	const draw = `rectangle ${x0},${y0} ${x1},${y1}`;
+	const draw = input.pointMarker
+		? `circle ${x0},${y0} ${x0 + Math.max(1, Math.round(input.markerPx.width))},${y0}`
+		: `rectangle ${x0},${y0} ${x1},${y1}`;
 	const drawResult = spawnSync(
 		"magick",
 		[
@@ -422,8 +425,8 @@ function buildMetadata(args: {
 			sidecarPath: args.jump.sidecarPath,
 			x: args.jump.x,
 			y: args.jump.y,
-			width: args.jump.width,
-			height: args.jump.height,
+			...(args.jump.width === undefined ? {} : { width: args.jump.width }),
+			...(args.jump.height === undefined ? {} : { height: args.jump.height }),
 		},
 		scale: {
 			pdfUnit: "pt" as const,
@@ -435,8 +438,8 @@ function buildMetadata(args: {
 			pdfPoints: {
 				x: args.jump.x,
 				y: args.jump.y,
-				width: args.jump.width,
-				height: args.jump.height,
+				...(args.jump.width === undefined ? {} : { width: args.jump.width }),
+				...(args.jump.height === undefined ? {} : { height: args.jump.height }),
 			},
 			imagePx: args.linePx,
 		},
@@ -482,14 +485,23 @@ function run(): void {
 	try {
 		const jump = mapForwardSynctex({ pdfPath: pdf, sourceFile: source, line: args.line, cwd: process.cwd() });
 		const fullPagePng = renderPdfPage({ pdfPath: pdf, page: jump.page, dpi: args.dpi, outBasePath: outBase });
-		const markerPx: MarkerImage = {
-			x: jump.x * (args.dpi / 72),
-			y: jump.y * (args.dpi / 72),
-			width: jump.width * (args.dpi / 72),
-			height: jump.height * (args.dpi / 72),
-		};
+		const pxPerPoint = args.dpi / 72;
+		const pointMarker = jump.width === undefined || jump.height === undefined;
+		const markerPx: MarkerImage = pointMarker
+			? {
+				x: jump.x * pxPerPoint,
+				y: jump.y * pxPerPoint,
+				width: Math.max(1, pxPerPoint),
+				height: Math.max(1, pxPerPoint),
+			}
+			: {
+				x: jump.x * pxPerPoint,
+				y: jump.y * pxPerPoint,
+				width: jump.width * pxPerPoint,
+				height: jump.height * pxPerPoint,
+			};
 		const overlayPng = join(out, `forward-synctex-page-${jump.page}-overlay.png`);
-		drawOverlay({ fullPagePng, overlayPng, markerPx });
+		drawOverlay({ fullPagePng, overlayPng, markerPx, pointMarker });
 
 		const imageSize = identifyImageSize(overlayPng);
 		const cropPng = join(out, `forward-synctex-page-${jump.page}-crop.png`);
@@ -521,7 +533,8 @@ function run(): void {
 		});
 		writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
 		printResultPaths(metadata);
-		console.log(`marker PDF points: x=${jump.x}, y=${jump.y}, width=${jump.width}, height=${jump.height}`);
+		const dimensions = jump.width === undefined || jump.height === undefined ? "" : `, width=${jump.width}, height=${jump.height}`;
+		console.log(`marker PDF points: x=${jump.x}, y=${jump.y}${dimensions}`);
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));
 		process.exit(1);

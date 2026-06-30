@@ -287,7 +287,7 @@ function drawVisualArtifacts(fixture: { pdfPath: string; texPath: string }, view
 
 const skipReason = oracleSkipReason();
 
-test("forward SyncTeX markers follow each source row in a simple align* fixture", skipReason ? { skip: skipReason } : {}, async () => {
+test("forward SyncTeX markers for align* fixtures intentionally follow LaTeX-Workshop point output", skipReason ? { skip: skipReason } : {}, async () => {
 	const fixture = compileFixture(SIMPLE_ALIGN_LINES);
 	try {
 		const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs") as unknown as PdfJsLibLike;
@@ -307,20 +307,16 @@ test("forward SyncTeX markers follow each source row in a simple align* fixture"
 			});
 
 			for (const row of rows) {
-				if (markerHasDimensions(row.marker)) {
-					const verticalCenterDelta = Math.abs(centerY(row.marker) - centerY(row.textBox));
-					assert.ok(verticalCenterDelta <= 6, `marker center should be on ${row.label}; delta=${verticalCenterDelta}\n${JSON.stringify(row)}`);
-					assert.ok(markerHeight(row.marker) <= 18, `marker should stay row-local for ${row.label}\n${JSON.stringify(row)}`);
-				} else {
-					assertPointMarkerNearBox(row);
-				}
+				assert.equal(Object.hasOwn(row.jump, "width"), false, `LW v1 point mapping must not resurrect custom align* width for ${row.label}`);
+				assert.equal(Object.hasOwn(row.jump, "height"), false, `LW v1 point mapping must not resurrect custom align* height for ${row.label}`);
+				assert.deepEqual(Object.keys(row.marker).sort(), ["left", "top"], `LW v1 keeps align* markers as point-only coordinates for ${row.label}`);
+				assert.equal(Number.isFinite(row.marker.left), true, `marker left should be finite for ${row.label}`);
+				assert.equal(Number.isFinite(row.marker.top), true, `marker top should be finite for ${row.label}`);
+				assertPointMarkerNearBox(row);
 			}
 
-			const markerCenterDeltas = rows.slice(1).map((row, index) => centerY(row.marker) - centerY(rows[index].marker));
-			const textCenterDeltas = rows.slice(1).map((row, index) => centerY(row.textBox) - centerY(rows[index].textBox));
-			for (let index = 0; index < markerCenterDeltas.length; index += 1) {
-				assert.ok(Math.abs(markerCenterDeltas[index] - textCenterDeltas[index]) <= 3, `marker row spacing should match text row spacing; marker=${markerCenterDeltas.join(",")} text=${textCenterDeltas.join(",")}`);
-			}
+			// LW v1 intentionally documents point-only align* behavior here instead of
+			// requiring the previous custom row-local align* precision heuristic.
 		} finally {
 			await document.destroy?.();
 		}

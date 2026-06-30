@@ -19,8 +19,8 @@ interface DiagnosticMetadata {
 		readonly page: number;
 		readonly x: number;
 		readonly y: number;
-		readonly width: number;
-		readonly height: number;
+		readonly width?: number;
+		readonly height?: number;
 		readonly sourceFile: string;
 		readonly sidecarPath: string;
 	};
@@ -121,8 +121,10 @@ test("debug forward SyncTeX CLI writes JSON and PNG artifacts for a compiled fix
 		assert.equal(metadata.mapping.sidecarPath, jump.sidecarPath);
 		assert.equal(metadata.mapping.x, jump.x);
 		assert.equal(metadata.mapping.y, jump.y);
-		assert.equal(metadata.mapping.width, jump.width);
-		assert.equal(metadata.mapping.height, jump.height);
+		assert.equal(Object.hasOwn(metadata.mapping, "width"), false);
+		assert.equal(Object.hasOwn(metadata.mapping, "height"), false);
+		assert.equal(Object.hasOwn(jump, "width"), false);
+		assert.equal(Object.hasOwn(jump, "height"), false);
 
 		assert.equal(existsSync(metadata.artifacts.fullPagePng), true, "full-page PNG should exist");
 		assert.equal(existsSync(metadata.artifacts.overlayPng), true, "overlay PNG should exist");
