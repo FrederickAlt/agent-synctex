@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { Socket } from "node:net";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { PdfJsViewerMcpService, type BrowserLauncher } from "../../src/modules/pdfjs_viewer_mcp_service.ts";
@@ -23,20 +23,9 @@ function writeForwardSynctexFixture(baseDir: string): { pdfPath: string; sourceP
 	const pdfPath = join(baseDir, "paper.pdf");
 	const sourcePath = join(baseDir, "main.tex");
 	writeFakePdf(pdfPath);
-	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nJump target text.\n\\end{document}\n% unmapped tail 1\n% unmapped tail 2\n% unmapped tail 3\n");
-	writeFileSync(join(baseDir, "paper.synctex"), [
-		"SyncTeX Version:1",
-		"Input:1:main.tex",
-		"Output:pdf",
-		"Unit:1",
-		"Content:",
-		"{1",
-		"h1,3:7208960,14417920:1000000,500000,0",
-		"}",
-		"Postamble:",
-		"Count:0",
-		"",
-	].join("\n"));
+	const fixtureDir = resolve("test/fixtures/synctex-forward");
+	copyFileSync(join(fixtureDir, "main.tex"), sourcePath);
+	copyFileSync(join(fixtureDir, "paper.synctex"), join(baseDir, "paper.synctex"));
 	return { pdfPath, sourcePath };
 }
 
@@ -463,20 +452,20 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 		assert.equal(jump.status_details.pdf_id, pdfId);
 		assert.equal(jump.status_details.source_file, sourcePath);
 		assert.equal(jump.status_details.line, 3);
-		assert.equal(jump.status_details.source_line, "Jump target text.");
+		assert.equal(jump.status_details.source_line, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(jump.status_details.page, 1);
-		assert.equal(jump.status_details.x, 110);
-		assert.equal(jump.status_details.y, 212.371);
+		assert.equal(jump.status_details.x, 143.7309977720268);
+		assert.equal(jump.status_details.y, 154.6899018816158);
+		assert.equal(Object.hasOwn(jump.status_details, "width"), false);
+		assert.equal(Object.hasOwn(jump.status_details, "height"), false);
 		assert.equal(jump.status_details.viewer_notifications, 1);
 		assert.equal(jump.status_details.reason, "notified_viewers=1");
 		assert.deepEqual(JSON.parse(notifications[0]), {
 			type: "synctex",
 			pdf_id: pdfId,
 			page: 1,
-			x: 110,
-			y: 212.371,
-			width: 15.259,
-			height: 10,
+			x: 143.7309977720268,
+			y: 154.6899018816158,
 			source_file: sourcePath,
 			line: 3,
 		});
@@ -510,8 +499,8 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		wsUrl.protocol = "ws:";
 		const socket = await connectRawWebSocket(wsUrl);
 
-		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 0, x: 110, y: 220 })));
-		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 1, x: 110, y: 220 })));
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 0, x: 144.27, y: 155.27 })));
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 1, x: 144.27, y: 155.27 })));
 
 		let events: Array<Record<string, unknown>> = [];
 		await waitFor(async () => {
@@ -534,7 +523,7 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		assert.equal(event.source_file, sourcePath);
 		assert.equal(event.line, 3);
 		assert.equal(event.column, 1);
-		assert.equal(event.source_line, "Jump target text.");
+		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(typeof event.timestamp, "string");
 		assert.equal("callback" in event, false);
 		assert.equal("socket_path" in event, false);
@@ -578,7 +567,7 @@ test("PDF.js MCP service preserves reverse_synctex WebSocket frames split across
 		wsUrl.protocol = "ws:";
 		const socket = await connectRawWebSocket(wsUrl);
 
-		const frame = encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 1, x: 110, y: 220 }));
+		const frame = encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 1, x: 144.27, y: 155.27 }));
 		const splitAt = Math.floor(frame.length / 2);
 		socket.write(frame.subarray(0, splitAt));
 		await new Promise((resolve) => setTimeout(resolve, 20));
@@ -638,7 +627,7 @@ test("PDF.js MCP service jump_pdf accepts symlink source_file when its realpath 
 
 		assert.equal(jump.status, "ok");
 		assert.equal(jump.status_details.source_file, symlinkPath);
-		assert.equal(jump.status_details.source_line, "Jump target text.");
+		assert.equal(jump.status_details.source_line, "First paragraph text that should wrap a little and create boxes.");
 	} finally {
 		await service.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -709,11 +698,11 @@ test("PDF.js MCP service jump_pdf reports clear errors for unknown pdf_id, missi
 			created_at_ns: 5,
 			workspace_context: { cwd: baseDir },
 			pdf_id: pdfId,
-			line: 7,
+			line: 12,
 			source_file: sourcePath,
 		});
 		assert.equal(unmappable.status, "error");
-		assert.match(unmappable.error ?? "", /No SyncTeX mapping found.*main\.tex:7/i);
+		assert.match(unmappable.error ?? "", /No SyncTeX mapping found.*main\.tex:12/i);
 	} finally {
 		await service.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -746,8 +735,8 @@ test("MCP jump_pdf resolves relative source_file against workspace_context.cwd",
 		assert.ok(response && "result" in response);
 		const result = response.result as { details: { source_file: string; source_line: string }; content: Array<{ text: string }> };
 		assert.equal(result.details.source_file, sourcePath);
-		assert.equal(result.details.source_line, "Jump target text.");
-		assert.match(result.content[0].text, /line 3 contains:\nJump target text\./);
+		assert.equal(result.details.source_line, "First paragraph text that should wrap a little and create boxes.");
+		assert.match(result.content[0].text, /line 3 contains:\nFirst paragraph text that should wrap a little and create boxes\./);
 	} finally {
 		await service.stop();
 		rmSync(baseDir, { recursive: true, force: true });

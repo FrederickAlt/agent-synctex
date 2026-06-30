@@ -29,6 +29,7 @@
   ],
   "dependencies": {
     "@mariozechner/pi-tui": "^0.73.1",
+    "iconv-lite": "^0.7.2",
     "pdfjs-dist": "^6.0.227",
     "typebox": "^1.1.39"
   },

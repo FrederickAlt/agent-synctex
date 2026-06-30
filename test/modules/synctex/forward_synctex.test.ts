@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { mapForwardSynctex, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
+import { syncTeXToPDF } from "../../../src/modules/synctex/latex_workshop/worker.ts";
 
 const FIXTURE_DIR = resolve("test/fixtures/synctex-forward");
 
@@ -17,21 +18,45 @@ function makeFixtureProject(options: { sidecar: "synctex" | "synctex.gz" }): { d
 	return { dir, pdfPath, sourcePath };
 }
 
-test("forward SyncTeX mapper reads realistic .synctex fixtures and maps source lines to page coordinates", () => {
+test("LaTeX-Workshop-derived syncTeXToPDF reads realistic .synctex fixtures and maps source lines to page coordinates", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
+	const previousCwd = process.cwd();
 	try {
+		process.chdir(project.dir);
+		const jump = syncTeXToPDF(3, project.sourcePath, project.pdfPath);
+
+		assert.deepEqual(jump, {
+			page: 1,
+			x: 143.7309977720268,
+			y: 154.6899018816158,
+			indicator: true,
+		});
+	} finally {
+		process.chdir(previousCwd);
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("forward SyncTeX adapter returns LaTeX-Workshop output plus current API glue fields", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	const previousCwd = process.cwd();
+	try {
+		process.chdir(project.dir);
+		const lwJump = syncTeXToPDF(3, project.sourcePath, project.pdfPath);
+		process.chdir(previousCwd);
 		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir });
 
-		assert.equal(jump.sidecarPath, join(project.dir, "paper.synctex"));
-		assert.equal(jump.sourceFile, project.sourcePath);
-		assert.equal(jump.line, 3);
-		assert.equal(jump.sourceLine, "First paragraph text that should wrap a little and create boxes.");
-		assert.equal(jump.page, 1);
-		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 145.27);
-		assert.equal((jump as { width?: number }).width !== undefined && (jump as { width?: number }).width! > 250, true);
-		assert.equal((jump as { height?: number }).height !== undefined && (jump as { height?: number }).height! >= 10, true);
+		assert.deepEqual(jump, {
+			...lwJump,
+			sourceFile: project.sourcePath,
+			line: 3,
+			sourceLine: "First paragraph text that should wrap a little and create boxes.",
+			sidecarPath: join(project.dir, "paper.synctex"),
+		});
+		assert.equal(Object.hasOwn(jump, "width"), false);
+		assert.equal(Object.hasOwn(jump, "height"), false);
 	} finally {
+		process.chdir(previousCwd);
 		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
@@ -73,8 +98,10 @@ test("forward SyncTeX mapper reads realistic .synctex.gz fixtures", () => {
 		assert.equal(jump.sidecarPath, join(project.dir, "paper.synctex.gz"));
 		assert.equal(jump.sourceLine, "Second paragraph text on a different source line for SyncTeX mapping.");
 		assert.equal(jump.page, 1);
-		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 157.27);
+		assert.equal(jump.x, 143.7309977720268);
+		assert.equal(jump.y, 166.6450700011675);
+		assert.equal(Object.hasOwn(jump, "width"), false);
+		assert.equal(Object.hasOwn(jump, "height"), false);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -89,7 +116,7 @@ test("forward SyncTeX mapper accepts realpath-equivalent source paths", () => {
 
 		assert.equal(jump.sourceFile, resolve(equivalentPath));
 		assert.equal(jump.page, 1);
-		assert.equal(jump.x, 144.27);
+		assert.equal(jump.x, 143.7309977720268);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -108,34 +135,36 @@ test("forward SyncTeX mapper resolves relative Input records against cwd for out
 
 		assert.equal(jump.sourceFile, project.sourcePath);
 		assert.equal(jump.page, 1);
-		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 145.27);
+		assert.equal(jump.x, 143.7309977720268);
+		assert.equal(jump.y, 154.6899018816158);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
 
-test("forward SyncTeX mapper interpolates non-exact lines instead of treating structural block lines as targets", () => {
+test("forward SyncTeX mapper follows LaTeX-Workshop forward selection for non-exact lines", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 4, cwd: project.dir });
 
 		assert.equal(jump.sourceLine, "");
 		assert.equal(jump.page, 1);
-		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 151.27);
+		assert.equal(jump.x, 487.44208120913765);
+		assert.equal(jump.y, 154.6899018816158);
+		assert.equal(Object.hasOwn(jump, "width"), false);
+		assert.equal(Object.hasOwn(jump, "height"), false);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
 
-test("forward SyncTeX mapper applies X/Y offsets from realistic SyncTeX fixtures", () => {
+test("forward SyncTeX mapper applies LaTeX-Workshop X/Y offsets from realistic SyncTeX fixtures", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir });
 
-		assert.equal(jump.x, 144.27);
-		assert.equal(jump.y, 145.27);
+		assert.equal(jump.x, 143.7309977720268);
+		assert.equal(jump.y, 154.6899018816158);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

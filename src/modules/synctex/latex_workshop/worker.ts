@@ -1,0 +1,193 @@
+/*
+The MIT License (MIT)
+
+Copyright (c) 2016 James Yu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Adapted from LaTeX-Workshop synctex_impl/src/locate/synctex/worker.ts.
+*/
+
+import * as fs from "node:fs";
+import * as iconv from "iconv-lite";
+import * as path from "node:path";
+import * as zlib from "node:zlib";
+import { type Block, type PdfSyncObject, parseSyncTex } from "./synctexjs.ts";
+import { iconvLiteSupportedEncodings } from "./convertfilename.ts";
+import { isSameRealPath } from "./pathnormalize.ts";
+
+export interface SyncTeXRecordToPDF {
+	page: number;
+	x: number;
+	y: number;
+	indicator?: boolean;
+}
+
+export class Rectangle {
+	readonly top: number;
+	readonly bottom: number;
+	readonly left: number;
+	readonly right: number;
+
+	constructor({ top, bottom, left, right }: { top: number; bottom: number; left: number; right: number }) {
+		this.top = top;
+		this.bottom = bottom;
+		this.left = left;
+		this.right = right;
+	}
+
+	include(rect: Rectangle): boolean {
+		return this.left <= rect.left && this.right >= rect.right && this.bottom >= rect.bottom && this.top <= rect.top;
+	}
+
+	distanceY(y: number): number {
+		return Math.min(Math.abs(this.bottom - y), Math.abs(this.top - y));
+	}
+
+	distanceXY(x: number, y: number): number {
+		return Math.sqrt(Math.pow(Math.min(Math.abs(this.bottom - y), Math.abs(this.top - y)), 2) + Math.pow(Math.min(Math.abs(this.left - x), Math.abs(this.right - x)), 2));
+	}
+
+	distanceFromCenter(x: number, y: number): number {
+		return Math.sqrt(Math.pow((this.left + this.right) / 2 - x, 2) + Math.pow((this.bottom + this.top) / 2 - y, 2));
+	}
+}
+
+export function getBlocks(linePageBlocks: { [inputLineNum: number]: { [pageNum: number]: Block[] } }, lineNum: number): Block[] {
+	const pageBlocks = linePageBlocks[lineNum];
+	const pageNums = Object.keys(pageBlocks);
+	if (pageNums.length === 0) {
+		return [];
+	}
+	const page = pageNums[0];
+	return pageBlocks[Number(page)];
+}
+
+export function toRect(blocks: Block): Rectangle;
+export function toRect(blocks: Block[]): Rectangle;
+export function toRect(blocks: Block | Block[]): Rectangle {
+	if (!Array.isArray(blocks)) {
+		const block = blocks;
+		const top = block.bottom - block.height;
+		const bottom = block.bottom;
+		const left = block.left;
+		const right = block.width ? block.left + block.width : block.left;
+		return new Rectangle({ top, bottom, left, right });
+	} else {
+		let cTop = 2e16;
+		let cBottom = 0;
+		let cLeft = 2e16;
+		let cRight = 0;
+
+		for (const b of blocks) {
+			// Skip a block if they have boxes inside, or their type is kern or rule.
+			// See also https://github.com/jlaurens/synctex/blob/2017/synctex_parser.c#L4655 for types.
+			if (b.elements !== undefined || b.type === "k" || b.type === "r") {
+				continue;
+			}
+			cBottom = Math.max(b.bottom, cBottom);
+			const top = b.bottom - b.height;
+			cTop = Math.min(top, cTop);
+			cLeft = Math.min(b.left, cLeft);
+			if (b.width !== undefined) {
+				const right = b.left + b.width;
+				cRight = Math.max(right, cRight);
+			}
+		}
+		return new Rectangle({ top: cTop, bottom: cBottom, left: cLeft, right: cRight });
+	}
+}
+
+export interface ParsedSyncTexForPdf {
+	pdfSyncObject: PdfSyncObject;
+	sidecarPath: string;
+}
+
+export function resolveLatexWorkshopSynctexSidecar(pdfPath: string): string | undefined {
+	const synctexPath = pdfPath.slice(0, -path.extname(pdfPath).length) + ".synctex";
+	if (fs.existsSync(synctexPath)) return synctexPath;
+	const synctexGzPath = `${synctexPath}.gz`;
+	if (fs.existsSync(synctexGzPath)) return synctexGzPath;
+	return undefined;
+}
+
+export function parseSyncTexForPdf(pdfPath: string): ParsedSyncTexForPdf | undefined {
+	const sidecarPath = resolveLatexWorkshopSynctexSidecar(pdfPath);
+	if (sidecarPath === undefined) return undefined;
+	const data = fs.readFileSync(sidecarPath);
+	const body = sidecarPath.endsWith(".gz") ? zlib.gunzipSync(data).toString("binary") : data.toString("utf8");
+	const pdfSyncObject = parseSyncTex(body);
+	return pdfSyncObject === undefined ? undefined : { pdfSyncObject, sidecarPath };
+}
+
+export function findInputFilePathForward(filePath: string, pdfSyncObject: PdfSyncObject): string | undefined {
+	for (const inputFilePath in pdfSyncObject.blockNumberLine) {
+		try {
+			if (isSameRealPath(inputFilePath, filePath)) {
+				return inputFilePath;
+			}
+		} catch { }
+	}
+	for (const inputFilePath in pdfSyncObject.blockNumberLine) {
+		for (const enc of iconvLiteSupportedEncodings) {
+			let convertedInputFilePath = "";
+			try {
+				convertedInputFilePath = iconv.decode(Buffer.from(inputFilePath, "binary"), enc);
+				if (isSameRealPath(convertedInputFilePath, filePath)) {
+					return inputFilePath;
+				}
+			} catch { }
+		}
+	}
+	return;
+}
+
+export function syncTeXToPDF(line: number, filePath: string, pdfPath: string): SyncTeXRecordToPDF | undefined {
+	const parsed = parseSyncTexForPdf(pdfPath);
+	if (!parsed) {
+		return undefined;
+	}
+	const inputFilePath = findInputFilePathForward(filePath, parsed.pdfSyncObject);
+	if (inputFilePath === undefined) {
+		return undefined;
+	}
+
+	const linePageBlocks = parsed.pdfSyncObject.blockNumberLine[inputFilePath];
+	const lineNums = Object.keys(linePageBlocks).map((x) => Number(x)).sort((a, b) => { return (a - b); });
+	const i = lineNums.findIndex((x) => x >= line);
+	if (i === 0 || lineNums[i] === line) {
+		const l = lineNums[i];
+		const blocks = getBlocks(linePageBlocks, l);
+		const c = toRect(blocks);
+		return { page: blocks[0].page, x: c.left + parsed.pdfSyncObject.offset.x, y: c.bottom + parsed.pdfSyncObject.offset.y, indicator: true };
+	}
+	const line0 = lineNums[i - 1];
+	const blocks0 = getBlocks(linePageBlocks, line0);
+	const c0 = toRect(blocks0);
+	const line1 = lineNums[i];
+	const blocks1 = getBlocks(linePageBlocks, line1);
+	const c1 = toRect(blocks1);
+	let bottom: number;
+	if (c0.bottom < c1.bottom) {
+		bottom = c0.bottom * (line1 - line) / (line1 - line0) + c1.bottom * (line - line0) / (line1 - line0);
+	} else {
+		bottom = c1.bottom;
+	}
+	return { page: blocks1[0].page, x: c1.left + parsed.pdfSyncObject.offset.x, y: bottom + parsed.pdfSyncObject.offset.y, indicator: true };
+}

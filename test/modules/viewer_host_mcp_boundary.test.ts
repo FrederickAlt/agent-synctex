@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { test } from "node:test";
@@ -15,20 +15,9 @@ function writeForwardSynctexFixture(baseDir: string): { pdfPath: string; sourceP
 	const pdfPath = join(baseDir, "paper.pdf");
 	const sourcePath = join(baseDir, "main.tex");
 	writeFakePdf(pdfPath);
-	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nJump target text.\n\\end{document}\n");
-	writeFileSync(join(baseDir, "paper.synctex"), [
-		"SyncTeX Version:1",
-		"Input:1:main.tex",
-		"Output:pdf",
-		"Unit:1",
-		"Content:",
-		"{1",
-		"h1,3:7208960,14417920:1000000,500000,0",
-		"}",
-		"Postamble:",
-		"Count:0",
-		"",
-	].join("\n"));
+	const fixtureDir = resolve("test/fixtures/synctex-forward");
+	copyFileSync(join(fixtureDir, "main.tex"), sourcePath);
+	copyFileSync(join(fixtureDir, "paper.synctex"), join(baseDir, "paper.synctex"));
 	return { pdfPath, sourcePath };
 }
 
@@ -272,13 +261,14 @@ test("jump_pdf maps SyncTeX in MCP and sends synctex_forward through Viewer Host
 			type: "synctex_forward",
 			pdf_id: 5,
 			page: 1,
-			x: 110,
-			y: 212.371,
-			width: 15.259,
-			height: 10,
+			x: 143.7309977720268,
+			y: 154.6899018816158,
+			indicator: true,
 			source_file: sourcePath,
 			line: 3,
 		});
+		assert.equal(Object.hasOwn(response.result?.details ?? {}, "width"), false);
+		assert.equal(Object.hasOwn(response.result?.details ?? {}, "height"), false);
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}

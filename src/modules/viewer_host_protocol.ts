@@ -25,6 +25,7 @@ export interface ViewerHostSynctexForwardMessage {
 	y: number;
 	width?: number;
 	height?: number;
+	indicator?: boolean;
 	source_file?: string;
 	line: number;
 }
@@ -112,6 +113,14 @@ function optionalCoordinate(value: unknown, field: string): number | undefined {
 	return requireCoordinate(value, field);
 }
 
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean") {
+		throw new Error(`${field} must be a boolean`);
+	}
+	return value;
+}
+
 function requireNonEmptyString(value: unknown, field: string): string {
 	if (typeof value !== "string" || !value.trim()) {
 		throw new Error(`${field} must be a non-empty string`);
@@ -165,6 +174,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
 			const width = optionalCoordinate(message.width, "width");
 			const height = optionalCoordinate(message.height, "height");
+			const indicator = optionalBoolean(message.indicator, "indicator");
 			return {
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
@@ -173,6 +183,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				y: requireCoordinate(message.y, "y"),
 				...(width === undefined ? {} : { width }),
 				...(height === undefined ? {} : { height }),
+				...(indicator === undefined ? {} : { indicator }),
 				...(sourceFile === undefined ? {} : { source_file: sourceFile }),
 				line: requirePositiveInteger(message.line, "line"),
 			};

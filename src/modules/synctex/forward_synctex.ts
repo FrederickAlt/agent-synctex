@@ -1,12 +1,11 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
+import { syncTeXToPDF, resolveLatexWorkshopSynctexSidecar } from "./latex_workshop/worker.ts";
 import { readSourceLine } from "./source_line.ts";
 
-// Self-authored forward SyncTeX mapper for PDF.js jumps. It intentionally does not copy
-// LaTeX-Workshop code; the parser below implements the subset of SyncTeX semantics this
-// service needs: input path normalization, offsets, page elements, line aggregation, and
-// nearest/interpolated line lookup.
+// Legacy self-authored SyncTeX helpers remain for reverse mapping only.
+// Production forward mapping is delegated to the LaTeX-Workshop-derived adapter below.
 const SCALED_POINTS_PER_POINT = 65_536;
 const MAX_NEAREST_LINE_DISTANCE = 2;
 const FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS = 10;
@@ -27,8 +26,9 @@ export interface ForwardSynctexJump {
 	page: number;
 	x: number;
 	y: number;
-	width: number;
-	height: number;
+	indicator?: boolean;
+	width?: number;
+	height?: number;
 	sourceFile: string;
 	line: number;
 	sourceLine: string;
@@ -92,10 +92,7 @@ export function resolveSynctexSidecar(pdfPath: string): string | undefined {
 	const basePath = normalizedPdfPath.toLowerCase().endsWith(".pdf")
 		? normalizedPdfPath.slice(0, -extname(normalizedPdfPath).length)
 		: normalizedPdfPath;
-	for (const candidate of [`${basePath}.synctex.gz`, `${basePath}.synctex`]) {
-		if (existsSync(candidate)) return candidate;
-	}
-	return undefined;
+	return resolveLatexWorkshopSynctexSidecar(`${basePath}.pdf`);
 }
 
 function readSynctexSidecar(sidecarPath: string): string {
@@ -459,52 +456,30 @@ export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; 
 	}
 
 	const sourceFile = isAbsolute(input.sourceFile) ? resolve(input.sourceFile) : resolve(input.cwd, input.sourceFile);
-	const canonicalSourceFile = canonicalFilePath(sourceFile);
-	const parsed = parseSynctexText(readSynctexSidecar(sidecarPath), dirname(pdfPath), input.cwd);
-	const matchingTags = new Set<number>();
-	for (const record of parsed.inputs.values()) {
-		if (record.canonicalPaths.has(canonicalSourceFile)) matchingTags.add(record.tag);
-	}
-	if (matchingTags.size === 0) {
-		throw new Error(`No SyncTeX input record matched source_file ${sourceFile}`);
-	}
-
 	const sourceLine = readSourceLine(sourceFile, input.line, input.cwd);
 	if (sourceLine === undefined) {
 		throw new Error(`Cannot read source_file line ${sourceFile}:${input.line}`);
 	}
-	const sourceLines = readSourceLines(sourceFile, input.cwd);
-	const alignedMathRowContext = sourceLines === undefined ? undefined : findAlignedMathRowContext(sourceLines, input.line);
 
-	const allowExact = sourceLine.trim().length > 0;
-	const primaryLinePositions = aggregateLinePositions(parsed.positions, matchingTags, true);
-	const fallbackLinePositions = aggregateLinePositions(parsed.positions, matchingTags, false);
-	const position = selectLinePosition(primaryLinePositions, input.line, allowExact)
-		?? (allowExact ? fallbackLinePositions.find((candidate) => candidate.line === input.line) : undefined);
-	if (!position) {
+	let mapped;
+	const previousCwd = process.cwd();
+	try {
+		process.chdir(input.cwd);
+		mapped = syncTeXToPDF(input.line, sourceFile, pdfPath);
+	} catch {
+		mapped = undefined;
+	} finally {
+		process.chdir(previousCwd);
+	}
+	if (mapped === undefined) {
 		throw new Error(`No SyncTeX mapping found for ${sourcePathLabel(sourceFile)}:${input.line}`);
 	}
 
-	const verticalPosition = allowExact
-		? (fallbackLinePositions.find((candidate) => candidate.page === position.page && candidate.line === position.line) ?? position)
-		: position;
-	const rowLocalPosition = allowExact && isAlignedMathSourceLine(sourceLine)
-		? (alignedMathRowContext === undefined
-			? aggregateRowLocalPosition(parsed.positions, matchingTags, input.line, position.page)
-			: aggregateAlignedMathRowPosition(parsed.positions, matchingTags, input.line, position.page, alignedMathRowContext)
-				?? aggregateRowLocalPosition(parsed.positions, matchingTags, input.line, position.page))
-		: undefined;
-	const highlightPosition = rowLocalPosition ?? verticalPosition;
-	const horizontalPosition = rowLocalPosition ?? position;
-	const rawHeight = Math.max(0, highlightPosition.maxY - highlightPosition.minY);
-	const height = Math.max(FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS, rawHeight);
-
 	return {
-		page: position.page,
-		x: horizontalPosition.x,
-		y: rawHeight > 0 ? highlightPosition.minY : horizontalPosition.y - height,
-		width: Math.max(0, horizontalPosition.maxX - horizontalPosition.minX),
-		height,
+		page: mapped.page,
+		x: mapped.x,
+		y: mapped.y,
+		...(mapped.indicator === undefined ? {} : { indicator: mapped.indicator }),
 		sourceFile,
 		line: input.line,
 		sourceLine,
