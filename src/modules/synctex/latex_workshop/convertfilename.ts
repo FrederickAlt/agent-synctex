@@ -24,6 +24,9 @@ SOFTWARE.
 Adapted from LaTeX-Workshop synctex_impl/src/utils/convertfilename.ts.
 */
 
+import * as fs from "node:fs";
+import * as iconv from "iconv-lite";
+
 // https://github.com/ashtuchkin/iconv-lite/wiki/Supported-Encodings
 export const iconvLiteSupportedEncodings = [
 	"utf8", "utf16le", "UTF-16BE", "UTF-16",
@@ -41,5 +44,17 @@ export const iconvLiteSupportedEncodings = [
 	"CP850", "CP852", "CP855", "CP856", "CP857", "CP858",
 	"CP860", "CP861", "CP862", "CP863", "CP864", "CP865", "CP866", "CP869",
 	"CP922", "CP1046", "CP1124", "CP1125", "CP1129", "CP1133", "CP1161", "CP1162", "CP1163",
-	"koi8-r", "koi8-u", "koi8-ru",
+	"koi8-r", "koi8-u", "koi8-ru", "koi8-t",
 ];
+
+export function convertFilenameEncoding(filePath: string): string | undefined {
+	for (const enc of iconvLiteSupportedEncodings) {
+		try {
+			const convertedPath = iconv.decode(Buffer.from(filePath, "binary"), enc);
+			if (fs.existsSync(convertedPath)) {
+				return convertedPath;
+			}
+		} catch { }
+	}
+	return undefined;
+}

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { gzipSync } from "node:zlib";
+import * as iconv from "iconv-lite";
 import { test } from "node:test";
 import { mapForwardSynctex, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
-import { syncTeXToPDF } from "../../../src/modules/synctex/latex_workshop/worker.ts";
+import { findInputFilePathForward, syncTeXToPDF } from "../../../src/modules/synctex/latex_workshop/worker.ts";
+import type { PdfSyncObject } from "../../../src/modules/synctex/latex_workshop/synctexjs.ts";
 
 const FIXTURE_DIR = resolve("test/fixtures/synctex-forward");
 
@@ -16,6 +19,14 @@ function makeFixtureProject(options: { sidecar: "synctex" | "synctex.gz" }): { d
 	copyFileSync(join(FIXTURE_DIR, "main.tex"), sourcePath);
 	copyFileSync(join(FIXTURE_DIR, `paper.${options.sidecar}`), join(dir, `paper.${options.sidecar}`));
 	return { dir, pdfPath, sourcePath };
+}
+
+function readFixtureSynctex(): string {
+	return readFileSync(join(FIXTURE_DIR, "paper.synctex"), "utf8");
+}
+
+function writeGzipSynctex(sidecarPath: string, body: string, encoding: BufferEncoding = "utf8"): void {
+	writeFileSync(sidecarPath, gzipSync(Buffer.from(body, encoding)));
 }
 
 test("LaTeX-Workshop-derived syncTeXToPDF reads realistic .synctex fixtures and maps source lines to page coordinates", () => {
@@ -107,18 +118,69 @@ test("forward SyncTeX mapper reads realistic .synctex.gz fixtures", () => {
 	}
 });
 
-test("forward SyncTeX mapper accepts realpath-equivalent source paths", () => {
+test("forward SyncTeX mapper follows LaTeX-Workshop sidecar ordering when both .synctex and .synctex.gz exist", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
-		mkdirSync(join(project.dir, "nested"));
-		const equivalentPath = join(project.dir, "nested", "..", "main.tex");
-		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: equivalentPath, line: 3, cwd: project.dir });
+		const gzBody = readFixtureSynctex().replace("X Offset:655360", "X Offset:1310720");
+		writeGzipSynctex(join(project.dir, "paper.synctex.gz"), gzBody);
 
-		assert.equal(jump.sourceFile, resolve(equivalentPath));
+		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir });
+
+		assert.equal(jump.sidecarPath, join(project.dir, "paper.synctex"));
+		assert.equal(jump.x, 143.7309977720268);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("forward SyncTeX mapper accepts symlink-equivalent source paths", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const symlinkPath = join(project.dir, "linked-main.tex");
+		symlinkSync(project.sourcePath, symlinkPath);
+		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: symlinkPath, line: 3, cwd: project.dir });
+
+		assert.equal(jump.sourceFile, resolve(symlinkPath));
 		assert.equal(jump.page, 1);
 		assert.equal(jump.x, 143.7309977720268);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("forward SyncTeX mapper matches encoded non-ASCII Input filenames through LaTeX-Workshop iconv path", () => {
+	const dir = mkdtempSync(join(tmpdir(), "forward-synctex-encoded-"));
+	const pdfPath = join(dir, "paper.pdf");
+	const sourcePath = join(dir, "café.tex");
+	try {
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		copyFileSync(join(FIXTURE_DIR, "main.tex"), sourcePath);
+		const encodedSourcePath = iconv.encode(sourcePath, "ISO-8859-1").toString("binary");
+		const body = readFixtureSynctex().replace("Input:1:main.tex", `Input:1:${encodedSourcePath}`);
+		writeGzipSynctex(join(dir, "paper.synctex.gz"), body, "binary");
+
+		const jump = mapForwardSynctex({ pdfPath, sourceFile: sourcePath, line: 3, cwd: dir });
+
+		assert.equal(jump.sidecarPath, join(dir, "paper.synctex.gz"));
+		assert.equal(jump.sourceFile, sourcePath);
+		assert.equal(jump.page, 1);
+		assert.equal(jump.x, 143.7309977720268);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("LaTeX-Workshop forward source matching decodes binary Input paths with iconv-lite", () => {
+	const dir = mkdtempSync(join(tmpdir(), "forward-synctex-iconv-"));
+	const sourcePath = join(dir, "café.tex");
+	try {
+		writeFileSync(sourcePath, "encoded source\n");
+		const encodedSourcePath = iconv.encode(sourcePath, "ISO-8859-1").toString("binary");
+		const pdfSyncObject = { blockNumberLine: { [encodedSourcePath]: {} } } as PdfSyncObject;
+
+		assert.equal(findInputFilePathForward(sourcePath, pdfSyncObject), encodedSourcePath);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
