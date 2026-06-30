@@ -86,7 +86,7 @@ async function renderPdf(config, options = {}) {
 		canvas.addEventListener("click", (event) => {
 			if (!activeViewerSocket || activeViewerSocket.readyState !== WebSocket.OPEN) return;
 			const rect = canvas.getBoundingClientRect();
-			const point = viewport.convertToPdfPoint(event.clientX - rect.left, event.clientY - rect.top);
+			const point = viewport.convertToPdfPoint(event.clientX - rect.left, canvas.offsetHeight - (event.clientY - rect.top));
 			activeViewerSocket.send(JSON.stringify({
 				type: "reverse_synctex",
 				page: pageNumber,

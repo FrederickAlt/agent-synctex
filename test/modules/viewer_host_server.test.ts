@@ -134,6 +134,8 @@ test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer 
 		const viewerScriptBody = viewerScript.body.toString("utf8");
 		assert.match(viewerScriptBody, /getDocument/);
 		assert.match(viewerScriptBody, /convertToPdfPoint/);
+		assert.match(viewerScriptBody, /viewportHeight: canvas\.offsetHeight/);
+		assert.match(viewerScriptBody, /input\.viewportHeight - input\.viewportY/);
 		assert.match(viewerScriptBody, /convertToViewportPoint/);
 		assertHostLoadedWebCode("viewer script", viewerScriptBody);
 

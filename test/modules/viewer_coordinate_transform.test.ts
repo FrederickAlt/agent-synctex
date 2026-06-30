@@ -17,12 +17,19 @@ function scaledViewport(scale: number, pageHeightPoints: number): PdfJsViewportC
 	};
 }
 
-test("reverse SyncTeX click coordinates are converted from viewport/CSS pixels to PDF points", () => {
-	const viewport = scaledViewport(1.25, 200);
+test("reverse SyncTeX click coordinates invert Y before converting like LaTeX-Workshop getPagePoint", () => {
+	const viewport: PdfJsViewportCoordinateConverter = {
+		convertToPdfPoint(viewportX: number, viewportY: number): [number, number] {
+			return [viewportX, viewportY];
+		},
+		convertToViewportPoint(pdfX: number, pdfY: number): [number, number] {
+			return [pdfX, pdfY];
+		},
+	};
 
-	const payload = reverseSynctexPayloadFromViewportPoint({ page: 2, viewportX: 125, viewportY: 50, viewport });
+	const payload = reverseSynctexPayloadFromViewportPoint({ page: 2, viewportX: 125, viewportY: 50, viewportHeight: 250, viewport });
 
-	assert.deepEqual(payload, { type: "reverse_synctex", page: 2, x: 100, y: 160 });
+	assert.deepEqual(payload, { type: "reverse_synctex", page: 2, x: 125, y: 200 });
 });
 
 test("forward SyncTeX marker coordinates keep SyncTeX top-origin Y instead of inverting vertically", () => {

@@ -163,7 +163,7 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		});
 
 		const canvas = page.locator("#pages canvas[data-page-number='1']");
-		await canvas.click({ position: { x: 180, y: 56 } });
+		await canvas.click({ position: { x: 180, y: 194 } });
 
 		let event: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
