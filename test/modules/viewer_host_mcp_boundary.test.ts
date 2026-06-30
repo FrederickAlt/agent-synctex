@@ -267,6 +267,8 @@ test("jump_pdf maps SyncTeX in MCP and sends synctex_forward through Viewer Host
 			source_file: sourcePath,
 			line: 3,
 		});
+		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "width"), false, "ViewerHostMcpService.jumpPdf must emit point-style Host messages without width");
+		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "height"), false, "ViewerHostMcpService.jumpPdf must emit point-style Host messages without height");
 		assert.equal(Object.hasOwn(response.result?.details ?? {}, "width"), false);
 		assert.equal(Object.hasOwn(response.result?.details ?? {}, "height"), false);
 	} finally {

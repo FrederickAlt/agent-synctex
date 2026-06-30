@@ -38,15 +38,27 @@ test("forward SyncTeX marker coordinates keep SyncTeX top-origin Y instead of in
 	assert.equal(topLine.top < bottomLine.top, true);
 });
 
-test("forward SyncTeX marker expands point-only targets to a useful snippet-sized highlight", () => {
+test("forward SyncTeX point marker keeps LaTeX-Workshop circle output point-only", () => {
 	const viewport = scaledViewport(1.25, 200);
 
 	const marker = forwardSynctexMarkerFromPdfPoint({ pdfX: 100, pdfY: 40, viewport });
 
-	assert.equal(marker.left, 125);
-	assert.equal(marker.top, 50);
-	assert.equal((marker as { width?: number }).width !== undefined && (marker as { width?: number }).width! >= 120, true);
-	assert.equal((marker as { height?: number }).height !== undefined && (marker as { height?: number }).height! >= 12, true);
+	assert.deepEqual(marker, { left: 125, top: 50 });
+});
+
+test("forward SyncTeX marker uses actual PDF.js viewport point conversion", () => {
+	const viewport: PdfJsViewportCoordinateConverter = {
+		convertToPdfPoint(viewportX: number, viewportY: number): [number, number] {
+			return [(viewportX - 10 - (0.5 * ((500 - viewportY) / 3))) / 2, (500 - viewportY) / 3];
+		},
+		convertToViewportPoint(pdfX: number, pdfY: number): [number, number] {
+			return [10 + (pdfX * 2) + (pdfY * 0.5), 500 - (pdfY * 3)];
+		},
+	};
+
+	const marker = forwardSynctexMarkerFromPdfPoint({ pdfX: 100, pdfY: 40, pageHeight: 500, viewport });
+
+	assert.deepEqual(marker, { left: 230, top: 120 });
 });
 
 test("forward SyncTeX marker uses SyncTeX target dimensions when available", () => {

@@ -184,10 +184,11 @@ function viewportScale(input) {
 
 function forwardSynctexMarkerFromPdfPoint(input) {
 	const scale = viewportScale(input);
-	const point = input.viewport.convertToViewportPoint(input.pdfX, 0);
-	const width = Math.max(Number(input.width) || 0, 96) * scale.x;
-	const height = Math.max(Number(input.height) || 0, 10) * scale.y;
-	return { left: point[0], top: input.pdfY * scale.y, width, height };
+	const point = input.viewport.convertToViewportPoint(input.pdfX, input.pdfY);
+	const pageHeight = input.pageHeight ?? input.viewport.convertToViewportPoint(0, 0)[1];
+	const position = { left: point[0], top: pageHeight - point[1] };
+	if (input.width === undefined || input.height === undefined) return position;
+	return { ...position, width: input.width * scale.x, height: input.height * scale.y };
 }
 
 async function renderPdf(config) {
@@ -235,18 +236,26 @@ function showSynctexMarker(message) {
 	if (!marker) {
 		marker = document.createElement("div");
 		marker.dataset.synctexMarker = "true";
+		marker.tabIndex = -1;
 		marker.style.position = "absolute";
-		marker.style.border = "2px solid #ef4444";
-		marker.style.background = "rgba(239,68,68,.18)";
 		marker.style.pointerEvents = "none";
+		marker.style.zIndex = "100000";
 		page.appendChild(marker);
 	}
-	const position = forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, width: message.width, height: message.height, viewport });
+	const isCircle = message.width === undefined || message.height === undefined;
+	const position = forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, width: message.width, height: message.height, pageHeight: page.getBoundingClientRect().height, viewport });
+	marker.dataset.synctexMarkerKind = isCircle ? "circle" : "rect";
 	marker.style.left = String(position.left) + "px";
 	marker.style.top = String(position.top) + "px";
-	marker.style.width = String(position.width) + "px";
-	marker.style.height = String(position.height) + "px";
+	marker.style.border = isCircle ? "0.2em solid red" : "2px solid #ef4444";
+	marker.style.borderRadius = isCircle ? "50%" : "0";
+	marker.style.background = isCircle ? "rgba(255,0,0,0.4)" : "rgba(239,68,68,.18)";
+	marker.style.transform = isCircle ? "translate(-50%, -50%)" : "";
+	marker.style.opacity = isCircle ? "0.8" : "";
+	marker.style.width = isCircle ? "0.5em" : String(position.width) + "px";
+	marker.style.height = isCircle ? "0.5em" : String(position.height) + "px";
 	marker.scrollIntoView({ block: "center", inline: "center" });
+	marker.focus({ preventScroll: true });
 }
 
 function connectViewerSocket(config) {

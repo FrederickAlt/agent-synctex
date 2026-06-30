@@ -18,6 +18,7 @@ test("Viewer Host protocol validates representative MCP to Host messages", () =>
 		{ type: "open_pdf", pdf_id: 123, pdf_path: "/tmp/main.pdf", title: "main.pdf" },
 		{ type: "focus_pdf", pdf_id: 123 },
 		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, width: 250, height: 12, source_file: "/tmp/main.tex", line: 42 },
+		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, indicator: true, source_file: "/tmp/main.tex", line: 42 },
 		{ type: "pdf_maybe_updated", pdf_id: 123 },
 	];
 

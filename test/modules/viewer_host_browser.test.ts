@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -53,20 +53,9 @@ function writeBrowserSynctexFixture(baseDir: string): { pdfPath: string; sourceP
 	const pdfPath = join(baseDir, "paper.pdf");
 	const sourcePath = join(baseDir, "main.tex");
 	writeFileSync(pdfPath, makeOnePagePdf());
-	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nBrowser reverse target.\n\\end{document}\n");
-	writeFileSync(join(baseDir, "paper.synctex"), [
-		"SyncTeX Version:1",
-		"Input:1:main.tex",
-		"Output:pdf",
-		"Unit:1",
-		"Content:",
-		"{1",
-		"h1,3:7208960,14417920:1000000,500000,0",
-		"}",
-		"Postamble:",
-		"Count:0",
-		"",
-	].join("\n"));
+	const fixtureDir = resolve("test/fixtures/synctex-forward");
+	copyFileSync(join(fixtureDir, "main.tex"), sourcePath);
+	copyFileSync(join(fixtureDir, "paper.synctex"), join(baseDir, "paper.synctex"));
 	return { pdfPath, sourcePath };
 }
 
@@ -174,7 +163,7 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		});
 
 		const canvas = page.locator("#pages canvas[data-page-number='1']");
-		await canvas.click({ position: { x: 125, y: 50 } });
+		await canvas.click({ position: { x: 180, y: 56 } });
 
 		let event: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -187,24 +176,26 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assert.equal(event.pdf_id, 209);
 		assert.equal(event.source_file, sourcePath);
 		assert.equal(event.line, 3);
-		assert.equal(event.source_line, "Browser reverse target.");
+		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(event.page, 1);
-		assertApproximatelyEqual(Number(event.x), 100, 1, "reverse x PDF coordinate");
-		assertApproximatelyEqual(Number(event.y), 160, 1, "reverse y PDF coordinate");
+		assertApproximatelyEqual(Number(event.x), 144, 1, "reverse x PDF coordinate");
+		assertApproximatelyEqual(Number(event.y), 155, 1, "reverse y PDF coordinate");
 
 		const control = new ViewerHostControlClient({ origin: server.origin });
-		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 209, page: 1, x: 100, y: 40, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 209 } });
-		await page.waitForSelector("[data-synctex-marker]", { state: "attached", timeout: 2_000 });
+		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 209, page: 1, x: 100, y: 40, indicator: true, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 209 } });
+		await page.waitForSelector("[data-synctex-marker][data-synctex-marker-kind='circle']", { state: "attached", timeout: 2_000 });
 		const marker = await page.locator("[data-synctex-marker]").evaluate((element) => ({
 			left: Number.parseFloat((element as HTMLElement).style.left),
 			top: Number.parseFloat((element as HTMLElement).style.top),
-			width: Number.parseFloat((element as HTMLElement).style.width),
-			height: Number.parseFloat((element as HTMLElement).style.height),
+			width: (element as HTMLElement).style.width,
+			height: (element as HTMLElement).style.height,
+			focused: element === document.activeElement,
 		}));
 		assertApproximatelyEqual(marker.left, 125, 1, "forward marker left viewport coordinate");
 		assertApproximatelyEqual(marker.top, 50, 1, "forward marker top-origin viewport coordinate");
-		assert.equal(marker.width >= 120, true, "forward marker should be snippet-sized, not a tiny fixed box");
-		assert.equal(marker.height >= 12, true, "forward marker should be line-height sized");
+		assert.equal(marker.width, "0.5em", "LW circle marker should not invent rectangle width from missing SyncTeX width");
+		assert.equal(marker.height, "0.5em", "LW circle marker should not invent rectangle height from missing SyncTeX height");
+		assert.equal(marker.focused, true, "forward marker should be focusable and focused after jump");
 	} finally {
 		await browser?.close();
 		await server.stop();
