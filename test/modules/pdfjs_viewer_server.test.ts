@@ -146,6 +146,7 @@ test("PDF.js viewer server serves shell/config/assets and registered PDF bytes o
 		assertNoExternalUrls("viewer script", viewerScript);
 		assert.match(viewerScript, /pdf_refresh/);
 		assert.match(viewerScript, /synctex/);
+		assert.match(viewerScript, /canvas\.offsetHeight - \(event\.clientY - rect\.top\)/);
 		assert.match(viewerScript, /window\.scrollTo/);
 		assert.doesNotMatch(viewerScript, /location\.reload|viewer_reload/);
 

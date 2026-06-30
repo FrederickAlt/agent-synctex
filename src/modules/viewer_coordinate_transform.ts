@@ -7,6 +7,7 @@ export interface ReverseSynctexViewportInput {
 	page: number;
 	viewportX: number;
 	viewportY: number;
+	viewportHeight: number;
 	viewport: PdfJsViewportCoordinateConverter;
 }
 
@@ -34,7 +35,7 @@ export interface ForwardSynctexMarkerPosition {
 }
 
 export function reverseSynctexPayloadFromViewportPoint(input: ReverseSynctexViewportInput): ReverseSynctexSocketPayload {
-	const [x, y] = input.viewport.convertToPdfPoint(input.viewportX, input.viewportY);
+	const [x, y] = input.viewport.convertToPdfPoint(input.viewportX, input.viewportHeight - input.viewportY);
 	return { type: "reverse_synctex", page: input.page, x, y };
 }
 

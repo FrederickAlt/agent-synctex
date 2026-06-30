@@ -171,7 +171,7 @@ let viewerSocket;
 const pageViewports = new Map();
 
 function reverseSynctexPayloadFromViewportPoint(input) {
-	const point = input.viewport.convertToPdfPoint(input.viewportX, input.viewportY);
+	const point = input.viewport.convertToPdfPoint(input.viewportX, input.viewportHeight - input.viewportY);
 	return { type: "reverse_synctex", page: input.page, x: point[0], y: point[1] };
 }
 
@@ -211,7 +211,7 @@ async function renderPdf(config) {
 		canvas.addEventListener("click", (event) => {
 			if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
 			const rect = canvas.getBoundingClientRect();
-			const payload = reverseSynctexPayloadFromViewportPoint({ page: pageNumber, viewportX: event.clientX - rect.left, viewportY: event.clientY - rect.top, viewport });
+			const payload = reverseSynctexPayloadFromViewportPoint({ page: pageNumber, viewportX: event.clientX - rect.left, viewportY: event.clientY - rect.top, viewportHeight: canvas.offsetHeight, viewport });
 			viewerSocket.send(JSON.stringify(payload));
 		});
 		const pageContainer = document.createElement("div");
