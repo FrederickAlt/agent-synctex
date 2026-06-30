@@ -39,6 +39,12 @@ export interface SyncTeXRecordToPDF {
 	indicator?: boolean;
 }
 
+export interface SyncTeXRecordToTeX {
+	input: string;
+	line: number;
+	column: number;
+}
+
 export class Rectangle {
 	readonly top: number;
 	readonly bottom: number;
@@ -190,4 +196,77 @@ export function syncTeXToPDF(line: number, filePath: string, pdfPath: string): S
 		bottom = c1.bottom;
 	}
 	return { page: blocks1[0].page, x: c1.left + parsed.pdfSyncObject.offset.x, y: bottom + parsed.pdfSyncObject.offset.y, indicator: true };
+}
+
+export function syncTeXToTeX(page: number, x: number, y: number, pdfPath: string): SyncTeXRecordToTeX | undefined {
+	const parsed = parseSyncTexForPdf(pdfPath);
+	if (!parsed) {
+		return undefined;
+	}
+	const pdfSyncObject = parsed.pdfSyncObject;
+	const y0 = y - pdfSyncObject.offset.y;
+	const x0 = x - pdfSyncObject.offset.x;
+	const fileNames = Object.keys(pdfSyncObject.blockNumberLine);
+
+	if (fileNames.length === 0) {
+		return undefined;
+	}
+
+	const record = {
+		input: "",
+		line: 0,
+		distanceXY: 2e16,
+		distanceFromCenter: 2e16,
+		rect: new Rectangle({ top: 0, bottom: 2e16, left: 0, right: 2e16 }),
+	};
+
+	for (const fileName of fileNames) {
+		const linePageBlocks = pdfSyncObject.blockNumberLine[fileName];
+		for (const lineNum in linePageBlocks) {
+			const pageBlocks = linePageBlocks[Number(lineNum)];
+			for (const pageNum in pageBlocks) {
+				if (page !== Number(pageNum)) {
+					continue;
+				}
+				const blocks = pageBlocks[Number(pageNum)];
+				for (const block of blocks) {
+					// Skip a block if they have boxes inside, or their type is kern or rule.
+					// See also https://github.com/jlaurens/synctex/blob/c11fe00dbdc6423a0e54d4e531563be645f78679/synctex_parser.c#L4706-L4727 for types.
+					if (block.elements !== undefined || block.type === "k" || block.type === "r") {
+						continue;
+					}
+					const rect = toRect(block);
+					const distFromCenter = rect.distanceFromCenter(x0, y0);
+					if (record.rect.include(rect) || (distFromCenter < record.distanceFromCenter && !rect.include(record.rect))) {
+						record.input = fileName;
+						record.line = Number(lineNum);
+						record.distanceFromCenter = distFromCenter;
+						record.rect = rect;
+					}
+				}
+			}
+		}
+	}
+
+	if (record.input === "") {
+		return undefined;
+	}
+
+	const input = convInputFilePath(record.input);
+	return input ? { input, line: record.line, column: 0 } : undefined;
+}
+
+export function convInputFilePath(inputFilePath: string): string | undefined {
+	if (fs.existsSync(inputFilePath)) {
+		return inputFilePath;
+	}
+	for (const enc of iconvLiteSupportedEncodings) {
+		try {
+			const convertedPath = iconv.decode(Buffer.from(inputFilePath, "binary"), enc);
+			if (fs.existsSync(convertedPath)) {
+				return convertedPath;
+			}
+		} catch { }
+	}
+	return undefined;
 }

@@ -1,16 +1,6 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { gunzipSync } from "node:zlib";
-import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
-import { syncTeXToPDF, resolveLatexWorkshopSynctexSidecar } from "./latex_workshop/worker.ts";
+import { extname, isAbsolute, resolve, basename } from "node:path";
+import { syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar } from "./latex_workshop/worker.ts";
 import { readSourceLine } from "./source_line.ts";
-
-// Legacy self-authored SyncTeX helpers remain for reverse mapping only.
-// Production forward mapping is delegated to the LaTeX-Workshop-derived adapter below.
-const SCALED_POINTS_PER_POINT = 65_536;
-const MAX_NEAREST_LINE_DISTANCE = 2;
-const FALLBACK_FORWARD_HIGHLIGHT_HEIGHT_POINTS = 10;
-const ROW_LOCAL_BASELINE_TOLERANCE_POINTS = 3;
-const ROW_LOCAL_SOURCE_LINE_WINDOW = 1;
 
 export interface ForwardSynctexTarget {
 	page: number;
@@ -46,47 +36,6 @@ export interface ReverseSynctexLocation {
 	sidecarPath: string;
 }
 
-interface SynctexInputRecord {
-	tag: number;
-	path: string;
-	canonicalPaths: Set<string>;
-}
-
-interface SynctexPositionRecord {
-	page: number;
-	tag: number;
-	line: number;
-	type: string;
-	x: number;
-	y: number;
-	width: number;
-	height: number;
-	depth: number;
-	primary: boolean;
-}
-
-interface SynctexLineAggregate {
-	line: number;
-	page: number;
-	x: number;
-	y: number;
-	minX: number;
-	minY: number;
-	maxX: number;
-	maxY: number;
-}
-
-interface AlignedMathRowContext {
-	rowIndex: number;
-	rowCount: number;
-	endLine: number;
-}
-
-interface ParsedSynctex {
-	inputs: Map<number, SynctexInputRecord>;
-	positions: SynctexPositionRecord[];
-}
-
 export function resolveSynctexSidecar(pdfPath: string): string | undefined {
 	const normalizedPdfPath = resolve(pdfPath);
 	const basePath = normalizedPdfPath.toLowerCase().endsWith(".pdf")
@@ -95,354 +44,8 @@ export function resolveSynctexSidecar(pdfPath: string): string | undefined {
 	return resolveLatexWorkshopSynctexSidecar(`${basePath}.pdf`);
 }
 
-function readSynctexSidecar(sidecarPath: string): string {
-	try {
-		const contents = readFileSync(sidecarPath);
-		return sidecarPath.endsWith(".gz") ? gunzipSync(contents).toString("utf8") : contents.toString("utf8");
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`Cannot read SyncTeX sidecar ${sidecarPath}: ${message}`);
-	}
-}
-
-function decodeSynctexPath(rawPath: string): string {
-	try {
-		return decodeURIComponent(rawPath);
-	} catch {
-		return rawPath;
-	}
-}
-
-function canonicalFilePath(path: string): string {
-	const resolvedPath = resolve(path);
-	try {
-		return realpathSync.native(resolvedPath);
-	} catch {
-		return resolvedPath;
-	}
-}
-
-function scaledPointToPdfPoint(value: number, unit: number): number {
-	const points = (value * unit) / SCALED_POINTS_PER_POINT;
-	return Math.round(points * 1000) / 1000;
-}
-
-function uniqueResolvedPaths(inputPath: string, pdfDirectory: string, cwd: string): string[] {
-	const candidates = isAbsolute(inputPath)
-		? [resolve(inputPath)]
-		: [resolve(cwd, inputPath), resolve(pdfDirectory, inputPath)];
-	return [...new Set(candidates)];
-}
-
-function isPrimaryPositionType(type: string): boolean {
-	// Containers (`[` and `(`) and kern records (`k`) commonly use nearby structural
-	// source lines. Prefer rendered glyph/glue/list/rule points for forward search.
-	return type !== "[" && type !== "(" && type !== "k";
-}
-
-function parseSynctexText(text: string, pdfDirectory: string, cwd: string): ParsedSynctex {
-	const inputs = new Map<number, SynctexInputRecord>();
-	const positions: SynctexPositionRecord[] = [];
-	let page: number | undefined;
-	let unit = 1;
-	let xOffset = 0;
-	let yOffset = 0;
-
-	for (const rawLine of text.split(/\r?\n/)) {
-		const line = rawLine.trim();
-		if (!line) continue;
-
-		const unitMatch = /^Unit:([0-9.]+)$/.exec(line);
-		if (unitMatch) {
-			const parsedUnit = Number(unitMatch[1]);
-			if (Number.isFinite(parsedUnit) && parsedUnit > 0) unit = parsedUnit;
-			continue;
-		}
-		const xOffsetMatch = /^X Offset:(-?\d+)$/.exec(line);
-		if (xOffsetMatch) {
-			xOffset = Number(xOffsetMatch[1]);
-			continue;
-		}
-		const yOffsetMatch = /^Y Offset:(-?\d+)$/.exec(line);
-		if (yOffsetMatch) {
-			yOffset = Number(yOffsetMatch[1]);
-			continue;
-		}
-
-		const inputMatch = /^Input:(\d+):(.+)$/.exec(line);
-		if (inputMatch) {
-			const tag = Number(inputMatch[1]);
-			const inputPath = decodeSynctexPath(inputMatch[2].trim());
-			const resolvedPaths = uniqueResolvedPaths(inputPath, pdfDirectory, cwd);
-			inputs.set(tag, {
-				tag,
-				path: resolvedPaths[0],
-				canonicalPaths: new Set(resolvedPaths.map(canonicalFilePath)),
-			});
-			continue;
-		}
-
-		const pageMatch = /^\{(\d+)/.exec(line);
-		if (pageMatch) {
-			page = Number(pageMatch[1]);
-			continue;
-		}
-		if (/^}\d*$/.test(line)) {
-			page = undefined;
-			continue;
-		}
-
-		const positionMatch = /^([\[(A-Za-z$])(\d+),(\d+):(-?\d+),(-?\d+)(?::(-?\d+),(-?\d+),(-?\d+))?/.exec(line);
-		if (!positionMatch || page === undefined) continue;
-		const type = positionMatch[1];
-		positions.push({
-			page,
-			type,
-			tag: Number(positionMatch[2]),
-			line: Number(positionMatch[3]),
-			x: scaledPointToPdfPoint(Number(positionMatch[4]) + xOffset, unit),
-			y: scaledPointToPdfPoint(Number(positionMatch[5]) + yOffset, unit),
-			width: scaledPointToPdfPoint(Number(positionMatch[6] ?? 0), unit),
-			height: scaledPointToPdfPoint(Number(positionMatch[7] ?? 0), unit),
-			depth: scaledPointToPdfPoint(Number(positionMatch[8] ?? 0), unit),
-			primary: isPrimaryPositionType(type),
-		});
-	}
-
-	return { inputs, positions };
-}
-
 function sourcePathLabel(sourceFile: string): string {
 	return basename(sourceFile) || sourceFile;
-}
-
-function positionBounds(position: SynctexPositionRecord): { minX: number; minY: number; maxX: number; maxY: number } {
-	const width = Math.max(0, position.width);
-	const height = Math.max(0, position.height);
-	const depth = Math.max(0, position.depth);
-	const minX = position.x;
-	const maxX = position.x + width;
-	// SyncTeX Y is a top-origin baseline; height extends above it and depth below it.
-	const minY = position.y - height;
-	const maxY = position.y + depth;
-	return { minX, minY, maxX, maxY };
-}
-
-function mergePositionIntoAggregate(aggregate: SynctexLineAggregate, position: SynctexPositionRecord): void {
-	const bounds = positionBounds(position);
-	aggregate.minX = Math.min(aggregate.minX, bounds.minX);
-	aggregate.minY = Math.min(aggregate.minY, bounds.minY);
-	aggregate.maxX = Math.max(aggregate.maxX, bounds.maxX);
-	aggregate.maxY = Math.max(aggregate.maxY, bounds.maxY);
-	aggregate.x = aggregate.minX;
-	aggregate.y = aggregate.minY;
-}
-
-function aggregateLinePositions(positions: SynctexPositionRecord[], matchingTags: Set<number>, primaryOnly: boolean): SynctexLineAggregate[] {
-	const byLine = new Map<number, SynctexLineAggregate>();
-	for (const position of positions) {
-		if (!matchingTags.has(position.tag)) continue;
-		if (primaryOnly && !position.primary) continue;
-		const bounds = positionBounds(position);
-		const aggregate = byLine.get(position.line);
-		if (!aggregate) {
-			byLine.set(position.line, {
-				line: position.line,
-				page: position.page,
-				x: bounds.minX,
-				y: bounds.minY,
-				minX: bounds.minX,
-				minY: bounds.minY,
-				maxX: bounds.maxX,
-				maxY: bounds.maxY,
-			});
-			continue;
-		}
-		mergePositionIntoAggregate(aggregate, position);
-	}
-	return [...byLine.values()].sort((left, right) => left.line - right.line);
-}
-
-function isAlignedMathSourceLine(sourceLine: string): boolean {
-	return /(^|[^\\])&/.test(sourceLine) || /\\\\\s*$/.test(sourceLine);
-}
-
-function readSourceLines(filePath: string, cwd: string): string[] | undefined {
-	const sourceFile = isAbsolute(filePath) ? resolve(filePath) : resolve(cwd, filePath);
-	try {
-		return readFileSync(sourceFile, "utf8").split(/\r?\n/);
-	} catch {
-		return undefined;
-	}
-}
-
-function findAlignedMathRowContext(sourceLines: string[], targetLine: number): AlignedMathRowContext | undefined {
-	const targetIndex = targetLine - 1;
-	if (!sourceLines[targetIndex] || !isAlignedMathSourceLine(sourceLines[targetIndex])) return undefined;
-
-	let beginIndex: number | undefined;
-	for (let index = targetIndex; index >= 0; index -= 1) {
-		if (/\\begin\{(?:align\*?|aligned)\}/.test(sourceLines[index])) {
-			beginIndex = index;
-			break;
-		}
-		if (/\\end\{(?:align\*?|aligned)\}/.test(sourceLines[index])) return undefined;
-	}
-	if (beginIndex === undefined) return undefined;
-
-	let endIndex: number | undefined;
-	for (let index = beginIndex + 1; index < sourceLines.length; index += 1) {
-		if (/\\end\{(?:align\*?|aligned)\}/.test(sourceLines[index])) {
-			endIndex = index;
-			break;
-		}
-	}
-	if (endIndex === undefined || targetIndex >= endIndex) return undefined;
-
-	const rowLines = [];
-	for (let index = beginIndex + 1; index < endIndex; index += 1) {
-		if (isAlignedMathSourceLine(sourceLines[index])) rowLines.push(index + 1);
-	}
-	const rowIndex = rowLines.indexOf(targetLine);
-	return rowIndex === -1 ? undefined : { rowIndex, rowCount: rowLines.length, endLine: endIndex + 1 };
-}
-
-function clusterBaseline(records: SynctexPositionRecord[]): number | undefined {
-	const sortedRecords = [...records].sort((left, right) => left.y - right.y);
-	let best: { y: number; count: number; width: number } | undefined;
-	let current: { y: number; count: number; width: number } | undefined;
-	for (const record of sortedRecords) {
-		const width = Math.max(0, record.width);
-		if (!current || Math.abs(record.y - current.y) > ROW_LOCAL_BASELINE_TOLERANCE_POINTS) {
-			if (!best || current && (current.count > best.count || current.count === best.count && current.width > best.width)) best = current;
-			current = { y: record.y, count: 1, width };
-			continue;
-		}
-		current.y = ((current.y * current.count) + record.y) / (current.count + 1);
-		current.count += 1;
-		current.width += width;
-	}
-	if (!best || current && (current.count > best.count || current.count === best.count && current.width > best.width)) best = current;
-	return best?.y;
-}
-
-function aggregateRecords(records: SynctexPositionRecord[], line: number, page: number): SynctexLineAggregate | undefined {
-	let aggregate: SynctexLineAggregate | undefined;
-	for (const position of records) {
-		const bounds = positionBounds(position);
-		if (!aggregate) {
-			aggregate = {
-				line,
-				page,
-				x: bounds.minX,
-				y: bounds.minY,
-				minX: bounds.minX,
-				minY: bounds.minY,
-				maxX: bounds.maxX,
-				maxY: bounds.maxY,
-			};
-			continue;
-		}
-		mergePositionIntoAggregate(aggregate, position);
-	}
-	return aggregate;
-}
-
-function aggregateRowLocalPosition(positions: SynctexPositionRecord[], matchingTags: Set<number>, targetLine: number, page: number): SynctexLineAggregate | undefined {
-	const anchorY = clusterBaseline(positions.filter((position) =>
-		position.page === page
-		&& position.line === targetLine
-		&& position.primary
-		&& matchingTags.has(position.tag),
-	));
-	if (anchorY === undefined) return undefined;
-
-	return aggregateRecords(positions.filter((position) =>
-		position.page === page
-		&& matchingTags.has(position.tag)
-		&& Math.abs(position.line - targetLine) <= ROW_LOCAL_SOURCE_LINE_WINDOW
-		&& Math.abs(position.y - anchorY) <= ROW_LOCAL_BASELINE_TOLERANCE_POINTS,
-	), targetLine, page);
-}
-
-function aggregateAlignedMathRowPosition(positions: SynctexPositionRecord[], matchingTags: Set<number>, targetLine: number, page: number, context: AlignedMathRowContext): SynctexLineAggregate | undefined {
-	const candidateLines = [...new Set(positions
-		.filter((position) => position.page === page && position.primary && matchingTags.has(position.tag) && position.line >= targetLine && position.line <= context.endLine + 2)
-		.map((position) => position.line))]
-		.sort((left, right) => left - right);
-
-	for (const line of candidateLines) {
-		const sortedRecords = positions
-			.filter((position) => position.page === page && position.line === line && position.primary && matchingTags.has(position.tag))
-			.sort((left, right) => left.y - right.y);
-		const rowClusters: SynctexPositionRecord[][] = [];
-		for (const record of sortedRecords) {
-			const lastCluster = rowClusters.at(-1);
-			const lastY = lastCluster === undefined ? undefined : clusterBaseline(lastCluster);
-			if (lastCluster === undefined || lastY === undefined || Math.abs(record.y - lastY) > ROW_LOCAL_BASELINE_TOLERANCE_POINTS) {
-				rowClusters.push([record]);
-				continue;
-			}
-			lastCluster.push(record);
-		}
-		if (rowClusters.length < context.rowCount || rowClusters[context.rowIndex] === undefined) continue;
-		return aggregateRecords(rowClusters[context.rowIndex], targetLine, page);
-	}
-	return undefined;
-}
-
-function interpolateLine(targetLine: number, lower: SynctexLineAggregate, upper: SynctexLineAggregate): SynctexLineAggregate {
-	if (lower.page !== upper.page) {
-		return targetLine - lower.line <= upper.line - targetLine ? lower : upper;
-	}
-	const ratio = (targetLine - lower.line) / (upper.line - lower.line);
-	return {
-		line: targetLine,
-		page: lower.page,
-		x: Math.round((lower.x + ((upper.x - lower.x) * ratio)) * 1000) / 1000,
-		y: Math.round((lower.y + ((upper.y - lower.y) * ratio)) * 1000) / 1000,
-		minX: Math.round((lower.minX + ((upper.minX - lower.minX) * ratio)) * 1000) / 1000,
-		minY: Math.round((lower.minY + ((upper.minY - lower.minY) * ratio)) * 1000) / 1000,
-		maxX: Math.round((lower.maxX + ((upper.maxX - lower.maxX) * ratio)) * 1000) / 1000,
-		maxY: Math.round((lower.maxY + ((upper.maxY - lower.maxY) * ratio)) * 1000) / 1000,
-	};
-}
-
-function selectLinePosition(linePositions: SynctexLineAggregate[], targetLine: number, allowExact = true): SynctexLineAggregate | undefined {
-	const exact = allowExact ? linePositions.find((candidate) => candidate.line === targetLine) : undefined;
-	if (exact) return exact;
-
-	let lower: SynctexLineAggregate | undefined;
-	let upper: SynctexLineAggregate | undefined;
-	for (const candidate of linePositions) {
-		if (candidate.line < targetLine) lower = candidate;
-		if (candidate.line > targetLine) {
-			upper = candidate;
-			break;
-		}
-	}
-	if (lower && upper) return interpolateLine(targetLine, lower, upper);
-
-	const nearest = linePositions
-		.map((candidate) => ({ candidate, distance: Math.abs(candidate.line - targetLine) }))
-		.sort((left, right) => left.distance - right.distance)[0];
-	return nearest && nearest.distance <= MAX_NEAREST_LINE_DISTANCE ? nearest.candidate : undefined;
-}
-
-function distanceToPosition(position: SynctexPositionRecord, x: number, y: number): number {
-	const minX = position.x;
-	const maxX = position.x + Math.max(0, position.width);
-	const minY = position.y;
-	const maxY = position.y + Math.max(0, position.height) + Math.max(0, position.depth);
-	const dx = x < minX ? minX - x : x > maxX ? x - maxX : 0;
-	const dy = y < minY ? minY - y : y > maxY ? y - maxY : 0;
-	return Math.hypot(dx, dy);
-}
-
-function estimateColumn(sourceLine: string | undefined, aggregate: SynctexLineAggregate | undefined, x: number): number {
-	if (!sourceLine || !aggregate || aggregate.maxX <= aggregate.minX) return 1;
-	const ratio = Math.max(0, Math.min(1, (x - aggregate.minX) / (aggregate.maxX - aggregate.minX)));
-	return Math.max(1, Math.min(sourceLine.length + 1, Math.round(ratio * sourceLine.length) + 1));
 }
 
 export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; line: number; cwd: string }): ForwardSynctexJump {
@@ -487,7 +90,15 @@ export function mapForwardSynctex(input: { pdfPath: string; sourceFile: string; 
 	};
 }
 
-export function mapReverseSynctex(input: { pdfPath: string; page: number; x: number; y: number; cwd: string }): ReverseSynctexLocation {
+export function mapReverseSynctex(input: {
+	pdfPath: string;
+	page: number;
+	x: number;
+	y: number;
+	cwd: string;
+	textBeforeSelection?: string;
+	textAfterSelection?: string;
+}): ReverseSynctexLocation {
 	if (!Number.isInteger(input.page) || input.page < 1) {
 		throw new Error("page must be a positive integer");
 	}
@@ -500,30 +111,29 @@ export function mapReverseSynctex(input: { pdfPath: string; page: number; x: num
 		throw new Error(`PDF ${pdfPath} is missing SyncTeX sidecar (${pdfPath.replace(/\.pdf$/i, "")}.synctex or .synctex.gz)`);
 	}
 
-	const parsed = parseSynctexText(readSynctexSidecar(sidecarPath), dirname(pdfPath), input.cwd);
-	const pagePositions = parsed.positions.filter((position) => position.page === input.page && parsed.inputs.has(position.tag));
-	const candidates = pagePositions.filter((position) => position.primary);
-	const pool = candidates.length > 0 ? candidates : pagePositions;
-	const nearest = pool
-		.map((position) => ({ position, distance: distanceToPosition(position, input.x, input.y) }))
-		.sort((left, right) => left.distance - right.distance)[0]?.position;
-	if (!nearest) {
+	let mapped;
+	const previousCwd = process.cwd();
+	try {
+		process.chdir(input.cwd);
+		mapped = syncTeXToTeX(input.page, input.x, input.y, pdfPath);
+	} catch {
+		mapped = undefined;
+	} finally {
+		process.chdir(previousCwd);
+	}
+	if (mapped === undefined) {
 		throw new Error(`No SyncTeX mapping found for page ${input.page} at ${input.x},${input.y}`);
 	}
-	const sourceFile = parsed.inputs.get(nearest.tag)?.path;
-	if (!sourceFile) {
-		throw new Error(`No SyncTeX input record matched tag ${nearest.tag}`);
-	}
-	const sourceLine = readSourceLine(sourceFile, nearest.line, input.cwd);
-	const lineAggregate = aggregateLinePositions(parsed.positions, new Set([nearest.tag]), false)
-		.find((candidate) => candidate.page === nearest.page && candidate.line === nearest.line);
+
+	const sourceFile = isAbsolute(mapped.input) ? resolve(mapped.input) : resolve(input.cwd, mapped.input);
+	const sourceLine = readSourceLine(sourceFile, mapped.line, input.cwd);
 	return {
 		page: input.page,
 		x: input.x,
 		y: input.y,
 		sourceFile,
-		line: nearest.line,
-		column: estimateColumn(sourceLine, lineAggregate, input.x),
+		line: mapped.line,
+		column: mapped.column,
 		...(sourceLine === undefined ? {} : { sourceLine }),
 		sidecarPath,
 	};

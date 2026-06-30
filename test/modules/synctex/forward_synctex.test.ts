@@ -6,7 +6,7 @@ import { gzipSync } from "node:zlib";
 import * as iconv from "iconv-lite";
 import { test } from "node:test";
 import { mapForwardSynctex, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
-import { findInputFilePathForward, syncTeXToPDF } from "../../../src/modules/synctex/latex_workshop/worker.ts";
+import { findInputFilePathForward, syncTeXToPDF, syncTeXToTeX } from "../../../src/modules/synctex/latex_workshop/worker.ts";
 import type { PdfSyncObject } from "../../../src/modules/synctex/latex_workshop/synctexjs.ts";
 
 const FIXTURE_DIR = resolve("test/fixtures/synctex-forward");
@@ -72,7 +72,25 @@ test("forward SyncTeX adapter returns LaTeX-Workshop output plus current API glu
 	}
 });
 
-test("reverse SyncTeX mapper reads realistic .synctex fixtures and maps page coordinates to source lines", () => {
+test("LaTeX-Workshop-derived syncTeXToTeX maps realistic .synctex fixture coordinates to source lines", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	const previousCwd = process.cwd();
+	try {
+		process.chdir(project.dir);
+		const location = syncTeXToTeX(1, 144.27, 155.27, project.pdfPath);
+
+		assert.deepEqual(location, {
+			input: "main.tex",
+			line: 3,
+			column: 0,
+		});
+	} finally {
+		process.chdir(previousCwd);
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX adapter returns LaTeX-Workshop output with column 0 and current API glue fields", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
@@ -80,14 +98,14 @@ test("reverse SyncTeX mapper reads realistic .synctex fixtures and maps page coo
 		assert.equal(location.sidecarPath, join(project.dir, "paper.synctex"));
 		assert.equal(location.sourceFile, project.sourcePath);
 		assert.equal(location.line, 3);
-		assert.equal(location.column, 1);
+		assert.equal(location.column, 0);
 		assert.equal(location.sourceLine, "First paragraph text that should wrap a little and create boxes.");
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
 
-test("reverse SyncTeX mapper reads realistic .synctex.gz fixtures", () => {
+test("reverse SyncTeX adapter reads realistic .synctex.gz fixtures", () => {
 	const project = makeFixtureProject({ sidecar: "synctex.gz" });
 	try {
 		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 167.27, cwd: project.dir });

@@ -522,7 +522,7 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		assert.equal(event.pdf_id, pdfId);
 		assert.equal(event.source_file, sourcePath);
 		assert.equal(event.line, 3);
-		assert.equal(event.column, 1);
+		assert.equal(event.column, 0);
 		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(typeof event.timestamp, "string");
 		assert.equal("callback" in event, false);

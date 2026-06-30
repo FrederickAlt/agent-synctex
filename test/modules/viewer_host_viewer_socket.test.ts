@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -19,20 +19,8 @@ function writeSynctexFixture(baseDir: string): { pdfPath: string; sourcePath: st
 	const pdfPath = join(baseDir, "paper.pdf");
 	const sourcePath = join(baseDir, "main.tex");
 	writeFakePdf(pdfPath);
-	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}\nReverse target text.\n\\end{document}\n");
-	writeFileSync(join(baseDir, "paper.synctex"), [
-		"SyncTeX Version:1",
-		"Input:1:main.tex",
-		"Output:pdf",
-		"Unit:1",
-		"Content:",
-		"{1",
-		"h1,3:7208960,14417920:1000000,500000,0",
-		"}",
-		"Postamble:",
-		"Count:0",
-		"",
-	].join("\n"));
+	copyFileSync(join(process.cwd(), "test/fixtures/synctex-forward/main.tex"), sourcePath);
+	copyFileSync(join(process.cwd(), "test/fixtures/synctex-forward/paper.synctex"), join(baseDir, "paper.synctex"));
 	return { pdfPath, sourcePath };
 }
 
@@ -265,7 +253,7 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 		const token = await getViewerSocketToken(server.origin, 112);
 		socket = await openViewerSocket(server.origin, 112, token);
 
-		socket.send(JSON.stringify({ type: "reverse_synctex", page: 1, x: 110, y: 220 }));
+		socket.send(JSON.stringify({ type: "reverse_synctex", page: 1, x: 144.27, y: 155.27 }));
 
 		let details: { events?: Array<Record<string, unknown>> } | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -282,12 +270,12 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 			pdf_id: 112,
 			source_file: sourcePath,
 			line: 3,
-			column: 1,
-			source_line: "Reverse target text.",
+			column: 0,
+			source_line: "First paragraph text that should wrap a little and create boxes.",
 			timestamp: details?.events?.[0]?.timestamp,
 			page: 1,
-			x: 110,
-			y: 220,
+			x: 144.27,
+			y: 155.27,
 		});
 		assert.match(String(details?.events?.[0]?.timestamp), /^\d{4}-\d{2}-\d{2}T/);
 	} finally {
