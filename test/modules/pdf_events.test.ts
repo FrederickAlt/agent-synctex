@@ -37,3 +37,20 @@ test("PDF event store filters by pdf_id before selecting last N events", () => {
 	assert.deepEqual(store.getEvents({ pdf_id: 10, max_events: 2, stale: true }).map((item) => item.sequence), [3, 5]);
 	assert.deepEqual(store.getEvents({ pdf_id: 20, max_events: 5, stale: true }).map((item) => item.sequence), [2, 4]);
 });
+
+test("PDF event store assigns sequences to selection debug events and returns full details", () => {
+	const store = new PdfEventStore();
+	const debug = store.appendSelectionDebugEvent({
+		type: "selection_debug",
+		pdf_id: 42,
+		timestamp: "2026-07-01T00:00:00.000Z",
+		phase: "send",
+		page: 1,
+		text: "selected browser text",
+		details: { selectionTextLength: 21, rangeCount: 1, nested: { retained: true } },
+	});
+
+	assert.equal(debug.sequence, 1);
+	assert.deepEqual(store.getEvents({ pdf_id: 42, max_events: 1 }), [debug]);
+	assert.deepEqual(store.getEvents({ pdf_id: 42, max_events: 1, stale: true }), [debug]);
+});

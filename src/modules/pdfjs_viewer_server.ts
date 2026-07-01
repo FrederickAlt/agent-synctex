@@ -53,6 +53,76 @@ let selectionGeneration = 0;
 let lastSentSelectionSignature;
 let lastSentSelectionGeneration;
 let pendingReverseSynctexSelectionSend;
+let pendingSelectionMouseDownDebug;
+let selectionDebugCount = 0;
+const MAX_SELECTION_DEBUG_EVENTS = 200;
+const MAX_SELECTION_DEBUG_TEXT = 500;
+
+function boundedSelectionDebugText(value) {
+	const text = typeof value === "string" ? value : "";
+	return text.length > MAX_SELECTION_DEBUG_TEXT ? text.slice(0, MAX_SELECTION_DEBUG_TEXT) : text;
+}
+
+function describeSelectionDebugNode(node) {
+	if (!node) return undefined;
+	if (node.nodeType === Node.TEXT_NODE) {
+		const text = node.textContent ?? "";
+		return { type: "text", length: text.length, text: boundedSelectionDebugText(text) };
+	}
+	if (node instanceof Element) {
+		return { type: "element", tag: node.tagName.toLowerCase(), id: node.id || undefined, className: typeof node.className === "string" ? node.className.slice(0, 80) : undefined, childNodes: node.childNodes.length };
+	}
+	return { type: String(node.nodeType) };
+}
+
+function selectionDebugSnapshot(phase, pageNumber, extra = {}) {
+	const selection = window.getSelection();
+	const text = selection ? selection.toString() : "";
+	const snapshot = {
+		phase,
+		time: Date.now(),
+		performanceNow: typeof performance !== "undefined" && performance.now ? performance.now() : undefined,
+		page: pageNumber,
+		selectionGeneration,
+		currentSignature: currentReverseSynctexSelectionSignature(),
+		selectionText: boundedSelectionDebugText(text),
+		selectionTextLength: text.length,
+		isCollapsed: selection?.isCollapsed,
+		rangeCount: selection?.rangeCount ?? 0,
+		anchorOffset: selection?.anchorOffset,
+		focusOffset: selection?.focusOffset,
+		anchorNode: describeSelectionDebugNode(selection?.anchorNode),
+		focusNode: describeSelectionDebugNode(selection?.focusNode),
+		...extra,
+	};
+	if (selection && selection.rangeCount > 0) {
+		const range = selection.getRangeAt(0);
+		snapshot.rangeStartOffset = range.startOffset;
+		snapshot.rangeEndOffset = range.endOffset;
+		snapshot.rangeStartNode = describeSelectionDebugNode(range.startContainer);
+		snapshot.rangeEndNode = describeSelectionDebugNode(range.endContainer);
+	}
+	return snapshot;
+}
+
+function sendSelectionDebugDetails(phase, pageNumber, details) {
+	if (selectionDebugCount >= MAX_SELECTION_DEBUG_EVENTS) return;
+	if (!activeViewerSocket || activeViewerSocket.readyState !== WebSocket.OPEN) return;
+	selectionDebugCount += 1;
+	activeViewerSocket.send(JSON.stringify({
+		type: "selection_debug",
+		phase,
+		...(pageNumber === undefined ? {} : { page: pageNumber }),
+		text: details.selectionText,
+		details,
+	}));
+}
+
+function sendSelectionDebug(phase, pageNumber, extra = {}) {
+	const details = selectionDebugSnapshot(phase, pageNumber, extra);
+	if (details.selectionTextLength === 0 && extra.selectedPayloadText === undefined && extra.suppressionReason === undefined && extra.sentText === undefined) return;
+	sendSelectionDebugDetails(phase, pageNumber, details);
+}
 
 function pdfUrlForRevision(config) {
 	return config.pdf_url;
@@ -263,6 +333,7 @@ document.addEventListener("selectionchange", () => {
 	const signature = currentReverseSynctexSelectionSignature();
 	if (signature !== lastObservedSelectionSignature) selectionGeneration += 1;
 	lastObservedSelectionSignature = signature;
+	sendSelectionDebug("selectionchange", undefined, { observedSignature: signature });
 });
 
 function sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport) {
@@ -270,9 +341,18 @@ function sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport) 
 	const selection = reverseSynctexContextForPage(pageElement, canvas, viewport);
 	if (selection.selectedText === undefined || selection.selectionStartX === undefined || selection.selectionStartY === undefined || selection.selectionEndX === undefined || selection.selectionEndY === undefined) return false;
 	const signature = reverseSynctexSelectionSignature(pageNumber, selection);
-	if (wasSelectionAlreadySent(signature, selectionGeneration)) return true;
+	if (wasSelectionAlreadySent(signature, selectionGeneration)) {
+		sendSelectionDebug("suppress", pageNumber, { suppressionReason: "already_sent", signature, generation: selectionGeneration, selectedPayloadText: boundedSelectionDebugText(selection.selectedText), selectedPayloadTextLength: selection.selectedText.length });
+		return true;
+	}
 	rememberSentSelection(signature, selectionGeneration);
-	activeViewerSocket.send(JSON.stringify(reverseSynctexSelectionPayload(pageNumber, selection)));
+	const payload = reverseSynctexSelectionPayload(pageNumber, selection);
+	sendSelectionDebug("send", pageNumber, { signature, generation: selectionGeneration, selectedPayloadText: boundedSelectionDebugText(payload.selectedText), selectedPayloadTextLength: payload.selectedText.length, selectionStartX: payload.selectionStartX, selectionStartY: payload.selectionStartY, selectionEndX: payload.selectionEndX, selectionEndY: payload.selectionEndY });
+	activeViewerSocket.send(JSON.stringify(payload));
+	setTimeout(() => {
+		const currentText = window.getSelection()?.toString() ?? "";
+		sendSelectionDebug("post_send_audit", pageNumber, { sentText: boundedSelectionDebugText(payload.selectedText), sentTextLength: payload.selectedText.length, currentText: boundedSelectionDebugText(currentText), currentTextLength: currentText.length, changed: currentText !== payload.selectedText });
+	}, 300);
 	return true;
 }
 
@@ -288,6 +368,7 @@ function scheduleReverseSynctexSelectionSend(pageNumber, pageElement, canvas, vi
 	function tick() {
 		if (pendingReverseSynctexSelectionSend !== request) return;
 		const signature = currentReverseSynctexSelectionSignature();
+		sendSelectionDebug("scheduler_tick", pageNumber, { observedGeneration, observedSignature, signature, stableSamples });
 		if (selectionGeneration !== observedGeneration || signature !== observedSignature) {
 			observedGeneration = selectionGeneration;
 			observedSignature = signature;
@@ -343,9 +424,15 @@ async function renderPdf(config, options = {}) {
 		pageContainer.appendChild(canvas);
 		await renderTextLayer(pdfjsLib, page, viewport, pageContainer);
 		pageContainer.addEventListener("mousedown", () => {
+			pendingSelectionMouseDownDebug = selectionDebugSnapshot("mousedown", pageNumber);
 			pendingReverseSynctexContexts.set(pageContainer, { ...reverseSynctexContextForPage(pageContainer, canvas, viewport), selectionGeneration });
 		}, true);
 		pageContainer.addEventListener("mouseup", () => {
+			if ((window.getSelection()?.toString() ?? "").length > 0 && pendingSelectionMouseDownDebug !== undefined) {
+				sendSelectionDebugDetails("mousedown", pageNumber, pendingSelectionMouseDownDebug);
+			}
+			pendingSelectionMouseDownDebug = undefined;
+			sendSelectionDebug("mouseup", pageNumber);
 			scheduleReverseSynctexSelectionSend(pageNumber, pageContainer, canvas, viewport);
 		}, true);
 		pageContainer.addEventListener("click", (event) => {
@@ -358,10 +445,19 @@ async function renderPdf(config, options = {}) {
 			const currentTextSelection = { ...reverseSynctexContextForPage(pageContainer, canvas, viewport), selectionGeneration };
 			const textSelection = hasReverseSynctexContext(pendingTextSelection) ? pendingTextSelection : currentTextSelection;
 			const selectionSignature = reverseSynctexSelectionSignature(pageNumber, textSelection);
-			if (wasSelectionAlreadySent(selectionSignature, textSelection.selectionGeneration)) return;
+			if (wasSelectionAlreadySent(selectionSignature, textSelection.selectionGeneration)) {
+				sendSelectionDebug("suppress", pageNumber, { suppressionReason: "already_sent_click", signature: selectionSignature, generation: textSelection.selectionGeneration, selectedPayloadText: boundedSelectionDebugText(textSelection.selectedText), selectedPayloadTextLength: textSelection.selectedText?.length });
+				return;
+			}
 			if (textSelection.selectedText !== undefined && textSelection.selectionStartX !== undefined && textSelection.selectionStartY !== undefined && textSelection.selectionEndX !== undefined && textSelection.selectionEndY !== undefined) {
 				rememberSentSelection(selectionSignature, textSelection.selectionGeneration);
-				activeViewerSocket.send(JSON.stringify(reverseSynctexSelectionPayload(pageNumber, textSelection)));
+				const payload = reverseSynctexSelectionPayload(pageNumber, textSelection);
+				sendSelectionDebug("send", pageNumber, { signature: selectionSignature, generation: textSelection.selectionGeneration, selectedPayloadText: boundedSelectionDebugText(payload.selectedText), selectedPayloadTextLength: payload.selectedText.length, selectionStartX: payload.selectionStartX, selectionStartY: payload.selectionStartY, selectionEndX: payload.selectionEndX, selectionEndY: payload.selectionEndY });
+				activeViewerSocket.send(JSON.stringify(payload));
+				setTimeout(() => {
+					const currentText = window.getSelection()?.toString() ?? "";
+					sendSelectionDebug("post_send_audit", pageNumber, { sentText: boundedSelectionDebugText(payload.selectedText), sentTextLength: payload.selectedText.length, currentText: boundedSelectionDebugText(currentText), currentTextLength: currentText.length, changed: currentText !== payload.selectedText });
+				}, 300);
 				return;
 			}
 			activeViewerSocket.send(JSON.stringify({
@@ -662,6 +758,29 @@ function decodeWebSocketTextFrames(frameBuffer: Buffer): { messages: string[]; r
 	return { messages, remaining: frameBuffer.subarray(cursor) };
 }
 
+function parseViewerSelectionDebug(pdfId: number, rawMessage: string): ViewerSelectionDebug | undefined {
+	let message: unknown;
+	try {
+		message = JSON.parse(rawMessage);
+	} catch {
+		return undefined;
+	}
+	if (typeof message !== "object" || message === null) return undefined;
+	const record = message as Record<string, unknown>;
+	if (record.type !== "selection_debug") return undefined;
+	if (typeof record.phase !== "string" || !record.phase.trim()) return undefined;
+	if (record.page !== undefined && (!Number.isInteger(record.page) || (record.page as number) < 1)) return undefined;
+	if (typeof record.text !== "string") return undefined;
+	if (typeof record.details !== "object" || record.details === null || Array.isArray(record.details)) return undefined;
+	return {
+		pdfId,
+		phase: record.phase,
+		...(record.page === undefined ? {} : { page: record.page as number }),
+		text: record.text,
+		details: record.details as Record<string, unknown>,
+	};
+}
+
 function parseReverseSynctexClick(pdfId: number, rawMessage: string): ReverseSynctexClick | undefined {
 	let message: unknown;
 	try {
@@ -727,12 +846,21 @@ export interface ReverseSynctexClick {
 	selectionEndY?: number;
 }
 
+export interface ViewerSelectionDebug {
+	pdfId: number;
+	phase: string;
+	page?: number;
+	text: string;
+	details: Record<string, unknown>;
+}
+
 export interface PdfJsViewerServerOptions {
 	registry: PdfJsViewerRegistry;
 	host?: string;
 	port?: number;
 	fileSystem?: PdfJsViewerFileSystem;
 	onReverseSynctex?: (click: ReverseSynctexClick) => void | Promise<void>;
+	onSelectionDebug?: (debug: ViewerSelectionDebug) => void | Promise<void>;
 }
 
 export class PdfJsViewerServer {
@@ -741,6 +869,7 @@ export class PdfJsViewerServer {
 	private readonly port: number;
 	private readonly fileSystem: PdfJsViewerFileSystem;
 	private readonly onReverseSynctex: ((click: ReverseSynctexClick) => void | Promise<void>) | undefined;
+	private readonly onSelectionDebug: ((debug: ViewerSelectionDebug) => void | Promise<void>) | undefined;
 	private server: Server | null = null;
 	private activeSockets = new Set<Socket>();
 	private activeWebSockets = new Set<Socket>();
@@ -755,6 +884,7 @@ export class PdfJsViewerServer {
 			createReadStream,
 		};
 		this.onReverseSynctex = options.onReverseSynctex;
+		this.onSelectionDebug = options.onSelectionDebug;
 	}
 
 	get origin(): string {
@@ -1030,6 +1160,11 @@ export class PdfJsViewerServer {
 			const decoded = decodeWebSocketTextFrames(webSocketInputBuffer);
 			webSocketInputBuffer = decoded.remaining;
 			for (const rawMessage of decoded.messages) {
+				const debug = parseViewerSelectionDebug(pdfId, rawMessage);
+				if (debug !== undefined && this.onSelectionDebug !== undefined) {
+					void Promise.resolve().then(() => this.onSelectionDebug!(debug)).catch(() => undefined);
+					continue;
+				}
 				const click = parseReverseSynctexClick(pdfId, rawMessage);
 				if (click === undefined || this.onReverseSynctex === undefined) continue;
 				void Promise.resolve()
