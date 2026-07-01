@@ -170,6 +170,10 @@ let activeConfig;
 let viewerSocket;
 const pageViewports = new Map();
 const pendingReverseSynctexContexts = new WeakMap();
+let lastObservedSelectionSignature;
+let selectionGeneration = 0;
+let lastSentSelectionSignature;
+let lastSentSelectionGeneration;
 
 function reverseSynctexPayloadFromViewportPoint(input) {
 	const point = input.viewport.convertToPdfPoint(input.viewportX, input.viewportHeight - input.viewportY);
@@ -347,6 +351,65 @@ function hasReverseSynctexContext(context) {
 	return context.textBeforeSelection !== undefined || context.textAfterSelection !== undefined || context.selectedText !== undefined;
 }
 
+function reverseSynctexSelectionSignature(pageNumber, selection) {
+	if (selection.selectedText === undefined) return undefined;
+	return [pageNumber, selection.selectedText, selection.selectionStartX, selection.selectionStartY, selection.selectionEndX, selection.selectionEndY].join("|");
+}
+
+function reverseSynctexSelectionPayload(pageNumber, selection) {
+	return {
+		type: "reverse_synctex",
+		page: pageNumber,
+		x: selection.selectionStartX,
+		y: selection.selectionStartY,
+		selectedText: selection.selectedText,
+		selectionStartX: selection.selectionStartX,
+		selectionStartY: selection.selectionStartY,
+		selectionEndX: selection.selectionEndX,
+		selectionEndY: selection.selectionEndY,
+	};
+}
+
+function wasSelectionAlreadySent(signature, generation) {
+	return signature !== undefined && signature === lastSentSelectionSignature && generation === lastSentSelectionGeneration;
+}
+
+function rememberSentSelection(signature, generation) {
+	lastSentSelectionSignature = signature;
+	lastSentSelectionGeneration = generation;
+}
+
+function currentReverseSynctexSelectionSignature() {
+	if (!pages) return undefined;
+	for (const pageElement of pages.querySelectorAll("div[data-page-number]")) {
+		const pageNumber = Number(pageElement.dataset.pageNumber);
+		const viewport = pageViewports.get(pageNumber);
+		const canvas = pageElement.querySelector("canvas[data-page-number]");
+		if (!viewport || !canvas) continue;
+		const selection = reverseSynctexContextForPage(pageElement, canvas, viewport);
+		const signature = reverseSynctexSelectionSignature(pageNumber, selection);
+		if (signature !== undefined) return signature;
+	}
+	return undefined;
+}
+
+document.addEventListener("selectionchange", () => {
+	const signature = currentReverseSynctexSelectionSignature();
+	if (signature !== lastObservedSelectionSignature) selectionGeneration += 1;
+	lastObservedSelectionSignature = signature;
+});
+
+function sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport) {
+	if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return false;
+	const selection = reverseSynctexContextForPage(pageElement, canvas, viewport);
+	if (selection.selectedText === undefined || selection.selectionStartX === undefined || selection.selectionStartY === undefined || selection.selectionEndX === undefined || selection.selectionEndY === undefined) return false;
+	const signature = reverseSynctexSelectionSignature(pageNumber, selection);
+	if (wasSelectionAlreadySent(signature, selectionGeneration)) return true;
+	rememberSentSelection(signature, selectionGeneration);
+	viewerSocket.send(JSON.stringify(reverseSynctexSelectionPayload(pageNumber, selection)));
+	return true;
+}
+
 function viewportScale(input) {
 	const origin = input.viewport.convertToViewportPoint(0, 0);
 	const xUnit = input.viewport.convertToViewportPoint(1, 0);
@@ -388,7 +451,10 @@ async function renderPdf(config) {
 		pageContainer.appendChild(canvas);
 		await renderTextLayer(pdfjsLib, page, viewport, pageContainer);
 		pageContainer.addEventListener("mousedown", () => {
-			pendingReverseSynctexContexts.set(pageContainer, reverseSynctexContextForPage(pageContainer, canvas, viewport));
+			pendingReverseSynctexContexts.set(pageContainer, { ...reverseSynctexContextForPage(pageContainer, canvas, viewport), selectionGeneration });
+		}, true);
+		pageContainer.addEventListener("mouseup", () => {
+			setTimeout(() => sendReverseSynctexSelection(pageNumber, pageContainer, canvas, viewport), 0);
 		}, true);
 		pageContainer.addEventListener("click", (event) => {
 			if (!event.ctrlKey) return;
@@ -396,8 +462,15 @@ async function renderPdf(config) {
 			const rect = canvas.getBoundingClientRect();
 			const pendingTextSelection = pendingReverseSynctexContexts.get(pageContainer) || {};
 			pendingReverseSynctexContexts.delete(pageContainer);
-			const currentTextSelection = reverseSynctexContextForPage(pageContainer, canvas, viewport);
+			const currentTextSelection = { ...reverseSynctexContextForPage(pageContainer, canvas, viewport), selectionGeneration };
 			const textSelection = hasReverseSynctexContext(pendingTextSelection) ? pendingTextSelection : currentTextSelection;
+			const selectionSignature = reverseSynctexSelectionSignature(pageNumber, textSelection);
+			if (wasSelectionAlreadySent(selectionSignature, textSelection.selectionGeneration)) return;
+			if (textSelection.selectedText !== undefined && textSelection.selectionStartX !== undefined && textSelection.selectionStartY !== undefined && textSelection.selectionEndX !== undefined && textSelection.selectionEndY !== undefined) {
+				rememberSentSelection(selectionSignature, textSelection.selectionGeneration);
+				viewerSocket.send(JSON.stringify(reverseSynctexSelectionPayload(pageNumber, textSelection)));
+				return;
+			}
 			const payload = reverseSynctexPayloadFromViewportPoint({
 				page: pageNumber,
 				viewportX: event.clientX - rect.left,

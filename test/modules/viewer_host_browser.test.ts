@@ -276,6 +276,16 @@ async function clickRenderedPagePoint(page: Page, x: number, y: number, options:
 	}
 }
 
+async function dispatchRenderedPageMouseup(page: Page, x: number, y: number): Promise<void> {
+	await page.evaluate(({ x, y }) => {
+		const pageElement = document.querySelector("#pages div[data-page-number='1']") as HTMLElement | null;
+		const canvas = document.querySelector("#pages canvas[data-page-number='1']") as HTMLCanvasElement | null;
+		if (!pageElement || !canvas) throw new Error("missing rendered page");
+		const rect = canvas.getBoundingClientRect();
+		pageElement.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: rect.left + x, clientY: rect.top + y }));
+	}, { x, y });
+}
+
 async function waitForSynctexCircleStyle(page: Page, expected: { left: number; top: number }, tolerance = 1): Promise<void> {
 	await page.waitForFunction(({ left, top, tolerance }) => {
 		const marker = document.querySelector("[data-synctex-marker][data-synctex-marker-kind='circle']") as HTMLElement | null;
@@ -385,11 +395,14 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assertApproximatelyEqual(Number(event.y), 155, 1, "reverse y PDF coordinate");
 
 		await selectRenderedPageText(page, "paragraph text");
-		await clickRenderedPagePoint(page, 190, 194, { ctrl: true });
+		await dispatchRenderedPageMouseup(page, 190, 194);
 		let selectionEvent: Record<string, unknown> | undefined;
+		let selectionEventCount = 0;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
 			const response = await callTool(3, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-			selectionEvent = response.result?.details?.events?.at(-1);
+			const events = response.result?.details?.events ?? [];
+			selectionEventCount = events.length;
+			selectionEvent = events.at(-1);
 			if (selectionEvent?.selected_text === "paragraph text") break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
@@ -398,14 +411,23 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assert.ok(selectionEvent?.selection_end, "selected range end should be mapped to source");
 		assert.equal((selectionEvent.selection_start as Record<string, unknown>).source_file, sourcePath);
 		assert.equal((selectionEvent.selection_end as Record<string, unknown>).source_file, sourcePath);
+		assert.equal((selectionEvent.selection_start as Record<string, unknown>).page, 1);
+		assert.equal((selectionEvent.selection_end as Record<string, unknown>).page, 1);
+		assertApproximatelyEqual(Number((selectionEvent.selection_start as Record<string, unknown>).x), Number(selectionEvent.x), 0.001, "selection event primary x should be first endpoint x");
+		assertApproximatelyEqual(Number((selectionEvent.selection_start as Record<string, unknown>).y), Number(selectionEvent.y), 0.001, "selection event primary y should be first endpoint y");
 		assert.equal(typeof (selectionEvent.selection_start as Record<string, unknown>).x, "number");
 		assert.equal(typeof (selectionEvent.selection_end as Record<string, unknown>).y, "number");
+
+		await clickRenderedPagePoint(page, 190, 194, { ctrl: true });
+		await new Promise((resolve) => setTimeout(resolve, 1200));
+		const duplicateResponse = await callTool(4, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+		assert.equal(duplicateResponse.result?.details?.events?.length ?? 0, selectionEventCount, "selection auto-send and delayed follow-up Ctrl+Click must not duplicate the same selected range");
 
 		await selectDetachedText(page, "stale outside page selection");
 		await clickRenderedPagePoint(page, 180, 194, { ctrl: true });
 		let staleSelectionEvent: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
-			const response = await callTool(4, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			const response = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 			staleSelectionEvent = response.result?.details?.events?.at(-1);
 			if (Number(staleSelectionEvent?.sequence) > Number(selectionEvent.sequence)) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
@@ -415,10 +437,10 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 
 		for (const mode of ["start-at-previous-end", "end-at-next-start", "element-offsets-between-spans"] as const) {
 			const boundaryText = await selectAdjacentTextLayerBoundary(page, mode);
-			await clickRenderedPagePoint(page, 190, 194, { ctrl: true });
+			await dispatchRenderedPageMouseup(page, 190, 194);
 			let boundaryEvent: Record<string, unknown> | undefined;
 			for (let attempt = 0; attempt < 20; attempt += 1) {
-				const response = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 10 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+				const response = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 10 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 				boundaryEvent = response.result?.details?.events?.at(-1);
 				if (boundaryEvent?.selected_text === boundaryText) break;
 				await new Promise((resolve) => setTimeout(resolve, 50));
