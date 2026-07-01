@@ -499,6 +499,12 @@ function invalidReadableSourceLineReason(mapped: ReverseSynctexMappedResult, cwd
 	return undefined;
 }
 
+function lowQualityNativeReverseSourceLineReason(mapped: ReverseSynctexMappedResult, cwd: string): string | undefined {
+	const sourceLine = readSourceLine(resolveReverseMappedSourceFile(mapped, cwd), mapped.line, cwd);
+	if (sourceLine?.trim() === "\\end{document}") return "native result is low-quality/end-document";
+	return undefined;
+}
+
 function lineColumnForSourceIndex(source: string, index: number): { line: number; column: number } {
 	let line = 1;
 	let column = 0;
@@ -702,7 +708,7 @@ export function mapReverseSynctex(input: {
 	let mapped = native.mapped;
 	let nativeFailureReason = native.failureReason;
 	if (mapped !== undefined) {
-		const invalidReason = invalidReadableSourceLineReason(mapped, input.cwd);
+		const invalidReason = invalidReadableSourceLineReason(mapped, input.cwd) ?? lowQualityNativeReverseSourceLineReason(mapped, input.cwd);
 		if (invalidReason !== undefined) {
 			nativeFailureReason = invalidReason;
 			mapped = undefined;

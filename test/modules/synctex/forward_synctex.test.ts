@@ -456,6 +456,45 @@ test("native reverse SyncTeX invalid source line falls back before accepting the
 	}
 });
 
+test("native reverse SyncTeX mapping to readable \\end{document} falls back before accepting the mapping", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\documentclass{article}",
+			"\\begin{document}",
+			"Useful equation source line",
+			"\\end{document}",
+		].join("\n"));
+
+		let fallbackCalls = 0;
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: () => ({
+				status: 0,
+				stdout: "SyncTeX result begin\nOutput:paper.pdf\nInput:main.tex\nLine:4\nColumn:0\nSyncTeX result end\n",
+				stderr: "",
+			}),
+			jsFallback: () => {
+				fallbackCalls += 1;
+				return { input: "main.tex", line: 3, column: 0 };
+			},
+		});
+
+		assert.equal(fallbackCalls, 1);
+		assert.equal(location.diagnostics.branch, "js_fallback");
+		assert.equal(location.line, 3);
+		assert.equal(location.sourceLine, "Useful equation source line");
+		assert.match(location.diagnostics.native.failureReason ?? "", /low-quality\/end-document/);
+		assert.deepEqual(location.diagnostics.jsFallback?.result, { input: "main.tex", line: 3, column: 0 });
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("native reverse SyncTeX no-result falls back to the existing LaTeX-Workshop JS parser", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
