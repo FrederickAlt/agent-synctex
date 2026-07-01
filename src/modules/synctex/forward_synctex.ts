@@ -15,6 +15,7 @@ export interface ForwardSynctexTarget {
 }
 
 export type ForwardSynctexBranch = "native" | "js_fallback";
+export type ReverseSynctexBranch = "native" | "js_fallback";
 
 export interface ForwardSynctexJump {
 	page: number;
@@ -75,6 +76,11 @@ export interface NativeSynctexRunResult {
 }
 
 export type NativeSynctexRunner = (command: string, args: string[], options: { cwd: string }) => NativeSynctexRunResult;
+export interface ReverseSynctexMappedResult {
+	input: string;
+	line: number;
+	column: number;
+}
 export interface ForwardSynctexPoint {
 	page: number;
 	x: number;
@@ -85,6 +91,7 @@ export interface ForwardSynctexPoint {
 	ranges?: ForwardSynctexRange[];
 }
 export type ForwardSynctexJsFallback = (line: number, sourceFile: string, pdfPath: string) => ForwardSynctexPoint | undefined;
+export type ReverseSynctexJsFallback = (page: number, x: number, y: number, pdfPath: string) => ReverseSynctexMappedResult | undefined;
 
 export interface MapForwardSynctexInput {
 	pdfPath: string;
@@ -121,12 +128,29 @@ export interface ReverseSynctexLocation {
 }
 
 export interface ReverseSynctexDiagnostics {
+	branch: ReverseSynctexBranch;
 	lookupInput: {
 		pdfPath: string;
 		page: number;
 		x: number;
 		y: number;
 		sidecarPath: string;
+	};
+	native: {
+		command: string;
+		args: string[];
+		cwd: string;
+		status?: number | null;
+		stdout?: string;
+		stderr?: string;
+		error?: string;
+		failureReason?: string;
+		parsedResult?: ReverseSynctexMappedResult;
+	};
+	jsFallback?: {
+		attempted: boolean;
+		result?: ReverseSynctexMappedResult;
+		failureReason?: string;
 	};
 	context: {
 		hasSelectionContext: boolean;
@@ -520,6 +544,62 @@ function normalizeFormulaClosingSpan(sourceFile: string, line: number, sourceLin
 	return { span: { sourceFile, startLine: span.startLine, endLine: span.endLine }, excerpt: span.excerpt };
 }
 
+function parseNativeReverseResult(stdout: string): ReverseSynctexMappedResult | undefined {
+	let started = false;
+	let input: string | undefined;
+	let line: number | undefined;
+	let column: number | undefined;
+	for (const outputLine of stdout.split("\n")) {
+		if (outputLine.includes("SyncTeX result begin")) {
+			started = true;
+			continue;
+		}
+		if (outputLine.includes("SyncTeX result end")) break;
+		if (!started) continue;
+		const pos = outputLine.indexOf(":");
+		if (pos < 0) continue;
+		const key = outputLine.substring(0, pos).trim().toLowerCase();
+		const value = outputLine.substring(pos + 1).trim();
+		if (key === "input" && value !== "") input = value;
+		else if (key === "line") {
+			const parsed = Number(value);
+			if (Number.isInteger(parsed) && parsed > 0) line = parsed;
+		} else if (key === "column") {
+			const parsed = Number(value);
+			if (Number.isFinite(parsed)) column = Math.max(0, Math.trunc(parsed));
+		}
+	}
+	if (input === undefined || line === undefined) return undefined;
+	return { input, line, column: column ?? 0 };
+}
+
+function runNativeReverseSynctex(input: { page: number; x: number; y: number; pdfPath: string; runner: NativeSynctexRunner; command: string }): { mapped?: ReverseSynctexMappedResult; failureReason?: string; diagnostics: ReverseSynctexDiagnostics["native"] } {
+	const args = ["edit", "-o", `${input.page}:${input.x}:${input.y}:${input.pdfPath}`];
+	const cwd = dirname(input.pdfPath);
+	const result = input.runner(input.command, args, { cwd });
+	const mapped = result.status === 0 && result.error === undefined ? parseNativeReverseResult(result.stdout) : undefined;
+	const failureReason = result.error !== undefined
+		? result.error.message
+		: result.status !== 0
+			? `exit status ${String(result.status)}${result.stderr ? `: ${result.stderr.trim()}` : ""}`
+			: mapped === undefined ? "no usable result" : undefined;
+	return {
+		...(mapped === undefined ? {} : { mapped }),
+		...(failureReason === undefined ? {} : { failureReason }),
+		diagnostics: {
+			command: input.command,
+			args,
+			cwd,
+			status: result.status,
+			stdout: result.stdout,
+			stderr: result.stderr,
+			...(result.error === undefined ? {} : { error: result.error.message }),
+			...(failureReason === undefined ? {} : { failureReason }),
+			...(mapped === undefined ? {} : { parsedResult: mapped }),
+		},
+	};
+}
+
 export function mapReverseSynctex(input: {
 	pdfPath: string;
 	page: number;
@@ -528,6 +608,9 @@ export function mapReverseSynctex(input: {
 	cwd: string;
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
+	nativeRunner?: NativeSynctexRunner;
+	jsFallback?: ReverseSynctexJsFallback;
+	synctexCommand?: string;
 }): ReverseSynctexLocation {
 	if (!Number.isInteger(input.page) || input.page < 1) {
 		throw new Error("page must be a positive integer");
@@ -541,18 +624,41 @@ export function mapReverseSynctex(input: {
 		throw new Error(`PDF ${pdfPath} is missing SyncTeX sidecar (${pdfPath.replace(/\.pdf$/i, "")}.synctex or .synctex.gz)`);
 	}
 
-	let mapped;
-	const previousCwd = process.cwd();
-	try {
-		process.chdir(input.cwd);
-		mapped = syncTeXToTeX(input.page, input.x, input.y, pdfPath);
-	} catch {
-		mapped = undefined;
-	} finally {
-		process.chdir(previousCwd);
+	const native = runNativeReverseSynctex({
+		page: input.page,
+		x: input.x,
+		y: input.y,
+		pdfPath,
+		runner: input.nativeRunner ?? defaultNativeSynctexRunner,
+		command: input.synctexCommand ?? "synctex",
+	});
+	let mapped = native.mapped;
+	let branch: ReverseSynctexBranch = "native";
+	let jsFallback: ReverseSynctexDiagnostics["jsFallback"] | undefined;
+	if (mapped === undefined) {
+		let jsMapped;
+		let jsFailureReason: string | undefined;
+		const previousCwd = process.cwd();
+		try {
+			process.chdir(input.cwd);
+			jsMapped = (input.jsFallback ?? syncTeXToTeX)(input.page, input.x, input.y, pdfPath);
+			if (jsMapped === undefined) jsFailureReason = "no result";
+		} catch (error) {
+			jsMapped = undefined;
+			jsFailureReason = error instanceof Error ? error.message : String(error);
+		} finally {
+			process.chdir(previousCwd);
+		}
+		jsFallback = {
+			attempted: true,
+			...(jsMapped === undefined ? {} : { result: jsMapped }),
+			...(jsFailureReason === undefined ? {} : { failureReason: jsFailureReason }),
+		};
+		mapped = jsMapped;
+		branch = "js_fallback";
 	}
 	if (mapped === undefined) {
-		throw new Error(`No SyncTeX mapping found for page ${input.page} at ${input.x},${input.y}`);
+		throw new Error(`No SyncTeX mapping found for page ${input.page} at ${input.x},${input.y}; native synctex edit returned ${native.failureReason ?? "no usable result"}; JS fallback returned ${jsFallback?.failureReason ?? "no result"}`);
 	}
 
 	const sourceFile = isAbsolute(mapped.input) ? resolve(mapped.input) : resolve(input.cwd, mapped.input);
@@ -596,7 +702,10 @@ export function mapReverseSynctex(input: {
 		});
 	}
 	const diagnostics: ReverseSynctexDiagnostics = {
+		branch,
 		lookupInput: { pdfPath, page: input.page, x: input.x, y: input.y, sidecarPath },
+		native: native.diagnostics,
+		...(jsFallback === undefined ? {} : { jsFallback }),
 		context: {
 			hasSelectionContext,
 			...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }),

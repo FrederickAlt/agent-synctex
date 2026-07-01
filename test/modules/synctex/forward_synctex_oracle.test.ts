@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
-import { mapForwardSynctex, type ForwardSynctexJump, type NativeSynctexRunner } from "../../../src/modules/synctex/forward_synctex.ts";
-import { forwardSynctexMarkerFromPdfPoint, type ForwardSynctexMarkerPosition } from "../../../src/modules/viewer_coordinate_transform.ts";
+import { mapForwardSynctex, mapReverseSynctex, type ForwardSynctexJump, type NativeSynctexRunner } from "../../../src/modules/synctex/forward_synctex.ts";
+import { forwardSynctexMarkerFromPdfPoint, reverseSynctexPayloadFromViewportPoint, type ForwardSynctexMarkerPosition } from "../../../src/modules/viewer_coordinate_transform.ts";
 
 interface TextItemLike {
 	str: string;
@@ -288,6 +288,7 @@ function drawVisualArtifacts(fixture: { pdfPath: string; texPath: string }, view
 }
 
 const skipReason = oracleSkipReason();
+const reverseSkipReason = skipReason ?? (!executableOnPath("synctex") ? "requires synctex on PATH" : undefined);
 
 test("forward SyncTeX markers for align* fixtures intentionally follow LaTeX-Workshop point output", skipReason ? { skip: skipReason } : {}, async () => {
 	const fixture = compileFixture(SIMPLE_ALIGN_LINES);
@@ -319,6 +320,59 @@ test("forward SyncTeX markers for align* fixtures intentionally follow LaTeX-Wor
 
 			// LW v1 intentionally documents point-only align* behavior here instead of
 			// requiring the previous custom row-local align* precision heuristic.
+		} finally {
+			await document.destroy?.();
+		}
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("native reverse SyncTeX improves real aligned display math clicks over JS fallback", reverseSkipReason ? { skip: reverseSkipReason } : {}, async () => {
+	const fixture = compileFixture();
+	try {
+		const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs") as unknown as PdfJsLibLike;
+		const pdfBytes = new Uint8Array(readFileSync(fixture.pdfPath));
+		const document = await pdfjsLib.getDocument({ data: pdfBytes, disableWorker: true }).promise;
+		try {
+			const page = await document.getPage(1);
+			const viewport = page.getViewport({ scale: 1 });
+			const textContent = await page.getTextContent();
+			const labels = ["ORACLEALIGNONE", "ORACLEALIGNTWO", "ORACLEALIGNTHREE"];
+
+			for (const label of labels) {
+				const item = textContent.items.find((candidate) => candidate.str.includes(label));
+				assert.ok(item, `PDF.js textContent should contain ${label}; extracted text was: ${textContent.items.map((candidate) => candidate.str).join(" | ")}`);
+				const box = textItemBox(pdfjsLib, viewport, item);
+				const expectedLine = lineForLabel(label);
+				const payload = reverseSynctexPayloadFromViewportPoint({
+					page: 1,
+					viewportX: (box.left + box.right) / 2,
+					viewportY: (box.top + box.bottom) / 2,
+					viewportHeight: viewport.height,
+					viewport,
+				});
+
+				const jsLocation = mapReverseSynctex({
+					pdfPath: fixture.pdfPath,
+					page: payload.page,
+					x: payload.x,
+					y: payload.y,
+					cwd: fixture.dir,
+					nativeRunner: forceJsFallbackNativeRunner,
+				});
+				const nativeLocation = mapReverseSynctex({
+					pdfPath: fixture.pdfPath,
+					page: payload.page,
+					x: payload.x,
+					y: payload.y,
+					cwd: fixture.dir,
+				});
+
+				assert.equal(nativeLocation.diagnostics.branch, "native", `${label} should use native reverse branch`);
+				assert.equal(nativeLocation.line, expectedLine, `${label} native reverse should resolve the clicked aligned row`);
+				assert.notEqual(jsLocation.line, expectedLine, `${label} JS fallback should reproduce the aligned display-math mis-map this fixture guards`);
+			}
 		} finally {
 			await document.destroy?.();
 		}

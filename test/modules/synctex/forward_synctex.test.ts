@@ -358,10 +358,136 @@ test("LaTeX-Workshop-derived syncTeXToTeX maps realistic .synctex fixture coordi
 	}
 });
 
-test("reverse SyncTeX adapter returns LaTeX-Workshop output with column 0 and current API glue fields", () => {
+test("native reverse SyncTeX success avoids JS fallback", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
-		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+		const calls: Array<{ command: string; args: string[]; cwd: string }> = [];
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: (command, args, options) => {
+				calls.push({ command, args, cwd: options.cwd });
+				return {
+					status: 0,
+					stdout: "SyncTeX result begin\nOutput:paper.pdf\nInput:main.tex\nLine:3\nColumn:-1\nOffset:0\nContext:\nSyncTeX result end\n",
+					stderr: "",
+				};
+			},
+			jsFallback: () => {
+				throw new Error("JS fallback should not be invoked after native success");
+			},
+		});
+
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.command, "synctex");
+		assert.deepEqual(calls[0]?.args, ["edit", "-o", `1:144.27:155.27:${project.pdfPath}`]);
+		assert.equal(calls[0]?.cwd, dirname(project.pdfPath));
+		assert.equal(location.sourceFile, project.sourcePath);
+		assert.equal(location.line, 3);
+		assert.equal(location.column, 0);
+		assert.equal(location.diagnostics.branch, "native");
+		assert.equal(location.diagnostics.native.status, 0);
+		assert.deepEqual(location.diagnostics.native.parsedResult, { input: "main.tex", line: 3, column: 0 });
+		assert.equal(location.diagnostics.jsFallback, undefined);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("native reverse SyncTeX failure falls back to the existing LaTeX-Workshop JS parser", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const fallbackCalls: Array<{ page: number; x: number; y: number; pdfPath: string }> = [];
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: () => ({ status: 1, stdout: "", stderr: "native failed" }),
+			jsFallback: (page, x, y, pdfPath) => {
+				fallbackCalls.push({ page, x, y, pdfPath });
+				return syncTeXToTeX(page, x, y, pdfPath);
+			},
+		});
+
+		assert.deepEqual(fallbackCalls, [{ page: 1, x: 144.27, y: 155.27, pdfPath: project.pdfPath }]);
+		assert.equal(location.diagnostics.branch, "js_fallback");
+		assert.equal(location.diagnostics.native.status, 1);
+		assert.match(location.diagnostics.native.failureReason ?? "", /native failed/);
+		assert.equal(location.diagnostics.jsFallback?.attempted, true);
+		assert.deepEqual(location.diagnostics.jsFallback?.result, { input: "main.tex", line: 3, column: 0 });
+		assert.equal(location.line, 3);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("native reverse SyncTeX no-result falls back to the existing LaTeX-Workshop JS parser", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		let fallbackCalls = 0;
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: () => ({ status: 0, stdout: "SyncTeX result begin\nSyncTeX result end\n", stderr: "" }),
+			jsFallback: (page, x, y, pdfPath) => {
+				fallbackCalls += 1;
+				return syncTeXToTeX(page, x, y, pdfPath);
+			},
+		});
+
+		assert.equal(fallbackCalls, 1);
+		assert.equal(location.diagnostics.branch, "js_fallback");
+		assert.equal(location.diagnostics.native.failureReason, "no usable result");
+		assert.equal(location.line, 3);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("native reverse SyncTeX can select a smoke-style formula source line when JS would select a closing line", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, Array.from({ length: 20 }, (_, index) => {
+			const line = index + 1;
+			if (line === 16) return "  a &= b + c \\\\";
+			if (line === 20) return "\\end{align}";
+			return `% line ${line}`;
+		}).join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: () => ({
+				status: 0,
+				stdout: "SyncTeX result begin\nOutput:paper.pdf\nInput:main.tex\nLine:16\nColumn:2\nSyncTeX result end\n",
+				stderr: "",
+			}),
+			jsFallback: () => ({ input: "main.tex", line: 20, column: 0 }),
+		});
+
+		assert.equal(location.diagnostics.branch, "native");
+		assert.equal(location.line, 16);
+		assert.equal(location.sourceLine, "  a &= b + c \\\\ ".trimEnd());
+		assert.equal(location.diagnostics.jsFallback, undefined);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX adapter returns mapped output with column 0 and current API glue fields", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(location.sidecarPath, join(project.dir, "paper.synctex"));
 		assert.equal(location.sourceFile, project.sourcePath);
@@ -383,7 +509,7 @@ test("reverse SyncTeX adapter normalizes \\end{equation} to the enclosing formul
 			"",
 		].join("\n"));
 
-		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(location.line, 3);
 		assert.equal(location.sourceLine, "\\end{equation}");
@@ -409,8 +535,23 @@ test("reverse SyncTeX adapter normalizes align and align* closing lines", () => 
 				"",
 			].join("\n"));
 
-			const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+			const location = mapReverseSynctex({
+				pdfPath: project.pdfPath,
+				page: 1,
+				x: 144.27,
+				y: 155.27,
+				cwd: project.dir,
+				nativeRunner: () => ({
+					status: 0,
+					stdout: `SyncTeX result begin\nOutput:paper.pdf\nInput:main.tex\nLine:3\nColumn:0\nSyncTeX result end\n`,
+					stderr: "",
+				}),
+				jsFallback: () => {
+					throw new Error("JS fallback should not be invoked after native success");
+				},
+			});
 
+			assert.equal(location.diagnostics.branch, "native");
 			assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
 			assert.equal(location.normalizedFormulaExcerpt, `\\begin{${environment}}\n  a &= b \\\\\n\\end{${environment}}`);
 		} finally {
@@ -429,7 +570,7 @@ test("reverse SyncTeX adapter normalizes \\] to the matching display math opener
 			"",
 		].join("\n"));
 
-		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
 		assert.equal(location.normalizedFormulaExcerpt, "\\[\n  x^2 + y^2 = z^2\n\\]");
@@ -451,7 +592,7 @@ test("reverse SyncTeX adapter matches nested same-environment closes to the near
 			"\\end{equation}",
 		].join("\n"));
 
-		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 167.27, cwd: project.dir });
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 167.27, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(location.line, 5);
 		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 3, endLine: 5 });
@@ -464,7 +605,7 @@ test("reverse SyncTeX adapter matches nested same-environment closes to the near
 test("reverse SyncTeX adapter leaves non-formula reverse events unchanged", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
-		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(location.sourceLine, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(Object.hasOwn(location, "rawMappedLine"), false);
@@ -484,6 +625,7 @@ test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct c
 			x: 144.27,
 			y: 155.27,
 			cwd: project.dir,
+			nativeRunner: failNativeRunner,
 			textBeforeSelection: "First paragraph",
 			textAfterSelection: " text that should wrap a little and create boxes.",
 		});
@@ -509,7 +651,7 @@ test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct c
 test("reverse SyncTeX adapter reads realistic .synctex.gz fixtures", () => {
 	const project = makeFixtureProject({ sidecar: "synctex.gz" });
 	try {
-		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 167.27, cwd: project.dir });
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 167.27, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(location.sidecarPath, join(project.dir, "paper.synctex.gz"));
 		assert.equal(location.sourceFile, project.sourcePath);
