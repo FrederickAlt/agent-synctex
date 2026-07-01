@@ -596,6 +596,56 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 	}
 });
 
+test("PDF.js MCP service get_pdf_events details include normalized formula excerpt for closing delimiter hits", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-reverse-formula-"));
+	const { pdfPath, sourcePath } = writeForwardSynctexFixture(baseDir);
+	writeFileSync(sourcePath, ["\\begin{equation}", "  a = b + c", "\\end{equation}", ""].join("\n"));
+	const service = new PdfJsViewerMcpService({
+		browserLauncher: new FakeBrowserLauncher({ ok: true }),
+		registry: new PdfJsViewerRegistry({ makePdfId: () => 53 }),
+		pdfRefresh: { autoStart: false },
+	});
+	try {
+		const open = await service.openPdf({
+			protocol_version: 1,
+			request_id: "open-reverse-formula",
+			operation: "open_pdf",
+			created_at_ns: 1,
+			workspace_context: { cwd: baseDir },
+			details: { pdf_path: pdfPath },
+		});
+		const pdfId = open.status_details.pdf_id ?? 0;
+		const origin = new URL(open.status_details.viewer_url ?? "").origin;
+		const wsUrl = new URL(`/ws?pdf_id=${pdfId}`, origin);
+		wsUrl.protocol = "ws:";
+		const socket = await connectRawWebSocket(wsUrl);
+
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 1, x: 144.27, y: 155.27 })));
+
+		let events: Array<Record<string, unknown>> = [];
+		await waitFor(async () => {
+			const response = await handleMcpRequest(JSON.stringify({
+				jsonrpc: "2.0",
+				id: 73,
+				method: "tools/call",
+				params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } },
+			}), service.pdfOperations);
+			assert.ok(response && "result" in response);
+			events = ((response.result as { details?: { events?: Array<Record<string, unknown>> } }).details?.events) ?? [];
+			return events.length === 1;
+		});
+
+		assert.equal(events[0]?.raw_mapped_line, 3);
+		assert.equal(events[0]?.raw_mapped_source_line, "\\end{equation}");
+		assert.deepEqual(events[0]?.normalized_formula_span, { source_file: sourcePath, start_line: 1, end_line: 3 });
+		assert.equal(events[0]?.normalized_formula_excerpt, "\\begin{equation}\n  a = b + c\n\\end{equation}");
+		socket.end();
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("PDF.js MCP service preserves reverse_synctex WebSocket frames split across TCP chunks", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-reverse-synctex-split-"));
 	const { pdfPath, sourcePath } = writeForwardSynctexFixture(baseDir);

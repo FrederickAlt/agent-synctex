@@ -8,7 +8,7 @@ Local parent PRD/TDD: `docs/prd-tdd-synctex-native-parity-rectangles-reverse-qua
 
 Keep reverse SyncTeX simple. Do not implement formula candidate ranking now.
 
-When reverse SyncTeX maps a click to a formula-closing structural line, enrich/normalize the reported source context to the enclosing formula span so the agent/LLM sees useful formula source instead of only a closing delimiter.
+When reverse SyncTeX maps a click to a formula-closing structural line, enrich/normalize the reported source context to the enclosing formula span so the agent/LLM sees useful formula source instead of only a closing delimiter. Formula reverse click should not always resolve to `\end{...}` as the only agent-facing source context.
 
 Examples of closing structural lines:
 

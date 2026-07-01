@@ -68,6 +68,12 @@ export interface MapForwardSynctexInput {
 	synctexCommand?: string;
 }
 
+export interface ReverseSynctexFormulaSpan {
+	sourceFile: string;
+	startLine: number;
+	endLine: number;
+}
+
 export interface ReverseSynctexLocation {
 	page: number;
 	x: number;
@@ -77,6 +83,12 @@ export interface ReverseSynctexLocation {
 	column: number;
 	sourceLine?: string;
 	sidecarPath: string;
+	rawMappedSourceFile?: string;
+	rawMappedLine?: number;
+	rawMappedColumn?: number;
+	rawMappedSourceLine?: string;
+	normalizedFormulaSpan?: ReverseSynctexFormulaSpan;
+	normalizedFormulaExcerpt?: string;
 }
 
 export function resolveSynctexSidecar(pdfPath: string): string | undefined {
@@ -328,6 +340,77 @@ function readSourceLines(sourceFile: string): string[] | undefined {
 	}
 }
 
+const FORMULA_ENVIRONMENTS = new Set([
+	"equation",
+	"equation*",
+	"align",
+	"align*",
+	"aligned",
+	"aligned*",
+	"alignedat",
+	"alignedat*",
+	"gather",
+	"gather*",
+	"multline",
+	"multline*",
+	"flalign",
+	"flalign*",
+	"split",
+]);
+
+function formulaEnvironmentClose(line: string): string | undefined {
+	const match = line.trim().match(/^\\end\{([^}]+)\}\s*$/);
+	if (match?.[1] === undefined || !FORMULA_ENVIRONMENTS.has(match[1])) return undefined;
+	return match[1];
+}
+
+function formulaEnvironmentToken(line: string, environment: string): "begin" | "end" | undefined {
+	const escaped = environment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const match = line.trim().match(new RegExp(`^\\\\(begin|end)\\{${escaped}\\}\\s*$`));
+	return match?.[1] === "begin" || match?.[1] === "end" ? match[1] : undefined;
+}
+
+function findFormulaEnvironmentSpan(lines: string[], closeLineIndex: number, environment: string): { startLine: number; endLine: number; excerpt: string } | undefined {
+	let depth = 0;
+	for (let index = closeLineIndex; index >= 0; index -= 1) {
+		const token = formulaEnvironmentToken(lines[index] ?? "", environment);
+		if (token === "end") depth += 1;
+		else if (token === "begin") {
+			depth -= 1;
+			if (depth === 0) {
+				return { startLine: index + 1, endLine: closeLineIndex + 1, excerpt: lines.slice(index, closeLineIndex + 1).join("\n") };
+			}
+		}
+	}
+	return undefined;
+}
+
+function findDisplayMathSpan(lines: string[], closeLineIndex: number): { startLine: number; endLine: number; excerpt: string } | undefined {
+	let depth = 0;
+	for (let index = closeLineIndex; index >= 0; index -= 1) {
+		const trimmed = (lines[index] ?? "").trim();
+		if (trimmed === "\\]") depth += 1;
+		else if (trimmed === "\\[") {
+			depth -= 1;
+			if (depth === 0) return { startLine: index + 1, endLine: closeLineIndex + 1, excerpt: lines.slice(index, closeLineIndex + 1).join("\n") };
+		}
+	}
+	return undefined;
+}
+
+function normalizeFormulaClosingSpan(sourceFile: string, line: number, sourceLines: string[] | undefined): { span: ReverseSynctexFormulaSpan; excerpt: string } | undefined {
+	if (sourceLines === undefined) return undefined;
+	const closeLineIndex = line - 1;
+	const sourceLine = sourceLines[closeLineIndex];
+	if (sourceLine === undefined) return undefined;
+	const environment = formulaEnvironmentClose(sourceLine);
+	const span = environment === undefined
+		? sourceLine.trim() === "\\]" ? findDisplayMathSpan(sourceLines, closeLineIndex) : undefined
+		: findFormulaEnvironmentSpan(sourceLines, closeLineIndex, environment);
+	if (span === undefined) return undefined;
+	return { span: { sourceFile, startLine: span.startLine, endLine: span.endLine }, excerpt: span.excerpt };
+}
+
 export function mapReverseSynctex(input: {
 	pdfPath: string;
 	page: number;
@@ -364,18 +447,20 @@ export function mapReverseSynctex(input: {
 	}
 
 	const sourceFile = isAbsolute(mapped.input) ? resolve(mapped.input) : resolve(input.cwd, mapped.input);
+	const rawMappedLine = mapped.line;
+	const rawMappedColumn = mapped.column;
 	let line = mapped.line;
 	let column = mapped.column;
 	const hasSelectionContext = input.textBeforeSelection !== undefined || input.textAfterSelection !== undefined;
-	if (column === 0 && hasSelectionContext) {
-		const sourceLines = readSourceLines(sourceFile);
-		if (sourceLines !== undefined) {
-			const [row, col] = getRowAndColumn(sourceLines, line - 1, input.textBeforeSelection ?? "", input.textAfterSelection ?? "");
-			line = row + 1;
-			column = col;
-		}
+	const sourceLines = readSourceLines(sourceFile);
+	if (column === 0 && hasSelectionContext && sourceLines !== undefined) {
+		const [row, col] = getRowAndColumn(sourceLines, line - 1, input.textBeforeSelection ?? "", input.textAfterSelection ?? "");
+		line = row + 1;
+		column = col;
 	}
 	const sourceLine = readSourceLine(sourceFile, line, input.cwd);
+	const rawMappedSourceLine = readSourceLine(sourceFile, rawMappedLine, input.cwd);
+	const normalizedFormula = normalizeFormulaClosingSpan(sourceFile, rawMappedLine, sourceLines);
 	return {
 		page: input.page,
 		x: input.x,
@@ -385,5 +470,13 @@ export function mapReverseSynctex(input: {
 		column,
 		...(sourceLine === undefined ? {} : { sourceLine }),
 		sidecarPath,
+		...(normalizedFormula === undefined ? {} : {
+			rawMappedSourceFile: sourceFile,
+			rawMappedLine,
+			rawMappedColumn,
+			...(rawMappedSourceLine === undefined ? {} : { rawMappedSourceLine }),
+			normalizedFormulaSpan: normalizedFormula.span,
+			normalizedFormulaExcerpt: normalizedFormula.excerpt,
+		}),
 	};
 }
