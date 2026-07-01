@@ -21,7 +21,7 @@ function makeOnePagePdf(): Buffer {
 		chunks.push(object);
 		length += Buffer.byteLength(object, "binary");
 	}
-	const content = "BT\n/F1 18 Tf\n36 150 Td\n(Host-served Viewer Client render test) Tj\nET\n";
+	const content = "BT\n/F1 18 Tf\n36 150 Td\n(First paragraph text that should wrap a little and create boxes.) Tj\nET\n";
 	addObject(1, "<< /Type /Catalog /Pages 2 0 R >>");
 	addObject(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
 	addObject(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>");
@@ -124,35 +124,36 @@ async function waitForViewerOutcome(page: Page): Promise<{ rendered: boolean; st
 	return { rendered: false, status, timedOut: true };
 }
 
-async function injectPageTextLayerAndSelection(page: Page): Promise<void> {
-	await page.evaluate(() => {
-		const pageElement = document.querySelector("#pages div[data-page-number='1']") as HTMLElement | null;
-		if (!pageElement) throw new Error("missing page element");
-		const textLayer = document.createElement("div");
-		textLayer.className = "textLayer";
-		textLayer.style.position = "absolute";
-		textLayer.style.left = "0px";
-		textLayer.style.top = "0px";
-		textLayer.style.width = "280px";
-		textLayer.style.height = "40px";
-		textLayer.style.pointerEvents = "auto";
-		const text = "First paragraph text that should wrap a little and create boxes.";
-		const span = document.createElement("span");
-		span.textContent = text;
-		textLayer.appendChild(span);
-		pageElement.appendChild(textLayer);
+async function selectRenderedPageTextLayerCaret(page: Page, textBeforeCaret: string): Promise<void> {
+	await page.waitForSelector("#pages div[data-page-number='1'] .textLayer[data-rendered='true'] span", { state: "attached", timeout: 2_000 });
+	await page.evaluate((before) => {
+		const textLayer = document.querySelector("#pages div[data-page-number='1'] .textLayer") as HTMLElement | null;
+		if (!textLayer) throw new Error("missing rendered text layer");
+		const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
+		let node = walker.nextNode();
+		while (node) {
+			const text = node.textContent ?? "";
+			const offset = text.indexOf(before) + before.length;
+			if (offset >= before.length) {
+				const selection = window.getSelection();
+				if (!selection) throw new Error("missing window selection");
+				const range = document.createRange();
+				range.setStart(node, offset);
+				range.setEnd(node, offset);
+				selection.removeAllRanges();
+				selection.addRange(range);
+				return;
+			}
+			node = walker.nextNode();
+		}
+		throw new Error(`text layer did not contain ${before}`);
+	}, textBeforeCaret);
+}
 
-		const textNode = span.firstChild;
-		if (!textNode) return;
-		const selection = window.getSelection();
-		if (!selection) return;
-		const range = document.createRange();
-		const anchorOffset = text.indexOf(" text");
-		range.setStart(textNode, anchorOffset);
-		range.setEnd(textNode, anchorOffset);
-		selection.removeAllRanges();
-		selection.addRange(range);
-	});
+async function clickRenderedPagePoint(page: Page, x: number, y: number): Promise<void> {
+	const box = await page.locator("#pages canvas[data-page-number='1']").boundingBox();
+	if (!box) throw new Error("missing rendered canvas box");
+	await page.mouse.click(box.x + x, box.y + y);
 }
 
 async function waitForSynctexCircleStyle(page: Page, expected: { left: number; top: number }, tolerance = 1): Promise<void> {
@@ -240,8 +241,7 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 			assert.equal(server.getConnectedViewerCount(209), 1);
 		});
 
-		const canvas = page.locator("#pages canvas[data-page-number='1']");
-		await canvas.click({ position: { x: 180, y: 194 } });
+		await clickRenderedPagePoint(page, 180, 194);
 
 		let event: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -485,7 +485,6 @@ test("Viewer Host-served Viewer Client maps reverse SyncTeX clicks with page-loc
 		await page.goto(`${server.origin}/viewer/219`, { waitUntil: "domcontentloaded" });
 		const outcome = await waitForViewerOutcome(page);
 		assert.equal(outcome.rendered, true, `viewer did not render first page; timedOut=${outcome.timedOut}; status=${JSON.stringify(outcome.status)}\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
-		await injectPageTextLayerAndSelection(page);
 		await assert.doesNotReject(async () => {
 			for (let attempt = 0; attempt < 20; attempt += 1) {
 				if (server.getConnectedViewerCount(219) === 1) return;
@@ -494,13 +493,50 @@ test("Viewer Host-served Viewer Client maps reverse SyncTeX clicks with page-loc
 			assert.equal(server.getConnectedViewerCount(219), 1);
 		});
 
-		await page.locator("#pages canvas[data-page-number='1']").click({ position: { x: 180, y: 194 } });
+		await page.evaluate(() => {
+			const outside = document.createElement("div");
+			outside.textContent = "First paragraph stale outside-page selection";
+			document.body.appendChild(outside);
+			const textNode = outside.firstChild;
+			if (!textNode) throw new Error("missing stale selection text node");
+			const selection = window.getSelection();
+			if (!selection) throw new Error("missing window selection");
+			const range = document.createRange();
+			range.setStart(textNode, "First paragraph".length);
+			range.setEnd(textNode, "First paragraph".length);
+			selection.removeAllRanges();
+			selection.addRange(range);
+		});
+		await page.evaluate(() => {
+			const pageElement = document.querySelector("#pages div[data-page-number='1']") as HTMLElement | null;
+			const canvas = document.querySelector("#pages canvas[data-page-number='1']") as HTMLCanvasElement | null;
+			if (!pageElement || !canvas) throw new Error("missing rendered page for stale-selection click");
+			const rect = canvas.getBoundingClientRect();
+			pageElement.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: rect.left + 180, clientY: rect.top + 194 }));
+		});
 
-		let event: Record<string, unknown> | undefined;
+		let staleEvent: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
 			const response = await callTool(2, "get_pdf_events", { pdf_id: 219, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-			event = response.result?.details?.events?.[0];
-			if (event) break;
+			staleEvent = response.result?.details?.events?.[0];
+			if (staleEvent) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(staleEvent, `reverse SyncTeX stale-selection event was not stored\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		assert.equal(staleEvent.column, 0, "selection outside the clicked page must not correct the mapped column");
+		assert.equal(((staleEvent.synctex_diagnostics as { context?: { hasSelectionContext?: boolean } } | undefined)?.context?.hasSelectionContext), false);
+
+		await selectRenderedPageTextLayerCaret(page, "First paragraph");
+		await clickRenderedPagePoint(page, 180, 194);
+
+		let event: Record<string, unknown> | undefined;
+		let toolText = "";
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(3, "get_pdf_events", { pdf_id: 219, max_events: 5 }, service) as { result?: { content?: Array<{ text?: string }>; details?: { events?: Array<Record<string, unknown>> } } };
+			const events = response.result?.details?.events ?? [];
+			event = events[events.length - 1];
+			toolText = response.result?.content?.map((item) => item.text ?? "").join("\n") ?? "";
+			if (events.length >= 2 && event?.column === 15) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 		assert.ok(event, `reverse SyncTeX event was not stored after context click\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
@@ -510,6 +546,8 @@ test("Viewer Host-served Viewer Client maps reverse SyncTeX clicks with page-loc
 		assert.equal(event.page, 1);
 		assert.equal(event.column, 15);
 		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
+		assert.equal(((event.synctex_diagnostics as { context?: { hasSelectionContext?: boolean } } | undefined)?.context?.hasSelectionContext), true);
+		assert.match(toolText, /context=selection=true/);
 	} finally {
 		await browser?.close();
 		await server.stop();

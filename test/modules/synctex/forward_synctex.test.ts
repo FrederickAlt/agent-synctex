@@ -648,6 +648,34 @@ test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct c
 	}
 });
 
+test("reverse SyncTeX adapter leaves no-context fallback mapping unchanged", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: failNativeRunner,
+		});
+
+		assert.equal(location.sourceFile, project.sourcePath);
+		assert.equal(location.line, 3);
+		assert.equal(location.column, 0);
+		assert.equal(location.diagnostics.context.hasSelectionContext, false);
+		assert.deepEqual(location.diagnostics.candidates.map((candidate) => candidate.kind), ["raw"]);
+		assert.deepEqual(location.diagnostics.selected, {
+			sourceFile: project.sourcePath,
+			line: 3,
+			column: 0,
+			sourceLine: "First paragraph text that should wrap a little and create boxes.",
+		});
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse SyncTeX adapter reads realistic .synctex.gz fixtures", () => {
 	const project = makeFixtureProject({ sidecar: "synctex.gz" });
 	try {
