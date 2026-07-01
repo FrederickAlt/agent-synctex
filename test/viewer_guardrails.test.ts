@@ -94,13 +94,25 @@ const PACKAGE_STALE_METADATA_TOKENS = [
 	"show-latex.service",
 	"codex-show-latex-viewer.service",
 ];
+const REMOVED_IMPLEMENTED_DOC_PATHS = [
+	"docs/prd-desktop-viewer-host-v1.md",
+	"docs/tdd-desktop-viewer-host-v1.md",
+] as const;
+
 const ACTIVE_DOC_PATHS = [
 	"README.md",
 	"CONTEXT.md",
-	"docs/prd-desktop-viewer-host-v1.md",
-	"docs/tdd-desktop-viewer-host-v1.md",
+	"docs/prd-tdd-synctex-native-parity-rectangles-reverse-quality.md",
 	"docs/prd-viewer-client-ux-followups.md",
 	"docs/tdd-viewer-client-ux-followups.md",
+	"docs/issues/synctex-native-parity/README.md",
+	"docs/issues/synctex-native-parity/TRACEABILITY.md",
+	"docs/issues/synctex-native-parity/001-native-forward-first-js-fallback.md",
+	"docs/issues/synctex-native-parity/002-rectangle-indicator-rendering.md",
+	"docs/issues/synctex-native-parity/003-forward-marker-placement-parity.md",
+	"docs/issues/synctex-native-parity/004-reverse-selection-context-parity.md",
+	"docs/issues/synctex-native-parity/005-formula-reverse-geometry-ranking.md",
+	"docs/issues/synctex-native-parity/006-synctex-diagnostics-and-acceptance.md",
 ] as const;
 const STALE_PI_EXTENSION_BRANDING_PATTERNS: Array<[RegExp, string]> = [
 	[/\bPi extension\b/gi, "stale Pi extension branding"],
@@ -705,12 +717,17 @@ test("Package metadata keeps approved production entrypoints", () => {
 });
 
 
-test("Active docs describe the MCP/Viewer Host boundary and safe MCP startup commands", () => {
+test("Active docs track current SyncTeX PRD/TDD and safe MCP startup commands", () => {
 	const violations: GuardrailViolation[] = [];
 	let combinedDocs = "";
 
+	for (const docPath of REMOVED_IMPLEMENTED_DOC_PATHS) {
+		assert.equal(existsSync(join(REPO_ROOT, docPath)), false, `${docPath} should remain removed after implementation`);
+	}
+
 	for (const docPath of ACTIVE_DOC_PATHS) {
 		const file = join(REPO_ROOT, docPath);
+		assert.equal(existsSync(file), true, `${docPath} should exist as an active documentation guardrail input`);
 		const source = readFileSync(file, "utf8");
 		combinedDocs += `\n${source}`;
 		violations.push(...collectActiveDocRuntimeGuidanceViolations(file, source));
@@ -718,6 +735,11 @@ test("Active docs describe the MCP/Viewer Host boundary and safe MCP startup com
 
 	assert.match(combinedDocs, /stdio MCP/i, "active docs must identify the stdio MCP runtime");
 	assert.match(combinedDocs, /Viewer Host/i, "active docs must identify the Viewer Host boundary");
+	assert.match(combinedDocs, /PRD\/TDD: SyncTeX parity and quality roadmap/i, "active docs must include the current SyncTeX PRD/TDD");
+	assert.match(combinedDocs, /Native `synctex view` forward path is attempted before JS fallback/i, "active docs must guard native-first SyncTeX forward parity");
+	assert.match(combinedDocs, /Rectangle configured \+ native success renders rectangles/i, "active docs must guard rectangle indicator parity");
+	assert.match(combinedDocs, /Formula reverse click should not always resolve to `\\end\{\.\.\.\}`/i, "active docs must guard reverse-sync quality goals");
+	assert.match(combinedDocs, /Local issue drafts: SyncTeX native parity/i, "active docs must include the current SyncTeX issue drafts");
 	assert.doesNotMatch(readFileSync(join(REPO_ROOT, "README.md"), "utf8"), /reachable browser\/PDF\.js|browser-hosted PDF\.js|process-local PDF\.js HTTP serving/i, "README must not promise old reachable in-process PDF.js behavior");
 	assert.equal(
 		violations.length,
