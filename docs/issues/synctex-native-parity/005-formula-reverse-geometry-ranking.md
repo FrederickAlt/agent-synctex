@@ -1,4 +1,4 @@
-# Formula reverse-sync geometry ranking
+# Formula reverse SyncTeX candidate diagnostics and native comparison
 
 ## Parent
 
@@ -6,40 +6,46 @@ Local parent PRD/TDD: `docs/prd-tdd-synctex-native-parity-rectangles-reverse-qua
 
 ## What to build
 
-Improve user-click reverse SyncTeX for displayed formulas and environments after LaTeX-Workshop parity is in place.
+Before implementing formula reverse ranking, add diagnostics that answer whether the data currently available can support correct formula reverse sync.
 
-Formula clicks cannot rely primarily on PDF text extraction. Implement a geometry-first candidate ranking strategy inspired by `../synctex_ideas/ideas.md` ideas 14 and 15:
+For each clicked formula point in a compiled fixture, compare:
 
-- prefer candidates geometrically close to the click;
-- prefer smaller/local/content candidates over large environment boxes;
-- penalize `\begin`, `\end`, labels, and tags when content candidates exist;
-- use nearby text only as secondary evidence for prose or reliable text regions.
+- expected source line;
+- current LaTeX-Workshop JS reverse candidates;
+- current JS-selected result;
+- native `synctex edit` result for the same PDF point;
+- whether the expected source line exists among candidate data;
+- enough geometry metadata to decide whether a grounded ranker can pick the right line.
 
-This slice must start with an oracle fixture that reproduces the current bad behavior: clicking formula content resolves to `\end{...}` or another structural line.
+If diagnostics prove the expected line is present in candidate data and a geometry-first ranking rule can be justified, continue to implement the ranking in this slice. If not, stop and report the blocker before inventing heuristics.
 
 ## Parent PRD coverage
 
 - User stories covered:
-  - clicking formula content should not always resolve to `\end{...}`;
-  - reverse sync should prefer the clicked visual row/content where candidate data supports it.
+  - formula reverse-sync failures can be diagnosed without guessing;
+  - clicking formula content should not be improved via speculative one-off heuristics;
+  - native reverse behavior is compared before deciding whether JS candidate ranking is sufficient.
 - Implementation decisions covered:
-  - geometry-first ranking for formulas;
-  - text repair is secondary, not primary, for math.
+  - diagnostics first;
+  - native `synctex edit` is allowed as a diagnostic/candidate source;
+  - geometry-first ranking may proceed only if candidate evidence supports it;
+  - text extraction is not the primary formula signal.
 - Parent invariants this slice must preserve:
-- server owns ranking decisions; client only supplies click coordinates/context and renders results;
-  - no one-off formula heuristics before test reproduction;
-  - ranking must be based on candidate evidence and geometry;
-  - compare against LaTeX-Workshop/native behavior where possible before diverging.
+  - server owns diagnostics/ranking decisions; client only supplies click coordinates/context;
+  - no speculative formula heuristics;
+  - if candidate data is insufficient, stop and report rather than diverging.
 
 ## Acceptance criteria
 
 - [ ] A compiled fixture covers `equation`, `align`, `aligned`, and at least one nested environment.
-- [ ] Test reproduces a bad reverse result such as resolving formula content to `\end{...}`.
-- [ ] Ranking prefers closer/smaller/content candidate over enclosing environment candidate.
-- [ ] Formula reverse tests pass without relying on PDF text extraction as the primary signal.
+- [ ] Diagnostic output includes the clicked PDF point, expected line, JS selected result, native `synctex edit` result, and all JS reverse candidates considered.
+- [ ] Each candidate includes source line, source text, rectangle geometry, distance to click, area, and whether the click is inside its rectangle.
+- [ ] Tests prove diagnostics can reproduce or explain a formula reverse failure such as choosing `\end{...}` or an unrelated formula row.
+- [ ] If JS candidates include the expected line with sufficient geometry evidence, ranking is implemented and tested.
+- [ ] If JS candidates do not include sufficient evidence but native does, native reverse first / JS fallback is recommended or implemented only if clearly in scope.
+- [ ] If neither JS nor native provides sufficient evidence, implementation stops and reports the limitation.
 - [ ] Prose reverse behavior does not regress.
-- [ ] Diagnostics expose candidate/ranking data for failed formula cases.
-- [ ] `npm run check` and relevant reverse/oracle tests pass.
+- [ ] `npm run check` and relevant reverse/oracle tests pass for any implemented changes.
 
 ## Blocked by
 
