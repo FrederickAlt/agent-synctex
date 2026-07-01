@@ -93,6 +93,16 @@ export interface ForwardSynctexPoint {
 export type ForwardSynctexJsFallback = (line: number, sourceFile: string, pdfPath: string) => ForwardSynctexPoint | undefined;
 export type ReverseSynctexJsFallback = (page: number, x: number, y: number, pdfPath: string) => ReverseSynctexMappedResult | undefined;
 
+export interface SelectedTextSourceRange {
+	sourceFile: string;
+	startLine: number;
+	startColumn: number;
+	endLine: number;
+	endColumn: number;
+	startSourceLine?: string;
+	endSourceLine?: string;
+}
+
 export interface MapForwardSynctexInput {
 	pdfPath: string;
 	sourceFile: string;
@@ -465,12 +475,69 @@ function getRowAndColumn(lines: string[], row: number, textBeforeSelectionFull: 
 	return [row, 0];
 }
 
-function readSourceLines(sourceFile: string): string[] | undefined {
+function readSourceText(sourceFile: string): string | undefined {
 	try {
-		return readFileSync(sourceFile, "utf8").split(/\r?\n/);
+		return readFileSync(sourceFile, "utf8");
 	} catch {
 		return undefined;
 	}
+}
+
+function readSourceLines(sourceFile: string): string[] | undefined {
+	return readSourceText(sourceFile)?.split(/\r?\n/);
+}
+
+function resolveReverseMappedSourceFile(mapped: ReverseSynctexMappedResult, cwd: string): string {
+	return isAbsolute(mapped.input) ? resolve(mapped.input) : resolve(cwd, mapped.input);
+}
+
+function invalidReadableSourceLineReason(mapped: ReverseSynctexMappedResult, cwd: string): string | undefined {
+	if (!Number.isInteger(mapped.line) || mapped.line < 1) return `mapped line ${mapped.line} is outside readable source line range`;
+	const sourceLines = readSourceLines(resolveReverseMappedSourceFile(mapped, cwd));
+	if (sourceLines === undefined) return undefined;
+	if (mapped.line > sourceLines.length) return `mapped line ${mapped.line} is outside readable source line range 1-${sourceLines.length}`;
+	return undefined;
+}
+
+function lineColumnForSourceIndex(source: string, index: number): { line: number; column: number } {
+	let line = 1;
+	let column = 0;
+	for (let pos = 0; pos < index; pos += 1) {
+		const char = source[pos];
+		if (char === "\r") {
+			if (source[pos + 1] === "\n") pos += 1;
+			line += 1;
+			column = 0;
+		} else if (char === "\n") {
+			line += 1;
+			column = 0;
+		} else {
+			column += 1;
+		}
+	}
+	return { line, column };
+}
+
+export function findUniqueSelectedTextSourceRange(sourceFile: string, selectedText: string): SelectedTextSourceRange | undefined {
+	if (selectedText.length === 0) return undefined;
+	const source = readSourceText(sourceFile);
+	if (source === undefined) return undefined;
+	const firstIndex = source.indexOf(selectedText);
+	if (firstIndex < 0) return undefined;
+	if (source.indexOf(selectedText, firstIndex + 1) >= 0) return undefined;
+	const lastIndex = firstIndex + selectedText.length - 1;
+	const start = lineColumnForSourceIndex(source, firstIndex);
+	const end = lineColumnForSourceIndex(source, lastIndex);
+	const sourceLines = source.split(/\r?\n/);
+	return {
+		sourceFile,
+		startLine: start.line,
+		startColumn: start.column,
+		endLine: end.line,
+		endColumn: end.column,
+		...(sourceLines[start.line - 1] === undefined ? {} : { startSourceLine: sourceLines[start.line - 1] }),
+		...(sourceLines[end.line - 1] === undefined ? {} : { endSourceLine: sourceLines[end.line - 1] }),
+	};
 }
 
 const FORMULA_ENVIRONMENTS = new Set([
@@ -633,6 +700,14 @@ export function mapReverseSynctex(input: {
 		command: input.synctexCommand ?? "synctex",
 	});
 	let mapped = native.mapped;
+	let nativeFailureReason = native.failureReason;
+	if (mapped !== undefined) {
+		const invalidReason = invalidReadableSourceLineReason(mapped, input.cwd);
+		if (invalidReason !== undefined) {
+			nativeFailureReason = invalidReason;
+			mapped = undefined;
+		}
+	}
 	let branch: ReverseSynctexBranch = "native";
 	let jsFallback: ReverseSynctexDiagnostics["jsFallback"] | undefined;
 	if (mapped === undefined) {
@@ -643,6 +718,13 @@ export function mapReverseSynctex(input: {
 			process.chdir(input.cwd);
 			jsMapped = (input.jsFallback ?? syncTeXToTeX)(input.page, input.x, input.y, pdfPath);
 			if (jsMapped === undefined) jsFailureReason = "no result";
+			else {
+				const invalidReason = invalidReadableSourceLineReason(jsMapped, input.cwd);
+				if (invalidReason !== undefined) {
+					jsMapped = undefined;
+					jsFailureReason = invalidReason;
+				}
+			}
 		} catch (error) {
 			jsMapped = undefined;
 			jsFailureReason = error instanceof Error ? error.message : String(error);
@@ -658,10 +740,10 @@ export function mapReverseSynctex(input: {
 		branch = "js_fallback";
 	}
 	if (mapped === undefined) {
-		throw new Error(`No SyncTeX mapping found for page ${input.page} at ${input.x},${input.y}; native synctex edit returned ${native.failureReason ?? "no usable result"}; JS fallback returned ${jsFallback?.failureReason ?? "no result"}`);
+		throw new Error(`No SyncTeX mapping found for page ${input.page} at ${input.x},${input.y}; native synctex edit returned ${nativeFailureReason ?? "no usable result"}; JS fallback returned ${jsFallback?.failureReason ?? "no result"}`);
 	}
 
-	const sourceFile = isAbsolute(mapped.input) ? resolve(mapped.input) : resolve(input.cwd, mapped.input);
+	const sourceFile = resolveReverseMappedSourceFile(mapped, input.cwd);
 	const rawMappedLine = mapped.line;
 	const rawMappedColumn = mapped.column;
 	let line = mapped.line;
@@ -704,7 +786,10 @@ export function mapReverseSynctex(input: {
 	const diagnostics: ReverseSynctexDiagnostics = {
 		branch,
 		lookupInput: { pdfPath, page: input.page, x: input.x, y: input.y, sidecarPath },
-		native: native.diagnostics,
+		native: {
+			...native.diagnostics,
+			...(nativeFailureReason === undefined ? {} : { failureReason: nativeFailureReason }),
+		},
 		...(jsFallback === undefined ? {} : { jsFallback }),
 		context: {
 			hasSelectionContext,
