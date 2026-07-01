@@ -415,22 +415,30 @@ function scheduleReverseSynctexSelectionSend(pageNumber, pageElement, canvas, vi
 	const request = { pageNumber, pageElement, canvas, viewport };
 	pendingReverseSynctexSelectionSend = request;
 	let observedGeneration = selectionGeneration;
-	let stableFrames = 0;
+	let observedSignature = currentReverseSynctexSelectionSignature();
+	let stableSamples = 0;
+	const scheduleTick = (delay) => {
+		setTimeout(() => requestAnimationFrame(tick), delay);
+	};
 	function tick() {
 		if (pendingReverseSynctexSelectionSend !== request) return;
-		if (selectionGeneration !== observedGeneration) {
+		const signature = currentReverseSynctexSelectionSignature();
+		if (selectionGeneration !== observedGeneration || signature !== observedSignature) {
 			observedGeneration = selectionGeneration;
-			stableFrames = 0;
+			observedSignature = signature;
+			stableSamples = 0;
+			scheduleTick(100);
+			return;
 		}
-		stableFrames += 1;
-		if (stableFrames < 2) {
-			requestAnimationFrame(tick);
+		stableSamples += 1;
+		if (stableSamples < 2) {
+			scheduleTick(25);
 			return;
 		}
 		pendingReverseSynctexSelectionSend = undefined;
 		sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport);
 	}
-	requestAnimationFrame(tick);
+	scheduleTick(100);
 }
 
 function viewportScale(input) {
