@@ -58,6 +58,7 @@ interface RasterMetadata {
 		readonly line: number;
 		readonly out: string;
 	};
+	readonly serverLookup: ReturnType<typeof mapForwardSynctex>["diagnostics"];
 	readonly mapping: {
 		readonly page: number;
 		readonly sourceFile: string;
@@ -72,6 +73,10 @@ interface RasterMetadata {
 			readonly x: number;
 			readonly y: number;
 		};
+	};
+	readonly viewerRenderedGeometry: {
+		readonly pdfPoints: MarkerPoints;
+		readonly imagePx: MarkerImage;
 	};
 	readonly marker: {
 		readonly pdfPoints: MarkerPoints;
@@ -418,6 +423,7 @@ function buildMetadata(args: {
 			line: args.jump.line,
 			out: args.outDir,
 		},
+		serverLookup: args.jump.diagnostics,
 		mapping: {
 			page: args.jump.page,
 			sourceFile: args.jump.sourceFile,
@@ -433,6 +439,15 @@ function buildMetadata(args: {
 			pxPerPoint: args.dpi / 72,
 			dpi: args.dpi,
 			viewportScale: { x: 1, y: 1 },
+		},
+		viewerRenderedGeometry: {
+			pdfPoints: {
+				x: args.jump.x,
+				y: args.jump.y,
+				...(args.jump.width === undefined ? {} : { width: args.jump.width }),
+				...(args.jump.height === undefined ? {} : { height: args.jump.height }),
+			},
+			imagePx: args.linePx,
 		},
 		marker: {
 			pdfPoints: {

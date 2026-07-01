@@ -451,6 +451,7 @@ export interface HostServiceJumpResponseDetails {
 	height?: number;
 	ranges?: HostServiceJumpResponseSynctexRange[];
 	synctex_branch?: "native" | "js_fallback";
+	synctex_diagnostics?: unknown;
 	viewer_notifications?: number;
 	reason?: string;
 	handle?: string;

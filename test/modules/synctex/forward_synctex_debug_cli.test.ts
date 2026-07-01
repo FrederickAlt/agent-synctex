@@ -15,6 +15,17 @@ interface DiagnosticMetadata {
 		readonly line: number;
 		readonly out: string;
 	};
+	readonly serverLookup: {
+		readonly branch: "native" | "js_fallback";
+		readonly native: {
+			readonly stdout?: string;
+			readonly parsedRectangles: unknown[];
+		};
+		readonly jsFallback?: {
+			readonly attempted: boolean;
+			readonly point?: unknown;
+		};
+	};
 	readonly mapping: {
 		readonly page: number;
 		readonly x: number;
@@ -23,6 +34,16 @@ interface DiagnosticMetadata {
 		readonly height?: number;
 		readonly sourceFile: string;
 		readonly sidecarPath: string;
+	};
+	readonly viewerRenderedGeometry: {
+		readonly pdfPoints: {
+			readonly x: number;
+			readonly y: number;
+		};
+		readonly imagePx: {
+			readonly x: number;
+			readonly y: number;
+		};
 	};
 	readonly artifacts: {
 		readonly fullPagePng: string;
@@ -121,6 +142,15 @@ test("debug forward SyncTeX CLI writes JSON and PNG artifacts for a compiled fix
 		assert.equal(metadata.mapping.sidecarPath, jump.sidecarPath);
 		assert.equal(metadata.mapping.x, jump.x);
 		assert.equal(metadata.mapping.y, jump.y);
+		assert.equal(metadata.serverLookup.branch, jump.branch);
+		assert.equal(typeof metadata.serverLookup.native.stdout, "string");
+		assert.deepEqual(metadata.serverLookup.native.parsedRectangles, jump.diagnostics.native.parsedRectangles);
+		if (jump.branch === "js_fallback") {
+			assert.equal(metadata.serverLookup.jsFallback?.attempted, true);
+			assert.deepEqual(metadata.serverLookup.jsFallback?.point, jump.diagnostics.jsFallback?.point);
+		}
+		assert.equal(metadata.viewerRenderedGeometry.pdfPoints.x, jump.x);
+		assert.equal(metadata.viewerRenderedGeometry.pdfPoints.y, jump.y);
 		assert.equal(Object.hasOwn(metadata.mapping, "width"), false);
 		assert.equal(Object.hasOwn(metadata.mapping, "height"), false);
 		assert.equal(Object.hasOwn(jump, "width"), false);

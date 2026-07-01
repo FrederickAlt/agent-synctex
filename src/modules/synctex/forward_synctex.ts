@@ -29,6 +29,7 @@ export interface ForwardSynctexJump {
 	sourceLine: string;
 	sidecarPath: string;
 	branch: ForwardSynctexBranch;
+	diagnostics: ForwardSynctexDiagnostics;
 }
 
 export interface ForwardSynctexRange {
@@ -37,6 +38,33 @@ export interface ForwardSynctexRange {
 	v: number;
 	W: number;
 	H: number;
+}
+
+export interface ForwardSynctexDiagnostics {
+	branch: ForwardSynctexBranch;
+	lookupInput: {
+		pdfPath: string;
+		sourceFile: string;
+		line: number;
+		sidecarPath: string;
+	};
+	native: {
+		command: string;
+		args: string[];
+		cwd: string;
+		status?: number | null;
+		stdout?: string;
+		stderr?: string;
+		error?: string;
+		failureReason?: string;
+		parsedPoint?: ForwardSynctexPoint;
+		parsedRectangles: ForwardSynctexRange[];
+	};
+	jsFallback?: {
+		attempted: boolean;
+		point?: ForwardSynctexPoint;
+		failureReason?: string;
+	};
 }
 
 export interface NativeSynctexRunResult {
@@ -89,6 +117,35 @@ export interface ReverseSynctexLocation {
 	rawMappedSourceLine?: string;
 	normalizedFormulaSpan?: ReverseSynctexFormulaSpan;
 	normalizedFormulaExcerpt?: string;
+	diagnostics: ReverseSynctexDiagnostics;
+}
+
+export interface ReverseSynctexDiagnostics {
+	lookupInput: {
+		pdfPath: string;
+		page: number;
+		x: number;
+		y: number;
+		sidecarPath: string;
+	};
+	context: {
+		hasSelectionContext: boolean;
+		textBeforeSelection?: string;
+		textAfterSelection?: string;
+	};
+	candidates: Array<{
+		sourceFile: string;
+		line: number;
+		column: number;
+		sourceLine?: string;
+		kind: "raw" | "context_corrected" | "formula_normalized";
+	}>;
+	selected: {
+		sourceFile: string;
+		line: number;
+		column: number;
+		sourceLine?: string;
+	};
 }
 
 export function resolveSynctexSidecar(pdfPath: string): string | undefined {
@@ -194,16 +251,57 @@ function parseNativeForwardResult(stdout: string): ForwardSynctexPoint | undefin
 	return { page: pointRecord.page, x: pointRecord.x, y: pointRecord.y, indicator: true };
 }
 
-function runNativeForwardSynctex(input: { line: number; sourceFile: string; pdfPath: string; runner: NativeSynctexRunner; command: string }): { mapped?: ForwardSynctexPoint; failureReason?: string } {
+function runNativeForwardSynctex(input: { line: number; sourceFile: string; pdfPath: string; runner: NativeSynctexRunner; command: string }): { mapped?: ForwardSynctexPoint; failureReason?: string; diagnostics: ForwardSynctexDiagnostics["native"] } {
 	const args = ["view", "-i", `${input.line}:1:${input.sourceFile}`, "-o", input.pdfPath];
-	const result = input.runner(input.command, args, { cwd: dirname(input.pdfPath) });
-	if (result.error) return { failureReason: result.error.message };
-	if (result.status !== 0) return { failureReason: `exit status ${String(result.status)}${result.stderr ? `: ${result.stderr.trim()}` : ""}` };
-	const mapped = parseNativeForwardResult(result.stdout);
-	return mapped === undefined ? { failureReason: "no usable result" } : { mapped };
+	const cwd = dirname(input.pdfPath);
+	const result = input.runner(input.command, args, { cwd });
+	const mapped = result.status === 0 && result.error === undefined ? parseNativeForwardResult(result.stdout) : undefined;
+	const failureReason = result.error !== undefined
+		? result.error.message
+		: result.status !== 0
+			? `exit status ${String(result.status)}${result.stderr ? `: ${result.stderr.trim()}` : ""}`
+			: mapped === undefined ? "no usable result" : undefined;
+	return {
+		...(mapped === undefined ? {} : { mapped }),
+		...(failureReason === undefined ? {} : { failureReason }),
+		diagnostics: {
+			command: input.command,
+			args,
+			cwd,
+			status: result.status,
+			stdout: result.stdout,
+			stderr: result.stderr,
+			...(result.error === undefined ? {} : { error: result.error.message }),
+			...(failureReason === undefined ? {} : { failureReason }),
+			...(mapped === undefined ? {} : { parsedPoint: mapped }),
+			parsedRectangles: mapped?.ranges ?? [],
+		},
+	};
 }
 
-function withForwardGlue(input: { mapped: ForwardSynctexPoint; branch: ForwardSynctexBranch; sourceFile: string; line: number; sourceLine: string; sidecarPath: string }): ForwardSynctexJump {
+function buildForwardDiagnostics(input: {
+	branch: ForwardSynctexBranch;
+	pdfPath: string;
+	sourceFile: string;
+	line: number;
+	sidecarPath: string;
+	native: ForwardSynctexDiagnostics["native"];
+	jsFallback?: ForwardSynctexDiagnostics["jsFallback"];
+}): ForwardSynctexDiagnostics {
+	return {
+		branch: input.branch,
+		lookupInput: {
+			pdfPath: input.pdfPath,
+			sourceFile: input.sourceFile,
+			line: input.line,
+			sidecarPath: input.sidecarPath,
+		},
+		native: input.native,
+		...(input.jsFallback === undefined ? {} : { jsFallback: input.jsFallback }),
+	};
+}
+
+function withForwardGlue(input: { mapped: ForwardSynctexPoint; branch: ForwardSynctexBranch; sourceFile: string; line: number; sourceLine: string; sidecarPath: string; diagnostics: ForwardSynctexDiagnostics }): ForwardSynctexJump {
 	return {
 		page: input.mapped.page,
 		x: input.mapped.x,
@@ -217,6 +315,7 @@ function withForwardGlue(input: { mapped: ForwardSynctexPoint; branch: ForwardSy
 		sourceLine: input.sourceLine,
 		sidecarPath: input.sidecarPath,
 		branch: input.branch,
+		diagnostics: input.diagnostics,
 	};
 }
 
@@ -244,24 +343,34 @@ export function mapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctex
 		command: input.synctexCommand ?? "synctex",
 	});
 	if (native.mapped !== undefined) {
-		return withForwardGlue({ mapped: native.mapped, branch: "native", sourceFile, line: input.line, sourceLine, sidecarPath });
+		const diagnostics = buildForwardDiagnostics({ branch: "native", pdfPath, sourceFile, line: input.line, sidecarPath, native: native.diagnostics });
+		return withForwardGlue({ mapped: native.mapped, branch: "native", sourceFile, line: input.line, sourceLine, sidecarPath, diagnostics });
 	}
 
 	let mapped;
+	let jsFailureReason: string | undefined;
 	const previousCwd = process.cwd();
 	try {
 		process.chdir(input.cwd);
 		mapped = (input.jsFallback ?? syncTeXToPDF)(input.line, sourceFile, pdfPath);
-	} catch {
+		if (mapped === undefined) jsFailureReason = "no result";
+	} catch (error) {
 		mapped = undefined;
+		jsFailureReason = error instanceof Error ? error.message : String(error);
 	} finally {
 		process.chdir(previousCwd);
 	}
+	const jsFallback = {
+		attempted: true,
+		...(mapped === undefined ? {} : { point: mapped }),
+		...(jsFailureReason === undefined ? {} : { failureReason: jsFailureReason }),
+	};
 	if (mapped === undefined) {
 		throw new Error(`No usable SyncTeX mapping found for ${sourcePathLabel(sourceFile)}:${input.line}; native synctex view returned ${native.failureReason ?? "no usable result"}; JS fallback returned no result`);
 	}
 
-	return withForwardGlue({ mapped, branch: "js_fallback", sourceFile, line: input.line, sourceLine, sidecarPath });
+	const diagnostics = buildForwardDiagnostics({ branch: "js_fallback", pdfPath, sourceFile, line: input.line, sidecarPath, native: native.diagnostics, jsFallback });
+	return withForwardGlue({ mapped, branch: "js_fallback", sourceFile, line: input.line, sourceLine, sidecarPath, diagnostics });
 }
 
 function indexes(source: string, find: string): number[] {
@@ -461,6 +570,46 @@ export function mapReverseSynctex(input: {
 	const sourceLine = readSourceLine(sourceFile, line, input.cwd);
 	const rawMappedSourceLine = readSourceLine(sourceFile, rawMappedLine, input.cwd);
 	const normalizedFormula = normalizeFormulaClosingSpan(sourceFile, rawMappedLine, sourceLines);
+	const candidates: ReverseSynctexDiagnostics["candidates"] = [{
+		sourceFile,
+		line: rawMappedLine,
+		column: rawMappedColumn,
+		...(rawMappedSourceLine === undefined ? {} : { sourceLine: rawMappedSourceLine }),
+		kind: "raw",
+	}];
+	if (line !== rawMappedLine || column !== rawMappedColumn) {
+		candidates.push({
+			sourceFile,
+			line,
+			column,
+			...(sourceLine === undefined ? {} : { sourceLine }),
+			kind: "context_corrected",
+		});
+	}
+	if (normalizedFormula !== undefined) {
+		candidates.push({
+			sourceFile: normalizedFormula.span.sourceFile,
+			line: normalizedFormula.span.startLine,
+			column: 0,
+			sourceLine: normalizedFormula.excerpt,
+			kind: "formula_normalized",
+		});
+	}
+	const diagnostics: ReverseSynctexDiagnostics = {
+		lookupInput: { pdfPath, page: input.page, x: input.x, y: input.y, sidecarPath },
+		context: {
+			hasSelectionContext,
+			...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }),
+			...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }),
+		},
+		candidates,
+		selected: {
+			sourceFile,
+			line,
+			column,
+			...(sourceLine === undefined ? {} : { sourceLine }),
+		},
+	};
 	return {
 		page: input.page,
 		x: input.x,
@@ -478,5 +627,6 @@ export function mapReverseSynctex(input: {
 			normalizedFormulaSpan: normalizedFormula.span,
 			normalizedFormulaExcerpt: normalizedFormula.excerpt,
 		}),
+		diagnostics,
 	};
 }

@@ -302,10 +302,52 @@ test("jump_pdf maps SyncTeX in MCP and sends synctex_forward through Viewer Host
 		assert.deepEqual(synctexMessage.ranges, expectedRanges);
 		assert.deepEqual(response.result?.details?.ranges, expectedRanges);
 		assert.match(String(response.result?.details?.synctex_branch), /^(native|js_fallback)$/);
+		const diagnostics = response.result?.details?.synctex_diagnostics as {
+			branch: string;
+			native: { command: string; stdout: string; parsedRectangles: unknown[] };
+		};
+		assert.equal(diagnostics.branch, "native");
+		assert.equal(diagnostics.native.command, "synctex");
+		assert.match(diagnostics.native.stdout, /SyncTeX result begin/);
+		assert.deepEqual(diagnostics.native.parsedRectangles, expectedRanges);
 		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "width"), false, "ViewerHostMcpService.jumpPdf must emit native ranges without legacy width");
 		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "height"), false, "ViewerHostMcpService.jumpPdf must emit native ranges without legacy height");
 		assert.equal(Object.hasOwn(response.result?.details ?? {}, "width"), false);
 		assert.equal(Object.hasOwn(response.result?.details ?? {}, "height"), false);
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("jump_pdf exposes JS fallback diagnostics after native SyncTeX failure", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-jump-js-fallback-diagnostics-"));
+	const binDir = join(baseDir, "bin");
+	const { pdfPath, sourcePath } = writeForwardSynctexFixture(baseDir);
+	const client = new FakeViewerHostClient({ origin: "http://viewer-host.local" });
+	const service = new ViewerHostMcpService({ client, makePdfId: () => 6 });
+	try {
+		writeFakeNativeSynctex(binDir, "native failed intentionally", 1);
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+		const response = await withPath(`${binDir}:${process.env.PATH ?? ""}`, async () => await callTool(2, "jump_pdf", { pdf_id: 6, line: 3, source_file: sourcePath, workspace_context: { cwd: baseDir } }, service)) as { result?: { details?: Record<string, unknown> } };
+
+		assert.equal(response.result?.details?.handled, true);
+		assert.equal(response.result?.details?.synctex_branch, "js_fallback");
+		const diagnostics = response.result?.details?.synctex_diagnostics as {
+			branch: string;
+			native: { status: number; stdout: string; failureReason: string; parsedRectangles: unknown[] };
+			jsFallback: { attempted: boolean; point: { page: number; x: number; y: number; indicator: boolean } };
+		};
+		assert.equal(diagnostics.branch, "js_fallback");
+		assert.equal(diagnostics.native.status, 1);
+		assert.equal(diagnostics.native.stdout, "native failed intentionally");
+		assert.deepEqual(diagnostics.native.parsedRectangles, []);
+		assert.equal(diagnostics.jsFallback.attempted, true);
+		assert.deepEqual(diagnostics.jsFallback.point, {
+			page: response.result?.details?.page,
+			x: response.result?.details?.x,
+			y: response.result?.details?.y,
+			indicator: true,
+		});
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}

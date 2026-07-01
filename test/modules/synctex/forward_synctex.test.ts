@@ -92,6 +92,16 @@ test("native forward SyncTeX returns native rectangle ranges", () => {
 		assert.deepEqual(calls[0]?.args, ["view", "-i", `3:1:${project.sourcePath}`, "-o", project.pdfPath]);
 		assert.equal(calls[0]?.cwd, dirname(project.pdfPath));
 		assert.equal(jump.branch, "native");
+		assert.equal(jump.diagnostics.branch, "native");
+		assert.equal(jump.diagnostics.native.command, "synctex");
+		assert.deepEqual(jump.diagnostics.native.args, ["view", "-i", `3:1:${project.sourcePath}`, "-o", project.pdfPath]);
+		assert.equal(jump.diagnostics.native.status, 0);
+		assert.match(jump.diagnostics.native.stdout ?? "", /SyncTeX result begin/);
+		assert.deepEqual(jump.diagnostics.native.parsedRectangles, [
+			{ page: 2, h: 20, v: 140, W: 30, H: 12 },
+			{ page: 3, h: 80, v: 200, W: 10, H: 8 },
+		]);
+		assert.equal(jump.diagnostics.jsFallback, undefined);
 		assert.equal(jump.page, 2);
 		assert.equal(jump.x, 20);
 		assert.equal(jump.y, 140);
@@ -173,6 +183,17 @@ test("native rectangle-mode failure falls back to JS circle semantics without sy
 		});
 
 		assert.equal(jump.branch, "js_fallback");
+		assert.equal(jump.diagnostics.branch, "js_fallback");
+		assert.equal(jump.diagnostics.native.status, 1);
+		assert.match(jump.diagnostics.native.failureReason ?? "", /native rectangle mode failed/);
+		assert.deepEqual(jump.diagnostics.native.parsedRectangles, []);
+		assert.equal(jump.diagnostics.jsFallback?.attempted, true);
+		assert.deepEqual(jump.diagnostics.jsFallback?.point, {
+			page: jump.page,
+			x: jump.x,
+			y: jump.y,
+			indicator: true,
+		});
 		assert.equal(jump.indicator, true);
 		assert.equal(Object.hasOwn(jump, "ranges"), false);
 		assert.equal(Object.hasOwn(jump, "width"), false);
@@ -301,14 +322,16 @@ test("forward SyncTeX adapter returns LaTeX-Workshop output plus current API glu
 		process.chdir(previousCwd);
 		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir, nativeRunner: failNativeRunner });
 
-		assert.deepEqual(jump, {
+		assert.deepEqual({ ...jump, diagnostics: undefined }, {
 			...lwJump,
 			sourceFile: project.sourcePath,
 			line: 3,
 			sourceLine: "First paragraph text that should wrap a little and create boxes.",
 			sidecarPath: join(project.dir, "paper.synctex"),
 			branch: "js_fallback",
+			diagnostics: undefined,
 		});
+		assert.equal(jump.diagnostics.branch, "js_fallback");
 		assert.equal(Object.hasOwn(jump, "width"), false);
 		assert.equal(Object.hasOwn(jump, "height"), false);
 	} finally {
@@ -469,6 +492,15 @@ test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct c
 		assert.equal(location.line, 3);
 		assert.equal(location.column, "First paragraph".length);
 		assert.equal(location.sourceLine, "First paragraph text that should wrap a little and create boxes.");
+		assert.equal(location.diagnostics.context.hasSelectionContext, true);
+		assert.equal(location.diagnostics.context.textBeforeSelection, "First paragraph");
+		assert.deepEqual(location.diagnostics.candidates.map((candidate) => candidate.kind), ["raw", "context_corrected"]);
+		assert.deepEqual(location.diagnostics.selected, {
+			sourceFile: project.sourcePath,
+			line: 3,
+			column: "First paragraph".length,
+			sourceLine: "First paragraph text that should wrap a little and create boxes.",
+		});
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

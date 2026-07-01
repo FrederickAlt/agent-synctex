@@ -271,7 +271,8 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 		}
 
 		assert.equal(details?.events?.length, 1);
-		assert.deepEqual(details?.events?.[0], {
+		const event = details?.events?.[0];
+		assert.deepEqual({ ...event, synctex_diagnostics: undefined }, {
 			type: "reverse_synctex",
 			sequence: 1,
 			pdf_id: 112,
@@ -279,11 +280,23 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 			line: 3,
 			column: "First paragraph".length,
 			source_line: "First paragraph text that should wrap a little and create boxes.",
-			timestamp: details?.events?.[0]?.timestamp,
+			timestamp: event?.timestamp,
 			page: 1,
 			x: 144.27,
 			y: 155.27,
+			synctex_diagnostics: undefined,
 		});
+		const diagnostics = event?.synctex_diagnostics as {
+			context: { hasSelectionContext: boolean; textBeforeSelection?: string };
+			candidates: Array<{ kind: string }>;
+			selected: { sourceFile: string; line: number; column: number };
+		};
+		assert.equal(diagnostics.context.hasSelectionContext, true);
+		assert.equal(diagnostics.context.textBeforeSelection, "First paragraph");
+		assert.deepEqual(diagnostics.candidates.map((candidate) => candidate.kind), ["raw", "context_corrected"]);
+		assert.equal(diagnostics.selected.sourceFile, sourcePath);
+		assert.equal(diagnostics.selected.line, 3);
+		assert.equal(diagnostics.selected.column, "First paragraph".length);
 		assert.match(String(details?.events?.[0]?.timestamp), /^\d{4}-\d{2}-\d{2}T/);
 	} finally {
 		socket?.close();
