@@ -1,4 +1,4 @@
-# Formula reverse SyncTeX candidate diagnostics and native comparison
+# Reverse SyncTeX formula closing-span normalization
 
 ## Parent
 
@@ -6,46 +6,54 @@ Local parent PRD/TDD: `docs/prd-tdd-synctex-native-parity-rectangles-reverse-qua
 
 ## What to build
 
-Before implementing formula reverse ranking, add diagnostics that answer whether the data currently available can support correct formula reverse sync.
+Keep reverse SyncTeX simple. Do not implement formula candidate ranking now.
 
-For each clicked formula point in a compiled fixture, compare:
+When reverse SyncTeX maps a click to a formula-closing structural line, enrich/normalize the reported source context to the enclosing formula span so the agent/LLM sees useful formula source instead of only a closing delimiter.
 
-- expected source line;
-- current LaTeX-Workshop JS reverse candidates;
-- current JS-selected result;
-- native `synctex edit` result for the same PDF point;
-- whether the expected source line exists among candidate data;
-- enough geometry metadata to decide whether a grounded ranker can pick the right line.
+Examples of closing structural lines:
 
-If diagnostics prove the expected line is present in candidate data and a geometry-first ranking rule can be justified, continue to implement the ranking in this slice. If not, stop and report the blocker before inventing heuristics.
+- `\end{equation}`
+- `\end{align}` / `\end{align*}`
+- `\end{aligned}` and similar math environments
+- `\]`
+- other simple display-math closing delimiters if already easy to detect safely
+
+For `\end{...}`, find the matching preceding `\begin{...}` using a small source scanner that handles same-environment nesting. For `\]`, find the matching preceding `\[`.
+
+Expose both:
+
+- the raw SyncTeX mapped location; and
+- the normalized formula source span/excerpt.
+
+Do not hide the raw result. The purpose is source-context quality for agents, not pretending reverse SyncTeX found an exact formula row.
 
 ## Parent PRD coverage
 
 - User stories covered:
-  - formula reverse-sync failures can be diagnosed without guessing;
-  - clicking formula content should not be improved via speculative one-off heuristics;
-  - native reverse behavior is compared before deciding whether JS candidate ranking is sufficient.
+  - formula reverse sync should not leave the agent with only `\end{...}` / `\]` source text;
+  - agent-facing reverse events should contain a useful formula excerpt when SyncTeX lands on a formula close.
 - Implementation decisions covered:
-  - diagnostics first;
-  - native `synctex edit` is allowed as a diagnostic/candidate source;
-  - geometry-first ranking may proceed only if candidate evidence supports it;
-  - text extraction is not the primary formula signal.
+  - keep this simple;
+  - no formula geometry ranking for now;
+  - no C scanner;
+  - stick with the existing CLI/native-forward and JS/LW reverse infrastructure;
+  - preserve raw SyncTeX output and add normalized span context.
 - Parent invariants this slice must preserve:
-  - server owns diagnostics/ranking decisions; client only supplies click coordinates/context;
-  - no speculative formula heuristics;
-  - if candidate data is insufficient, stop and report rather than diverging.
+  - server owns source-span normalization; client only supplies click coordinates/context;
+  - no speculative formula ranking heuristics;
+  - no PDF text extraction as primary formula signal;
+  - no native C library.
 
 ## Acceptance criteria
 
-- [ ] A compiled fixture covers `equation`, `align`, `aligned`, and at least one nested environment.
-- [ ] Diagnostic output includes the clicked PDF point, expected line, JS selected result, native `synctex edit` result, and all JS reverse candidates considered.
-- [ ] Each candidate includes source line, source text, rectangle geometry, distance to click, area, and whether the click is inside its rectangle.
-- [ ] Tests prove diagnostics can reproduce or explain a formula reverse failure such as choosing `\end{...}` or an unrelated formula row.
-- [ ] If JS candidates include the expected line with sufficient geometry evidence, ranking is implemented and tested.
-- [ ] If JS candidates do not include sufficient evidence but native does, native reverse first / JS fallback is recommended or implemented only if clearly in scope.
-- [ ] If neither JS nor native provides sufficient evidence, implementation stops and reports the limitation.
-- [ ] Prose reverse behavior does not regress.
-- [ ] `npm run check` and relevant reverse/oracle tests pass for any implemented changes.
+- [ ] Reverse event for `\end{equation}` includes a normalized formula span covering the matching `\begin{equation}`...`\end{equation}` block.
+- [ ] Reverse event for `\end{align}` / `\end{align*}` includes the matching environment span.
+- [ ] Reverse event for `\]` includes the matching `\[`...`\]` display-math span.
+- [ ] Raw mapped line/source text remains available in event details.
+- [ ] Normalized excerpt is included in agent-facing `get_pdf_events` details.
+- [ ] Non-formula reverse events are unchanged.
+- [ ] Nested same-environment cases do not pair with the wrong `\begin`.
+- [ ] `npm run check` and relevant reverse/event tests pass.
 
 ## Blocked by
 

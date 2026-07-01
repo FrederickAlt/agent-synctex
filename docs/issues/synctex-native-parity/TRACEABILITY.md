@@ -13,7 +13,7 @@ Parent PRD/TDD: `docs/prd-tdd-synctex-native-parity-rectangles-reverse-quality.m
 | Circle appears at mapped PDF point, not left edge | 003 |
 | Reverse click events include LW selection context where available | 004 |
 | Reverse row/column correction uses copied LW logic where applicable | 004 |
-| Formula reverse failures are diagnosed with JS/native candidate evidence before ranking | 005 |
+| Formula reverse events expose useful enclosing formula span when SyncTeX lands on a closing delimiter | 005 |
 | Agent-facing diagnostics expose branch/candidate/selection data | 006 |
 | Manual desktop smoke verifies visible behavior | 006 |
 
@@ -28,7 +28,7 @@ Parent PRD/TDD: `docs/prd-tdd-synctex-native-parity-rectangles-reverse-quality.m
 | Do not synthesize rectangles for JS fallback | 002 |
 | Prefer LW indicator placement or prove adaptation with browser tests | 003 |
 | Port LW reverse selection-context payload/correction | 004 |
-| Run formula reverse diagnostics and native comparison before geometry ranking | 005 |
+| Keep formula reverse simple: normalize closing structural hits to enclosing source spans, preserve raw result | 005 |
 | Treat text repair as secondary for math | 005 |
 | Expose debug/introspection data | 006 |
 
@@ -40,8 +40,8 @@ Parent PRD/TDD: `docs/prd-tdd-synctex-native-parity-rectangles-reverse-quality.m
 | Rectangle parser/protocol/viewer rendering | 002 |
 | Left/center/right circle browser placement | 003 |
 | Reverse context correction and no-context fallback | 004 |
-| Formula/environment reverse diagnostics and oracle | 005 |
-| Formula candidate/native comparison diagnostics | 005,006 |
+| Formula closing-span normalization tests | 005 |
+| Formula span normalization diagnostics/context | 005,006 |
 | Full `npm run check` and `npm test` | Each issue, final in 006 |
 | Manual desktop Viewer Host smoke | 006 |
 
