@@ -155,6 +155,53 @@ async function injectPageTextLayerAndSelection(page: Page): Promise<void> {
 	});
 }
 
+async function waitForSynctexCircleStyle(page: Page, expected: { left: number; top: number }, tolerance = 1): Promise<void> {
+	await page.waitForFunction(({ left, top, tolerance }) => {
+		const marker = document.querySelector("[data-synctex-marker][data-synctex-marker-kind='circle']") as HTMLElement | null;
+		if (!marker) return false;
+		const actualLeft = Number.parseFloat(marker.style.left);
+		const actualTop = Number.parseFloat(marker.style.top);
+		return Math.abs(actualLeft - left) <= tolerance && Math.abs(actualTop - top) <= tolerance;
+	}, { left: expected.left, top: expected.top, tolerance }, { timeout: 2_000 });
+}
+
+async function synctexMarkerGeometry(page: Page): Promise<{
+	marker: { left: number; right: number; top: number; bottom: number; width: number; height: number; centerX: number; centerY: number };
+	canvas: { left: number; right: number; top: number; bottom: number; width: number; height: number };
+	style: { left: number; top: number };
+}> {
+	return await page.locator("[data-synctex-marker]").evaluate((element) => {
+		const markerRect = element.getBoundingClientRect();
+		const canvas = document.querySelector("#pages canvas[data-page-number='1']") as HTMLCanvasElement | null;
+		if (!canvas) throw new Error("missing rendered canvas");
+		const canvasRect = canvas.getBoundingClientRect();
+		return {
+			marker: {
+				left: markerRect.left,
+				right: markerRect.right,
+				top: markerRect.top,
+				bottom: markerRect.bottom,
+				width: markerRect.width,
+				height: markerRect.height,
+				centerX: markerRect.left + markerRect.width / 2,
+				centerY: markerRect.top + markerRect.height / 2,
+			},
+			canvas: {
+				left: canvasRect.left,
+				right: canvasRect.right,
+				top: canvasRect.top,
+				bottom: canvasRect.bottom,
+				width: canvasRect.width,
+				height: canvasRect.height,
+			},
+			style: {
+				left: Number.parseFloat((element as HTMLElement).style.left),
+				top: Number.parseFloat((element as HTMLElement).style.top),
+			},
+		};
+	});
+}
+
 test("Viewer Host-served Viewer Client connects viewer socket, sends reverse SyncTeX clicks, and renders forward markers", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-socket-"));
 	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
@@ -242,6 +289,74 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assertApproximatelyEqual(scalarRect.top, 50, 1, "scalar rectangle marker top-origin viewport coordinate");
 		assertApproximatelyEqual(scalarRect.width, 12.5, 0.5, "scalar rectangle marker width");
 		assertApproximatelyEqual(scalarRect.height, 10, 0.5, "scalar rectangle marker height");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host-served Viewer Client places circle markers at left, center, and right PDF points", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-circles-"));
+	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	let service: ViewerHostMcpService | undefined;
+	const server = new ViewerHostServer({
+		registry,
+		mcpEventSink: (message) => service?.handleHostMessage(message),
+	});
+	let browser: Browser | undefined;
+	const consoleMessages: string[] = [];
+	const pageErrors: string[] = [];
+	const failedRequests: string[] = [];
+	try {
+		await server.start();
+		service = new ViewerHostMcpService({ client: new HttpViewerHostClient(server.origin), makePdfId: () => 229 });
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 240, height: 160 } });
+		page.on("console", (message) => consoleMessages.push(`${message.type()}: ${message.text()}`));
+		page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}`));
+		page.on("requestfailed", (request: Request) => failedRequests.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "request failed"}`));
+		page.on("response", (response: Response) => {
+			if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`);
+		});
+
+		await page.goto(`${server.origin}/viewer/229`, { waitUntil: "domcontentloaded" });
+		const outcome = await waitForViewerOutcome(page);
+		assert.equal(outcome.rendered, true, `viewer did not render first page; timedOut=${outcome.timedOut}; status=${JSON.stringify(outcome.status)}\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		await assert.doesNotReject(async () => {
+			for (let attempt = 0; attempt < 20; attempt += 1) {
+				if (server.getConnectedViewerCount(229) === 1) return;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			assert.equal(server.getConnectedViewerCount(229), 1);
+		});
+
+		const control = new ViewerHostControlClient({ origin: server.origin });
+		const points = [
+			{ label: "left", x: 20, y: 40, expectedX: 25, expectedY: 50 },
+			{ label: "center", x: 150, y: 40, expectedX: 187.5, expectedY: 50 },
+			{ label: "right", x: 280, y: 40, expectedX: 350, expectedY: 50 },
+		];
+		for (const point of points) {
+			assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 229, page: 1, x: point.x, y: point.y, indicator: true, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 229 } });
+			await waitForSynctexCircleStyle(page, { left: point.expectedX, top: point.expectedY });
+			const geometry = await synctexMarkerGeometry(page);
+			assertApproximatelyEqual(geometry.style.left, point.expectedX, 1, `${point.label} circle style left`);
+			assertApproximatelyEqual(geometry.style.top, point.expectedY, 1, `${point.label} circle style top`);
+			assertApproximatelyEqual(geometry.marker.centerX - geometry.canvas.left, point.expectedX, 1, `${point.label} circle bounding-box center x within canvas`);
+			assertApproximatelyEqual(geometry.marker.centerY - geometry.canvas.top, point.expectedY, 1, `${point.label} circle bounding-box center y within canvas`);
+			assert.ok(geometry.marker.left >= geometry.canvas.left - 0.5, `${point.label} circle should be inside rendered canvas left edge`);
+			assert.ok(geometry.marker.right <= geometry.canvas.right + 0.5, `${point.label} circle should be inside rendered canvas right edge`);
+			assert.ok(geometry.marker.top >= geometry.canvas.top - 0.5, `${point.label} circle should be inside rendered canvas top edge`);
+			assert.ok(geometry.marker.bottom <= geometry.canvas.bottom + 0.5, `${point.label} circle should be inside rendered canvas bottom edge`);
+			if (point.label !== "left") {
+				assert.ok(geometry.marker.centerX > 20, `${point.label} circle should not be pinned to the viewport left edge`);
+				assert.ok(geometry.style.left > 20, `${point.label} circle should not be pinned to the page left edge`);
+			}
+		}
 	} finally {
 		await browser?.close();
 		await server.stop();

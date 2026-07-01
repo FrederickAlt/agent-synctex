@@ -321,7 +321,7 @@ function showSynctexMarker(message) {
 		marker.style.width = "0.5em";
 		marker.style.height = "0.5em";
 		page.appendChild(marker);
-		page.scrollIntoView({ block: "center", inline: "center" });
+		scrollToUnionInViewport([marker]);
 		marker.focus({ preventScroll: true });
 		return;
 	}

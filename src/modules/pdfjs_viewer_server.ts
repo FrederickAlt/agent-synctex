@@ -129,14 +129,11 @@ function viewportScale(viewport) {
 
 function forwardSynctexMarkerFromPdfPoint(input) {
 	const point = input.viewport.convertToViewportPoint(input.pdfX, input.pdfY);
+	const pageHeight = input.pageHeight ?? input.page.getBoundingClientRect().height;
+	const position = { left: point[0], top: pageHeight - point[1] };
+	if (input.width === undefined || input.height === undefined) return position;
 	const scale = viewportScale(input.viewport);
-	const pageHeight = input.page.getBoundingClientRect().height;
-	return {
-		left: point[0],
-		top: pageHeight - point[1],
-		width: Number(input.width) * scale.x,
-		height: Number(input.height) * scale.y,
-	};
+	return { ...position, width: Number(input.width) * scale.x, height: Number(input.height) * scale.y };
 }
 
 function forwardSynctexMarkerFromPdfRange(input) {
@@ -194,9 +191,9 @@ function handleSynctexMessage(message) {
 		marker.style.position = "absolute";
 		marker.style.pointerEvents = "none";
 		marker.style.zIndex = "100000";
-		const point = viewport.convertToViewportPoint(Number(message.x) || 0, Number(message.y) || 0);
-		marker.style.left = String(point[0]) + "px";
-		marker.style.top = String(page.getBoundingClientRect().height - point[1]) + "px";
+		const position = forwardSynctexMarkerFromPdfPoint({ pdfX: Number(message.x) || 0, pdfY: Number(message.y) || 0, page, viewport });
+		marker.style.left = String(position.left) + "px";
+		marker.style.top = String(position.top) + "px";
 		marker.style.width = "0.5em";
 		marker.style.height = "0.5em";
 		marker.style.border = "0.2em solid red";
@@ -205,8 +202,8 @@ function handleSynctexMessage(message) {
 		marker.style.transform = "translate(-50%, -50%)";
 		marker.style.opacity = "0.8";
 		page.appendChild(marker);
+		focusMarkersInUnion(page, [marker]);
 		marker.focus({ preventScroll: true });
-		page.scrollIntoView({ block: "center", inline: "center" });
 		setStatus("SyncTeX jump: page " + message.page);
 		return;
 	}
