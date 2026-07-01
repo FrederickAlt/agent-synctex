@@ -643,6 +643,39 @@ test("Viewer Host-served Viewer Client renders multiple native rectangle markers
 		assert.equal(activeKind, "rect", "rectangle marker should remain the focused marker kind");
 		const scrolled = await page.evaluate(() => window.scrollY);
 		assert.ok(scrolled > 0, `expected viewer to scroll to rectangle union, saw scrollY=${scrolled}`);
+
+		assert.deepEqual(await control.send({
+			type: "synctex_forward",
+			pdf_id: 219,
+			page: 1,
+			x: 20,
+			y: 30,
+			ranges: [{ page: 1, h: 20, v: 30, W: 140, H: 0 }],
+			source_file: sourcePath,
+			line: 17,
+		}), { ok: true, result: { type: "synctex_forward", pdf_id: 219 } });
+		await page.waitForFunction(() => {
+			const markers = Array.from(document.querySelectorAll("[data-synctex-marker][data-synctex-marker-kind='rect']")) as HTMLElement[];
+			if (markers.length !== 1) return false;
+			const marker = markers[0];
+			return Math.abs(Number.parseFloat(marker.style.width) - 175) <= 0.5 && Math.abs(Number.parseFloat(marker.style.height) - 2) <= 0.5;
+		}, undefined, { timeout: 2_000 });
+		const zeroHeightMarkers = await page.locator("[data-synctex-marker]").evaluateAll((elements) => elements.map((element) => {
+			const marker = element as HTMLElement;
+			return {
+				width: Number.parseFloat(marker.style.width),
+				height: Number.parseFloat(marker.style.height),
+				border: marker.style.border,
+				background: marker.style.background,
+			};
+		}));
+		assert.equal(zeroHeightMarkers.length, 1, "zero-height native rectangle jump should replace previous markers with one row marker");
+		const zeroHeightMarker = zeroHeightMarkers[0];
+		assert.ok(zeroHeightMarker, "zero-height native rectangle marker should exist");
+		assertApproximatelyEqual(zeroHeightMarker.width, 175, 0.5, "zero-height native rectangle should keep its scaled row width");
+		assertApproximatelyEqual(zeroHeightMarker.height, 2, 0.5, "zero-height native rectangle should use the minimum visible fallback height");
+		assert.equal(zeroHeightMarker.border, "0px", "zero-height native rectangle highlight should not draw a red border");
+		assert.notEqual(zeroHeightMarker.background, "", "zero-height native rectangle should keep a background highlight");
 	} finally {
 		await browser?.close();
 		await server.stop();

@@ -488,14 +488,18 @@ async function renderPdf(config) {
 	setStatus("Loaded PDF " + config.pdf_id + " revision " + config.revision + ": " + pdf.numPages + " page(s)");
 }
 
+function visibleSynctexRectDimension(value) {
+	return Math.max(value, 2);
+}
+
 function forwardSynctexMarkerFromPdfRange(input) {
 	const leftTop = input.viewport.convertToViewportPoint(input.h, input.v - input.H);
 	const rightBottom = input.viewport.convertToViewportPoint(input.h + input.W, input.v);
 	return {
 		left: leftTop[0],
 		top: input.pageHeight - leftTop[1],
-		width: rightBottom[0] - leftTop[0],
-		height: leftTop[1] - rightBottom[1],
+		width: visibleSynctexRectDimension(rightBottom[0] - leftTop[0]),
+		height: visibleSynctexRectDimension(leftTop[1] - rightBottom[1]),
 	};
 }
 

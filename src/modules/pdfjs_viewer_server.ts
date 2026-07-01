@@ -369,6 +369,10 @@ function forwardSynctexMarkerFromPdfPoint(input) {
 	return { ...position, width: Number(input.width) * scale.x, height: Number(input.height) * scale.y };
 }
 
+function visibleSynctexRectDimension(value) {
+	return Math.max(value, 2);
+}
+
 function forwardSynctexMarkerFromPdfRange(input) {
 	const leftTop = input.viewport.convertToViewportPoint(input.h, input.v - input.H);
 	const rightBottom = input.viewport.convertToViewportPoint(input.h + input.W, input.v);
@@ -376,8 +380,8 @@ function forwardSynctexMarkerFromPdfRange(input) {
 	return {
 		left: leftTop[0],
 		top: pageHeight - leftTop[1],
-		width: rightBottom[0] - leftTop[0],
-		height: leftTop[1] - rightBottom[1],
+		width: visibleSynctexRectDimension(rightBottom[0] - leftTop[0]),
+		height: visibleSynctexRectDimension(leftTop[1] - rightBottom[1]),
 	};
 }
 

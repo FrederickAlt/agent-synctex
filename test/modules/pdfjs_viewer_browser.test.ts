@@ -72,6 +72,10 @@ function summarizeFailures(consoleMessages: string[], pageErrors: string[], fail
 	].join("\n");
 }
 
+function assertApproximatelyEqual(actual: number, expected: number, tolerance: number, label: string): void {
+	assert.ok(Math.abs(actual - expected) <= tolerance, `${label}: expected ${actual} to be within ${tolerance} of ${expected}`);
+}
+
 async function waitForViewerOutcome(page: Page): Promise<{ rendered: boolean; status: string; timedOut: boolean }> {
 	const deadline = Date.now() + 10_000;
 	let status = "";
@@ -95,9 +99,10 @@ test("PDF.js MCP viewer renders a registered PDF in a real browser", async () =>
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFileSync(pdfPath, makeOnePagePdf());
 	const launcher = new CapturingBrowserLauncher();
+	const registry = new PdfJsViewerRegistry({ makePdfId: () => 101 });
 	const service = new PdfJsViewerMcpService({
 		browserLauncher: launcher,
-		registry: new PdfJsViewerRegistry({ makePdfId: () => 101 }),
+		registry,
 		pdfRefresh: { autoStart: false },
 	});
 	let browser: Browser | undefined;
@@ -130,6 +135,46 @@ test("PDF.js MCP viewer renders a registered PDF in a real browser", async () =>
 		await page.goto(viewerUrl!, { waitUntil: "domcontentloaded" });
 		const outcome = await waitForViewerOutcome(page);
 		assert.equal(outcome.rendered, true, `viewer did not render first page; timedOut=${outcome.timedOut}; status=${JSON.stringify(outcome.status)}\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		await assert.doesNotReject(async () => {
+			for (let attempt = 0; attempt < 20; attempt += 1) {
+				if (registry.clientCount(101) === 1) return;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			assert.equal(registry.clientCount(101), 1);
+		});
+
+		assert.equal(registry.sendToClients(101, JSON.stringify({
+			type: "synctex",
+			pdf_id: 101,
+			page: 1,
+			x: 20,
+			y: 30,
+			ranges: [{ page: 1, h: 20, v: 30, W: 140, H: 0 }],
+			source_file: join(baseDir, "main.tex"),
+			line: 17,
+		})), 1);
+		await page.waitForFunction(() => {
+			const markers = Array.from(document.querySelectorAll("[data-synctex-marker][data-synctex-marker-kind='rect']")) as HTMLElement[];
+			if (markers.length !== 1) return false;
+			const marker = markers[0];
+			return Math.abs(Number.parseFloat(marker.style.width) - 175) <= 0.5 && Math.abs(Number.parseFloat(marker.style.height) - 2) <= 0.5;
+		}, undefined, { timeout: 2_000 });
+		const markers = await page.locator("[data-synctex-marker]").evaluateAll((elements) => elements.map((element) => {
+			const marker = element as HTMLElement;
+			return {
+				width: Number.parseFloat(marker.style.width),
+				height: Number.parseFloat(marker.style.height),
+				border: marker.style.border,
+				background: marker.style.background,
+			};
+		}));
+		assert.equal(markers.length, 1, "PDF.js viewer zero-height native rectangle should render exactly one marker");
+		const marker = markers[0];
+		assert.ok(marker, "PDF.js viewer zero-height native rectangle marker should exist");
+		assertApproximatelyEqual(marker.width, 175, 0.5, "PDF.js viewer zero-height native rectangle should keep its scaled row width");
+		assertApproximatelyEqual(marker.height, 2, 0.5, "PDF.js viewer zero-height native rectangle should use the minimum visible fallback height");
+		assert.equal(marker.border, "0px", "PDF.js viewer zero-height native rectangle should not draw a red border");
+		assert.notEqual(marker.background, "", "PDF.js viewer zero-height native rectangle should keep a background highlight");
 	} finally {
 		await browser?.close();
 		await service.stop();
