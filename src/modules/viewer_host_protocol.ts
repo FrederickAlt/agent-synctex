@@ -75,6 +75,11 @@ export interface ViewerHostReverseSynctexMessage {
 	y: number;
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
+	selectedText?: string;
+	selectionStartX?: number;
+	selectionStartY?: number;
+	selectionEndX?: number;
+	selectionEndY?: number;
 }
 
 export type ViewerHostToMcpMessage =
@@ -259,6 +264,11 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 		case "reverse_synctex": {
 			const textBeforeSelection = optionalString(message.textBeforeSelection, "textBeforeSelection");
 			const textAfterSelection = optionalString(message.textAfterSelection, "textAfterSelection");
+			const selectedText = optionalString(message.selectedText, "selectedText");
+			const selectionStartX = optionalCoordinate(message.selectionStartX, "selectionStartX");
+			const selectionStartY = optionalCoordinate(message.selectionStartY, "selectionStartY");
+			const selectionEndX = optionalCoordinate(message.selectionEndX, "selectionEndX");
+			const selectionEndY = optionalCoordinate(message.selectionEndY, "selectionEndY");
 			return {
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
@@ -267,6 +277,11 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				y: requireCoordinate(message.y, "y"),
 				...(textBeforeSelection === undefined ? {} : { textBeforeSelection }),
 				...(textAfterSelection === undefined ? {} : { textAfterSelection }),
+				...(selectedText === undefined ? {} : { selectedText }),
+				...(selectionStartX === undefined ? {} : { selectionStartX }),
+				...(selectionStartY === undefined ? {} : { selectionStartY }),
+				...(selectionEndX === undefined ? {} : { selectionEndX }),
+				...(selectionEndY === undefined ? {} : { selectionEndY }),
 			};
 		}
 		default:

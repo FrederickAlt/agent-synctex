@@ -11,6 +11,11 @@ export interface ReverseSynctexViewportInput {
 	viewport: PdfJsViewportCoordinateConverter;
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
+	selectedText?: string;
+	selectionStartX?: number;
+	selectionStartY?: number;
+	selectionEndX?: number;
+	selectionEndY?: number;
 }
 
 export interface ReverseSynctexSocketPayload {
@@ -20,6 +25,11 @@ export interface ReverseSynctexSocketPayload {
 	y: number;
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
+	selectedText?: string;
+	selectionStartX?: number;
+	selectionStartY?: number;
+	selectionEndX?: number;
+	selectionEndY?: number;
 }
 
 export interface ForwardSynctexMarkerInput {
@@ -47,6 +57,11 @@ export function reverseSynctexPayloadFromViewportPoint(input: ReverseSynctexView
 		y,
 		...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }),
 		...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }),
+		...(input.selectedText === undefined ? {} : { selectedText: input.selectedText }),
+		...(input.selectionStartX === undefined ? {} : { selectionStartX: input.selectionStartX }),
+		...(input.selectionStartY === undefined ? {} : { selectionStartY: input.selectionStartY }),
+		...(input.selectionEndX === undefined ? {} : { selectionEndX: input.selectionEndX }),
+		...(input.selectionEndY === undefined ? {} : { selectionEndY: input.selectionEndY }),
 	};
 }
 

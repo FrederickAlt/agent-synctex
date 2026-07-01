@@ -917,6 +917,14 @@ function formatPdfEventForTool(event: PdfEvent): string {
 	if (event.page !== undefined) fields.push(`page=${event.page}`);
 	if (event.x !== undefined) fields.push(`x=${event.x}`);
 	if (event.y !== undefined) fields.push(`y=${event.y}`);
+	const selectedText = formatMaybeTextField("selected_text", event.selected_text, 240);
+	if (selectedText !== undefined) fields.push(selectedText);
+	if (event.selection_start !== undefined) fields.push(`selection_start=${event.selection_start.source_file}:line=${event.selection_start.line}:column=${event.selection_start.column}`);
+	if (event.selection_end !== undefined) fields.push(`selection_end=${event.selection_end.source_file}:line=${event.selection_end.line}:column=${event.selection_end.column}`);
+	const selectionStartError = formatMaybeTextField("selection_start_error", event.selection_start_error, 180);
+	if (selectionStartError !== undefined) fields.push(selectionStartError);
+	const selectionEndError = formatMaybeTextField("selection_end_error", event.selection_end_error, 180);
+	if (selectionEndError !== undefined) fields.push(selectionEndError);
 	if (event.raw_mapped_source_file !== undefined && event.raw_mapped_source_file !== event.source_file) {
 		fields.push(`raw_mapped_source_file=${event.raw_mapped_source_file}`);
 	}

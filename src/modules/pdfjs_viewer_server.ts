@@ -53,17 +53,134 @@ function pdfUrlForRevision(config) {
 	return config.pdf_url;
 }
 
-function reverseSynctexContextForPage(pageElement) {
+function firstTextNode(node) {
+	if (node.nodeType === Node.TEXT_NODE && (node.textContent ?? "").length > 0) return node;
+	const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+	let current = walker.nextNode();
+	while (current) {
+		if ((current.textContent ?? "").length > 0) return current;
+		current = walker.nextNode();
+	}
+	return undefined;
+}
+
+function lastTextNode(node) {
+	if (node.nodeType === Node.TEXT_NODE && (node.textContent ?? "").length > 0) return node;
+	const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+	let last;
+	let current = walker.nextNode();
+	while (current) {
+		if ((current.textContent ?? "").length > 0) last = current;
+		current = walker.nextNode();
+	}
+	return last;
+}
+
+function adjacentTextNodeAtBoundary(root, node, offset, preferPrevious) {
+	const boundary = document.createRange();
+	boundary.setStart(node, offset);
+	boundary.collapse(true);
+	const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+	let previous;
+	let current = walker.nextNode();
+	while (current) {
+		const length = (current.textContent ?? "").length;
+		if (length > 0) {
+			const probe = document.createRange();
+			probe.setStart(current, preferPrevious ? length : 0);
+			probe.collapse(true);
+			const comparison = probe.compareBoundaryPoints(Range.START_TO_START, boundary);
+			probe.detach?.();
+			if (preferPrevious) {
+				if (comparison <= 0) previous = current;
+				else break;
+			} else if (comparison >= 0) {
+				boundary.detach?.();
+				return current;
+			}
+		}
+		current = walker.nextNode();
+	}
+	boundary.detach?.();
+	return preferPrevious ? previous : undefined;
+}
+
+function textNodeAtBoundary(root, node, offset, preferPrevious) {
+	if (node.nodeType === Node.TEXT_NODE) {
+		const length = (node.textContent ?? "").length;
+		if (length === 0) {
+			const adjacent = adjacentTextNodeAtBoundary(root, node, offset, preferPrevious);
+			return adjacent ? { node: adjacent, offset: preferPrevious ? (adjacent.textContent ?? "").length : 0 } : undefined;
+		}
+		if (preferPrevious) {
+			if (offset > 0) return { node, offset };
+			const previous = adjacentTextNodeAtBoundary(root, node, offset, true);
+			return previous ? { node: previous, offset: (previous.textContent ?? "").length } : undefined;
+		}
+		if (offset < length) return { node, offset };
+		const next = adjacentTextNodeAtBoundary(root, node, offset, false);
+		return next ? { node: next, offset: 0 } : undefined;
+	}
+	const children = Array.from(node.childNodes ?? []);
+	if (preferPrevious) {
+		for (let index = Math.min(offset, children.length) - 1; index >= 0; index -= 1) {
+			const candidate = lastTextNode(children[index]);
+			if (candidate) return { node: candidate, offset: (candidate.textContent ?? "").length };
+		}
+		const previous = adjacentTextNodeAtBoundary(root, node, offset, true);
+		return previous ? { node: previous, offset: (previous.textContent ?? "").length } : undefined;
+	}
+	for (let index = Math.max(0, offset); index < children.length; index += 1) {
+		const candidate = firstTextNode(children[index]);
+		if (candidate) return { node: candidate, offset: 0 };
+	}
+	const next = adjacentTextNodeAtBoundary(root, node, offset, false);
+	return next ? { node: next, offset: 0 } : undefined;
+}
+
+function boundaryClientRect(root, boundary) {
+	const text = textNodeAtBoundary(root, boundary.node, boundary.offset, boundary.preferPrevious);
+	if (!text || !text.node || !text.node.textContent) return undefined;
+	const length = text.node.textContent.length;
+	const start = boundary.preferPrevious ? text.offset - 1 : text.offset;
+	const end = boundary.preferPrevious ? text.offset : text.offset + 1;
+	if (start < 0 || end > length || start >= end) return undefined;
+	const probe = document.createRange();
+	probe.setStart(text.node, start);
+	probe.setEnd(text.node, end);
+	const rect = probe.getBoundingClientRect();
+	probe.detach?.();
+	return rect.width || rect.height ? rect : undefined;
+}
+
+function pdfPointFromClientRect(rect, canvas, viewport) {
+	const canvasRect = canvas.getBoundingClientRect();
+	return viewport.convertToPdfPoint(rect.left + rect.width / 2 - canvasRect.left, canvas.offsetHeight - (rect.top + rect.height / 2 - canvasRect.top));
+}
+
+function reverseSynctexContextForPage(pageElement, canvas, viewport) {
 	const selection = window.getSelection();
 	if (!selection || selection.rangeCount === 0) return {};
-	const anchorNode = selection.anchorNode;
-	if (!anchorNode || anchorNode.nodeName !== "#text" || !anchorNode.textContent) return {};
 	const textLayer = pageElement.querySelector(".textLayer");
-	if (!textLayer || !textLayer.contains(anchorNode)) return {};
-	return {
-		textBeforeSelection: anchorNode.textContent.substring(0, selection.anchorOffset),
-		textAfterSelection: anchorNode.textContent.substring(selection.anchorOffset),
-	};
+	if (!textLayer) return {};
+	const range = selection.getRangeAt(0);
+	if (!textLayer.contains(range.commonAncestorContainer)) return {};
+	if (selection.isCollapsed) {
+		const anchorNode = selection.anchorNode;
+		if (!anchorNode || anchorNode.nodeType !== Node.TEXT_NODE || !anchorNode.textContent || !textLayer.contains(anchorNode)) return {};
+		return {
+			textBeforeSelection: anchorNode.textContent.substring(0, selection.anchorOffset),
+			textAfterSelection: anchorNode.textContent.substring(selection.anchorOffset),
+		};
+	}
+	const selectedText = selection.toString();
+	if (!selectedText) return {};
+	const startRect = boundaryClientRect(textLayer, { node: range.startContainer, offset: range.startOffset, preferPrevious: false });
+	const endRect = boundaryClientRect(textLayer, { node: range.endContainer, offset: range.endOffset, preferPrevious: true });
+	if (!startRect || !endRect) return {};
+	const start = pdfPointFromClientRect(startRect, canvas, viewport);
+	const end = pdfPointFromClientRect(endRect, canvas, viewport);
+	return { selectedText, selectionStartX: start[0], selectionStartY: start[1], selectionEndX: end[0], selectionEndY: end[1] };
 }
 
 async function renderTextLayer(pdfjsLib, page, viewport, pageContainer) {
@@ -92,7 +209,7 @@ async function renderTextLayer(pdfjsLib, page, viewport, pageContainer) {
 }
 
 function hasReverseSynctexContext(context) {
-	return context.textBeforeSelection !== undefined || context.textAfterSelection !== undefined;
+	return context.textBeforeSelection !== undefined || context.textAfterSelection !== undefined || context.selectedText !== undefined;
 }
 
 function captureViewerState() {
@@ -132,15 +249,16 @@ async function renderPdf(config, options = {}) {
 		pageContainer.appendChild(canvas);
 		await renderTextLayer(pdfjsLib, page, viewport, pageContainer);
 		pageContainer.addEventListener("mousedown", () => {
-			pendingReverseSynctexContexts.set(pageContainer, reverseSynctexContextForPage(pageContainer));
+			pendingReverseSynctexContexts.set(pageContainer, reverseSynctexContextForPage(pageContainer, canvas, viewport));
 		}, true);
 		pageContainer.addEventListener("click", (event) => {
+			if (!event.ctrlKey) return;
 			if (!activeViewerSocket || activeViewerSocket.readyState !== WebSocket.OPEN) return;
 			const rect = canvas.getBoundingClientRect();
 			const point = viewport.convertToPdfPoint(event.clientX - rect.left, canvas.offsetHeight - (event.clientY - rect.top));
 			const pendingTextSelection = pendingReverseSynctexContexts.get(pageContainer) || {};
 			pendingReverseSynctexContexts.delete(pageContainer);
-			const currentTextSelection = reverseSynctexContextForPage(pageContainer);
+			const currentTextSelection = reverseSynctexContextForPage(pageContainer, canvas, viewport);
 			const textSelection = hasReverseSynctexContext(pendingTextSelection) ? pendingTextSelection : currentTextSelection;
 			activeViewerSocket.send(JSON.stringify({
 				type: "reverse_synctex",
@@ -149,6 +267,11 @@ async function renderPdf(config, options = {}) {
 				y: point[1],
 				...(textSelection.textBeforeSelection === undefined ? {} : { textBeforeSelection: textSelection.textBeforeSelection }),
 				...(textSelection.textAfterSelection === undefined ? {} : { textAfterSelection: textSelection.textAfterSelection }),
+				...(textSelection.selectedText === undefined ? {} : { selectedText: textSelection.selectedText }),
+				...(textSelection.selectionStartX === undefined ? {} : { selectionStartX: textSelection.selectionStartX }),
+				...(textSelection.selectionStartY === undefined ? {} : { selectionStartY: textSelection.selectionStartY }),
+				...(textSelection.selectionEndX === undefined ? {} : { selectionEndX: textSelection.selectionEndX }),
+				...(textSelection.selectionEndY === undefined ? {} : { selectionEndY: textSelection.selectionEndY }),
 			}));
 		});
 		pages.appendChild(pageContainer);
@@ -258,7 +381,7 @@ function handleSynctexMessage(message) {
 		marker.style.top = String(position.top) + "px";
 		marker.style.width = String(position.width) + "px";
 		marker.style.height = String(position.height) + "px";
-		marker.style.border = "2px solid #d11";
+		marker.style.border = "0";
 		marker.style.borderRadius = "0";
 		marker.style.background = "rgba(255,255,0,0.35)";
 		markers.push(marker);
@@ -447,6 +570,10 @@ function parseReverseSynctexClick(pdfId: number, rawMessage: string): ReverseSyn
 	if (typeof y !== "number" || !Number.isFinite(y) || y < 0) return undefined;
 	if (record.textBeforeSelection !== undefined && typeof record.textBeforeSelection !== "string") return undefined;
 	if (record.textAfterSelection !== undefined && typeof record.textAfterSelection !== "string") return undefined;
+	if (record.selectedText !== undefined && typeof record.selectedText !== "string") return undefined;
+	for (const field of ["selectionStartX", "selectionStartY", "selectionEndX", "selectionEndY"] as const) {
+		if (record[field] !== undefined && (typeof record[field] !== "number" || !Number.isFinite(record[field]) || record[field] < 0)) return undefined;
+	}
 	return {
 		pdfId,
 		page: page as number,
@@ -454,6 +581,11 @@ function parseReverseSynctexClick(pdfId: number, rawMessage: string): ReverseSyn
 		y,
 		...(record.textBeforeSelection === undefined ? {} : { textBeforeSelection: record.textBeforeSelection }),
 		...(record.textAfterSelection === undefined ? {} : { textAfterSelection: record.textAfterSelection }),
+		...(record.selectedText === undefined ? {} : { selectedText: record.selectedText }),
+		...(record.selectionStartX === undefined ? {} : { selectionStartX: record.selectionStartX as number }),
+		...(record.selectionStartY === undefined ? {} : { selectionStartY: record.selectionStartY as number }),
+		...(record.selectionEndX === undefined ? {} : { selectionEndX: record.selectionEndX as number }),
+		...(record.selectionEndY === undefined ? {} : { selectionEndY: record.selectionEndY as number }),
 	};
 }
 
@@ -480,6 +612,11 @@ export interface ReverseSynctexClick {
 	y: number;
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
+	selectedText?: string;
+	selectionStartX?: number;
+	selectionStartY?: number;
+	selectionEndX?: number;
+	selectionEndY?: number;
 }
 
 export interface PdfJsViewerServerOptions {

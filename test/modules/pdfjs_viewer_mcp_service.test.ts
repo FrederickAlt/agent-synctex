@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { PdfJsViewerMcpService, type BrowserLauncher } from "../../src/modules/pdfjs_viewer_mcp_service.ts";
 import { PdfJsViewerRegistry } from "../../src/modules/pdfjs_viewer_registry.ts";
+import { mapReverseSynctex } from "../../src/modules/synctex/forward_synctex.ts";
 
 function writeFakePdf(path: string, body = "1 0 obj"): void {
 	writeFileSync(path, `%PDF-1.4\n${body}\n%%EOF\n`);
@@ -541,6 +542,10 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		browserLauncher: new FakeBrowserLauncher({ ok: true }),
 		registry: new PdfJsViewerRegistry({ makePdfId: () => 51 }),
 		pdfRefresh: { autoStart: false },
+		reverseSynctexMapper: (input) => {
+			if (input.x === 999999) throw new Error("stubbed endpoint mapping failure");
+			return mapReverseSynctex(input);
+		},
 	});
 	try {
 		const open = await service.openPdf({
@@ -565,6 +570,11 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 			y: 155.27,
 			textBeforeSelection: "First paragraph",
 			textAfterSelection: " text that should wrap a little and create boxes.",
+			selectedText: "First paragraph",
+			selectionStartX: 144.27,
+			selectionStartY: 155.27,
+			selectionEndX: 145.27,
+			selectionEndY: 155.27,
 		})));
 
 		let events: Array<Record<string, unknown>> = [];
@@ -589,6 +599,9 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		assert.equal(event.line, 3);
 		assert.equal(event.column, "First paragraph".length);
 		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
+		assert.equal(event.selected_text, "First paragraph");
+		assert.equal((event.selection_start as Record<string, unknown>).source_file, sourcePath);
+		assert.equal((event.selection_end as Record<string, unknown>).source_file, sourcePath);
 		const reverseDiagnostics = event.synctex_diagnostics as {
 			context: { hasSelectionContext: boolean; textBeforeSelection?: string; textAfterSelection?: string };
 			candidates: Array<{ kind: string; line: number; column: number }>;
@@ -611,6 +624,39 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		}), service.pdfOperations);
 		assert.ok(secondRead && "result" in secondRead);
 		assert.deepEqual(((secondRead.result as { details: { events: Array<Record<string, unknown>> } }).details.events).map((item) => item.sequence), [1]);
+		const text = (secondRead.result as { content?: Array<{ text: string }> }).content?.[0]?.text ?? "";
+		assert.match(text, /selected_text=First paragraph/);
+		assert.match(text, /selection_start=.*line=3:column=15/);
+
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({
+			type: "reverse_synctex",
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			selectedText: "bad endpoint",
+			selectionStartX: 999999,
+			selectionStartY: 999999,
+			selectionEndX: 144.27,
+			selectionEndY: 155.27,
+		})));
+		let endpointFailureEvent: Record<string, unknown> | undefined;
+		await waitFor(async () => {
+			const response = await handleMcpRequest(JSON.stringify({
+				jsonrpc: "2.0",
+				id: 72,
+				method: "tools/call",
+				params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } },
+			}), service.pdfOperations);
+			assert.ok(response && "result" in response);
+			const nextEvents = ((response.result as { details?: { events?: Array<Record<string, unknown>> } }).details?.events) ?? [];
+			endpointFailureEvent = nextEvents.at(-1);
+			return nextEvents.length === 2;
+		});
+		assert.equal(endpointFailureEvent?.line, 3, "main point event should still be stored when a selected range has endpoint mapping work");
+		assert.equal(endpointFailureEvent?.selected_text, "bad endpoint");
+		assert.equal(endpointFailureEvent?.selection_start_error, "stubbed endpoint mapping failure");
+		assert.equal(endpointFailureEvent?.selection_start, undefined);
+		assert.ok(endpointFailureEvent?.selection_end, "successful endpoint should still be exposed");
 		socket.end();
 	} finally {
 		await service.stop();

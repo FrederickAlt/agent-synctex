@@ -260,6 +260,11 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 			y: 155.27,
 			textBeforeSelection: "First paragraph",
 			textAfterSelection: " text that should wrap a little and create boxes.",
+			selectedText: "First paragraph",
+			selectionStartX: 144.27,
+			selectionStartY: 155.27,
+			selectionEndX: 145.27,
+			selectionEndY: 155.27,
 		}));
 
 		let details: { events?: Array<Record<string, unknown>> } | undefined;
@@ -272,7 +277,7 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 
 		assert.equal(details?.events?.length, 1);
 		const event = details?.events?.[0];
-		assert.deepEqual({ ...event, synctex_diagnostics: undefined }, {
+		assert.deepEqual({ ...event, synctex_diagnostics: undefined, selection_start: undefined, selection_end: undefined }, {
 			type: "reverse_synctex",
 			sequence: 1,
 			pdf_id: 112,
@@ -284,8 +289,13 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 			page: 1,
 			x: 144.27,
 			y: 155.27,
+			selected_text: "First paragraph",
 			synctex_diagnostics: undefined,
+			selection_start: undefined,
+			selection_end: undefined,
 		});
+		assert.equal((event?.selection_start as Record<string, unknown>).source_file, sourcePath);
+		assert.equal((event?.selection_end as Record<string, unknown>).source_file, sourcePath);
 		const diagnostics = event?.synctex_diagnostics as {
 			context: { hasSelectionContext: boolean; textBeforeSelection?: string };
 			candidates: Array<{ kind: string }>;

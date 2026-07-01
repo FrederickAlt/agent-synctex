@@ -104,12 +104,15 @@ export interface PdfJsViewerRefreshOptions {
 	stabilityDebounceMs?: number;
 }
 
+type ReverseSynctexMapper = typeof mapReverseSynctex;
+
 export interface PdfJsViewerMcpServiceOptions {
 	registry?: PdfJsViewerRegistry;
 	server?: PdfJsViewerServer;
 	browserLauncher?: BrowserLauncher;
 	pdfRefresh?: PdfJsViewerRefreshOptions;
 	eventStore?: PdfEventStore;
+	reverseSynctexMapper?: ReverseSynctexMapper;
 }
 
 export interface MarkTrackedPdfUpdatedResult {
@@ -138,6 +141,7 @@ export class PdfJsViewerMcpService {
 	private readonly server: PdfJsViewerServer;
 	private readonly browserLauncher: BrowserLauncher;
 	private readonly eventStore: PdfEventStore;
+	private readonly reverseSynctexMapper: ReverseSynctexMapper;
 	private readonly pdfRefreshAutoStart: boolean;
 	private readonly pdfRefreshPollIntervalMs: number;
 	private readonly pdfRefreshStabilityDebounceMs: number;
@@ -154,6 +158,7 @@ export class PdfJsViewerMcpService {
 			onReverseSynctex: (click) => this.handleReverseSynctexClick(click),
 		});
 		this.browserLauncher = options.browserLauncher ?? new DefaultBrowserLauncher();
+		this.reverseSynctexMapper = options.reverseSynctexMapper ?? mapReverseSynctex;
 		this.pdfRefreshAutoStart = options.pdfRefresh?.autoStart ?? true;
 		this.pdfRefreshPollIntervalMs = options.pdfRefresh?.pollIntervalMs ?? DEFAULT_PDF_REFRESH_POLL_INTERVAL_MS;
 		this.pdfRefreshStabilityDebounceMs = options.pdfRefresh?.stabilityDebounceMs ?? DEFAULT_PDF_REFRESH_STABILITY_DEBOUNCE_MS;
@@ -456,15 +461,34 @@ export class PdfJsViewerMcpService {
 
 	private handleReverseSynctexClick(click: ReverseSynctexClick): void {
 		const record = this.registry.getActiveRecord(click.pdfId);
-		const location = mapReverseSynctex({
+		const cwd = record.workspaceCwd ?? dirname(record.pdfPath);
+		const location = this.reverseSynctexMapper({
 			pdfPath: record.pdfPath,
 			page: click.page,
 			x: click.x,
 			y: click.y,
-			cwd: record.workspaceCwd ?? dirname(record.pdfPath),
+			cwd,
 			...(click.textBeforeSelection === undefined ? {} : { textBeforeSelection: click.textBeforeSelection }),
 			...(click.textAfterSelection === undefined ? {} : { textAfterSelection: click.textAfterSelection }),
 		});
+		let selectionStart: ReturnType<typeof mapReverseSynctex> | undefined;
+		let selectionStartError: string | undefined;
+		if (click.selectedText !== undefined && click.selectionStartX !== undefined && click.selectionStartY !== undefined) {
+			try {
+				selectionStart = this.reverseSynctexMapper({ pdfPath: record.pdfPath, page: click.page, x: click.selectionStartX, y: click.selectionStartY, cwd });
+			} catch (error) {
+				selectionStartError = error instanceof Error ? error.message : String(error);
+			}
+		}
+		let selectionEnd: ReturnType<typeof mapReverseSynctex> | undefined;
+		let selectionEndError: string | undefined;
+		if (click.selectedText !== undefined && click.selectionEndX !== undefined && click.selectionEndY !== undefined) {
+			try {
+				selectionEnd = this.reverseSynctexMapper({ pdfPath: record.pdfPath, page: click.page, x: click.selectionEndX, y: click.selectionEndY, cwd });
+			} catch (error) {
+				selectionEndError = error instanceof Error ? error.message : String(error);
+			}
+		}
 		this.eventStore.appendReverseSynctexEvent({
 			type: "reverse_synctex",
 			pdf_id: click.pdfId,
@@ -477,6 +501,11 @@ export class PdfJsViewerMcpService {
 			page: click.page,
 			x: click.x,
 			y: click.y,
+			...(click.selectedText === undefined ? {} : { selected_text: click.selectedText }),
+			...(selectionStart === undefined ? {} : { selection_start: { source_file: selectionStart.sourceFile, line: selectionStart.line, column: selectionStart.column, ...(selectionStart.sourceLine === undefined ? {} : { source_line: selectionStart.sourceLine }), page: click.page, x: click.selectionStartX as number, y: click.selectionStartY as number } }),
+			...(selectionEnd === undefined ? {} : { selection_end: { source_file: selectionEnd.sourceFile, line: selectionEnd.line, column: selectionEnd.column, ...(selectionEnd.sourceLine === undefined ? {} : { source_line: selectionEnd.sourceLine }), page: click.page, x: click.selectionEndX as number, y: click.selectionEndY as number } }),
+			...(selectionStartError === undefined ? {} : { selection_start_error: selectionStartError }),
+			...(selectionEndError === undefined ? {} : { selection_end_error: selectionEndError }),
 			...(location.normalizedFormulaSpan === undefined ? {} : {
 				raw_mapped_source_file: location.rawMappedSourceFile,
 				raw_mapped_line: location.rawMappedLine,

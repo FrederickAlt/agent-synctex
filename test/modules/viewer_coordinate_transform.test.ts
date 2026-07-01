@@ -50,9 +50,14 @@ test("reverse SyncTeX click payload includes LaTeX-Workshop selection context wh
 		viewport,
 		textBeforeSelection: "before",
 		textAfterSelection: "after",
+		selectedText: "selected",
+		selectionStartX: 120,
+		selectionStartY: 201,
+		selectionEndX: 180,
+		selectionEndY: 199,
 	});
 
-	assert.deepEqual(payload, { type: "reverse_synctex", page: 2, x: 125, y: 200, textBeforeSelection: "before", textAfterSelection: "after" });
+	assert.deepEqual(payload, { type: "reverse_synctex", page: 2, x: 125, y: 200, textBeforeSelection: "before", textAfterSelection: "after", selectedText: "selected", selectionStartX: 120, selectionStartY: 201, selectionEndX: 180, selectionEndY: 199 });
 });
 
 test("forward SyncTeX marker coordinates keep SyncTeX top-origin Y instead of inverting vertically", () => {

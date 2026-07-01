@@ -35,6 +35,7 @@ test("Viewer Host protocol validates representative Host to MCP messages", () =>
 		{ type: "viewer_tab_closed", pdf_id: 123 },
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500 },
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
+		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500, selectedText: "chosen", selectionStartX: 95, selectionStartY: 500, selectionEndX: 150, selectionEndY: 500 },
 	];
 
 	for (const message of messages) {
@@ -74,6 +75,8 @@ test("Viewer Host protocol validation rejects malformed boundary messages", () =
 		[{ type: "viewer_loaded", pdf_id: -1 }, /pdf_id/],
 		[{ type: "reverse_synctex", pdf_id: 1, page: 1, x: Number.POSITIVE_INFINITY, y: 1 }, /x/],
 		[{ type: "reverse_synctex", pdf_id: 1, page: 1, x: 1, y: 1, textBeforeSelection: 1 }, /textBeforeSelection/],
+		[{ type: "reverse_synctex", pdf_id: 1, page: 1, x: 1, y: 1, selectedText: 1 }, /selectedText/],
+		[{ type: "reverse_synctex", pdf_id: 1, page: 1, x: 1, y: 1, selectionStartX: -1 }, /selectionStartX/],
 	];
 
 	for (const [message, pattern] of invalidHostMessages) {

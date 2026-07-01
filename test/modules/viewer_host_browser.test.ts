@@ -150,10 +150,130 @@ async function selectRenderedPageTextLayerCaret(page: Page, textBeforeCaret: str
 	}, textBeforeCaret);
 }
 
-async function clickRenderedPagePoint(page: Page, x: number, y: number): Promise<void> {
+async function selectDetachedText(page: Page, selectedText: string): Promise<void> {
+	await page.evaluate((text) => {
+		let element = document.getElementById("outside-selection-fixture");
+		if (!element) {
+			element = document.createElement("div");
+			element.id = "outside-selection-fixture";
+			document.body.appendChild(element);
+		}
+		element.textContent = text;
+		const node = element.firstChild;
+		if (!node) throw new Error("missing outside text node");
+		const selection = window.getSelection();
+		if (!selection) throw new Error("missing window selection");
+		const range = document.createRange();
+		range.setStart(node, 0);
+		range.setEnd(node, text.length);
+		selection.removeAllRanges();
+		selection.addRange(range);
+	}, selectedText);
+}
+
+async function selectAdjacentTextLayerBoundary(page: Page, mode: "start-at-previous-end" | "end-at-next-start" | "element-offsets-between-spans"): Promise<string> {
+	await page.waitForSelector("#pages div[data-page-number='1'] .textLayer[data-rendered='true'] span", { state: "attached", timeout: 2_000 });
+	return await page.evaluate((selectionMode) => {
+		const textLayer = document.querySelector("#pages div[data-page-number='1'] .textLayer") as HTMLElement | null;
+		if (!textLayer) throw new Error("missing rendered text layer");
+		let firstFixture = document.getElementById("boundary-span-a")?.firstChild as Text | null;
+		let secondFixture = document.getElementById("boundary-span-b")?.firstChild as Text | null;
+		let thirdFixture = document.getElementById("boundary-span-c")?.firstChild as Text | null;
+		if (!firstFixture || !secondFixture || !thirdFixture) {
+			const firstSpan = document.createElement("span");
+			firstSpan.id = "boundary-span-a";
+			firstSpan.textContent = "Alpha";
+			firstSpan.style.position = "absolute";
+			firstSpan.style.left = "20px";
+			firstSpan.style.top = "20px";
+			const secondSpan = document.createElement("span");
+			secondSpan.id = "boundary-span-b";
+			secondSpan.textContent = "Beta";
+			secondSpan.style.position = "absolute";
+			secondSpan.style.left = "70px";
+			secondSpan.style.top = "20px";
+			const thirdSpan = document.createElement("span");
+			thirdSpan.id = "boundary-span-c";
+			thirdSpan.textContent = "Gamma";
+			thirdSpan.style.position = "absolute";
+			thirdSpan.style.left = "110px";
+			thirdSpan.style.top = "20px";
+			textLayer.append(firstSpan, secondSpan, thirdSpan);
+			firstFixture = firstSpan.firstChild as Text;
+			secondFixture = secondSpan.firstChild as Text;
+			thirdFixture = thirdSpan.firstChild as Text;
+		}
+		if (selectionMode === "element-offsets-between-spans") {
+			const firstSpan = document.getElementById("boundary-span-a");
+			const thirdSpan = document.getElementById("boundary-span-c");
+			if (!firstSpan || !thirdSpan) throw new Error("missing element boundary spans");
+			const selection = window.getSelection();
+			if (!selection) throw new Error("missing window selection");
+			const range = document.createRange();
+			range.setStart(firstSpan, 1);
+			range.setEnd(thirdSpan, 0);
+			selection.removeAllRanges();
+			selection.addRange(range);
+			return selection.toString();
+		}
+		const nodes: Text[] = [firstFixture, secondFixture];
+		for (let index = 0; index + 1 < nodes.length; index += 1) {
+			const first = nodes[index];
+			const second = nodes[index + 1];
+			if (first.parentElement === second.parentElement) continue;
+			const selection = window.getSelection();
+			if (!selection) throw new Error("missing window selection");
+			const range = document.createRange();
+			if (selectionMode === "start-at-previous-end") {
+				range.setStart(first, first.length);
+				range.setEnd(second, 1);
+			} else {
+				range.setStart(first, first.length - 1);
+				range.setEnd(second, 0);
+			}
+			selection.removeAllRanges();
+			selection.addRange(range);
+			return selection.toString();
+		}
+		throw new Error("could not find adjacent text-layer spans");
+	}, mode);
+}
+
+async function selectRenderedPageText(page: Page, selectedText: string): Promise<void> {
+	await page.waitForSelector("#pages div[data-page-number='1'] .textLayer[data-rendered='true'] span", { state: "attached", timeout: 2_000 });
+	await page.evaluate((needle) => {
+		const textLayer = document.querySelector("#pages div[data-page-number='1'] .textLayer") as HTMLElement | null;
+		if (!textLayer) throw new Error("missing rendered text layer");
+		const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
+		let node = walker.nextNode();
+		while (node) {
+			const text = node.textContent ?? "";
+			const start = text.indexOf(needle);
+			if (start >= 0) {
+				const selection = window.getSelection();
+				if (!selection) throw new Error("missing window selection");
+				const range = document.createRange();
+				range.setStart(node, start);
+				range.setEnd(node, start + needle.length);
+				selection.removeAllRanges();
+				selection.addRange(range);
+				return;
+			}
+			node = walker.nextNode();
+		}
+		throw new Error(`text layer did not contain ${needle}`);
+	}, selectedText);
+}
+
+async function clickRenderedPagePoint(page: Page, x: number, y: number, options: { ctrl?: boolean } = {}): Promise<void> {
 	const box = await page.locator("#pages canvas[data-page-number='1']").boundingBox();
 	if (!box) throw new Error("missing rendered canvas box");
-	await page.mouse.click(box.x + x, box.y + y);
+	if (options.ctrl) await page.keyboard.down("Control");
+	try {
+		await page.mouse.click(box.x + x, box.y + y);
+	} finally {
+		if (options.ctrl) await page.keyboard.up("Control");
+	}
 }
 
 async function waitForSynctexCircleStyle(page: Page, expected: { left: number; top: number }, tolerance = 1): Promise<void> {
@@ -242,6 +362,11 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		});
 
 		await clickRenderedPagePoint(page, 180, 194);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const emptyResponse = await callTool(2, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+		assert.equal(emptyResponse.result?.details?.events?.length ?? 0, 0, "plain click must not send reverse SyncTeX events");
+
+		await clickRenderedPagePoint(page, 180, 194, { ctrl: true });
 
 		let event: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -258,6 +383,50 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assert.equal(event.page, 1);
 		assertApproximatelyEqual(Number(event.x), 144, 1, "reverse x PDF coordinate");
 		assertApproximatelyEqual(Number(event.y), 155, 1, "reverse y PDF coordinate");
+
+		await selectRenderedPageText(page, "paragraph text");
+		await clickRenderedPagePoint(page, 190, 194, { ctrl: true });
+		let selectionEvent: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(3, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			selectionEvent = response.result?.details?.events?.at(-1);
+			if (selectionEvent?.selected_text === "paragraph text") break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.equal(selectionEvent?.selected_text, "paragraph text");
+		assert.ok(selectionEvent?.selection_start, "selected range start should be mapped to source");
+		assert.ok(selectionEvent?.selection_end, "selected range end should be mapped to source");
+		assert.equal((selectionEvent.selection_start as Record<string, unknown>).source_file, sourcePath);
+		assert.equal((selectionEvent.selection_end as Record<string, unknown>).source_file, sourcePath);
+		assert.equal(typeof (selectionEvent.selection_start as Record<string, unknown>).x, "number");
+		assert.equal(typeof (selectionEvent.selection_end as Record<string, unknown>).y, "number");
+
+		await selectDetachedText(page, "stale outside page selection");
+		await clickRenderedPagePoint(page, 180, 194, { ctrl: true });
+		let staleSelectionEvent: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(4, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			staleSelectionEvent = response.result?.details?.events?.at(-1);
+			if (Number(staleSelectionEvent?.sequence) > Number(selectionEvent.sequence)) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.equal(staleSelectionEvent?.selected_text, undefined, "selection outside clicked page should be ignored");
+		assert.equal(staleSelectionEvent?.selection_start, undefined, "selection outside clicked page should not attach range start");
+
+		for (const mode of ["start-at-previous-end", "end-at-next-start", "element-offsets-between-spans"] as const) {
+			const boundaryText = await selectAdjacentTextLayerBoundary(page, mode);
+			await clickRenderedPagePoint(page, 190, 194, { ctrl: true });
+			let boundaryEvent: Record<string, unknown> | undefined;
+			for (let attempt = 0; attempt < 20; attempt += 1) {
+				const response = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 10 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+				boundaryEvent = response.result?.details?.events?.at(-1);
+				if (boundaryEvent?.selected_text === boundaryText) break;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			assert.equal(boundaryEvent?.selected_text, boundaryText, `${mode} selected text should survive boundary endpoint extraction`);
+			assert.ok(boundaryEvent?.selection_start, `${mode} should map selection start`);
+			assert.ok(boundaryEvent?.selection_end, `${mode} should map selection end`);
+		}
 
 		const control = new ViewerHostControlClient({ origin: server.origin });
 		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 209, page: 1, x: 100, y: 40, indicator: true, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 209 } });
@@ -283,12 +452,16 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 			width: Number.parseFloat((element as HTMLElement).style.width),
 			height: Number.parseFloat((element as HTMLElement).style.height),
 			kind: (element as HTMLElement).dataset.synctexMarkerKind,
+			border: (element as HTMLElement).style.border,
+			background: (element as HTMLElement).style.background,
 		}));
 		assert.equal(scalarRect.kind, "rect");
 		assertApproximatelyEqual(scalarRect.left, 125, 1, "scalar rectangle marker left viewport coordinate");
 		assertApproximatelyEqual(scalarRect.top, 50, 1, "scalar rectangle marker top-origin viewport coordinate");
 		assertApproximatelyEqual(scalarRect.width, 12.5, 0.5, "scalar rectangle marker width");
 		assertApproximatelyEqual(scalarRect.height, 10, 0.5, "scalar rectangle marker height");
+		assert.equal(scalarRect.border, "0px", "rectangle highlight should not draw a red border");
+		assert.notEqual(scalarRect.background, "", "rectangle highlight should keep background highlight");
 	} finally {
 		await browser?.close();
 		await server.stop();
@@ -512,7 +685,7 @@ test("Viewer Host-served Viewer Client maps reverse SyncTeX clicks with page-loc
 			const canvas = document.querySelector("#pages canvas[data-page-number='1']") as HTMLCanvasElement | null;
 			if (!pageElement || !canvas) throw new Error("missing rendered page for stale-selection click");
 			const rect = canvas.getBoundingClientRect();
-			pageElement.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: rect.left + 180, clientY: rect.top + 194 }));
+			pageElement.dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true, clientX: rect.left + 180, clientY: rect.top + 194 }));
 		});
 
 		let staleEvent: Record<string, unknown> | undefined;
@@ -527,7 +700,7 @@ test("Viewer Host-served Viewer Client maps reverse SyncTeX clicks with page-loc
 		assert.equal(((staleEvent.synctex_diagnostics as { context?: { hasSelectionContext?: boolean } } | undefined)?.context?.hasSelectionContext), false);
 
 		await selectRenderedPageTextLayerCaret(page, "First paragraph");
-		await clickRenderedPagePoint(page, 180, 194);
+		await clickRenderedPagePoint(page, 180, 194, { ctrl: true });
 
 		let event: Record<string, unknown> | undefined;
 		let toolText = "";

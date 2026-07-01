@@ -4,6 +4,16 @@ export interface ReverseSynctexFormulaSpanEvent {
 	end_line: number;
 }
 
+export interface ReverseSynctexSourceLocationEvent {
+	source_file: string;
+	line: number;
+	column: number;
+	source_line?: string;
+	page: number;
+	x: number;
+	y: number;
+}
+
 export interface ReverseSynctexPdfEventInput {
 	type: "reverse_synctex";
 	pdf_id: number;
@@ -15,6 +25,11 @@ export interface ReverseSynctexPdfEventInput {
 	page?: number;
 	x?: number;
 	y?: number;
+	selected_text?: string;
+	selection_start?: ReverseSynctexSourceLocationEvent;
+	selection_end?: ReverseSynctexSourceLocationEvent;
+	selection_start_error?: string;
+	selection_end_error?: string;
 	raw_mapped_source_file?: string;
 	raw_mapped_line?: number;
 	raw_mapped_column?: number;
