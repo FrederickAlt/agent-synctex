@@ -21,6 +21,7 @@ export interface ReverseSynctexPdfEventInput {
 	raw_mapped_source_line?: string;
 	normalized_formula_span?: ReverseSynctexFormulaSpanEvent;
 	normalized_formula_excerpt?: string;
+	synctex_diagnostics?: unknown;
 }
 
 export interface ReverseSynctexPdfEvent extends ReverseSynctexPdfEventInput {

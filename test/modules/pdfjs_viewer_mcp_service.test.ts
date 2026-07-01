@@ -496,6 +496,19 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 		assert.equal(jump.status_details.x, 111);
 		assert.equal(jump.status_details.y, 222);
 		assert.equal(jump.status_details.synctex_branch, "native");
+		const forwardDiagnostics = jump.status_details.synctex_diagnostics as {
+			branch: string;
+			native: { command: string; stdout: string; parsedRectangles: unknown[] };
+			jsFallback?: unknown;
+		};
+		assert.equal(forwardDiagnostics.branch, "native");
+		assert.equal(forwardDiagnostics.native.command, "synctex");
+		assert.match(forwardDiagnostics.native.stdout, /SyncTeX result begin/);
+		assert.deepEqual(forwardDiagnostics.native.parsedRectangles, [
+			{ page: 6, h: 110, v: 220, W: 44, H: 7 },
+			{ page: 6, h: 330, v: 440, W: 22, H: 5 },
+		]);
+		assert.equal(forwardDiagnostics.jsFallback, undefined);
 		assert.deepEqual(jump.status_details.ranges, [
 			{ page: 6, h: 110, v: 220, W: 44, H: 7 },
 			{ page: 6, h: 330, v: 440, W: 22, H: 5 },
@@ -576,6 +589,15 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		assert.equal(event.line, 3);
 		assert.equal(event.column, "First paragraph".length);
 		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
+		const reverseDiagnostics = event.synctex_diagnostics as {
+			context: { hasSelectionContext: boolean; textBeforeSelection?: string; textAfterSelection?: string };
+			candidates: Array<{ kind: string; line: number; column: number }>;
+			selected: { line: number; column: number; sourceFile: string };
+		};
+		assert.equal(reverseDiagnostics.context.hasSelectionContext, true);
+		assert.equal(reverseDiagnostics.context.textBeforeSelection, "First paragraph");
+		assert.deepEqual(reverseDiagnostics.candidates.map((candidate) => candidate.kind), ["raw", "context_corrected"]);
+		assert.deepEqual(reverseDiagnostics.selected, { sourceFile: sourcePath, line: 3, column: "First paragraph".length, sourceLine: "First paragraph text that should wrap a little and create boxes." });
 		assert.equal(typeof event.timestamp, "string");
 		assert.equal("callback" in event, false);
 		assert.equal("socket_path" in event, false);
