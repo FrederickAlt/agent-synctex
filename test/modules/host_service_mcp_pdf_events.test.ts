@@ -113,7 +113,7 @@ test("get_pdf_events text formats selection debug compactly while retaining full
 		jsonrpc: "2.0",
 		id: 2,
 		method: "tools/call",
-		params: { name: "get_pdf_events", arguments: { pdf_id: event.pdf_id, max_events: 5 } },
+		params: { name: "get_pdf_events", arguments: { pdf_id: event.pdf_id, max_events: 5, debug: true } },
 	}), {
 		getPdfEvents: () => [event],
 	});
@@ -147,7 +147,7 @@ test("Viewer Host MCP service accepts and stores selection debug messages", asyn
 		details: { selectionTextLength: 17, selectedPayloadTextLength: 17 },
 	});
 
-	const events = await service.getPdfEvents({ pdf_id: 77, max_events: 5 });
+	const events = await service.getPdfEvents({ pdf_id: 77, max_events: 5, debug: true });
 	assert.equal(events.length, 1);
 	assert.equal(events[0]?.type, "selection_debug");
 	assert.equal(events[0]?.phase, "send");
@@ -183,27 +183,37 @@ test("PdfEventStore max_events returns oldest unread page and leaves overflow un
 	assert.deepEqual(store.getEvents({ max_events: 2 }), [third]);
 });
 
-test("get_pdf_events schema accepts stale boolean and rejects invalid stale", async () => {
+test("get_pdf_events schema accepts stale and debug booleans and rejects invalid values", async () => {
 	const listResponse = await handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
 	assert.ok(listResponse && "result" in listResponse);
 	const tools = (listResponse.result as { tools?: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown> } }> }).tools ?? [];
 	const tool = tools.find((candidate) => candidate.name === "get_pdf_events");
 	assert.deepEqual(tool?.inputSchema?.properties?.stale, { type: "boolean" });
+	assert.deepEqual(tool?.inputSchema?.properties?.debug, { type: "boolean" });
 
 	const accepted = await handleMcpRequest(JSON.stringify({
 		jsonrpc: "2.0",
 		id: 2,
 		method: "tools/call",
-		params: { name: "get_pdf_events", arguments: { max_events: 1, stale: true } },
+		params: { name: "get_pdf_events", arguments: { max_events: 1, stale: true, debug: true } },
 	}), { getPdfEvents: () => [] });
 	assert.ok(accepted && "result" in accepted);
 
-	const rejected = await handleMcpRequest(JSON.stringify({
+	const rejectedStale = await handleMcpRequest(JSON.stringify({
 		jsonrpc: "2.0",
 		id: 3,
 		method: "tools/call",
 		params: { name: "get_pdf_events", arguments: { max_events: 1, stale: "yes" } },
 	}), { getPdfEvents: () => [] });
-	assert.ok(rejected && "error" in rejected);
-	assert.match(rejected.error.message, /stale must be a boolean/);
+	assert.ok(rejectedStale && "error" in rejectedStale);
+	assert.match(rejectedStale.error.message, /stale must be a boolean/);
+
+	const rejectedDebug = await handleMcpRequest(JSON.stringify({
+		jsonrpc: "2.0",
+		id: 4,
+		method: "tools/call",
+		params: { name: "get_pdf_events", arguments: { max_events: 1, debug: "yes" } },
+	}), { getPdfEvents: () => [] });
+	assert.ok(rejectedDebug && "error" in rejectedDebug);
+	assert.match(rejectedDebug.error.message, /debug must be a boolean/);
 });

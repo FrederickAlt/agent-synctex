@@ -651,13 +651,14 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "get_pdf_events",
-			description: "Return unread process-local viewer events by default, or inspect old events with stale=true. Optionally filter by pdf_id.",
+			description: "Return unread process-local viewer events by default, or inspect old events with stale=true. Selection diagnostics are hidden unless debug=true. Optionally filter by pdf_id.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					pdf_id: { type: "integer", minimum: 1 },
 					max_events: { type: "integer", minimum: 1 },
 					stale: { type: "boolean" },
+					debug: { type: "boolean" },
 				},
 				required: ["max_events"],
 				additionalProperties: false,
@@ -851,7 +852,7 @@ async function handleSetLatexPreambleTool(
 
 function parseGetPdfEventsRequest(args: Record<string, unknown>): GetPdfEventsRequest {
 	for (const key of Object.keys(args)) {
-		if (key !== "pdf_id" && key !== "max_events" && key !== "stale") {
+		if (key !== "pdf_id" && key !== "max_events" && key !== "stale" && key !== "debug") {
 			throw new Error(`get_pdf_events unknown argument: ${key}`);
 		}
 	}
@@ -865,10 +866,14 @@ function parseGetPdfEventsRequest(args: Record<string, unknown>): GetPdfEventsRe
 	if (args.stale !== undefined && typeof args.stale !== "boolean") {
 		throw new Error("get_pdf_events stale must be a boolean");
 	}
+	if (args.debug !== undefined && typeof args.debug !== "boolean") {
+		throw new Error("get_pdf_events debug must be a boolean");
+	}
 	return {
 		max_events: maxEvents,
 		...(args.pdf_id === undefined ? {} : { pdf_id: args.pdf_id }),
 		...(args.stale === undefined ? {} : { stale: args.stale }),
+		...(args.debug === undefined ? {} : { debug: args.debug }),
 	};
 }
 

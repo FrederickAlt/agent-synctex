@@ -38,7 +38,7 @@ test("PDF event store filters by pdf_id before selecting last N events", () => {
 	assert.deepEqual(store.getEvents({ pdf_id: 20, max_events: 5, stale: true }).map((item) => item.sequence), [2, 4]);
 });
 
-test("PDF event store assigns sequences to selection debug events and returns full details", () => {
+test("PDF event store hides selection debug events by default without marking them read", () => {
 	const store = new PdfEventStore();
 	const debug = store.appendSelectionDebugEvent({
 		type: "selection_debug",
@@ -49,8 +49,27 @@ test("PDF event store assigns sequences to selection debug events and returns fu
 		text: "selected browser text",
 		details: { selectionTextLength: 21, rangeCount: 1, nested: { retained: true } },
 	});
+	const normal = store.appendReverseSynctexEvent(event(2, 42));
 
 	assert.equal(debug.sequence, 1);
-	assert.deepEqual(store.getEvents({ pdf_id: 42, max_events: 1 }), [debug]);
-	assert.deepEqual(store.getEvents({ pdf_id: 42, max_events: 1, stale: true }), [debug]);
+	assert.deepEqual(store.getEvents({ pdf_id: 42, max_events: 5 }), [normal]);
+	assert.deepEqual(store.getEvents({ pdf_id: 42, max_events: 5, debug: true }), [debug]);
+	assert.deepEqual(store.getEvents({ pdf_id: 42, max_events: 5, debug: true }), []);
+	assert.deepEqual(store.getEvents({ pdf_id: 42, max_events: 5, stale: true, debug: true }), [debug, normal]);
+});
+
+test("PDF event store stale reads select last N normal events when debug is false", () => {
+	const store = new PdfEventStore();
+	const first = store.appendReverseSynctexEvent(event(1, 42));
+	store.appendSelectionDebugEvent({
+		type: "selection_debug",
+		pdf_id: 42,
+		timestamp: "2026-07-01T00:00:00.000Z",
+		phase: "send",
+		text: "selected browser text",
+		details: { selectionTextLength: 21 },
+	});
+	const second = store.appendReverseSynctexEvent(event(2, 42));
+
+	assert.deepEqual(store.getEvents({ pdf_id: 42, max_events: 2, stale: true }), [first, second]);
 });

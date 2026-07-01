@@ -65,6 +65,7 @@ export interface GetPdfEventsRequest {
 	pdf_id?: number;
 	max_events: number;
 	stale?: boolean;
+	debug?: boolean;
 }
 
 export class PdfEventStore {
@@ -93,9 +94,12 @@ export class PdfEventStore {
 	}
 
 	getEvents(request: GetPdfEventsRequest): PdfEvent[] {
-		const filtered = request.pdf_id === undefined
+		const pdfFiltered = request.pdf_id === undefined
 			? this.events
 			: this.events.filter((event) => event.pdf_id === request.pdf_id);
+		const filtered = request.debug === true
+			? pdfFiltered
+			: pdfFiltered.filter((event) => event.type !== "selection_debug");
 		if (request.stale === true) {
 			return filtered.slice(-request.max_events);
 		}

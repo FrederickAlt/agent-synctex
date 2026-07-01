@@ -492,7 +492,7 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 
 		let selectionDebugEvents: Array<Record<string, unknown>> = [];
 		for (let attempt = 0; attempt < 20; attempt += 1) {
-			const response = await callTool(3, "get_pdf_events", { pdf_id: 209, max_events: 80, stale: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			const response = await callTool(3, "get_pdf_events", { pdf_id: 209, max_events: 80, stale: true, debug: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 			selectionDebugEvents = (response.result?.details?.events ?? []).filter((candidate) => candidate.type === "selection_debug");
 			const phases = new Set(selectionDebugEvents.map((candidate) => candidate.phase));
 			if (["selectionchange", "mouseup", "scheduler_tick", "send", "post_send_audit"].every((phase) => phases.has(phase))) break;
@@ -565,7 +565,7 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assert.equal(typeof dragSelectedText, "string", "real-ish text-layer drag should emit selected text without an extra click");
 		assert.match(dragSelectedText as string, /paragraph/);
 		assert.match(dragSelectedText as string, /text that/, "drag selection should include suffix after the selected token");
-		const dragDebugResponse = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 80, stale: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+		const dragDebugResponse = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 80, stale: true, debug: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 		const dragDebugPhases = new Set((dragDebugResponse.result?.details?.events ?? []).filter((candidate) => candidate.type === "selection_debug").map((candidate) => candidate.phase));
 		assert.ok(dragDebugPhases.has("mousedown"), "drag selection diagnostics should include mousedown");
 
@@ -598,7 +598,7 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		await selectRenderedPageText(page, "First");
 		let changedAudit: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
-			const response = await callTool(7, "get_pdf_events", { pdf_id: 209, max_events: 120, stale: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			const response = await callTool(7, "get_pdf_events", { pdf_id: 209, max_events: 120, stale: true, debug: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 			changedAudit = (response.result?.details?.events ?? []).find((candidate) => {
 				const details = candidate.details as Record<string, unknown> | undefined;
 				return candidate.type === "selection_debug" && candidate.phase === "post_send_audit" && details?.sentText === auditSentText && details.changed === true && details.currentText === "First";
