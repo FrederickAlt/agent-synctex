@@ -169,6 +169,7 @@ window.addEventListener("unhandledrejection", (event) => {
 let activeConfig;
 let viewerSocket;
 const pageViewports = new Map();
+const pendingReverseSynctexContexts = new WeakMap();
 
 function reverseSynctexPayloadFromViewportPoint(input) {
 	const point = input.viewport.convertToPdfPoint(input.viewportX, input.viewportHeight - input.viewportY);
@@ -186,14 +187,42 @@ function reverseSynctexContextForPage(pageElement) {
 	const selection = window.getSelection();
 	if (!selection || selection.rangeCount === 0) return {};
 	const anchorNode = selection.anchorNode;
-	if (!anchorNode) return {};
-	if (anchorNode.nodeName !== "#text" || !anchorNode.textContent) return {};
+	if (!anchorNode || anchorNode.nodeName !== "#text" || !anchorNode.textContent) return {};
 	const textLayer = pageElement.querySelector(".textLayer");
 	if (!textLayer || !textLayer.contains(anchorNode)) return {};
 	return {
 		textBeforeSelection: anchorNode.textContent.substring(0, selection.anchorOffset),
 		textAfterSelection: anchorNode.textContent.substring(selection.anchorOffset),
 	};
+}
+
+async function renderTextLayer(pdfjsLib, page, viewport, pageContainer) {
+	const textLayer = document.createElement("div");
+	textLayer.className = "textLayer";
+	textLayer.style.position = "absolute";
+	textLayer.style.inset = "0";
+	textLayer.style.overflow = "hidden";
+	textLayer.style.lineHeight = "1";
+	textLayer.style.textAlign = "initial";
+	textLayer.style.transformOrigin = "0 0";
+	pageContainer.appendChild(textLayer);
+	try {
+		if (typeof pdfjsLib.TextLayer === "function") {
+			const textContentSource = typeof page.streamTextContent === "function"
+				? page.streamTextContent({ includeMarkedContent: true })
+				: await page.getTextContent({ includeMarkedContent: true });
+			const layer = new pdfjsLib.TextLayer({ textContentSource, container: textLayer, viewport });
+			await layer.render();
+			textLayer.dataset.rendered = "true";
+		}
+	} catch (error) {
+		textLayer.remove();
+		console.warn("Unable to render PDF.js text layer", error);
+	}
+}
+
+function hasReverseSynctexContext(context) {
+	return context.textBeforeSelection !== undefined || context.textAfterSelection !== undefined;
 }
 
 function viewportScale(input) {
@@ -235,10 +264,17 @@ async function renderPdf(config) {
 		pageContainer.style.margin = "1rem auto";
 		pageContainer.dataset.pageNumber = String(pageNumber);
 		pageContainer.appendChild(canvas);
+		await renderTextLayer(pdfjsLib, page, viewport, pageContainer);
+		pageContainer.addEventListener("mousedown", () => {
+			pendingReverseSynctexContexts.set(pageContainer, reverseSynctexContextForPage(pageContainer));
+		}, true);
 		pageContainer.addEventListener("click", (event) => {
 			if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
 			const rect = canvas.getBoundingClientRect();
-			const textSelection = reverseSynctexContextForPage(pageContainer);
+			const pendingTextSelection = pendingReverseSynctexContexts.get(pageContainer) || {};
+			pendingReverseSynctexContexts.delete(pageContainer);
+			const currentTextSelection = reverseSynctexContextForPage(pageContainer);
+			const textSelection = hasReverseSynctexContext(pendingTextSelection) ? pendingTextSelection : currentTextSelection;
 			const payload = reverseSynctexPayloadFromViewportPoint({
 				page: pageNumber,
 				viewportX: event.clientX - rect.left,
@@ -781,7 +817,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PDF.js viewer ${pdfId}</title>
-<style>body{font-family:sans-serif;margin:1rem;background:#f7f7f7}canvas{display:block;background:white;box-shadow:0 1px 8px #999}#status{margin-bottom:1rem}</style>
+<style>body{font-family:sans-serif;margin:1rem;background:#f7f7f7}canvas{display:block;background:white;box-shadow:0 1px 8px #999}#status{margin-bottom:1rem}.textLayer{position:absolute;inset:0;overflow:hidden;line-height:1;text-align:initial;transform-origin:0 0}.textLayer span,.textLayer br{color:transparent;position:absolute;white-space:pre;cursor:text;transform-origin:0 0}.textLayer ::selection{background:rgba(0,0,255,.25)}</style>
 </head>
 <body data-config-url="/config/${pdfId}.json">
 <h1>PDF.js viewer</h1>
