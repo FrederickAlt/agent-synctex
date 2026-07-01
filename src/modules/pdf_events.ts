@@ -48,10 +48,12 @@ export type PdfEvent = ReverseSynctexPdfEvent;
 export interface GetPdfEventsRequest {
 	pdf_id?: number;
 	max_events: number;
+	stale?: boolean;
 }
 
 export class PdfEventStore {
 	private readonly events: PdfEvent[] = [];
+	private readonly readSequences = new Set<number>();
 	private nextSequence = 1;
 
 	appendReverseSynctexEvent(input: ReverseSynctexPdfEventInput): ReverseSynctexPdfEvent {
@@ -68,11 +70,20 @@ export class PdfEventStore {
 		const filtered = request.pdf_id === undefined
 			? this.events
 			: this.events.filter((event) => event.pdf_id === request.pdf_id);
-		return filtered.slice(-request.max_events);
+		if (request.stale === true) {
+			return filtered.slice(-request.max_events);
+		}
+		const unread = filtered.filter((event) => !this.readSequences.has(event.sequence));
+		const returned = unread.slice(0, request.max_events);
+		for (const event of returned) {
+			this.readSequences.add(event.sequence);
+		}
+		return returned;
 	}
 
 	clear(): void {
 		this.events.length = 0;
+		this.readSequences.clear();
 		this.nextSequence = 1;
 	}
 }

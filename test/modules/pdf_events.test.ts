@@ -13,14 +13,14 @@ function event(line: number, pdfId: number): ReverseSynctexPdfEventInput {
 	};
 }
 
-test("PDF event store assigns monotonic sequences and returns last N events across PDFs chronologically and non-destructively", () => {
+test("PDF event store assigns monotonic sequences and returns stale last N events across PDFs chronologically and non-destructively", () => {
 	const store = new PdfEventStore();
 	assert.equal(store.appendReverseSynctexEvent(event(1, 10)).sequence, 1);
 	assert.equal(store.appendReverseSynctexEvent(event(2, 20)).sequence, 2);
 	assert.equal(store.appendReverseSynctexEvent(event(3, 10)).sequence, 3);
 
-	const firstRead = store.getEvents({ max_events: 2 });
-	const secondRead = store.getEvents({ max_events: 2 });
+	const firstRead = store.getEvents({ max_events: 2, stale: true });
+	const secondRead = store.getEvents({ max_events: 2, stale: true });
 
 	assert.deepEqual(firstRead.map((item) => item.sequence), [2, 3]);
 	assert.deepEqual(secondRead.map((item) => item.sequence), [2, 3]);
@@ -34,6 +34,6 @@ test("PDF event store filters by pdf_id before selecting last N events", () => {
 	store.appendReverseSynctexEvent(event(4, 20));
 	store.appendReverseSynctexEvent(event(5, 10));
 
-	assert.deepEqual(store.getEvents({ pdf_id: 10, max_events: 2 }).map((item) => item.sequence), [3, 5]);
-	assert.deepEqual(store.getEvents({ pdf_id: 20, max_events: 5 }).map((item) => item.sequence), [2, 4]);
+	assert.deepEqual(store.getEvents({ pdf_id: 10, max_events: 2, stale: true }).map((item) => item.sequence), [3, 5]);
+	assert.deepEqual(store.getEvents({ pdf_id: 20, max_events: 5, stale: true }).map((item) => item.sequence), [2, 4]);
 });

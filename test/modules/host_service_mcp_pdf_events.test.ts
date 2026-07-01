@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
-import type { PdfEvent } from "../../src/modules/pdf_events.ts";
+import { PdfEventStore, type PdfEvent, type ReverseSynctexPdfEventInput } from "../../src/modules/pdf_events.ts";
 
 test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	const event: PdfEvent = {
@@ -59,8 +59,10 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	assert.match(text, /line=42/);
 	assert.match(text, /source_line=\\section\{Visible target\}/);
 	assert.match(text, /page=3/);
-	assert.match(text, /x=110/);
-	assert.match(text, /y=220/);
+	assert.doesNotMatch(text, /\bx=110\b/);
+	assert.doesNotMatch(text, /\by=220\b/);
+	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.x, 110);
+	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.y, 220);
 	assert.match(text, /selected_text=chosen formula/);
 	assert.match(text, /selection_start=\/tmp\/paper\/main\.tex:line=40:column=2/);
 	assert.match(text, /selection_end=\/tmp\/paper\/main\.tex:line=42:column=12/);
@@ -73,4 +75,69 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	assert.match(text, /selected=\/tmp\/paper\/main\.tex:line=42:column=1/);
 	assert.match(text, /context=selection=true;before=formula body;after=closing delimiter/);
 	assert.match(text, /candidates=2/);
+});
+
+function eventInput(pdfId: number, line: number): ReverseSynctexPdfEventInput {
+	return {
+		type: "reverse_synctex",
+		pdf_id: pdfId,
+		source_file: `/tmp/${pdfId}.tex`,
+		line,
+		column: 1,
+		timestamp: `2026-06-29T12:00:${String(line).padStart(2, "0")}.000Z`,
+	};
+}
+
+test("PdfEventStore default reads return unread events once while stale reads preserve old events", () => {
+	const store = new PdfEventStore();
+	const first = store.appendReverseSynctexEvent(eventInput(1, 10));
+	const second = store.appendReverseSynctexEvent(eventInput(1, 11));
+
+	assert.deepEqual(store.getEvents({ pdf_id: 1, max_events: 5 }), [first, second]);
+	assert.deepEqual(store.getEvents({ pdf_id: 1, max_events: 5 }), []);
+	assert.deepEqual(store.getEvents({ pdf_id: 1, max_events: 5, stale: true }), [first, second]);
+});
+
+test("PdfEventStore pdf_id reads mark only matching PDF events read", () => {
+	const store = new PdfEventStore();
+	const pdfOne = store.appendReverseSynctexEvent(eventInput(1, 10));
+	const pdfTwo = store.appendReverseSynctexEvent(eventInput(2, 20));
+
+	assert.deepEqual(store.getEvents({ pdf_id: 1, max_events: 5 }), [pdfOne]);
+	assert.deepEqual(store.getEvents({ max_events: 5 }), [pdfTwo]);
+});
+
+test("PdfEventStore max_events returns oldest unread page and leaves overflow unread", () => {
+	const store = new PdfEventStore();
+	const first = store.appendReverseSynctexEvent(eventInput(1, 10));
+	const second = store.appendReverseSynctexEvent(eventInput(1, 11));
+	const third = store.appendReverseSynctexEvent(eventInput(1, 12));
+
+	assert.deepEqual(store.getEvents({ max_events: 2 }), [first, second]);
+	assert.deepEqual(store.getEvents({ max_events: 2 }), [third]);
+});
+
+test("get_pdf_events schema accepts stale boolean and rejects invalid stale", async () => {
+	const listResponse = await handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+	assert.ok(listResponse && "result" in listResponse);
+	const tools = (listResponse.result as { tools?: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown> } }> }).tools ?? [];
+	const tool = tools.find((candidate) => candidate.name === "get_pdf_events");
+	assert.deepEqual(tool?.inputSchema?.properties?.stale, { type: "boolean" });
+
+	const accepted = await handleMcpRequest(JSON.stringify({
+		jsonrpc: "2.0",
+		id: 2,
+		method: "tools/call",
+		params: { name: "get_pdf_events", arguments: { max_events: 1, stale: true } },
+	}), { getPdfEvents: () => [] });
+	assert.ok(accepted && "result" in accepted);
+
+	const rejected = await handleMcpRequest(JSON.stringify({
+		jsonrpc: "2.0",
+		id: 3,
+		method: "tools/call",
+		params: { name: "get_pdf_events", arguments: { max_events: 1, stale: "yes" } },
+	}), { getPdfEvents: () => [] });
+	assert.ok(rejected && "error" in rejected);
+	assert.match(rejected.error.message, /stale must be a boolean/);
 });

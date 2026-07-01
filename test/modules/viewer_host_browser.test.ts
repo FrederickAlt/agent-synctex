@@ -286,6 +286,41 @@ async function dispatchRenderedPageMouseup(page: Page, x: number, y: number): Pr
 	}, { x, y });
 }
 
+async function dispatchMouseupThenFinalizeSelection(page: Page, prefixText: string, finalText: string, x: number, y: number): Promise<void> {
+	await page.waitForSelector("#pages div[data-page-number='1'] .textLayer[data-rendered='true'] span", { state: "attached", timeout: 2_000 });
+	await page.evaluate(({ prefixText, finalText, x, y }) => {
+		const pageElement = document.querySelector("#pages div[data-page-number='1']") as HTMLElement | null;
+		const canvas = document.querySelector("#pages canvas[data-page-number='1']") as HTMLCanvasElement | null;
+		const textLayer = document.querySelector("#pages div[data-page-number='1'] .textLayer") as HTMLElement | null;
+		if (!pageElement || !canvas || !textLayer) throw new Error("missing rendered page");
+		const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
+		let node = walker.nextNode();
+		while (node) {
+			const text = node.textContent ?? "";
+			const start = text.indexOf(finalText);
+			if (start >= 0) {
+				const textNode = node;
+				const selection = window.getSelection();
+				if (!selection) throw new Error("missing window selection");
+				const selectText = (length: number) => {
+					const range = document.createRange();
+					range.setStart(textNode, start);
+					range.setEnd(textNode, start + length);
+					selection.removeAllRanges();
+					selection.addRange(range);
+				};
+				selectText(prefixText.length);
+				const rect = canvas.getBoundingClientRect();
+				pageElement.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: rect.left + x, clientY: rect.top + y }));
+				requestAnimationFrame(() => selectText(finalText.length));
+				return;
+			}
+			node = walker.nextNode();
+		}
+		throw new Error(`text layer did not contain ${finalText}`);
+	}, { prefixText, finalText, x, y });
+}
+
 async function waitForSynctexCircleStyle(page: Page, expected: { left: number; top: number }, tolerance = 1): Promise<void> {
 	await page.waitForFunction(({ left, top, tolerance }) => {
 		const marker = document.querySelector("[data-synctex-marker][data-synctex-marker-kind='circle']") as HTMLElement | null;
@@ -397,11 +432,9 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		await selectRenderedPageText(page, "paragraph text");
 		await dispatchRenderedPageMouseup(page, 190, 194);
 		let selectionEvent: Record<string, unknown> | undefined;
-		let selectionEventCount = 0;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
 			const response = await callTool(3, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 			const events = response.result?.details?.events ?? [];
-			selectionEventCount = events.length;
 			selectionEvent = events.at(-1);
 			if (selectionEvent?.selected_text === "paragraph text") break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
@@ -421,7 +454,35 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		await clickRenderedPagePoint(page, 190, 194, { ctrl: true });
 		await new Promise((resolve) => setTimeout(resolve, 1200));
 		const duplicateResponse = await callTool(4, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-		assert.equal(duplicateResponse.result?.details?.events?.length ?? 0, selectionEventCount, "selection auto-send and delayed follow-up Ctrl+Click must not duplicate the same selected range");
+		assert.equal(duplicateResponse.result?.details?.events?.length ?? 0, 0, "selection auto-send and delayed follow-up Ctrl+Click must not duplicate the same selected range");
+
+		const finalSelectionBaselineSequence = Number(selectionEvent.sequence);
+		assert.ok(Number.isFinite(finalSelectionBaselineSequence), "previous selection event should have a sequence");
+		const earlySelectionPrefix = "First";
+		const disallowedFinalSelectionTexts = new Set(["First", earlySelectionPrefix]);
+		const finalSelectionText = "First paragraph";
+		await dispatchMouseupThenFinalizeSelection(page, earlySelectionPrefix, finalSelectionText, 180, 194);
+		let finalizedSelectionEvent: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			finalizedSelectionEvent = response.result?.details?.events?.at(-1);
+			if (finalizedSelectionEvent?.selected_text === finalSelectionText) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.equal(finalizedSelectionEvent?.selected_text, finalSelectionText, "auto-send should wait for final browser selection, not the mouseup prefix");
+		const finalizedSelectionSequence = Number(finalizedSelectionEvent.sequence);
+		assert.ok(Number.isFinite(finalizedSelectionSequence), "finalized selection event should have a sequence");
+		const finalizedSelectionStaleResponse = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 50, stale: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+		const finalizedInteractionEvents = (finalizedSelectionStaleResponse.result?.details?.events ?? []).filter((candidate) => {
+			const sequence = Number(candidate.sequence);
+			return sequence > finalSelectionBaselineSequence && sequence <= finalizedSelectionSequence;
+		});
+		assert.ok(finalizedInteractionEvents.length > 0, "stale event read should retain the finalized-selection interaction events");
+		assert.deepEqual(
+			finalizedInteractionEvents.filter((candidate) => disallowedFinalSelectionTexts.has(candidate.selected_text as string)),
+			[],
+			"finalized-selection interaction must not emit the mouseup prefix before the final browser selection",
+		);
 
 		await selectDetachedText(page, "stale outside page selection");
 		await clickRenderedPagePoint(page, 180, 194, { ctrl: true });
@@ -429,7 +490,7 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		for (let attempt = 0; attempt < 20; attempt += 1) {
 			const response = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 			staleSelectionEvent = response.result?.details?.events?.at(-1);
-			if (Number(staleSelectionEvent?.sequence) > Number(selectionEvent.sequence)) break;
+			if (Number(staleSelectionEvent?.sequence) > Number(finalizedSelectionEvent?.sequence)) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 		assert.equal(staleSelectionEvent?.selected_text, undefined, "selection outside clicked page should be ignored");
@@ -764,7 +825,7 @@ test("Viewer Host-served Viewer Client maps reverse SyncTeX clicks with page-loc
 			const events = response.result?.details?.events ?? [];
 			event = events[events.length - 1];
 			toolText = response.result?.content?.map((item) => item.text ?? "").join("\n") ?? "";
-			if (events.length >= 2 && event?.column === 15) break;
+			if (event?.column === 15) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 		assert.ok(event, `reverse SyncTeX event was not stored after context click\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);

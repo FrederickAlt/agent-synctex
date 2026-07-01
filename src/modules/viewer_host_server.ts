@@ -174,6 +174,7 @@ let lastObservedSelectionSignature;
 let selectionGeneration = 0;
 let lastSentSelectionSignature;
 let lastSentSelectionGeneration;
+let pendingReverseSynctexSelectionSend;
 
 function reverseSynctexPayloadFromViewportPoint(input) {
 	const point = input.viewport.convertToPdfPoint(input.viewportX, input.viewportHeight - input.viewportY);
@@ -410,6 +411,28 @@ function sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport) 
 	return true;
 }
 
+function scheduleReverseSynctexSelectionSend(pageNumber, pageElement, canvas, viewport) {
+	const request = { pageNumber, pageElement, canvas, viewport };
+	pendingReverseSynctexSelectionSend = request;
+	let observedGeneration = selectionGeneration;
+	let stableFrames = 0;
+	function tick() {
+		if (pendingReverseSynctexSelectionSend !== request) return;
+		if (selectionGeneration !== observedGeneration) {
+			observedGeneration = selectionGeneration;
+			stableFrames = 0;
+		}
+		stableFrames += 1;
+		if (stableFrames < 2) {
+			requestAnimationFrame(tick);
+			return;
+		}
+		pendingReverseSynctexSelectionSend = undefined;
+		sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport);
+	}
+	requestAnimationFrame(tick);
+}
+
 function viewportScale(input) {
 	const origin = input.viewport.convertToViewportPoint(0, 0);
 	const xUnit = input.viewport.convertToViewportPoint(1, 0);
@@ -454,7 +477,7 @@ async function renderPdf(config) {
 			pendingReverseSynctexContexts.set(pageContainer, { ...reverseSynctexContextForPage(pageContainer, canvas, viewport), selectionGeneration });
 		}, true);
 		pageContainer.addEventListener("mouseup", () => {
-			setTimeout(() => sendReverseSynctexSelection(pageNumber, pageContainer, canvas, viewport), 0);
+			scheduleReverseSynctexSelectionSend(pageNumber, pageContainer, canvas, viewport);
 		}, true);
 		pageContainer.addEventListener("click", (event) => {
 			if (!event.ctrlKey) return;
