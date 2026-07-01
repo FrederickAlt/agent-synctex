@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { PdfEventStore, type PdfEvent, type ReverseSynctexPdfEventInput } from "../../src/modules/pdf_events.ts";
+import { ViewerHostMcpService, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import type { McpToViewerHostMessage, ViewerHostControlResponse } from "../../src/modules/viewer_host_protocol.ts";
 
 test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	const event: PdfEvent = {
@@ -87,6 +89,70 @@ function eventInput(pdfId: number, line: number): ReverseSynctexPdfEventInput {
 		timestamp: `2026-06-29T12:00:${String(line).padStart(2, "0")}.000Z`,
 	};
 }
+
+test("get_pdf_events text formats selection debug compactly while retaining full details", async () => {
+	const event: PdfEvent = {
+		type: "selection_debug",
+		sequence: 3,
+		pdf_id: 88,
+		timestamp: "2026-07-01T00:00:00.000Z",
+		phase: "post_send_audit",
+		page: 1,
+		text: "selected text",
+		details: {
+			phase: "post_send_audit",
+			selectionTextLength: 13,
+			sentText: "selected text",
+			currentText: "changed text",
+			changed: true,
+			rangeStartNode: { type: "text", text: "full node text retained" },
+		},
+	};
+
+	const response = await handleMcpRequest(JSON.stringify({
+		jsonrpc: "2.0",
+		id: 2,
+		method: "tools/call",
+		params: { name: "get_pdf_events", arguments: { pdf_id: event.pdf_id, max_events: 5 } },
+	}), {
+		getPdfEvents: () => [event],
+	});
+
+	assert.ok(response && "result" in response);
+	assert.deepEqual((response.result as { details?: { events?: PdfEvent[] } }).details, { events: [event] });
+	const text = (response.result as { content?: Array<{ type: string; text: string }> }).content?.[0]?.text ?? "";
+	assert.match(text, /selection_debug/);
+	assert.match(text, /phase=post_send_audit/);
+	assert.match(text, /page=1/);
+	assert.match(text, /selection_text_len=13/);
+	assert.match(text, /selection_text=selected text/);
+	assert.doesNotMatch(text, /full node text retained/);
+});
+
+class SelectionDebugTestClient implements ViewerHostClient {
+	readonly origin = "http://127.0.0.1:1";
+	async send(_message: McpToViewerHostMessage): Promise<void | ViewerHostControlResponse> {
+		return undefined;
+	}
+}
+
+test("Viewer Host MCP service accepts and stores selection debug messages", async () => {
+	const service = new ViewerHostMcpService({ client: new SelectionDebugTestClient() });
+	service.handleHostMessage({
+		type: "selection_debug",
+		pdf_id: 77,
+		phase: "send",
+		page: 2,
+		text: "browser selection",
+		details: { selectionTextLength: 17, selectedPayloadTextLength: 17 },
+	});
+
+	const events = await service.getPdfEvents({ pdf_id: 77, max_events: 5 });
+	assert.equal(events.length, 1);
+	assert.equal(events[0]?.type, "selection_debug");
+	assert.equal(events[0]?.phase, "send");
+	assert.deepEqual(events[0]?.details, { selectionTextLength: 17, selectedPayloadTextLength: 17 });
+});
 
 test("PdfEventStore default reads return unread events once while stale reads preserve old events", () => {
 	const store = new PdfEventStore();

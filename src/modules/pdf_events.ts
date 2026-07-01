@@ -43,7 +43,23 @@ export interface ReverseSynctexPdfEvent extends ReverseSynctexPdfEventInput {
 	sequence: number;
 }
 
-export type PdfEvent = ReverseSynctexPdfEvent;
+export interface SelectionDebugPdfEventInput {
+	type: "selection_debug";
+	pdf_id: number;
+	timestamp: string;
+	phase: string;
+	page?: number;
+	x?: undefined;
+	y?: undefined;
+	text: string;
+	details: unknown;
+}
+
+export interface SelectionDebugPdfEvent extends SelectionDebugPdfEventInput {
+	sequence: number;
+}
+
+export type PdfEvent = ReverseSynctexPdfEvent | SelectionDebugPdfEvent;
 
 export interface GetPdfEventsRequest {
 	pdf_id?: number;
@@ -58,6 +74,16 @@ export class PdfEventStore {
 
 	appendReverseSynctexEvent(input: ReverseSynctexPdfEventInput): ReverseSynctexPdfEvent {
 		const event: ReverseSynctexPdfEvent = {
+			...input,
+			sequence: this.nextSequence,
+		};
+		this.nextSequence += 1;
+		this.events.push(event);
+		return event;
+	}
+
+	appendSelectionDebugEvent(input: SelectionDebugPdfEventInput): SelectionDebugPdfEvent {
+		const event: SelectionDebugPdfEvent = {
 			...input,
 			sequence: this.nextSequence,
 		};

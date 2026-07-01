@@ -14,7 +14,7 @@ import type {
 } from "./host_service_protocol.ts";
 import type { HostServiceMcpPdfOperations } from "./host_service_mcp.ts";
 import { arePdfSnapshotsEqual, PdfJsViewerRegistry, type PdfJsViewerFileSnapshot, type PdfJsViewerRecord } from "./pdfjs_viewer_registry.ts";
-import { PdfJsViewerServer, type ReverseSynctexClick } from "./pdfjs_viewer_server.ts";
+import { PdfJsViewerServer, type ReverseSynctexClick, type ViewerSelectionDebug } from "./pdfjs_viewer_server.ts";
 
 const PDFJS_VIEWER_BACKEND_NAME = "pdfjs-browser";
 const PDFJS_VIEWER_BACKEND_CAPABILITIES = {
@@ -156,6 +156,7 @@ export class PdfJsViewerMcpService {
 		this.server = options.server ?? new PdfJsViewerServer({
 			registry: this.registry,
 			onReverseSynctex: (click) => this.handleReverseSynctexClick(click),
+			onSelectionDebug: (debug) => this.handleSelectionDebug(debug),
 		});
 		this.browserLauncher = options.browserLauncher ?? new DefaultBrowserLauncher();
 		this.reverseSynctexMapper = options.reverseSynctexMapper ?? mapReverseSynctex;
@@ -467,6 +468,18 @@ export class PdfJsViewerMcpService {
 			selectionStart: { source_file: range.sourceFile, line: range.startLine, column: range.startColumn, ...(range.startSourceLine === undefined ? {} : { source_line: range.startSourceLine }), page: click.page, x: click.selectionStartX as number, y: click.selectionStartY as number },
 			selectionEnd: { source_file: range.sourceFile, line: range.endLine, column: range.endColumn, ...(range.endSourceLine === undefined ? {} : { source_line: range.endSourceLine }), page: click.page, x: click.selectionEndX as number, y: click.selectionEndY as number },
 		};
+	}
+
+	private handleSelectionDebug(debug: ViewerSelectionDebug): void {
+		this.eventStore.appendSelectionDebugEvent({
+			type: "selection_debug",
+			pdf_id: debug.pdfId,
+			timestamp: new Date().toISOString(),
+			phase: debug.phase,
+			...(debug.page === undefined ? {} : { page: debug.page }),
+			text: debug.text,
+			details: debug.details,
+		});
 	}
 
 	private handleReverseSynctexClick(click: ReverseSynctexClick): void {

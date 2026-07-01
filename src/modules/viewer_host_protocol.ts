@@ -82,11 +82,21 @@ export interface ViewerHostReverseSynctexMessage {
 	selectionEndY?: number;
 }
 
+export interface ViewerHostSelectionDebugMessage {
+	type: "selection_debug";
+	pdf_id: number;
+	phase: string;
+	page?: number;
+	text: string;
+	details: Record<string, unknown>;
+}
+
 export type ViewerHostToMcpMessage =
 	| ViewerHostReadyMessage
 	| ViewerHostViewerLoadedMessage
 	| ViewerHostViewerTabClosedMessage
-	| ViewerHostReverseSynctexMessage;
+	| ViewerHostReverseSynctexMessage
+	| ViewerHostSelectionDebugMessage;
 
 export interface ViewerHostControlAcceptedResult {
 	type: McpToViewerHostMessage["type"];
@@ -177,6 +187,13 @@ function optionalString(value: unknown, field: string): string | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string") {
 		throw new Error(`${field} must be a string`);
+	}
+	return value;
+}
+
+function requireRecord(value: unknown, field: string): Record<string, unknown> {
+	if (!isRecord(value) || Array.isArray(value)) {
+		throw new Error(`${field} must be an object`);
 	}
 	return value;
 }
@@ -282,6 +299,17 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				...(selectionStartY === undefined ? {} : { selectionStartY }),
 				...(selectionEndX === undefined ? {} : { selectionEndX }),
 				...(selectionEndY === undefined ? {} : { selectionEndY }),
+			};
+		}
+		case "selection_debug": {
+			const page = message.page === undefined ? undefined : requirePositiveInteger(message.page, "page");
+			return {
+				type,
+				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
+				phase: requireNonEmptyString(message.phase, "phase"),
+				...(page === undefined ? {} : { page }),
+				text: optionalString(message.text, "text") ?? "",
+				details: requireRecord(message.details, "details"),
 			};
 		}
 		default:

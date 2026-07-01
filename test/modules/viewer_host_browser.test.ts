@@ -472,9 +472,9 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		await dispatchRenderedPageMouseup(page, 190, 194);
 		let selectionEvent: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
-			const response = await callTool(3, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			const response = await callTool(3, "get_pdf_events", { pdf_id: 209, max_events: 20 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 			const events = response.result?.details?.events ?? [];
-			selectionEvent = events.at(-1);
+			selectionEvent = events.filter((candidate) => candidate.type === "reverse_synctex").at(-1);
 			if (selectionEvent?.selected_text === "paragraph text") break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
@@ -490,10 +490,28 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assert.equal(typeof (selectionEvent.selection_start as Record<string, unknown>).x, "number");
 		assert.equal(typeof (selectionEvent.selection_end as Record<string, unknown>).y, "number");
 
+		let selectionDebugEvents: Array<Record<string, unknown>> = [];
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(3, "get_pdf_events", { pdf_id: 209, max_events: 80, stale: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			selectionDebugEvents = (response.result?.details?.events ?? []).filter((candidate) => candidate.type === "selection_debug");
+			const phases = new Set(selectionDebugEvents.map((candidate) => candidate.phase));
+			if (["selectionchange", "mouseup", "scheduler_tick", "send", "post_send_audit"].every((phase) => phases.has(phase))) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		const selectionDebugPhases = new Set(selectionDebugEvents.map((candidate) => candidate.phase));
+		for (const phase of ["selectionchange", "mouseup", "scheduler_tick", "send", "post_send_audit"]) {
+			assert.ok(selectionDebugPhases.has(phase), `selection diagnostics should include ${phase}`);
+		}
+		const sendDebug = selectionDebugEvents.find((candidate) => candidate.phase === "send" && (candidate.details as Record<string, unknown> | undefined)?.selectedPayloadText === "paragraph text");
+		assert.ok(sendDebug, "selection diagnostics should include send payload details");
+		assert.equal((sendDebug.details as Record<string, unknown>).selectedPayloadTextLength, "paragraph text".length);
+		assert.equal((sendDebug.details as Record<string, unknown>).selectionTextLength, "paragraph text".length);
+
 		await clickRenderedPagePoint(page, 190, 194, { ctrl: true });
 		await new Promise((resolve) => setTimeout(resolve, 1200));
-		const duplicateResponse = await callTool(4, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-		assert.equal(duplicateResponse.result?.details?.events?.length ?? 0, 0, "selection auto-send and delayed follow-up Ctrl+Click must not duplicate the same selected range");
+		const duplicateResponse = await callTool(4, "get_pdf_events", { pdf_id: 209, max_events: 20 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+		const duplicateReverseEvents = (duplicateResponse.result?.details?.events ?? []).filter((candidate) => candidate.type === "reverse_synctex");
+		assert.equal(duplicateReverseEvents.length, 0, "selection auto-send and delayed follow-up Ctrl+Click must not duplicate the same selected range");
 
 		const finalSelectionBaselineSequence = Number(selectionEvent.sequence);
 		assert.ok(Number.isFinite(finalSelectionBaselineSequence), "previous selection event should have a sequence");
@@ -503,8 +521,8 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		await dispatchMouseupThenFinalizeSelection(page, earlySelectionPrefix, finalSelectionText, 180, 194);
 		let finalizedSelectionEvent: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
-			const response = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-			finalizedSelectionEvent = response.result?.details?.events?.at(-1);
+			const response = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 20 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			finalizedSelectionEvent = (response.result?.details?.events ?? []).filter((candidate) => candidate.type === "reverse_synctex").at(-1);
 			if (finalizedSelectionEvent?.selected_text === finalSelectionText) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
@@ -527,8 +545,8 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		await clickRenderedPagePoint(page, 180, 194, { ctrl: true });
 		let staleSelectionEvent: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
-			const response = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-			staleSelectionEvent = response.result?.details?.events?.at(-1);
+			const response = await callTool(5, "get_pdf_events", { pdf_id: 209, max_events: 20 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			staleSelectionEvent = (response.result?.details?.events ?? []).filter((candidate) => candidate.type === "reverse_synctex").at(-1);
 			if (Number(staleSelectionEvent?.sequence) > Number(finalizedSelectionEvent?.sequence)) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
@@ -538,8 +556,8 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		await dragSelectRenderedPageText(page, "paragraph text that should");
 		let dragSelectionEvent: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
-			const response = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-			dragSelectionEvent = response.result?.details?.events?.at(-1);
+			const response = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 20 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			dragSelectionEvent = (response.result?.details?.events ?? []).filter((candidate) => candidate.type === "reverse_synctex").at(-1);
 			if (typeof dragSelectionEvent?.selected_text === "string" && dragSelectionEvent.selected_text.includes("paragraph") && dragSelectionEvent.selected_text.includes("text that")) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
@@ -547,14 +565,17 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assert.equal(typeof dragSelectedText, "string", "real-ish text-layer drag should emit selected text without an extra click");
 		assert.match(dragSelectedText as string, /paragraph/);
 		assert.match(dragSelectedText as string, /text that/, "drag selection should include suffix after the selected token");
+		const dragDebugResponse = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 80, stale: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+		const dragDebugPhases = new Set((dragDebugResponse.result?.details?.events ?? []).filter((candidate) => candidate.type === "selection_debug").map((candidate) => candidate.phase));
+		assert.ok(dragDebugPhases.has("mousedown"), "drag selection diagnostics should include mousedown");
 
 		for (const mode of ["start-at-previous-end", "end-at-next-start", "element-offsets-between-spans"] as const) {
 			const boundaryText = await selectAdjacentTextLayerBoundary(page, mode);
 			await dispatchRenderedPageMouseup(page, 190, 194);
 			let boundaryEvent: Record<string, unknown> | undefined;
 			for (let attempt = 0; attempt < 20; attempt += 1) {
-				const response = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 10 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-				boundaryEvent = response.result?.details?.events?.at(-1);
+				const response = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 20 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+				boundaryEvent = (response.result?.details?.events ?? []).filter((candidate) => candidate.type === "reverse_synctex").at(-1);
 				if (boundaryEvent?.selected_text === boundaryText) break;
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
@@ -562,6 +583,30 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 			assert.ok(boundaryEvent?.selection_start, `${mode} should map selection start`);
 			assert.ok(boundaryEvent?.selection_end, `${mode} should map selection end`);
 		}
+
+		const auditSentText = "paragraph text";
+		await selectRenderedPageText(page, auditSentText);
+		await dispatchRenderedPageMouseup(page, 190, 194);
+		let auditReverseEvent: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(7, "get_pdf_events", { pdf_id: 209, max_events: 20 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			auditReverseEvent = (response.result?.details?.events ?? []).filter((candidate) => candidate.type === "reverse_synctex").at(-1);
+			if (auditReverseEvent?.selected_text === auditSentText) break;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		assert.equal(auditReverseEvent?.selected_text, auditSentText, "audit setup should send the selected text");
+		await selectRenderedPageText(page, "First");
+		let changedAudit: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(7, "get_pdf_events", { pdf_id: 209, max_events: 120, stale: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			changedAudit = (response.result?.details?.events ?? []).find((candidate) => {
+				const details = candidate.details as Record<string, unknown> | undefined;
+				return candidate.type === "selection_debug" && candidate.phase === "post_send_audit" && details?.sentText === auditSentText && details.changed === true && details.currentText === "First";
+			});
+			if (changedAudit) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(changedAudit, "post-send audit should detect when current selection changes after send");
 
 		const control = new ViewerHostControlClient({ origin: server.origin });
 		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 209, page: 1, x: 100, y: 40, indicator: true, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 209 } });

@@ -605,8 +605,19 @@ export class ViewerHostMcpService {
 
 	handleHostMessage(message: ViewerHostToMcpMessage): void {
 		const parsed = validateViewerHostToMcpMessage(message);
-		if (parsed.type !== "reverse_synctex") return;
-		this.appendReverseSynctexEvent(parsed);
+		if (parsed.type === "reverse_synctex") {
+			this.appendReverseSynctexEvent(parsed);
+		} else if (parsed.type === "selection_debug") {
+			this.eventStore.appendSelectionDebugEvent({
+				type: "selection_debug",
+				pdf_id: parsed.pdf_id,
+				timestamp: new Date().toISOString(),
+				phase: parsed.phase,
+				...(parsed.page === undefined ? {} : { page: parsed.page }),
+				text: parsed.text,
+				details: parsed.details,
+			});
+		}
 	}
 
 	private async drainHostEvents(): Promise<void> {

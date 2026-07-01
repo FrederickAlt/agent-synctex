@@ -910,6 +910,17 @@ function formatReverseSynctexDiagnosticsSummary(diagnostics: unknown): string | 
 }
 
 function formatPdfEventForTool(event: PdfEvent): string {
+	if (event.type === "selection_debug") {
+		const fields = [
+			`type=${event.type}`,
+			`pdf_id=${event.pdf_id}`,
+			`phase=${event.phase}`,
+		];
+		if (event.page !== undefined) fields.push(`page=${event.page}`);
+		fields.push(`selection_text_len=${event.text.length}`);
+		fields.push(`selection_text=${compactToolText(event.text, 160)}`);
+		return fields.join(", ");
+	}
 	const fields = [
 		`type=${event.type}`,
 		`pdf_id=${event.pdf_id}`,
