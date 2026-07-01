@@ -867,6 +867,43 @@ function parseGetPdfEventsRequest(args: Record<string, unknown>): GetPdfEventsRe
 	};
 }
 
+function compactToolText(value: string, maxLength = 180): string {
+	const compacted = value.replace(/\s+/g, " ").trim();
+	return compacted.length > maxLength ? `${compacted.slice(0, maxLength - 1)}…` : compacted;
+}
+
+function formatMaybeTextField(name: string, value: unknown, maxLength?: number): string | undefined {
+	return typeof value === "string" ? `${name}=${compactToolText(value, maxLength)}` : undefined;
+}
+
+function formatReverseSynctexDiagnosticsSummary(diagnostics: unknown): string | undefined {
+	if (!isRecord(diagnostics)) return undefined;
+	const parts: string[] = [];
+	if (typeof diagnostics.branch === "string") {
+		parts.push(`branch=${diagnostics.branch}`);
+	}
+	const selected = diagnostics.selected;
+	if (isRecord(selected)) {
+		const selectedParts: string[] = [];
+		if (typeof selected.sourceFile === "string") selectedParts.push(selected.sourceFile);
+		if (typeof selected.line === "number") selectedParts.push(`line=${selected.line}`);
+		if (typeof selected.column === "number") selectedParts.push(`column=${selected.column}`);
+		if (selectedParts.length > 0) parts.push(`selected=${selectedParts.join(":")}`);
+	}
+	const context = diagnostics.context;
+	if (isRecord(context)) {
+		const contextParts: string[] = [];
+		if (typeof context.hasSelectionContext === "boolean") contextParts.push(`selection=${context.hasSelectionContext}`);
+		if (typeof context.textBeforeSelection === "string") contextParts.push(`before=${compactToolText(context.textBeforeSelection, 48)}`);
+		if (typeof context.textAfterSelection === "string") contextParts.push(`after=${compactToolText(context.textAfterSelection, 48)}`);
+		if (contextParts.length > 0) parts.push(`context=${contextParts.join(";")}`);
+	}
+	if (Array.isArray(diagnostics.candidates)) {
+		parts.push(`candidates=${diagnostics.candidates.length}`);
+	}
+	return parts.length > 0 ? `synctex_diagnostics=${parts.join(" ")}` : undefined;
+}
+
 function formatPdfEventForTool(event: PdfEvent): string {
 	const fields = [
 		`type=${event.type}`,
@@ -875,8 +912,25 @@ function formatPdfEventForTool(event: PdfEvent): string {
 		`line=${event.line}`,
 	];
 	if (event.source_line !== undefined) {
-		fields.push(`source_line=${event.source_line}`);
+		fields.push(`source_line=${compactToolText(event.source_line)}`);
 	}
+	if (event.page !== undefined) fields.push(`page=${event.page}`);
+	if (event.x !== undefined) fields.push(`x=${event.x}`);
+	if (event.y !== undefined) fields.push(`y=${event.y}`);
+	if (event.raw_mapped_source_file !== undefined && event.raw_mapped_source_file !== event.source_file) {
+		fields.push(`raw_mapped_source_file=${event.raw_mapped_source_file}`);
+	}
+	if (event.raw_mapped_line !== undefined) fields.push(`raw_mapped_line=${event.raw_mapped_line}`);
+	if (event.raw_mapped_column !== undefined) fields.push(`raw_mapped_column=${event.raw_mapped_column}`);
+	const rawMappedSourceLine = formatMaybeTextField("raw_mapped_source_line", event.raw_mapped_source_line);
+	if (rawMappedSourceLine !== undefined) fields.push(rawMappedSourceLine);
+	if (event.normalized_formula_span !== undefined) {
+		fields.push(`normalized_formula_span=${event.normalized_formula_span.start_line}-${event.normalized_formula_span.end_line}`);
+	}
+	const normalizedFormulaExcerpt = formatMaybeTextField("normalized_formula_excerpt", event.normalized_formula_excerpt, 240);
+	if (normalizedFormulaExcerpt !== undefined) fields.push(normalizedFormulaExcerpt);
+	const diagnosticsSummary = formatReverseSynctexDiagnosticsSummary(event.synctex_diagnostics);
+	if (diagnosticsSummary !== undefined) fields.push(diagnosticsSummary);
 	return fields.join(", ");
 }
 

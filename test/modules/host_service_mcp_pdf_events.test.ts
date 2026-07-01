@@ -16,6 +16,24 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 		page: 3,
 		x: 110,
 		y: 220,
+		raw_mapped_line: 43,
+		raw_mapped_column: 9,
+		raw_mapped_source_line: "\\end{align}",
+		normalized_formula_span: {
+			source_file: "/tmp/paper/main.tex",
+			start_line: 40,
+			end_line: 43,
+		},
+		normalized_formula_excerpt: "\\begin{align}\n  a &= b + c\\\\\n\\end{align}",
+		synctex_diagnostics: {
+			branch: "js_fallback",
+			selected: { sourceFile: "/tmp/paper/main.tex", line: 42, column: 1, sourceLine: "\\section{Visible target}" },
+			context: { hasSelectionContext: true, textBeforeSelection: "formula body", textAfterSelection: "closing delimiter" },
+			candidates: [
+				{ kind: "raw", sourceFile: "/tmp/paper/main.tex", line: 43, column: 9 },
+				{ kind: "formula_normalized", sourceFile: "/tmp/paper/main.tex", line: 42, column: 1 },
+			],
+		},
 	};
 
 	const response = await handleMcpRequest(JSON.stringify({
@@ -37,4 +55,16 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	assert.match(text, /source_file=\/tmp\/paper\/main\.tex/);
 	assert.match(text, /line=42/);
 	assert.match(text, /source_line=\\section\{Visible target\}/);
+	assert.match(text, /page=3/);
+	assert.match(text, /x=110/);
+	assert.match(text, /y=220/);
+	assert.match(text, /raw_mapped_line=43/);
+	assert.match(text, /raw_mapped_column=9/);
+	assert.match(text, /raw_mapped_source_line=\\end\{align\}/);
+	assert.match(text, /normalized_formula_span=40-43/);
+	assert.match(text, /normalized_formula_excerpt=\\begin\{align\} a &= b \+ c\\\\ \\end\{align\}/);
+	assert.match(text, /synctex_diagnostics=branch=js_fallback/);
+	assert.match(text, /selected=\/tmp\/paper\/main\.tex:line=42:column=1/);
+	assert.match(text, /context=selection=true;before=formula body;after=closing delimiter/);
+	assert.match(text, /candidates=2/);
 });
