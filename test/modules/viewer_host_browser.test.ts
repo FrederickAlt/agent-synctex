@@ -312,13 +312,52 @@ async function dispatchMouseupThenFinalizeSelection(page: Page, prefixText: stri
 				selectText(prefixText.length);
 				const rect = canvas.getBoundingClientRect();
 				pageElement.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: rect.left + x, clientY: rect.top + y }));
-				requestAnimationFrame(() => selectText(finalText.length));
+				setTimeout(() => selectText(finalText.length), 80);
 				return;
 			}
 			node = walker.nextNode();
 		}
 		throw new Error(`text layer did not contain ${finalText}`);
 	}, { prefixText, finalText, x, y });
+}
+
+async function dragSelectRenderedPageText(page: Page, selectedText: string): Promise<void> {
+	await page.waitForSelector("#pages div[data-page-number='1'] .textLayer[data-rendered='true'] span", { state: "attached", timeout: 2_000 });
+	const points = await page.evaluate((needle) => {
+		const textLayer = document.querySelector("#pages div[data-page-number='1'] .textLayer") as HTMLElement | null;
+		if (!textLayer) throw new Error("missing rendered text layer");
+		window.getSelection()?.removeAllRanges();
+		const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
+		let node = walker.nextNode();
+		while (node) {
+			const text = node.textContent ?? "";
+			const start = text.indexOf(needle);
+			if (start >= 0) {
+				const startProbe = document.createRange();
+				startProbe.setStart(node, start);
+				startProbe.setEnd(node, start + 1);
+				const startRect = startProbe.getBoundingClientRect();
+				startProbe.detach?.();
+				const endProbe = document.createRange();
+				endProbe.setStart(node, start + needle.length - 1);
+				endProbe.setEnd(node, start + needle.length);
+				const endRect = endProbe.getBoundingClientRect();
+				endProbe.detach?.();
+				return {
+					startX: startRect.left + 1,
+					startY: startRect.top + startRect.height / 2,
+					endX: endRect.right - 1,
+					endY: endRect.top + endRect.height / 2,
+				};
+			}
+			node = walker.nextNode();
+		}
+		throw new Error(`text layer did not contain ${needle}`);
+	}, selectedText);
+	await page.mouse.move(points.startX, points.startY);
+	await page.mouse.down();
+	await page.mouse.move(points.endX, points.endY, { steps: 12 });
+	await page.mouse.up();
 }
 
 async function waitForSynctexCircleStyle(page: Page, expected: { left: number; top: number }, tolerance = 1): Promise<void> {
@@ -495,6 +534,19 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		}
 		assert.equal(staleSelectionEvent?.selected_text, undefined, "selection outside clicked page should be ignored");
 		assert.equal(staleSelectionEvent?.selection_start, undefined, "selection outside clicked page should not attach range start");
+
+		await dragSelectRenderedPageText(page, "paragraph text that should");
+		let dragSelectionEvent: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			dragSelectionEvent = response.result?.details?.events?.at(-1);
+			if (typeof dragSelectionEvent?.selected_text === "string" && dragSelectionEvent.selected_text.includes("paragraph") && dragSelectionEvent.selected_text.includes("text that")) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		const dragSelectedText = dragSelectionEvent?.selected_text;
+		assert.equal(typeof dragSelectedText, "string", "real-ish text-layer drag should emit selected text without an extra click");
+		assert.match(dragSelectedText as string, /paragraph/);
+		assert.match(dragSelectedText as string, /text that/, "drag selection should include suffix after the selected token");
 
 		for (const mode of ["start-at-previous-end", "end-at-next-start", "element-offsets-between-spans"] as const) {
 			const boundaryText = await selectAdjacentTextLayerBoundary(page, mode);
