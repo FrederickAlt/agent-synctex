@@ -350,6 +350,108 @@ test("reverse SyncTeX adapter returns LaTeX-Workshop output with column 0 and cu
 	}
 });
 
+test("reverse SyncTeX adapter normalizes \\end{equation} to the enclosing formula span while preserving raw mapped result", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\begin{equation}",
+			"  a = b + c",
+			"\\end{equation}",
+			"",
+		].join("\n"));
+
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+
+		assert.equal(location.line, 3);
+		assert.equal(location.sourceLine, "\\end{equation}");
+		assert.equal(location.rawMappedSourceFile, project.sourcePath);
+		assert.equal(location.rawMappedLine, 3);
+		assert.equal(location.rawMappedColumn, 0);
+		assert.equal(location.rawMappedSourceLine, "\\end{equation}");
+		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+		assert.equal(location.normalizedFormulaExcerpt, "\\begin{equation}\n  a = b + c\n\\end{equation}");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX adapter normalizes align and align* closing lines", () => {
+	for (const environment of ["align", "align*"]) {
+		const project = makeFixtureProject({ sidecar: "synctex" });
+		try {
+			writeFileSync(project.sourcePath, [
+				`\\begin{${environment}}`,
+				"  a &= b \\\\",
+				`\\end{${environment}}`,
+				"",
+			].join("\n"));
+
+			const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+
+			assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+			assert.equal(location.normalizedFormulaExcerpt, `\\begin{${environment}}\n  a &= b \\\\\n\\end{${environment}}`);
+		} finally {
+			rmSync(project.dir, { recursive: true, force: true });
+		}
+	}
+});
+
+test("reverse SyncTeX adapter normalizes \\] to the matching display math opener", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\[",
+			"  x^2 + y^2 = z^2",
+			"\\]",
+			"",
+		].join("\n"));
+
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+
+		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+		assert.equal(location.normalizedFormulaExcerpt, "\\[\n  x^2 + y^2 = z^2\n\\]");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX adapter matches nested same-environment closes to the nearest opener", () => {
+	const project = makeFixtureProject({ sidecar: "synctex.gz" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\begin{equation}",
+			"outer before",
+			"\\begin{equation}",
+			"inner",
+			"\\end{equation}",
+			"outer after",
+			"\\end{equation}",
+		].join("\n"));
+
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 167.27, cwd: project.dir });
+
+		assert.equal(location.line, 5);
+		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 3, endLine: 5 });
+		assert.equal(location.normalizedFormulaExcerpt, "\\begin{equation}\ninner\n\\end{equation}");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX adapter leaves non-formula reverse events unchanged", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir });
+
+		assert.equal(location.sourceLine, "First paragraph text that should wrap a little and create boxes.");
+		assert.equal(Object.hasOwn(location, "rawMappedLine"), false);
+		assert.equal(Object.hasOwn(location, "normalizedFormulaSpan"), false);
+		assert.equal(Object.hasOwn(location, "normalizedFormulaExcerpt"), false);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct column", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {

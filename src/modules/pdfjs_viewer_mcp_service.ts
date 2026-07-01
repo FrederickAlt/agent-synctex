@@ -475,6 +475,18 @@ export class PdfJsViewerMcpService {
 			page: click.page,
 			x: click.x,
 			y: click.y,
+			...(location.normalizedFormulaSpan === undefined ? {} : {
+				raw_mapped_source_file: location.rawMappedSourceFile,
+				raw_mapped_line: location.rawMappedLine,
+				raw_mapped_column: location.rawMappedColumn,
+				...(location.rawMappedSourceLine === undefined ? {} : { raw_mapped_source_line: location.rawMappedSourceLine }),
+				normalized_formula_span: {
+					source_file: location.normalizedFormulaSpan.sourceFile,
+					start_line: location.normalizedFormulaSpan.startLine,
+					end_line: location.normalizedFormulaSpan.endLine,
+				},
+				normalized_formula_excerpt: location.normalizedFormulaExcerpt,
+			}),
 		});
 	}
 

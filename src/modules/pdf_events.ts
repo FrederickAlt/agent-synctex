@@ -1,3 +1,9 @@
+export interface ReverseSynctexFormulaSpanEvent {
+	source_file: string;
+	start_line: number;
+	end_line: number;
+}
+
 export interface ReverseSynctexPdfEventInput {
 	type: "reverse_synctex";
 	pdf_id: number;
@@ -9,6 +15,12 @@ export interface ReverseSynctexPdfEventInput {
 	page?: number;
 	x?: number;
 	y?: number;
+	raw_mapped_source_file?: string;
+	raw_mapped_line?: number;
+	raw_mapped_column?: number;
+	raw_mapped_source_line?: string;
+	normalized_formula_span?: ReverseSynctexFormulaSpanEvent;
+	normalized_formula_excerpt?: string;
 }
 
 export interface ReverseSynctexPdfEvent extends ReverseSynctexPdfEventInput {
