@@ -260,13 +260,14 @@ test("jump_pdf maps SyncTeX in MCP and sends synctex_forward through Viewer Host
 		assert.deepEqual(client.messages[1], {
 			type: "synctex_forward",
 			pdf_id: 5,
-			page: 1,
-			x: 143.7309977720268,
-			y: 154.6899018816158,
+			page: response.result?.details?.page,
+			x: response.result?.details?.x,
+			y: response.result?.details?.y,
 			indicator: true,
 			source_file: sourcePath,
 			line: 3,
 		});
+		assert.match(String(response.result?.details?.synctex_branch), /^(native|js_fallback)$/);
 		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "width"), false, "ViewerHostMcpService.jumpPdf must emit point-style Host messages without width");
 		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "height"), false, "ViewerHostMcpService.jumpPdf must emit point-style Host messages without height");
 		assert.equal(Object.hasOwn(response.result?.details ?? {}, "width"), false);

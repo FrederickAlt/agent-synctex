@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
-import { mapForwardSynctex, type ForwardSynctexJump } from "../../../src/modules/synctex/forward_synctex.ts";
+import { mapForwardSynctex, type ForwardSynctexJump, type NativeSynctexRunner } from "../../../src/modules/synctex/forward_synctex.ts";
 import { forwardSynctexMarkerFromPdfPoint, type ForwardSynctexMarkerPosition } from "../../../src/modules/viewer_coordinate_transform.ts";
 
 interface TextItemLike {
@@ -54,6 +54,8 @@ interface OracleCase {
 	marker: ForwardSynctexMarkerPosition;
 	textBox: Box;
 }
+
+const forceJsFallbackNativeRunner: NativeSynctexRunner = () => ({ status: 1, stdout: "", stderr: "native disabled for deterministic JS fallback oracle" });
 
 const FIXTURE_LINES = [
 	"\\documentclass[12pt]{article}",
@@ -223,7 +225,7 @@ async function collectOracleCases(pdfjsLib: PdfJsLibLike, fixture: { dir: string
 			const textBox = textBoxes.get(label);
 			assert.ok(textBox, `PDF.js textContent should contain ${label}; extracted text was: ${textContent.items.map((item) => item.str).join(" | ")}`);
 			const line = lineForLabel(label);
-			const jump = mapForwardSynctex({ pdfPath: fixture.pdfPath, sourceFile: fixture.texPath, line, cwd: fixture.dir });
+			const jump = mapForwardSynctex({ pdfPath: fixture.pdfPath, sourceFile: fixture.texPath, line, cwd: fixture.dir, nativeRunner: forceJsFallbackNativeRunner });
 			assert.equal(jump.page, 1, `${label} should map to the fixture page`);
 			const marker = forwardSynctexMarkerFromPdfPoint({ pdfX: jump.x, pdfY: jump.y, width: jump.width, height: jump.height, viewport });
 			return { label, kind, line, jump, marker, textBox };
@@ -301,7 +303,7 @@ test("forward SyncTeX markers for align* fixtures intentionally follow LaTeX-Wor
 				const item = textContent.items.find((candidate) => candidate.str.includes(label));
 				assert.ok(item, `PDF.js textContent should contain ${label}; extracted text was: ${textContent.items.map((candidate) => candidate.str).join(" | ")}`);
 				const textBox = textItemBox(pdfjsLib, viewport, item);
-				const jump = mapForwardSynctex({ pdfPath: fixture.pdfPath, sourceFile: fixture.texPath, line, cwd: fixture.dir });
+				const jump = mapForwardSynctex({ pdfPath: fixture.pdfPath, sourceFile: fixture.texPath, line, cwd: fixture.dir, nativeRunner: forceJsFallbackNativeRunner });
 				const marker = forwardSynctexMarkerFromPdfPoint({ pdfX: jump.x, pdfY: jump.y, width: jump.width, height: jump.height, viewport });
 				return { label, line, jump, marker, textBox };
 			});

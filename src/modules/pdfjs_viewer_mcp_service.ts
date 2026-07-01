@@ -290,6 +290,7 @@ export class PdfJsViewerMcpService {
 					page: jump.page,
 					x: jump.x,
 					y: jump.y,
+					synctex_branch: jump.branch,
 					...(jump.width === undefined ? {} : { width: jump.width }),
 					...(jump.height === undefined ? {} : { height: jump.height }),
 					viewer_notifications: viewerNotifications,
@@ -306,7 +307,7 @@ export class PdfJsViewerMcpService {
 						capabilities: PDFJS_VIEWER_BACKEND_CAPABILITIES,
 						backendPath: PDFJS_VIEWER_BACKEND_NAME,
 						defaultSourcePath: inferDefaultSourceFileForPdf(pdfPath),
-						metadata: { viewer_url: record.viewerUrl, synctex_sidecar: jump.sidecarPath, viewer_notifications: viewerNotifications },
+						metadata: { viewer_url: record.viewerUrl, synctex_sidecar: jump.sidecarPath, synctex_branch: jump.branch, viewer_notifications: viewerNotifications },
 					},
 				},
 			};

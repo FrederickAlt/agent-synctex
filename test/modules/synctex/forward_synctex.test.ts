@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import * as iconv from "iconv-lite";
 import { test } from "node:test";
@@ -29,6 +29,8 @@ function writeGzipSynctex(sidecarPath: string, body: string, encoding: BufferEnc
 	writeFileSync(sidecarPath, gzipSync(Buffer.from(body, encoding)));
 }
 
+const failNativeRunner = () => ({ status: 1, stdout: "", stderr: "native disabled for JS fallback assertion" });
+
 test("LaTeX-Workshop-derived syncTeXToPDF reads realistic .synctex fixtures and maps source lines to page coordinates", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	const previousCwd = process.cwd();
@@ -48,6 +50,115 @@ test("LaTeX-Workshop-derived syncTeXToPDF reads realistic .synctex fixtures and 
 	}
 });
 
+test("native forward SyncTeX success returns native output without using JS fallback", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const calls: Array<{ command: string; args: string[]; cwd: string }> = [];
+		const jump = mapForwardSynctex({
+			pdfPath: project.pdfPath,
+			sourceFile: project.sourcePath,
+			line: 3,
+			cwd: project.dir,
+			nativeRunner: (command, args, options) => {
+				calls.push({ command, args, cwd: options.cwd });
+				return {
+					status: 0,
+					stdout: "SyncTeX result begin\nPage:2\nx:11.5\ny:22.25\nSyncTeX result end\n",
+					stderr: "",
+				};
+			},
+			jsFallback: () => {
+				throw new Error("JS fallback should not be invoked after native success");
+			},
+		});
+
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.command, "synctex");
+		assert.deepEqual(calls[0]?.args, ["view", "-i", `3:1:${project.sourcePath}`, "-o", project.pdfPath]);
+		assert.equal(calls[0]?.cwd, dirname(project.pdfPath));
+		assert.equal(jump.branch, "native");
+		assert.equal(jump.page, 2);
+		assert.equal(jump.x, 11.5);
+		assert.equal(jump.y, 22.25);
+		assert.equal(jump.indicator, true);
+		assert.equal(jump.sourceLine, "First paragraph text that should wrap a little and create boxes.");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("native forward SyncTeX failure falls back to the existing LaTeX-Workshop JS parser", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const fallbackCalls: Array<{ line: number; sourceFile: string; pdfPath: string }> = [];
+		const jump = mapForwardSynctex({
+			pdfPath: project.pdfPath,
+			sourceFile: project.sourcePath,
+			line: 3,
+			cwd: project.dir,
+			nativeRunner: () => ({ status: 1, stdout: "", stderr: "native failed" }),
+			jsFallback: (line, sourceFile, pdfPath) => {
+				fallbackCalls.push({ line, sourceFile, pdfPath });
+				return syncTeXToPDF(line, sourceFile, pdfPath);
+			},
+		});
+
+		assert.deepEqual(fallbackCalls, [{ line: 3, sourceFile: project.sourcePath, pdfPath: project.pdfPath }]);
+		assert.equal(jump.branch, "js_fallback");
+		assert.equal(jump.indicator, true);
+		assert.equal(jump.page, 1);
+		assert.equal(jump.x, 143.7309977720268);
+		assert.equal(jump.y, 154.6899018816158);
+		assert.equal(Object.hasOwn(jump, "width"), false);
+		assert.equal(Object.hasOwn(jump, "height"), false);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("native forward SyncTeX no-result plus JS fallback no-result reports no usable mapping clearly", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		assert.throws(
+			() => mapForwardSynctex({
+				pdfPath: project.pdfPath,
+				sourceFile: project.sourcePath,
+				line: 3,
+				cwd: project.dir,
+				nativeRunner: () => ({ status: 0, stdout: "SyncTeX result begin\nSyncTeX result end\n", stderr: "" }),
+				jsFallback: () => undefined,
+			}),
+			/No usable SyncTeX mapping found.*native.*no usable result.*JS fallback.*no result/i,
+		);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("forward SyncTeX native path does not reintroduce a custom sidecar parser before JS fallback", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		let fallbackCalls = 0;
+		assert.throws(
+			() => mapForwardSynctex({
+				pdfPath: project.pdfPath,
+				sourceFile: project.sourcePath,
+				line: 3,
+				cwd: project.dir,
+				nativeRunner: () => ({ status: 1, stdout: "", stderr: "native failed" }),
+				jsFallback: () => {
+					fallbackCalls += 1;
+					return undefined;
+				},
+			}),
+			/JS fallback returned no result/i,
+		);
+		assert.equal(fallbackCalls, 1);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("forward SyncTeX adapter returns LaTeX-Workshop output plus current API glue fields", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	const previousCwd = process.cwd();
@@ -55,7 +166,7 @@ test("forward SyncTeX adapter returns LaTeX-Workshop output plus current API glu
 		process.chdir(project.dir);
 		const lwJump = syncTeXToPDF(3, project.sourcePath, project.pdfPath);
 		process.chdir(previousCwd);
-		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir });
+		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.deepEqual(jump, {
 			...lwJump,
@@ -63,6 +174,7 @@ test("forward SyncTeX adapter returns LaTeX-Workshop output plus current API glu
 			line: 3,
 			sourceLine: "First paragraph text that should wrap a little and create boxes.",
 			sidecarPath: join(project.dir, "paper.synctex"),
+			branch: "js_fallback",
 		});
 		assert.equal(Object.hasOwn(jump, "width"), false);
 		assert.equal(Object.hasOwn(jump, "height"), false);
@@ -122,7 +234,7 @@ test("reverse SyncTeX adapter reads realistic .synctex.gz fixtures", () => {
 test("forward SyncTeX mapper reads realistic .synctex.gz fixtures", () => {
 	const project = makeFixtureProject({ sidecar: "synctex.gz" });
 	try {
-		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 5, cwd: project.dir });
+		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 5, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(jump.sidecarPath, join(project.dir, "paper.synctex.gz"));
 		assert.equal(jump.sourceLine, "Second paragraph text on a different source line for SyncTeX mapping.");
@@ -142,7 +254,7 @@ test("forward SyncTeX mapper follows LaTeX-Workshop sidecar ordering when both .
 		const gzBody = readFixtureSynctex().replace("X Offset:655360", "X Offset:1310720");
 		writeGzipSynctex(join(project.dir, "paper.synctex.gz"), gzBody);
 
-		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir });
+		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(jump.sidecarPath, join(project.dir, "paper.synctex"));
 		assert.equal(jump.x, 143.7309977720268);
@@ -156,7 +268,7 @@ test("forward SyncTeX mapper accepts symlink-equivalent source paths", () => {
 	try {
 		const symlinkPath = join(project.dir, "linked-main.tex");
 		symlinkSync(project.sourcePath, symlinkPath);
-		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: symlinkPath, line: 3, cwd: project.dir });
+		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: symlinkPath, line: 3, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(jump.sourceFile, resolve(symlinkPath));
 		assert.equal(jump.page, 1);
@@ -177,7 +289,7 @@ test("forward SyncTeX mapper matches encoded non-ASCII Input filenames through L
 		const body = readFixtureSynctex().replace("Input:1:main.tex", `Input:1:${encodedSourcePath}`);
 		writeGzipSynctex(join(dir, "paper.synctex.gz"), body, "binary");
 
-		const jump = mapForwardSynctex({ pdfPath, sourceFile: sourcePath, line: 3, cwd: dir });
+		const jump = mapForwardSynctex({ pdfPath, sourceFile: sourcePath, line: 3, cwd: dir, nativeRunner: failNativeRunner });
 
 		assert.equal(jump.sidecarPath, join(dir, "paper.synctex.gz"));
 		assert.equal(jump.sourceFile, sourcePath);
@@ -211,7 +323,7 @@ test("forward SyncTeX mapper resolves relative Input records against cwd for out
 		copyFileSync(join(project.dir, "paper.synctex"), join(project.dir, "out", "paper.synctex"));
 		rmSync(join(project.dir, "paper.synctex"));
 
-		const jump = mapForwardSynctex({ pdfPath: outPdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir });
+		const jump = mapForwardSynctex({ pdfPath: outPdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(jump.sourceFile, project.sourcePath);
 		assert.equal(jump.page, 1);
@@ -225,7 +337,7 @@ test("forward SyncTeX mapper resolves relative Input records against cwd for out
 test("forward SyncTeX mapper follows LaTeX-Workshop forward selection for non-exact lines", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
-		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 4, cwd: project.dir });
+		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 4, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(jump.sourceLine, "");
 		assert.equal(jump.page, 1);
@@ -241,7 +353,7 @@ test("forward SyncTeX mapper follows LaTeX-Workshop forward selection for non-ex
 test("forward SyncTeX mapper applies LaTeX-Workshop X/Y offsets from realistic SyncTeX fixtures", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
-		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir });
+		const jump = mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 3, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(jump.x, 143.7309977720268);
 		assert.equal(jump.y, 154.6899018816158);
@@ -261,8 +373,8 @@ test("forward SyncTeX mapper reports missing sidecars and unmappable lines clear
 		);
 		copyFileSync(join(FIXTURE_DIR, "paper.synctex"), join(project.dir, "paper.synctex"));
 		assert.throws(
-			() => mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 12, cwd: project.dir }),
-			/No SyncTeX mapping found.*main\.tex:12/i,
+			() => mapForwardSynctex({ pdfPath: project.pdfPath, sourceFile: project.sourcePath, line: 12, cwd: project.dir, nativeRunner: failNativeRunner }),
+			/No usable SyncTeX mapping found.*main\.tex:12/i,
 		);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });

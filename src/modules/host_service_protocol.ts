@@ -441,6 +441,7 @@ export interface HostServiceJumpResponseDetails {
 	y?: number;
 	width?: number;
 	height?: number;
+	synctex_branch?: "native" | "js_fallback";
 	viewer_notifications?: number;
 	reason?: string;
 	handle?: string;

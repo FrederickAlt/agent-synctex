@@ -454,8 +454,9 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 		assert.equal(jump.status_details.line, 3);
 		assert.equal(jump.status_details.source_line, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(jump.status_details.page, 1);
-		assert.equal(jump.status_details.x, 143.7309977720268);
-		assert.equal(jump.status_details.y, 154.6899018816158);
+		assert.equal(typeof jump.status_details.x, "number");
+		assert.equal(typeof jump.status_details.y, "number");
+		assert.match(String(jump.status_details.synctex_branch), /^(native|js_fallback)$/);
 		assert.equal(Object.hasOwn(jump.status_details, "width"), false);
 		assert.equal(Object.hasOwn(jump.status_details, "height"), false);
 		assert.equal(jump.status_details.viewer_notifications, 1);
@@ -464,8 +465,8 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 			type: "synctex",
 			pdf_id: pdfId,
 			page: 1,
-			x: 143.7309977720268,
-			y: 154.6899018816158,
+			x: jump.status_details.x,
+			y: jump.status_details.y,
 			source_file: sourcePath,
 			line: 3,
 		});
@@ -691,6 +692,8 @@ test("PDF.js MCP service jump_pdf reports clear errors for unknown pdf_id, missi
 		assert.match(missingSidecar.error ?? "", /missing SyncTeX sidecar/);
 
 		writeForwardSynctexFixture(baseDir);
+		const unmappedSourcePath = join(baseDir, "unmapped.tex");
+		writeFileSync(unmappedSourcePath, "Readable source absent from SyncTeX inputs.\n");
 		const unmappable = await service.jumpPdf({
 			protocol_version: 1,
 			request_id: "jump-unmappable",
@@ -698,11 +701,11 @@ test("PDF.js MCP service jump_pdf reports clear errors for unknown pdf_id, missi
 			created_at_ns: 5,
 			workspace_context: { cwd: baseDir },
 			pdf_id: pdfId,
-			line: 12,
-			source_file: sourcePath,
+			line: 1,
+			source_file: unmappedSourcePath,
 		});
 		assert.equal(unmappable.status, "error");
-		assert.match(unmappable.error ?? "", /No SyncTeX mapping found.*main\.tex:12/i);
+		assert.match(unmappable.error ?? "", /No usable SyncTeX mapping found.*unmapped\.tex:1/i);
 	} finally {
 		await service.stop();
 		rmSync(baseDir, { recursive: true, force: true });

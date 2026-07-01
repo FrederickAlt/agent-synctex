@@ -547,6 +547,7 @@ export class ViewerHostMcpService {
 					page: jump.page,
 					x: jump.x,
 					y: jump.y,
+					synctex_branch: jump.branch,
 					...(jump.width === undefined ? {} : { width: jump.width }),
 					...(jump.height === undefined ? {} : { height: jump.height }),
 					viewer_notifications: 0,
