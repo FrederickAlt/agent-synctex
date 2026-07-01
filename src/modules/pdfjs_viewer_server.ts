@@ -52,6 +52,7 @@ let lastObservedSelectionSignature;
 let selectionGeneration = 0;
 let lastSentSelectionSignature;
 let lastSentSelectionGeneration;
+let pendingReverseSynctexSelectionSend;
 
 function pdfUrlForRevision(config) {
 	return config.pdf_url;
@@ -275,6 +276,28 @@ function sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport) 
 	return true;
 }
 
+function scheduleReverseSynctexSelectionSend(pageNumber, pageElement, canvas, viewport) {
+	const request = { pageNumber, pageElement, canvas, viewport };
+	pendingReverseSynctexSelectionSend = request;
+	let observedGeneration = selectionGeneration;
+	let stableFrames = 0;
+	function tick() {
+		if (pendingReverseSynctexSelectionSend !== request) return;
+		if (selectionGeneration !== observedGeneration) {
+			observedGeneration = selectionGeneration;
+			stableFrames = 0;
+		}
+		stableFrames += 1;
+		if (stableFrames < 2) {
+			requestAnimationFrame(tick);
+			return;
+		}
+		pendingReverseSynctexSelectionSend = undefined;
+		sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport);
+	}
+	requestAnimationFrame(tick);
+}
+
 function captureViewerState() {
 	return { scrollX: window.scrollX, scrollY: window.scrollY };
 }
@@ -315,7 +338,7 @@ async function renderPdf(config, options = {}) {
 			pendingReverseSynctexContexts.set(pageContainer, { ...reverseSynctexContextForPage(pageContainer, canvas, viewport), selectionGeneration });
 		}, true);
 		pageContainer.addEventListener("mouseup", () => {
-			setTimeout(() => sendReverseSynctexSelection(pageNumber, pageContainer, canvas, viewport), 0);
+			scheduleReverseSynctexSelectionSend(pageNumber, pageContainer, canvas, viewport);
 		}, true);
 		pageContainer.addEventListener("click", (event) => {
 			if (!event.ctrlKey) return;

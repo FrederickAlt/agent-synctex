@@ -620,7 +620,7 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 			jsonrpc: "2.0",
 			id: 71,
 			method: "tools/call",
-			params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } },
+			params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5, stale: true } },
 		}), service.pdfOperations);
 		assert.ok(secondRead && "result" in secondRead);
 		assert.deepEqual(((secondRead.result as { details: { events: Array<Record<string, unknown>> } }).details.events).map((item) => item.sequence), [1]);
@@ -651,7 +651,7 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 			assert.ok(response && "result" in response);
 			const nextEvents = ((response.result as { details?: { events?: Array<Record<string, unknown>> } }).details?.events) ?? [];
 			endpointFailureEvent = nextEvents.at(-1);
-			return nextEvents.length === 2;
+			return endpointFailureEvent?.selected_text === "bad endpoint";
 		});
 		assert.equal(endpointFailureEvent?.line, 3, "main point event should still be stored when a selected range has endpoint mapping work");
 		assert.equal(endpointFailureEvent?.selected_text, "bad endpoint");
@@ -681,7 +681,7 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 			assert.ok(response && "result" in response);
 			const nextEvents = ((response.result as { details?: { events?: Array<Record<string, unknown>> } }).details?.events) ?? [];
 			repairedEndpointEvent = nextEvents.at(-1);
-			return nextEvents.length === 3;
+			return repairedEndpointEvent?.selected_text === "text that should wrap";
 		});
 		assert.equal(repairedEndpointEvent?.selected_text, "text that should wrap");
 		assert.equal((repairedEndpointEvent?.selection_start as Record<string, unknown>).line, 3);

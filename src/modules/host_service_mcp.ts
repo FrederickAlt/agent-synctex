@@ -651,12 +651,13 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "get_pdf_events",
-			description: "Return the last N process-local viewer events. Reads are non-destructive. Optionally filter by pdf_id.",
+			description: "Return unread process-local viewer events by default, or inspect old events with stale=true. Optionally filter by pdf_id.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					pdf_id: { type: "integer", minimum: 1 },
 					max_events: { type: "integer", minimum: 1 },
+					stale: { type: "boolean" },
 				},
 				required: ["max_events"],
 				additionalProperties: false,
@@ -850,7 +851,7 @@ async function handleSetLatexPreambleTool(
 
 function parseGetPdfEventsRequest(args: Record<string, unknown>): GetPdfEventsRequest {
 	for (const key of Object.keys(args)) {
-		if (key !== "pdf_id" && key !== "max_events") {
+		if (key !== "pdf_id" && key !== "max_events" && key !== "stale") {
 			throw new Error(`get_pdf_events unknown argument: ${key}`);
 		}
 	}
@@ -861,9 +862,13 @@ function parseGetPdfEventsRequest(args: Record<string, unknown>): GetPdfEventsRe
 	if (args.pdf_id !== undefined && (typeof args.pdf_id !== "number" || !Number.isInteger(args.pdf_id) || args.pdf_id < 1)) {
 		throw new Error("get_pdf_events pdf_id must be a positive integer");
 	}
+	if (args.stale !== undefined && typeof args.stale !== "boolean") {
+		throw new Error("get_pdf_events stale must be a boolean");
+	}
 	return {
 		max_events: maxEvents,
 		...(args.pdf_id === undefined ? {} : { pdf_id: args.pdf_id }),
+		...(args.stale === undefined ? {} : { stale: args.stale }),
 	};
 }
 
@@ -915,8 +920,6 @@ function formatPdfEventForTool(event: PdfEvent): string {
 		fields.push(`source_line=${compactToolText(event.source_line)}`);
 	}
 	if (event.page !== undefined) fields.push(`page=${event.page}`);
-	if (event.x !== undefined) fields.push(`x=${event.x}`);
-	if (event.y !== undefined) fields.push(`y=${event.y}`);
 	const selectedText = formatMaybeTextField("selected_text", event.selected_text, 240);
 	if (selectedText !== undefined) fields.push(selectedText);
 	if (event.selection_start !== undefined) fields.push(`selection_start=${event.selection_start.source_file}:line=${event.selection_start.line}:column=${event.selection_start.column}`);
