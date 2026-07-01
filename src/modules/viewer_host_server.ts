@@ -256,35 +256,106 @@ async function renderPdf(config) {
 	setStatus("Loaded PDF " + config.pdf_id + " revision " + config.revision + ": " + pdf.numPages + " page(s)");
 }
 
+function forwardSynctexMarkerFromPdfRange(input) {
+	const leftTop = input.viewport.convertToViewportPoint(input.h, input.v - input.H);
+	const rightBottom = input.viewport.convertToViewportPoint(input.h + input.W, input.v);
+	return {
+		left: leftTop[0],
+		top: input.pageHeight - leftTop[1],
+		width: rightBottom[0] - leftTop[0],
+		height: leftTop[1] - rightBottom[1],
+	};
+}
+
+function scrollToUnionInViewport(markers) {
+	const page = markers[0]?.parentNode;
+	if (!page || !(page instanceof HTMLElement)) return;
+	let left = Infinity;
+	let right = -Infinity;
+	let top = Infinity;
+	let bottom = -Infinity;
+	for (const marker of markers) {
+		const bounds = marker.getBoundingClientRect();
+		left = Math.min(left, bounds.left);
+		right = Math.max(right, bounds.right);
+		top = Math.min(top, bounds.top);
+		bottom = Math.max(bottom, bounds.bottom);
+	}
+	if (!Number.isFinite(left) || !Number.isFinite(right) || !Number.isFinite(top) || !Number.isFinite(bottom)) return;
+	window.scrollTo({
+		left: window.scrollX + (left + right) / 2 - window.innerWidth / 2,
+		top: window.scrollY + (top + bottom) / 2 - window.innerHeight * 0.4,
+	});
+}
+
 function showSynctexMarker(message) {
 	const pageNumber = Number(message.page);
 	const page = pages.querySelector("[data-page-number='" + String(pageNumber) + "']");
 	const viewport = pageViewports.get(pageNumber);
 	if (!page || !viewport) return;
-	let marker = page.querySelector("[data-synctex-marker]");
-	if (!marker) {
-		marker = document.createElement("div");
+	const existing = document.querySelectorAll("[data-synctex-marker]");
+	for (const marker of existing) marker.remove();
+
+	const ranges = Array.isArray(message.ranges) ? message.ranges : [];
+	const rectRanges = ranges.filter((entry) => Number(entry.page) === pageNumber);
+	const scalarRectPosition = rectRanges.length === 0 && message.width !== undefined && message.height !== undefined
+		? forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, width: message.width, height: message.height, pageHeight: page.getBoundingClientRect().height, viewport })
+		: undefined;
+	const isCircle = rectRanges.length === 0 && scalarRectPosition === undefined;
+	if (isCircle) {
+		const marker = document.createElement("div");
 		marker.dataset.synctexMarker = "true";
 		marker.tabIndex = -1;
 		marker.style.position = "absolute";
 		marker.style.pointerEvents = "none";
 		marker.style.zIndex = "100000";
+		const position = forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, pageHeight: page.getBoundingClientRect().height, viewport });
+		marker.dataset.synctexMarkerKind = "circle";
+		marker.style.left = String(position.left) + "px";
+		marker.style.top = String(position.top) + "px";
+		marker.style.border = "0.2em solid red";
+		marker.style.borderRadius = "50%";
+		marker.style.background = "rgba(255,0,0,0.4)";
+		marker.style.transform = "translate(-50%, -50%)";
+		marker.style.opacity = "0.8";
+		marker.style.width = "0.5em";
+		marker.style.height = "0.5em";
+		page.appendChild(marker);
+		page.scrollIntoView({ block: "center", inline: "center" });
+		marker.focus({ preventScroll: true });
+		return;
+	}
+
+	const markers = [];
+	const positions = scalarRectPosition === undefined ? rectRanges.map((range) => forwardSynctexMarkerFromPdfRange({
+		h: Number(range.h),
+		v: Number(range.v),
+		W: Number(range.W),
+		H: Number(range.H),
+		pageHeight: page.getBoundingClientRect().height,
+		viewport,
+	})) : [scalarRectPosition];
+	for (const position of positions) {
+		const marker = document.createElement("div");
+		marker.dataset.synctexMarker = "true";
+		marker.tabIndex = -1;
+		marker.style.position = "absolute";
+		marker.style.pointerEvents = "none";
+		marker.style.zIndex = "100000";
+		marker.dataset.synctexMarkerKind = "rect";
+		marker.style.left = String(position.left) + "px";
+		marker.style.top = String(position.top) + "px";
+		marker.style.width = String(position.width) + "px";
+		marker.style.height = String(position.height) + "px";
+		marker.style.border = "2px solid #ef4444";
+		marker.style.borderRadius = "0";
+		marker.style.background = "rgba(239,68,68,.18)";
+		markers.push(marker);
 		page.appendChild(marker);
 	}
-	const isCircle = message.width === undefined || message.height === undefined;
-	const position = forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, width: message.width, height: message.height, pageHeight: page.getBoundingClientRect().height, viewport });
-	marker.dataset.synctexMarkerKind = isCircle ? "circle" : "rect";
-	marker.style.left = String(position.left) + "px";
-	marker.style.top = String(position.top) + "px";
-	marker.style.border = isCircle ? "0.2em solid red" : "2px solid #ef4444";
-	marker.style.borderRadius = isCircle ? "50%" : "0";
-	marker.style.background = isCircle ? "rgba(255,0,0,0.4)" : "rgba(239,68,68,.18)";
-	marker.style.transform = isCircle ? "translate(-50%, -50%)" : "";
-	marker.style.opacity = isCircle ? "0.8" : "";
-	marker.style.width = isCircle ? "0.5em" : String(position.width) + "px";
-	marker.style.height = isCircle ? "0.5em" : String(position.height) + "px";
-	marker.scrollIntoView({ block: "center", inline: "center" });
-	marker.focus({ preventScroll: true });
+	if (markers.length === 0) return;
+	scrollToUnionInViewport(markers);
+	markers[0].focus({ preventScroll: true });
 }
 
 function connectViewerSocket(config) {

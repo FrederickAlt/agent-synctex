@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
-import { copyFileSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { Socket } from "node:net";
 import { join, resolve } from "node:path";
@@ -17,6 +17,24 @@ function writeFakePdf(path: string, body = "1 0 obj"): void {
 function forceMtime(path: string, mtimeMs: number): void {
 	const seconds = mtimeMs / 1000;
 	utimesSync(path, seconds, seconds);
+}
+
+function writeFakeNativeSynctex(binDir: string, stdout: string, status = 0): void {
+	mkdirSync(binDir, { recursive: true });
+	const commandPath = join(binDir, "synctex");
+	writeFileSync(commandPath, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(stdout)});\nprocess.exit(${status});\n`);
+	chmodSync(commandPath, 0o700);
+}
+
+async function withPath<T>(pathValue: string, fn: () => Promise<T>): Promise<T> {
+	const previous = process.env.PATH;
+	process.env.PATH = pathValue;
+	try {
+		return await fn();
+	} finally {
+		if (previous === undefined) delete process.env.PATH;
+		else process.env.PATH = previous;
+	}
 }
 
 function writeForwardSynctexFixture(baseDir: string): { pdfPath: string; sourcePath: string } {
@@ -424,6 +442,27 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 	const launcher = new FakeBrowserLauncher({ ok: true });
 	const service = new PdfJsViewerMcpService({ browserLauncher: launcher, registry });
 	try {
+		const binDir = join(baseDir, "bin");
+		writeFakeNativeSynctex(binDir, [
+			"SyncTeX result begin",
+			"Output:1",
+			"Page:6",
+			"x:111",
+			"y:222",
+			"h:110",
+			"v:220",
+			"W:44",
+			"H:7",
+			"Output:2",
+			"Page:6",
+			"x:333",
+			"y:444",
+			"h:330",
+			"v:440",
+			"W:22",
+			"H:5",
+			"SyncTeX result end",
+		].join("\n"));
 		const open = await service.openPdf({
 			protocol_version: 1,
 			request_id: "open-jump",
@@ -436,7 +475,7 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 		const notifications: string[] = [];
 		registry.addClient(pdfId, { send: (message) => notifications.push(message) });
 
-		const jump = await service.jumpPdf({
+		const jump = await withPath(`${binDir}:${process.env.PATH ?? ""}`, async () => await service.jumpPdf({
 			protocol_version: 1,
 			request_id: "jump-1",
 			operation: "jump_pdf",
@@ -445,7 +484,7 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 			pdf_id: pdfId,
 			line: 3,
 			source_file: sourcePath,
-		});
+		}));
 
 		assert.equal(jump.status, "ok");
 		assert.equal(jump.status_details.handled, true);
@@ -453,23 +492,28 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 		assert.equal(jump.status_details.source_file, sourcePath);
 		assert.equal(jump.status_details.line, 3);
 		assert.equal(jump.status_details.source_line, "First paragraph text that should wrap a little and create boxes.");
-		assert.equal(jump.status_details.page, 1);
-		assert.equal(typeof jump.status_details.x, "number");
-		assert.equal(typeof jump.status_details.y, "number");
-		assert.match(String(jump.status_details.synctex_branch), /^(native|js_fallback)$/);
+		assert.equal(jump.status_details.page, 6);
+		assert.equal(jump.status_details.x, 111);
+		assert.equal(jump.status_details.y, 222);
+		assert.equal(jump.status_details.synctex_branch, "native");
+		assert.deepEqual(jump.status_details.ranges, [
+			{ page: 6, h: 110, v: 220, W: 44, H: 7 },
+			{ page: 6, h: 330, v: 440, W: 22, H: 5 },
+		]);
 		assert.equal(Object.hasOwn(jump.status_details, "width"), false);
 		assert.equal(Object.hasOwn(jump.status_details, "height"), false);
 		assert.equal(jump.status_details.viewer_notifications, 1);
 		assert.equal(jump.status_details.reason, "notified_viewers=1");
-		assert.deepEqual(JSON.parse(notifications[0]), {
-			type: "synctex",
-			pdf_id: pdfId,
-			page: 1,
-			x: jump.status_details.x,
-			y: jump.status_details.y,
-			source_file: sourcePath,
-			line: 3,
-		});
+
+		const notification = JSON.parse(notifications[0] ?? "{}") as Record<string, unknown>;
+		assert.equal(notification.type, "synctex");
+		assert.equal(notification.pdf_id, pdfId);
+		assert.equal(notification.page, 6);
+		assert.equal(notification.x, jump.status_details.x);
+		assert.equal(notification.y, jump.status_details.y);
+		assert.equal(notification.source_file, sourcePath);
+		assert.equal(notification.line, 3);
+		assert.deepEqual(notification.ranges, jump.status_details.ranges);
 		assert.equal(launcher.urls.length, 1, "jump_pdf must not launch or command a native viewer");
 	} finally {
 		await service.stop();

@@ -261,6 +261,7 @@ export class PdfJsViewerMcpService {
 				y: jump.y,
 				...(jump.width === undefined ? {} : { width: jump.width }),
 				...(jump.height === undefined ? {} : { height: jump.height }),
+				...(jump.ranges === undefined ? {} : { ranges: jump.ranges }),
 				source_file: jump.sourceFile,
 				line: jump.line,
 			});
@@ -293,6 +294,7 @@ export class PdfJsViewerMcpService {
 					synctex_branch: jump.branch,
 					...(jump.width === undefined ? {} : { width: jump.width }),
 					...(jump.height === undefined ? {} : { height: jump.height }),
+					...(jump.ranges === undefined ? {} : { ranges: jump.ranges }),
 					viewer_notifications: viewerNotifications,
 					handle: record.viewerUrl,
 					reason: `notified_viewers=${viewerNotifications}`,

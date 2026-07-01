@@ -21,6 +21,13 @@ function writeForwardSynctexFixture(baseDir: string): { pdfPath: string; sourceP
 	return { pdfPath, sourcePath };
 }
 
+function writeFakeNativeSynctex(binDir: string, stdout: string, status = 0): void {
+	mkdirSync(binDir, { recursive: true });
+	const commandPath = join(binDir, "synctex");
+	writeFileSync(commandPath, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(stdout)});\nprocess.exit(${status});\n`);
+	chmodSync(commandPath, 0o700);
+}
+
 function writeFakeLatexmk(binDir: string): void {
 	mkdirSync(binDir, { recursive: true });
 	const compilerPath = join(binDir, "latexmk");
@@ -252,24 +259,51 @@ test("jump_pdf maps SyncTeX in MCP and sends synctex_forward through Viewer Host
 	const client = new FakeViewerHostClient({ origin: "http://127.0.0.1:43125" });
 	const service = new ViewerHostMcpService({ client, makePdfId: () => 5 });
 	try {
+		const binDir = join(baseDir, "bin");
+		writeFakeNativeSynctex(binDir, [
+			"SyncTeX result begin",
+			"Output:1",
+			"Page:4",
+			"x:501",
+			"y:601",
+			"h:500",
+			"v:600",
+			"W:70",
+			"H:9",
+			"Output:2",
+			"Page:4",
+			"x:801",
+			"y:901",
+			"h:800",
+			"v:900",
+			"W:30",
+			"H:6",
+			"SyncTeX result end",
+		].join("\n"));
 		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
-		const response = await callTool(2, "jump_pdf", { pdf_id: 5, line: 3, source_file: sourcePath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
+		const response = await withPath(`${binDir}:${process.env.PATH ?? ""}`, async () => await callTool(2, "jump_pdf", { pdf_id: 5, line: 3, source_file: sourcePath, workspace_context: { cwd: baseDir } }, service)) as { result?: { details?: Record<string, unknown> } };
 
 		assert.equal(response.result?.details?.handled, true);
 		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "synctex_forward"]);
-		assert.deepEqual(client.messages[1], {
-			type: "synctex_forward",
-			pdf_id: 5,
-			page: response.result?.details?.page,
-			x: response.result?.details?.x,
-			y: response.result?.details?.y,
-			indicator: true,
-			source_file: sourcePath,
-			line: 3,
-		});
+		const synctexMessage = client.messages[1] as unknown as Record<string, unknown>;
+		assert.equal(synctexMessage.page, response.result?.details?.page);
+		assert.equal(synctexMessage.x, response.result?.details?.x);
+		assert.equal(synctexMessage.y, response.result?.details?.y);
+		assert.equal(synctexMessage.page, 4);
+		assert.equal(synctexMessage.x, 501);
+		assert.equal(synctexMessage.y, 601);
+		assert.equal(synctexMessage.indicator, true);
+		assert.equal(synctexMessage.source_file, sourcePath);
+		assert.equal(synctexMessage.line, 3);
+		const expectedRanges = [
+			{ page: 4, h: 500, v: 600, W: 70, H: 9 },
+			{ page: 4, h: 800, v: 900, W: 30, H: 6 },
+		];
+		assert.deepEqual(synctexMessage.ranges, expectedRanges);
+		assert.deepEqual(response.result?.details?.ranges, expectedRanges);
 		assert.match(String(response.result?.details?.synctex_branch), /^(native|js_fallback)$/);
-		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "width"), false, "ViewerHostMcpService.jumpPdf must emit point-style Host messages without width");
-		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "height"), false, "ViewerHostMcpService.jumpPdf must emit point-style Host messages without height");
+		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "width"), false, "ViewerHostMcpService.jumpPdf must emit native ranges without legacy width");
+		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "height"), false, "ViewerHostMcpService.jumpPdf must emit native ranges without legacy height");
 		assert.equal(Object.hasOwn(response.result?.details ?? {}, "width"), false);
 		assert.equal(Object.hasOwn(response.result?.details ?? {}, "height"), false);
 	} finally {

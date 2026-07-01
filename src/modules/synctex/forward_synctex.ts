@@ -23,11 +23,20 @@ export interface ForwardSynctexJump {
 	indicator?: boolean;
 	width?: number;
 	height?: number;
+	ranges?: ForwardSynctexRange[];
 	sourceFile: string;
 	line: number;
 	sourceLine: string;
 	sidecarPath: string;
 	branch: ForwardSynctexBranch;
+}
+
+export interface ForwardSynctexRange {
+	page: number;
+	h: number;
+	v: number;
+	W: number;
+	H: number;
 }
 
 export interface NativeSynctexRunResult {
@@ -45,6 +54,7 @@ export interface ForwardSynctexPoint {
 	indicator?: boolean;
 	width?: number;
 	height?: number;
+	ranges?: ForwardSynctexRange[];
 }
 export type ForwardSynctexJsFallback = (line: number, sourceFile: string, pdfPath: string) => ForwardSynctexPoint | undefined;
 
@@ -91,25 +101,85 @@ export const defaultNativeSynctexRunner: NativeSynctexRunner = (command, args, o
 	};
 };
 
-function parseNativeForwardPoint(stdout: string): ForwardSynctexPoint | undefined {
-	const record: { page?: number; x?: number; y?: number } = {};
+interface NativeForwardRecord {
+	page?: number;
+	x?: number;
+	y?: number;
+	h?: number;
+	v?: number;
+	W?: number;
+	H?: number;
+}
+
+function completeRange(record: NativeForwardRecord): ForwardSynctexRange | undefined {
+	if (record.page === undefined || record.h === undefined || record.v === undefined || record.W === undefined || record.H === undefined) return undefined;
+	return { page: record.page, h: record.h, v: record.v, W: record.W, H: record.H };
+}
+
+function parseNativeForwardResult(stdout: string): ForwardSynctexPoint | undefined {
+	const records: NativeForwardRecord[] = [];
 	let started = false;
+	let activeRecord: NativeForwardRecord | undefined;
+
+	function currentRecord(): NativeForwardRecord {
+		activeRecord ??= {};
+		return activeRecord;
+	}
+
+	function flushRecord(): void {
+		if (activeRecord !== undefined && Object.keys(activeRecord).length > 0) {
+			records.push(activeRecord);
+		}
+		activeRecord = undefined;
+	}
+
 	for (const line of stdout.split("\n")) {
 		if (line.includes("SyncTeX result begin")) {
 			started = true;
 			continue;
 		}
-		if (line.includes("SyncTeX result end")) break;
+		if (line.includes("SyncTeX result end")) {
+			break;
+		}
 		if (!started) continue;
 		const pos = line.indexOf(":");
 		if (pos < 0) continue;
-		const key = line.substring(0, pos).toLowerCase();
-		if (key !== "page" && key !== "x" && key !== "y") continue;
+		const rawKey = line.substring(0, pos).trim();
+		const key = rawKey.toLowerCase();
+		if (key === "output") {
+			flushRecord();
+			activeRecord = {};
+			continue;
+		}
 		const value = Number(line.substring(pos + 1));
-		if (Number.isFinite(value)) record[key] = value;
+		if (!Number.isFinite(value)) continue;
+		const record = currentRecord();
+		if (key === "page") record.page = value;
+		else if (key === "x") record.x = value;
+		else if (key === "y") record.y = value;
+		else if (key === "h") {
+			if (rawKey === "H") record.H = value;
+			else record.h = value;
+		} else if (key === "v") record.v = value;
+		else if (key === "w") record.W = value;
 	}
-	if (record.page === undefined || record.x === undefined || record.y === undefined) return undefined;
-	return { page: record.page, x: record.x, y: record.y, indicator: true };
+	flushRecord();
+
+	const ranges = records.map(completeRange).filter((range): range is ForwardSynctexRange => range !== undefined);
+	if (ranges.length > 0) {
+		const primaryRecord = records.find((record) => completeRange(record) !== undefined);
+		const primaryRange = ranges[0];
+		return {
+			page: primaryRecord?.page ?? primaryRange.page,
+			x: primaryRecord?.x ?? primaryRange.h,
+			y: primaryRecord?.y ?? primaryRange.v,
+			indicator: true,
+			ranges,
+		};
+	}
+	const pointRecord = records.find((record) => record.page !== undefined && record.x !== undefined && record.y !== undefined);
+	if (pointRecord === undefined || pointRecord.page === undefined || pointRecord.x === undefined || pointRecord.y === undefined) return undefined;
+	return { page: pointRecord.page, x: pointRecord.x, y: pointRecord.y, indicator: true };
 }
 
 function runNativeForwardSynctex(input: { line: number; sourceFile: string; pdfPath: string; runner: NativeSynctexRunner; command: string }): { mapped?: ForwardSynctexPoint; failureReason?: string } {
@@ -117,7 +187,7 @@ function runNativeForwardSynctex(input: { line: number; sourceFile: string; pdfP
 	const result = input.runner(input.command, args, { cwd: dirname(input.pdfPath) });
 	if (result.error) return { failureReason: result.error.message };
 	if (result.status !== 0) return { failureReason: `exit status ${String(result.status)}${result.stderr ? `: ${result.stderr.trim()}` : ""}` };
-	const mapped = parseNativeForwardPoint(result.stdout);
+	const mapped = parseNativeForwardResult(result.stdout);
 	return mapped === undefined ? { failureReason: "no usable result" } : { mapped };
 }
 
@@ -129,6 +199,7 @@ function withForwardGlue(input: { mapped: ForwardSynctexPoint; branch: ForwardSy
 		...(input.mapped.indicator === undefined ? {} : { indicator: input.mapped.indicator }),
 		...(input.mapped.width === undefined ? {} : { width: input.mapped.width }),
 		...(input.mapped.height === undefined ? {} : { height: input.mapped.height }),
+		...(input.mapped.ranges === undefined ? {} : { ranges: input.mapped.ranges }),
 		sourceFile: input.sourceFile,
 		line: input.line,
 		sourceLine: input.sourceLine,

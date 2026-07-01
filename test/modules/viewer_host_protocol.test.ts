@@ -19,6 +19,7 @@ test("Viewer Host protocol validates representative MCP to Host messages", () =>
 		{ type: "focus_pdf", pdf_id: 123 },
 		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, width: 250, height: 12, source_file: "/tmp/main.tex", line: 42 },
 		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, indicator: true, source_file: "/tmp/main.tex", line: 42 },
+		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, ranges: [{ page: 2, h: 10, v: 20, W: 30, H: 4 }, { page: 2, h: 30, v: 40, W: 10, H: 3 }], source_file: "/tmp/main.tex", line: 42 },
 		{ type: "pdf_maybe_updated", pdf_id: 123 },
 	];
 
@@ -57,6 +58,9 @@ test("Viewer Host protocol validation rejects malformed boundary messages", () =
 		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: Number.NaN, y: 1, line: 1 }, /x/],
 		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: -1, line: 1 }, /y/],
 		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: 1, width: -1, line: 1 }, /width/],
+		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: 1, ranges: [] }, /ranges/],
+		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: 1, ranges: {} }, /ranges/],
+		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: 1, ranges: [{ page: 1, h: -1, v: 2, W: 3, H: 4 }] }, /ranges\[0\]\.h/],
 		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: 1, line: 0 }, /line/],
 	];
 

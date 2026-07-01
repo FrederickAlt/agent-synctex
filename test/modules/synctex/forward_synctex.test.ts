@@ -50,6 +50,138 @@ test("LaTeX-Workshop-derived syncTeXToPDF reads realistic .synctex fixtures and 
 	}
 });
 
+test("native forward SyncTeX returns native rectangle ranges", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const calls: Array<{ command: string; args: string[]; cwd: string }> = [];
+		const jump = mapForwardSynctex({
+			pdfPath: project.pdfPath,
+			sourceFile: project.sourcePath,
+			line: 3,
+			cwd: project.dir,
+			nativeRunner: (command, args, options) => {
+				calls.push({ command, args, cwd: options.cwd });
+				return {
+					status: 0,
+					stdout: [
+						"SyncTeX result begin",
+						"Output:1",
+						"Page:2",
+						"h:20",
+						"v:140",
+						"W:30",
+						"H:12",
+						"Output:2",
+						"Page:3",
+						"h:80",
+						"v:200",
+						"W:10",
+						"H:8",
+						"SyncTeX result end",
+					].join("\n"),
+					stderr: "",
+				};
+			},
+			jsFallback: () => {
+				throw new Error("JS fallback should not be invoked after native success");
+			},
+		});
+
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.command, "synctex");
+		assert.deepEqual(calls[0]?.args, ["view", "-i", `3:1:${project.sourcePath}`, "-o", project.pdfPath]);
+		assert.equal(calls[0]?.cwd, dirname(project.pdfPath));
+		assert.equal(jump.branch, "native");
+		assert.equal(jump.page, 2);
+		assert.equal(jump.x, 20);
+		assert.equal(jump.y, 140);
+		assert.deepEqual(jump.ranges, [
+			{ page: 2, h: 20, v: 140, W: 30, H: 12 },
+			{ page: 3, h: 80, v: 200, W: 10, H: 8 },
+		]);
+		assert.equal(jump.indicator, true);
+		assert.equal(jump.sourceLine, "First paragraph text that should wrap a little and create boxes.");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("native forward SyncTeX keeps top-level point consistent with the first rectangle record when multiple native records include x/y", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const jump = mapForwardSynctex({
+			pdfPath: project.pdfPath,
+			sourceFile: project.sourcePath,
+			line: 3,
+			cwd: project.dir,
+			nativeRunner: () => ({
+				status: 0,
+				stdout: [
+					"SyncTeX result begin",
+					"Output:1",
+					"Page:2",
+					"x:21",
+					"y:141",
+					"h:20",
+					"v:140",
+					"W:30",
+					"H:12",
+					"Output:2",
+					"Page:3",
+					"x:888",
+					"y:999",
+					"h:80",
+					"v:200",
+					"W:10",
+					"H:8",
+					"SyncTeX result end",
+				].join("\n"),
+				stderr: "",
+			}),
+			jsFallback: () => {
+				throw new Error("JS fallback should not be invoked after native success");
+			},
+		});
+
+		assert.equal(jump.branch, "native");
+		assert.equal(jump.page, 2);
+		assert.equal(jump.x, 21);
+		assert.equal(jump.y, 141);
+		assert.deepEqual(jump.ranges, [
+			{ page: 2, h: 20, v: 140, W: 30, H: 12 },
+			{ page: 3, h: 80, v: 200, W: 10, H: 8 },
+		]);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("native rectangle-mode failure falls back to JS circle semantics without synthetic ranges", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const jump = mapForwardSynctex({
+			pdfPath: project.pdfPath,
+			sourceFile: project.sourcePath,
+			line: 3,
+			cwd: project.dir,
+			nativeRunner: () => ({
+				status: 1,
+				stdout: "SyncTeX result begin\nOutput:1\nPage:1\nh:20\nv:40\nW:10\nH:5\nSyncTeX result end\n",
+				stderr: "native rectangle mode failed",
+			}),
+			jsFallback: (line, sourceFile, pdfPath) => syncTeXToPDF(line, sourceFile, pdfPath),
+		});
+
+		assert.equal(jump.branch, "js_fallback");
+		assert.equal(jump.indicator, true);
+		assert.equal(Object.hasOwn(jump, "ranges"), false);
+		assert.equal(Object.hasOwn(jump, "width"), false);
+		assert.equal(Object.hasOwn(jump, "height"), false);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("native forward SyncTeX success returns native output without using JS fallback", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
@@ -111,6 +243,7 @@ test("native forward SyncTeX failure falls back to the existing LaTeX-Workshop J
 		assert.equal(jump.y, 154.6899018816158);
 		assert.equal(Object.hasOwn(jump, "width"), false);
 		assert.equal(Object.hasOwn(jump, "height"), false);
+		assert.equal(Object.hasOwn(jump, "ranges"), false);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

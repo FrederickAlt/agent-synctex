@@ -17,6 +17,14 @@ export interface ViewerHostFocusPdfMessage {
 	pdf_id: number;
 }
 
+export interface ViewerHostSynctexForwardRange {
+	page: number;
+	h: number;
+	v: number;
+	W: number;
+	H: number;
+}
+
 export interface ViewerHostSynctexForwardMessage {
 	type: "synctex_forward";
 	pdf_id: number;
@@ -25,6 +33,7 @@ export interface ViewerHostSynctexForwardMessage {
 	y: number;
 	width?: number;
 	height?: number;
+	ranges?: ViewerHostSynctexForwardRange[];
 	indicator?: boolean;
 	source_file?: string;
 	line: number;
@@ -123,6 +132,30 @@ function optionalBoolean(value: unknown, field: string): boolean | undefined {
 	return value;
 }
 
+function parseSynctexForwardRange(value: unknown, field: string): ViewerHostSynctexForwardRange {
+	if (!isRecord(value)) {
+		throw new Error(`${field} must be an object`);
+	}
+	return {
+		page: requirePositiveInteger(value.page, `${field}.page`),
+		h: requireCoordinate(value.h, `${field}.h`),
+		v: requireCoordinate(value.v, `${field}.v`),
+		W: requireCoordinate(value.W, `${field}.W`),
+		H: requireCoordinate(value.H, `${field}.H`),
+	};
+}
+
+function optionalSynctexRanges(value: unknown, field: string): ViewerHostSynctexForwardRange[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) {
+		throw new Error(`${field} must be an array`);
+	}
+	if (value.length === 0) {
+		throw new Error(`${field} must not be empty`);
+	}
+	return value.map((entry, index) => parseSynctexForwardRange(entry, `${field}[${index}]`));
+}
+
 function requireNonEmptyString(value: unknown, field: string): string {
 	if (typeof value !== "string" || !value.trim()) {
 		throw new Error(`${field} must be a non-empty string`);
@@ -184,6 +217,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
 			const width = optionalCoordinate(message.width, "width");
 			const height = optionalCoordinate(message.height, "height");
+			const ranges = optionalSynctexRanges(message.ranges, "ranges");
 			const indicator = optionalBoolean(message.indicator, "indicator");
 			return {
 				type,
@@ -193,6 +227,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				y: requireCoordinate(message.y, "y"),
 				...(width === undefined ? {} : { width }),
 				...(height === undefined ? {} : { height }),
+				...(ranges === undefined ? {} : { ranges }),
 				...(indicator === undefined ? {} : { indicator }),
 				...(sourceFile === undefined ? {} : { source_file: sourceFile }),
 				line: requirePositiveInteger(message.line, "line"),

@@ -227,6 +227,112 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assert.equal(marker.width, "0.5em", "LW circle marker should not invent rectangle width from missing SyncTeX width");
 		assert.equal(marker.height, "0.5em", "LW circle marker should not invent rectangle height from missing SyncTeX height");
 		assert.equal(marker.focused, true, "forward marker should be focusable and focused after jump");
+
+		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 209, page: 1, x: 100, y: 40, width: 10, height: 8, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 209 } });
+		await page.waitForSelector("[data-synctex-marker][data-synctex-marker-kind='rect']", { state: "attached", timeout: 2_000 });
+		const scalarRect = await page.locator("[data-synctex-marker]").evaluate((element) => ({
+			left: Number.parseFloat((element as HTMLElement).style.left),
+			top: Number.parseFloat((element as HTMLElement).style.top),
+			width: Number.parseFloat((element as HTMLElement).style.width),
+			height: Number.parseFloat((element as HTMLElement).style.height),
+			kind: (element as HTMLElement).dataset.synctexMarkerKind,
+		}));
+		assert.equal(scalarRect.kind, "rect");
+		assertApproximatelyEqual(scalarRect.left, 125, 1, "scalar rectangle marker left viewport coordinate");
+		assertApproximatelyEqual(scalarRect.top, 50, 1, "scalar rectangle marker top-origin viewport coordinate");
+		assertApproximatelyEqual(scalarRect.width, 12.5, 0.5, "scalar rectangle marker width");
+		assertApproximatelyEqual(scalarRect.height, 10, 0.5, "scalar rectangle marker height");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host-served Viewer Client renders multiple native rectangle markers and keeps all primary-page rectangles visible", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-rectangles-"));
+	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	let service: ViewerHostMcpService | undefined;
+	const server = new ViewerHostServer({
+		registry,
+		mcpEventSink: (message) => service?.handleHostMessage(message),
+	});
+	let browser: Browser | undefined;
+	const consoleMessages: string[] = [];
+	const pageErrors: string[] = [];
+	const failedRequests: string[] = [];
+	try {
+		await server.start();
+		service = new ViewerHostMcpService({ client: new HttpViewerHostClient(server.origin), makePdfId: () => 219 });
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 240, height: 160 } });
+		page.on("console", (message) => consoleMessages.push(`${message.type()}: ${message.text()}`));
+		page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}`));
+		page.on("requestfailed", (request: Request) => failedRequests.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "request failed"}`));
+		page.on("response", (response: Response) => {
+			if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`);
+		});
+
+		await page.goto(`${server.origin}/viewer/219`, { waitUntil: "domcontentloaded" });
+		const outcome = await waitForViewerOutcome(page);
+		assert.equal(outcome.rendered, true, `viewer did not render first page; timedOut=${outcome.timedOut}; status=${JSON.stringify(outcome.status)}\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		await assert.doesNotReject(async () => {
+			for (let attempt = 0; attempt < 20; attempt += 1) {
+				if (server.getConnectedViewerCount(219) === 1) return;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			assert.equal(server.getConnectedViewerCount(219), 1);
+		});
+
+		const control = new ViewerHostControlClient({ origin: server.origin });
+		assert.deepEqual(await control.send({
+			type: "synctex_forward",
+			pdf_id: 219,
+			page: 1,
+			x: 50,
+			y: 100,
+			ranges: [
+				{ page: 1, h: 20, v: 30, W: 10, H: 4 },
+				{ page: 1, h: 80, v: 190, W: 20, H: 10 },
+			],
+			source_file: sourcePath,
+			line: 3,
+		}), { ok: true, result: { type: "synctex_forward", pdf_id: 219 } });
+		await page.waitForSelector("[data-synctex-marker][data-synctex-marker-kind='rect']", { state: "attached", timeout: 2_000 });
+		const markers = page.locator("[data-synctex-marker]");
+		const markerKinds = await markers.evaluateAll((elements) => elements.map((element) => (element as HTMLElement).dataset.synctexMarkerKind));
+		const markerStyles = await markers.evaluateAll((elements) => elements.map((element) => {
+			const marker = element as HTMLElement;
+			return {
+				left: Number.parseFloat(marker.style.left),
+				top: Number.parseFloat(marker.style.top),
+				width: Number.parseFloat(marker.style.width),
+				height: Number.parseFloat(marker.style.height),
+			};
+		}));
+		assert.equal(markerKinds.length, 2);
+		assert.equal(markerKinds.every((kind) => kind === "rect"), true);
+		assert.equal(markerStyles.length, 2);
+		const expected = [
+			{ left: 25, top: 32.5, width: 12.5, height: 5 },
+			{ left: 100, top: 225, width: 25, height: 12.5 },
+		];
+		for (let index = 0; index < expected.length; index += 1) {
+			const actual = markerStyles[index];
+			const target = expected[index];
+			if (!actual) continue;
+			assertApproximatelyEqual(actual.left, target.left, 0.5, `rectangle marker ${index} left`);
+			assertApproximatelyEqual(actual.top, target.top, 0.5, `rectangle marker ${index} top`);
+			assertApproximatelyEqual(actual.width, target.width, 0.5, `rectangle marker ${index} width`);
+			assertApproximatelyEqual(actual.height, target.height, 0.5, `rectangle marker ${index} height`);
+		}
+		const activeKind = await page.evaluate(() => (document.activeElement as HTMLElement | null)?.dataset.synctexMarkerKind);
+		assert.equal(activeKind, "rect", "rectangle marker should remain the focused marker kind");
+		const scrolled = await page.evaluate(() => window.scrollY);
+		assert.ok(scrolled > 0, `expected viewer to scroll to rectangle union, saw scrollY=${scrolled}`);
 	} finally {
 		await browser?.close();
 		await server.stop();

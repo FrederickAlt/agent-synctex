@@ -418,6 +418,14 @@ export interface HostServiceCloseResponseDetails {
 	error_code?: string;
 }
 
+export interface HostServiceJumpResponseSynctexRange {
+	page: number;
+	h: number;
+	v: number;
+	W: number;
+	H: number;
+}
+
 export interface HostServiceJumpResponseDetails {
 	protocol_version: number;
 	supported: boolean;
@@ -441,6 +449,7 @@ export interface HostServiceJumpResponseDetails {
 	y?: number;
 	width?: number;
 	height?: number;
+	ranges?: HostServiceJumpResponseSynctexRange[];
 	synctex_branch?: "native" | "js_fallback";
 	viewer_notifications?: number;
 	reason?: string;

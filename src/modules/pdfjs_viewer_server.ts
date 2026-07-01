@@ -23,8 +23,6 @@ const status = document.getElementById("status");
 const pages = document.getElementById("pages");
 const fallback = document.getElementById("fallback-link");
 const configUrl = document.body.dataset.configUrl;
-let activeSynctexMarker;
-
 function setStatus(message) {
 	if (status) status.textContent = message;
 }
@@ -129,31 +127,112 @@ function viewportScale(viewport) {
 	return { x: Math.abs(xUnit[0] - origin[0]) || 1, y: Math.abs(yUnit[1] - origin[1]) || 1 };
 }
 
+function forwardSynctexMarkerFromPdfPoint(input) {
+	const point = input.viewport.convertToViewportPoint(input.pdfX, input.pdfY);
+	const scale = viewportScale(input.viewport);
+	const pageHeight = input.page.getBoundingClientRect().height;
+	return {
+		left: point[0],
+		top: pageHeight - point[1],
+		width: Number(input.width) * scale.x,
+		height: Number(input.height) * scale.y,
+	};
+}
+
+function forwardSynctexMarkerFromPdfRange(input) {
+	const leftTop = input.viewport.convertToViewportPoint(input.h, input.v - input.H);
+	const rightBottom = input.viewport.convertToViewportPoint(input.h + input.W, input.v);
+	const pageHeight = input.page.getBoundingClientRect().height;
+	return {
+		left: leftTop[0],
+		top: pageHeight - leftTop[1],
+		width: rightBottom[0] - leftTop[0],
+		height: leftTop[1] - rightBottom[1],
+	};
+}
+
+function focusMarkersInUnion(page, markers) {
+	let minLeft = Infinity;
+	let maxRight = -Infinity;
+	let minTop = Infinity;
+	let maxBottom = -Infinity;
+	for (const marker of markers) {
+		const bounds = marker.getBoundingClientRect();
+		minLeft = Math.min(minLeft, bounds.left);
+		maxRight = Math.max(maxRight, bounds.right);
+		minTop = Math.min(minTop, bounds.top);
+		maxBottom = Math.max(maxBottom, bounds.bottom);
+	}
+	if (!Number.isFinite(minLeft) || !Number.isFinite(maxRight) || !Number.isFinite(minTop) || !Number.isFinite(maxBottom)) return;
+	const unionCenterX = (minLeft + maxRight) / 2;
+	const unionCenterY = (minTop + maxBottom) / 2;
+	window.scrollTo({
+		left: window.scrollX + unionCenterX - window.innerWidth / 2,
+		top: window.scrollY + unionCenterY - window.innerHeight * 0.4,
+	});
+}
+
 function handleSynctexMessage(message) {
 	const pageNumber = Number(message.page);
 	const page = document.querySelector("[data-page-number='" + pageNumber + "']");
 	const viewport = pageViewports.get(pageNumber);
 	if (!page || !viewport) return;
-	page.scrollIntoView({ block: "center" });
-	if (activeSynctexMarker) activeSynctexMarker.remove();
-	const marker = document.createElement("div");
-	marker.style.position = "absolute";
-	marker.style.pointerEvents = "none";
-	marker.style.zIndex = "100000";
-	const point = viewport.convertToViewportPoint(Number(message.x) || 0, Number(message.y) || 0);
-	const scale = viewportScale(viewport);
-	const isCircle = message.width === undefined || message.height === undefined;
-	marker.style.left = String(point[0]) + "px";
-	marker.style.top = String(page.getBoundingClientRect().height - point[1]) + "px";
-	marker.style.width = isCircle ? "0.5em" : String(Number(message.width) * scale.x) + "px";
-	marker.style.height = isCircle ? "0.5em" : String(Number(message.height) * scale.y) + "px";
-	marker.style.border = isCircle ? "0.2em solid red" : "2px solid #d11";
-	marker.style.borderRadius = isCircle ? "50%" : "0";
-	marker.style.background = isCircle ? "rgba(255,0,0,0.4)" : "rgba(255,255,0,0.35)";
-	marker.style.transform = isCircle ? "translate(-50%, -50%)" : "";
-	marker.style.opacity = isCircle ? "0.8" : "";
-	page.appendChild(marker);
-	activeSynctexMarker = marker;
+	for (const marker of document.querySelectorAll("[data-synctex-marker]")) {
+		marker.remove();
+	}
+	const ranges = Array.isArray(message.ranges) ? message.ranges : [];
+	const rectRanges = ranges.filter((record) => Number(record.page) === pageNumber);
+	const scalarRectPosition = rectRanges.length === 0 && message.width !== undefined && message.height !== undefined
+		? forwardSynctexMarkerFromPdfPoint({ pdfX: Number(message.x) || 0, pdfY: Number(message.y) || 0, width: message.width, height: message.height, page, viewport })
+		: undefined;
+	const isCircle = rectRanges.length === 0 && scalarRectPosition === undefined;
+	if (isCircle) {
+		const marker = document.createElement("div");
+		marker.dataset.synctexMarker = "true";
+		marker.dataset.synctexMarkerKind = "circle";
+		marker.tabIndex = -1;
+		marker.style.position = "absolute";
+		marker.style.pointerEvents = "none";
+		marker.style.zIndex = "100000";
+		const point = viewport.convertToViewportPoint(Number(message.x) || 0, Number(message.y) || 0);
+		marker.style.left = String(point[0]) + "px";
+		marker.style.top = String(page.getBoundingClientRect().height - point[1]) + "px";
+		marker.style.width = "0.5em";
+		marker.style.height = "0.5em";
+		marker.style.border = "0.2em solid red";
+		marker.style.borderRadius = "50%";
+		marker.style.background = "rgba(255,0,0,0.4)";
+		marker.style.transform = "translate(-50%, -50%)";
+		marker.style.opacity = "0.8";
+		page.appendChild(marker);
+		marker.focus({ preventScroll: true });
+		page.scrollIntoView({ block: "center", inline: "center" });
+		setStatus("SyncTeX jump: page " + message.page);
+		return;
+	}
+	const markers = [];
+	const positions = scalarRectPosition === undefined ? rectRanges.map((range) => forwardSynctexMarkerFromPdfRange({ h: Number(range.h), v: Number(range.v), W: Number(range.W), H: Number(range.H), page, viewport })) : [scalarRectPosition];
+	for (const position of positions) {
+		const marker = document.createElement("div");
+		marker.dataset.synctexMarker = "true";
+		marker.dataset.synctexMarkerKind = "rect";
+		marker.tabIndex = -1;
+		marker.style.position = "absolute";
+		marker.style.pointerEvents = "none";
+		marker.style.zIndex = "100000";
+		marker.style.left = String(position.left) + "px";
+		marker.style.top = String(position.top) + "px";
+		marker.style.width = String(position.width) + "px";
+		marker.style.height = String(position.height) + "px";
+		marker.style.border = "2px solid #d11";
+		marker.style.borderRadius = "0";
+		marker.style.background = "rgba(255,255,0,0.35)";
+		markers.push(marker);
+		page.appendChild(marker);
+	}
+	if (markers.length === 0) return;
+	focusMarkersInUnion(page, markers);
+	markers[0].focus({ preventScroll: true });
 	setStatus("SyncTeX jump: page " + message.page);
 }
 
@@ -470,7 +549,7 @@ export class PdfJsViewerServer {
 		}));
 	}
 
-	notifySynctex(pdfId: number, target: { page: number; x: number; y: number; width?: number; height?: number; source_file: string; line: number }): number {
+	notifySynctex(pdfId: number, target: { page: number; x: number; y: number; width?: number; height?: number; ranges?: Array<{ page: number; h: number; v: number; W: number; H: number }>; source_file: string; line: number }): number {
 		return this.registry.sendToClients(pdfId, JSON.stringify({ type: "synctex", pdf_id: pdfId, ...target }));
 	}
 
