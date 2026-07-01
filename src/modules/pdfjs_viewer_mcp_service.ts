@@ -459,6 +459,8 @@ export class PdfJsViewerMcpService {
 			x: click.x,
 			y: click.y,
 			cwd: record.workspaceCwd ?? dirname(record.pdfPath),
+			...(click.textBeforeSelection === undefined ? {} : { textBeforeSelection: click.textBeforeSelection }),
+			...(click.textAfterSelection === undefined ? {} : { textAfterSelection: click.textAfterSelection }),
 		});
 		this.eventStore.appendReverseSynctexEvent({
 			type: "reverse_synctex",

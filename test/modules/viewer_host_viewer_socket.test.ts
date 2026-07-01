@@ -253,7 +253,14 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 		const token = await getViewerSocketToken(server.origin, 112);
 		socket = await openViewerSocket(server.origin, 112, token);
 
-		socket.send(JSON.stringify({ type: "reverse_synctex", page: 1, x: 144.27, y: 155.27 }));
+		socket.send(JSON.stringify({
+			type: "reverse_synctex",
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			textBeforeSelection: "First paragraph",
+			textAfterSelection: " text that should wrap a little and create boxes.",
+		}));
 
 		let details: { events?: Array<Record<string, unknown>> } | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -270,7 +277,7 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 			pdf_id: 112,
 			source_file: sourcePath,
 			line: 3,
-			column: 0,
+			column: "First paragraph".length,
 			source_line: "First paragraph text that should wrap a little and create boxes.",
 			timestamp: details?.events?.[0]?.timestamp,
 			page: 1,

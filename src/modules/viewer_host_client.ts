@@ -719,6 +719,8 @@ export class ViewerHostMcpService {
 			x: message.x,
 			y: message.y,
 			cwd: record.workspaceCwd || dirname(record.pdfPath),
+			...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }),
+			...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }),
 		});
 		this.eventStore.appendReverseSynctexEvent({
 			type: "reverse_synctex",

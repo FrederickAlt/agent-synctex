@@ -9,6 +9,8 @@ export interface ReverseSynctexViewportInput {
 	viewportY: number;
 	viewportHeight: number;
 	viewport: PdfJsViewportCoordinateConverter;
+	textBeforeSelection?: string;
+	textAfterSelection?: string;
 }
 
 export interface ReverseSynctexSocketPayload {
@@ -16,6 +18,8 @@ export interface ReverseSynctexSocketPayload {
 	page: number;
 	x: number;
 	y: number;
+	textBeforeSelection?: string;
+	textAfterSelection?: string;
 }
 
 export interface ForwardSynctexMarkerInput {
@@ -36,7 +40,14 @@ export interface ForwardSynctexMarkerPosition {
 
 export function reverseSynctexPayloadFromViewportPoint(input: ReverseSynctexViewportInput): ReverseSynctexSocketPayload {
 	const [x, y] = input.viewport.convertToPdfPoint(input.viewportX, input.viewportHeight - input.viewportY);
-	return { type: "reverse_synctex", page: input.page, x, y };
+	return {
+		type: "reverse_synctex",
+		page: input.page,
+		x,
+		y,
+		...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }),
+		...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }),
+	};
 }
 
 function viewportScale(input: { viewport: PdfJsViewportCoordinateConverter }): { x: number; y: number } {

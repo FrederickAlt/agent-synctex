@@ -32,6 +32,29 @@ test("reverse SyncTeX click coordinates invert Y before converting like LaTeX-Wo
 	assert.deepEqual(payload, { type: "reverse_synctex", page: 2, x: 125, y: 200 });
 });
 
+test("reverse SyncTeX click payload includes LaTeX-Workshop selection context when available", () => {
+	const viewport: PdfJsViewportCoordinateConverter = {
+		convertToPdfPoint(viewportX: number, viewportY: number): [number, number] {
+			return [viewportX, viewportY];
+		},
+		convertToViewportPoint(pdfX: number, pdfY: number): [number, number] {
+			return [pdfX, pdfY];
+		},
+	};
+
+	const payload = reverseSynctexPayloadFromViewportPoint({
+		page: 2,
+		viewportX: 125,
+		viewportY: 50,
+		viewportHeight: 250,
+		viewport,
+		textBeforeSelection: "before",
+		textAfterSelection: "after",
+	});
+
+	assert.deepEqual(payload, { type: "reverse_synctex", page: 2, x: 125, y: 200, textBeforeSelection: "before", textAfterSelection: "after" });
+});
+
 test("forward SyncTeX marker coordinates keep SyncTeX top-origin Y instead of inverting vertically", () => {
 	const viewport = scaledViewport(1.25, 200);
 

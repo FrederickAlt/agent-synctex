@@ -501,7 +501,14 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		const socket = await connectRawWebSocket(wsUrl);
 
 		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 0, x: 144.27, y: 155.27 })));
-		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({ type: "reverse_synctex", page: 1, x: 144.27, y: 155.27 })));
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({
+			type: "reverse_synctex",
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			textBeforeSelection: "First paragraph",
+			textAfterSelection: " text that should wrap a little and create boxes.",
+		})));
 
 		let events: Array<Record<string, unknown>> = [];
 		await waitFor(async () => {
@@ -523,7 +530,7 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		assert.equal(event.pdf_id, pdfId);
 		assert.equal(event.source_file, sourcePath);
 		assert.equal(event.line, 3);
-		assert.equal(event.column, 0);
+		assert.equal(event.column, "First paragraph".length);
 		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(typeof event.timestamp, "string");
 		assert.equal("callback" in event, false);

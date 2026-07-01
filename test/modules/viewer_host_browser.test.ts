@@ -124,6 +124,37 @@ async function waitForViewerOutcome(page: Page): Promise<{ rendered: boolean; st
 	return { rendered: false, status, timedOut: true };
 }
 
+async function injectPageTextLayerAndSelection(page: Page): Promise<void> {
+	await page.evaluate(() => {
+		const pageElement = document.querySelector("#pages div[data-page-number='1']") as HTMLElement | null;
+		if (!pageElement) throw new Error("missing page element");
+		const textLayer = document.createElement("div");
+		textLayer.className = "textLayer";
+		textLayer.style.position = "absolute";
+		textLayer.style.left = "0px";
+		textLayer.style.top = "0px";
+		textLayer.style.width = "280px";
+		textLayer.style.height = "40px";
+		textLayer.style.pointerEvents = "auto";
+		const text = "First paragraph text that should wrap a little and create boxes.";
+		const span = document.createElement("span");
+		span.textContent = text;
+		textLayer.appendChild(span);
+		pageElement.appendChild(textLayer);
+
+		const textNode = span.firstChild;
+		if (!textNode) return;
+		const selection = window.getSelection();
+		if (!selection) return;
+		const range = document.createRange();
+		const anchorOffset = text.indexOf(" text");
+		range.setStart(textNode, anchorOffset);
+		range.setEnd(textNode, anchorOffset);
+		selection.removeAllRanges();
+		selection.addRange(range);
+	});
+}
+
 test("Viewer Host-served Viewer Client connects viewer socket, sends reverse SyncTeX clicks, and renders forward markers", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-socket-"));
 	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
@@ -196,6 +227,68 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		assert.equal(marker.width, "0.5em", "LW circle marker should not invent rectangle width from missing SyncTeX width");
 		assert.equal(marker.height, "0.5em", "LW circle marker should not invent rectangle height from missing SyncTeX height");
 		assert.equal(marker.focused, true, "forward marker should be focusable and focused after jump");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host-served Viewer Client maps reverse SyncTeX clicks with page-local text-layer context", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-context-"));
+	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	let service: ViewerHostMcpService | undefined;
+	const server = new ViewerHostServer({
+		registry,
+		mcpEventSink: (message) => service?.handleHostMessage(message),
+	});
+	let browser: Browser | undefined;
+	const consoleMessages: string[] = [];
+	const pageErrors: string[] = [];
+	const failedRequests: string[] = [];
+	try {
+		await server.start();
+		service = new ViewerHostMcpService({ client: new HttpViewerHostClient(server.origin), makePdfId: () => 219 });
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		page.on("console", (message) => consoleMessages.push(`${message.type()}: ${message.text()}`));
+		page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}`));
+		page.on("requestfailed", (request: Request) => failedRequests.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "request failed"}`));
+		page.on("response", (response: Response) => {
+			if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`);
+		});
+
+		await page.goto(`${server.origin}/viewer/219`, { waitUntil: "domcontentloaded" });
+		const outcome = await waitForViewerOutcome(page);
+		assert.equal(outcome.rendered, true, `viewer did not render first page; timedOut=${outcome.timedOut}; status=${JSON.stringify(outcome.status)}\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		await injectPageTextLayerAndSelection(page);
+		await assert.doesNotReject(async () => {
+			for (let attempt = 0; attempt < 20; attempt += 1) {
+				if (server.getConnectedViewerCount(219) === 1) return;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			assert.equal(server.getConnectedViewerCount(219), 1);
+		});
+
+		await page.locator("#pages canvas[data-page-number='1']").click({ position: { x: 180, y: 194 } });
+
+		let event: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const response = await callTool(2, "get_pdf_events", { pdf_id: 219, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+			event = response.result?.details?.events?.[0];
+			if (event) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(event, `reverse SyncTeX event was not stored after context click\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		assert.equal(event.pdf_id, 219);
+		assert.equal(event.source_file, sourcePath);
+		assert.equal(event.line, 3);
+		assert.equal(event.page, 1);
+		assert.equal(event.column, 15);
+		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
 	} finally {
 		await browser?.close();
 		await server.stop();

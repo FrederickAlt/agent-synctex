@@ -54,6 +54,19 @@ function pdfUrlForRevision(config) {
 	return config.pdf_url;
 }
 
+function reverseSynctexContextForPage(pageElement) {
+	const selection = window.getSelection();
+	if (!selection || selection.rangeCount === 0) return {};
+	const anchorNode = selection.anchorNode;
+	if (!anchorNode || anchorNode.nodeName !== "#text" || !anchorNode.textContent) return {};
+	const textLayer = pageElement.querySelector(".textLayer");
+	if (!textLayer || !textLayer.contains(anchorNode)) return {};
+	return {
+		textBeforeSelection: anchorNode.textContent.substring(0, selection.anchorOffset),
+		textAfterSelection: anchorNode.textContent.substring(selection.anchorOffset),
+	};
+}
+
 function captureViewerState() {
 	return { scrollX: window.scrollX, scrollY: window.scrollY };
 }
@@ -83,23 +96,26 @@ async function renderPdf(config, options = {}) {
 		canvas.width = viewport.width;
 		canvas.height = viewport.height;
 		canvas.dataset.pageNumber = String(pageNumber);
-		canvas.addEventListener("click", (event) => {
-			if (!activeViewerSocket || activeViewerSocket.readyState !== WebSocket.OPEN) return;
-			const rect = canvas.getBoundingClientRect();
-			const point = viewport.convertToPdfPoint(event.clientX - rect.left, canvas.offsetHeight - (event.clientY - rect.top));
-			activeViewerSocket.send(JSON.stringify({
-				type: "reverse_synctex",
-				page: pageNumber,
-				x: point[0],
-				y: point[1],
-			}));
-		});
 		const pageContainer = document.createElement("div");
 		pageContainer.style.position = "relative";
 		pageContainer.style.width = String(viewport.width) + "px";
 		pageContainer.style.margin = "1rem auto";
 		pageContainer.dataset.pageNumber = String(pageNumber);
 		pageContainer.appendChild(canvas);
+		pageContainer.addEventListener("click", (event) => {
+			if (!activeViewerSocket || activeViewerSocket.readyState !== WebSocket.OPEN) return;
+			const rect = canvas.getBoundingClientRect();
+			const point = viewport.convertToPdfPoint(event.clientX - rect.left, canvas.offsetHeight - (event.clientY - rect.top));
+			const textSelection = reverseSynctexContextForPage(pageContainer);
+			activeViewerSocket.send(JSON.stringify({
+				type: "reverse_synctex",
+				page: pageNumber,
+				x: point[0],
+				y: point[1],
+				...(textSelection.textBeforeSelection === undefined ? {} : { textBeforeSelection: textSelection.textBeforeSelection }),
+				...(textSelection.textAfterSelection === undefined ? {} : { textAfterSelection: textSelection.textAfterSelection }),
+			}));
+		});
 		pages.appendChild(pageContainer);
 		await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
 	}
@@ -316,7 +332,16 @@ function parseReverseSynctexClick(pdfId: number, rawMessage: string): ReverseSyn
 	if (!Number.isInteger(page) || (page as number) < 1) return undefined;
 	if (typeof x !== "number" || !Number.isFinite(x) || x < 0) return undefined;
 	if (typeof y !== "number" || !Number.isFinite(y) || y < 0) return undefined;
-	return { pdfId, page: page as number, x, y };
+	if (record.textBeforeSelection !== undefined && typeof record.textBeforeSelection !== "string") return undefined;
+	if (record.textAfterSelection !== undefined && typeof record.textAfterSelection !== "string") return undefined;
+	return {
+		pdfId,
+		page: page as number,
+		x,
+		y,
+		...(record.textBeforeSelection === undefined ? {} : { textBeforeSelection: record.textBeforeSelection }),
+		...(record.textAfterSelection === undefined ? {} : { textAfterSelection: record.textAfterSelection }),
+	};
 }
 
 class SocketViewerClient implements PdfJsViewerClient {
@@ -340,6 +365,8 @@ export interface ReverseSynctexClick {
 	page: number;
 	x: number;
 	y: number;
+	textBeforeSelection?: string;
+	textAfterSelection?: string;
 }
 
 export interface PdfJsViewerServerOptions {

@@ -217,6 +217,28 @@ test("reverse SyncTeX adapter returns LaTeX-Workshop output with column 0 and cu
 	}
 });
 
+test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct column", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			textBeforeSelection: "First paragraph",
+			textAfterSelection: " text that should wrap a little and create boxes.",
+		});
+
+		assert.equal(location.sourceFile, project.sourcePath);
+		assert.equal(location.line, 3);
+		assert.equal(location.column, "First paragraph".length);
+		assert.equal(location.sourceLine, "First paragraph text that should wrap a little and create boxes.");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse SyncTeX adapter reads realistic .synctex.gz fixtures", () => {
 	const project = makeFixtureProject({ sidecar: "synctex.gz" });
 	try {

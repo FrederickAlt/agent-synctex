@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
 import { syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar } from "./latex_workshop/worker.ts";
 import { readSourceLine } from "./source_line.ts";
@@ -180,12 +181,90 @@ export function mapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctex
 	return withForwardGlue({ mapped, branch: "js_fallback", sourceFile, line: input.line, sourceLine, sidecarPath });
 }
 
+function indexes(source: string, find: string): number[] {
+	const result: number[] = [];
+	for (let i = 0; i < source.length; ++i) {
+		if (source.substring(i, i + find.length) === find) {
+			result.push(i);
+		}
+	}
+	return result;
+}
+
+function getColumnBySurroundingText(line: string, textBeforeSelectionFull: string, textAfterSelectionFull: string): number | null {
+	let previousColumnMatches = Object.create(null) as { [k: string]: number };
+
+	for (let length = 5; length <= Math.max(textBeforeSelectionFull.length, textAfterSelectionFull.length); length++) {
+		const columns: number[] = [];
+		const textBeforeSelection = textBeforeSelectionFull.substring(textBeforeSelectionFull.length - length, textBeforeSelectionFull.length);
+		const textAfterSelection = textAfterSelectionFull.substring(0, length);
+
+		if (textBeforeSelection !== "") {
+			columns.push(...indexes(line, textBeforeSelection).map((index) => index + textBeforeSelection.length));
+		}
+		if (textAfterSelection !== "") {
+			columns.push(...indexes(line, textAfterSelection));
+		}
+
+		const columnMatches = Object.create(null) as { [k: string]: number };
+		columns.forEach((column) => columnMatches[column] = (columnMatches[column] || 0) + 1);
+		const values = Object.values(columnMatches).sort();
+
+		if (values.length > 1 && values[0] === values[1]) {
+			previousColumnMatches = columnMatches;
+			continue;
+		}
+		if (values.length >= 1) {
+			return parseInt(Object.keys(columnMatches).reduce((a, b) => columnMatches[a] > columnMatches[b] ? a : b));
+		}
+		if (Object.keys(previousColumnMatches).length > 0) {
+			return parseInt(Object.keys(previousColumnMatches).reduce((a, b) => previousColumnMatches[a] > previousColumnMatches[b] ? a : b));
+		} else {
+			return null;
+		}
+	}
+	return null;
+}
+
+function getRowAndColumn(lines: string[], row: number, textBeforeSelectionFull: string, textAfterSelectionFull: string): [number, number] {
+	let tempCol = getColumnBySurroundingText(lines[row] ?? "", textBeforeSelectionFull, textAfterSelectionFull);
+	if (tempCol !== null) {
+		return [row, tempCol];
+	}
+
+	if (row - 1 >= 0) {
+		tempCol = getColumnBySurroundingText(lines[row - 1] ?? "", textBeforeSelectionFull, textAfterSelectionFull);
+		if (tempCol !== null) {
+			return [row - 1, tempCol];
+		}
+	}
+
+	if (row + 1 < lines.length) {
+		tempCol = getColumnBySurroundingText(lines[row + 1] ?? "", textBeforeSelectionFull, textAfterSelectionFull);
+		if (tempCol !== null) {
+			return [row + 1, tempCol];
+		}
+	}
+
+	return [row, 0];
+}
+
+function readSourceLines(sourceFile: string): string[] | undefined {
+	try {
+		return readFileSync(sourceFile, "utf8").split(/\r?\n/);
+	} catch {
+		return undefined;
+	}
+}
+
 export function mapReverseSynctex(input: {
 	pdfPath: string;
 	page: number;
 	x: number;
 	y: number;
 	cwd: string;
+	textBeforeSelection?: string;
+	textAfterSelection?: string;
 }): ReverseSynctexLocation {
 	if (!Number.isInteger(input.page) || input.page < 1) {
 		throw new Error("page must be a positive integer");
@@ -214,14 +293,25 @@ export function mapReverseSynctex(input: {
 	}
 
 	const sourceFile = isAbsolute(mapped.input) ? resolve(mapped.input) : resolve(input.cwd, mapped.input);
-	const sourceLine = readSourceLine(sourceFile, mapped.line, input.cwd);
+	let line = mapped.line;
+	let column = mapped.column;
+	const hasSelectionContext = input.textBeforeSelection !== undefined || input.textAfterSelection !== undefined;
+	if (column === 0 && hasSelectionContext) {
+		const sourceLines = readSourceLines(sourceFile);
+		if (sourceLines !== undefined) {
+			const [row, col] = getRowAndColumn(sourceLines, line - 1, input.textBeforeSelection ?? "", input.textAfterSelection ?? "");
+			line = row + 1;
+			column = col;
+		}
+	}
+	const sourceLine = readSourceLine(sourceFile, line, input.cwd);
 	return {
 		page: input.page,
 		x: input.x,
 		y: input.y,
 		sourceFile,
-		line: mapped.line,
-		column: mapped.column,
+		line,
+		column,
 		...(sourceLine === undefined ? {} : { sourceLine }),
 		sidecarPath,
 	};

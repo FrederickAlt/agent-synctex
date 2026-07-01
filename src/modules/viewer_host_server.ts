@@ -172,7 +172,28 @@ const pageViewports = new Map();
 
 function reverseSynctexPayloadFromViewportPoint(input) {
 	const point = input.viewport.convertToPdfPoint(input.viewportX, input.viewportHeight - input.viewportY);
-	return { type: "reverse_synctex", page: input.page, x: point[0], y: point[1] };
+	return {
+		type: "reverse_synctex",
+		page: input.page,
+		x: point[0],
+		y: point[1],
+		...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }),
+		...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }),
+	};
+}
+
+function reverseSynctexContextForPage(pageElement) {
+	const selection = window.getSelection();
+	if (!selection || selection.rangeCount === 0) return {};
+	const anchorNode = selection.anchorNode;
+	if (!anchorNode) return {};
+	if (anchorNode.nodeName !== "#text" || !anchorNode.textContent) return {};
+	const textLayer = pageElement.querySelector(".textLayer");
+	if (!textLayer || !textLayer.contains(anchorNode)) return {};
+	return {
+		textBeforeSelection: anchorNode.textContent.substring(0, selection.anchorOffset),
+		textAfterSelection: anchorNode.textContent.substring(selection.anchorOffset),
+	};
 }
 
 function viewportScale(input) {
@@ -208,18 +229,26 @@ async function renderPdf(config) {
 		canvas.width = viewport.width;
 		canvas.height = viewport.height;
 		canvas.dataset.pageNumber = String(pageNumber);
-		canvas.addEventListener("click", (event) => {
-			if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
-			const rect = canvas.getBoundingClientRect();
-			const payload = reverseSynctexPayloadFromViewportPoint({ page: pageNumber, viewportX: event.clientX - rect.left, viewportY: event.clientY - rect.top, viewportHeight: canvas.offsetHeight, viewport });
-			viewerSocket.send(JSON.stringify(payload));
-		});
 		const pageContainer = document.createElement("div");
 		pageContainer.style.position = "relative";
 		pageContainer.style.width = String(viewport.width) + "px";
 		pageContainer.style.margin = "1rem auto";
 		pageContainer.dataset.pageNumber = String(pageNumber);
 		pageContainer.appendChild(canvas);
+		pageContainer.addEventListener("click", (event) => {
+			if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
+			const rect = canvas.getBoundingClientRect();
+			const textSelection = reverseSynctexContextForPage(pageContainer);
+			const payload = reverseSynctexPayloadFromViewportPoint({
+				page: pageNumber,
+				viewportX: event.clientX - rect.left,
+				viewportY: event.clientY - rect.top,
+				viewportHeight: canvas.offsetHeight,
+				viewport,
+				...textSelection,
+			});
+			viewerSocket.send(JSON.stringify(payload));
+		});
 		pages.appendChild(pageContainer);
 		await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
 		canvas.dataset.rendered = "true";

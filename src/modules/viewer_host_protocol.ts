@@ -64,6 +64,8 @@ export interface ViewerHostReverseSynctexMessage {
 	page: number;
 	x: number;
 	y: number;
+	textBeforeSelection?: string;
+	textAfterSelection?: string;
 }
 
 export type ViewerHostToMcpMessage =
@@ -131,6 +133,14 @@ function requireNonEmptyString(value: unknown, field: string): string {
 function optionalNonEmptyString(value: unknown, field: string): string | undefined {
 	if (value === undefined) return undefined;
 	return requireNonEmptyString(value, field);
+}
+
+function optionalString(value: unknown, field: string): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string") {
+		throw new Error(`${field} must be a string`);
+	}
+	return value;
 }
 
 function requireProtocolVersion(value: unknown): number {
@@ -211,14 +221,19 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
 		case "viewer_tab_closed":
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
-		case "reverse_synctex":
+		case "reverse_synctex": {
+			const textBeforeSelection = optionalString(message.textBeforeSelection, "textBeforeSelection");
+			const textAfterSelection = optionalString(message.textAfterSelection, "textAfterSelection");
 			return {
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
 				page: requirePositiveInteger(message.page, "page"),
 				x: requireCoordinate(message.x, "x"),
 				y: requireCoordinate(message.y, "y"),
+				...(textBeforeSelection === undefined ? {} : { textBeforeSelection }),
+				...(textAfterSelection === undefined ? {} : { textAfterSelection }),
 			};
+		}
 		default:
 			throw new Error(`unknown message type: ${type}`);
 	}
