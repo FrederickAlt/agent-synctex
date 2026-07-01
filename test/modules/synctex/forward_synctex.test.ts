@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import * as iconv from "iconv-lite";
 import { test } from "node:test";
-import { mapForwardSynctex, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
+import { findUniqueSelectedTextSourceRange, mapForwardSynctex, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
 import { findInputFilePathForward, syncTeXToPDF, syncTeXToTeX } from "../../../src/modules/synctex/latex_workshop/worker.ts";
 import type { PdfSyncObject } from "../../../src/modules/synctex/latex_workshop/synctexjs.ts";
 
@@ -426,6 +426,36 @@ test("native reverse SyncTeX failure falls back to the existing LaTeX-Workshop J
 	}
 });
 
+test("native reverse SyncTeX invalid source line falls back before accepting the mapping", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		let fallbackCalls = 0;
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: () => ({
+				status: 0,
+				stdout: "SyncTeX result begin\nOutput:paper.pdf\nInput:main.tex\nLine:8737\nColumn:0\nSyncTeX result end\n",
+				stderr: "",
+			}),
+			jsFallback: () => {
+				fallbackCalls += 1;
+				return { input: "main.tex", line: 3, column: 0 };
+			},
+		});
+
+		assert.equal(fallbackCalls, 1);
+		assert.equal(location.diagnostics.branch, "js_fallback");
+		assert.match(location.diagnostics.native.failureReason ?? "", /outside readable source line range/);
+		assert.equal(location.line, 3);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("native reverse SyncTeX no-result falls back to the existing LaTeX-Workshop JS parser", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
@@ -479,6 +509,44 @@ test("native reverse SyncTeX can select a smoke-style formula source line when J
 		assert.equal(location.line, 16);
 		assert.equal(location.sourceLine, "  a &= b + c \\\\ ".trimEnd());
 		assert.equal(location.diagnostics.jsFallback, undefined);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("selected text source range repair maps a unique partial selection with spaces", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"one",
+			"alpha beta gamma",
+			"omega",
+		].join("\n"));
+
+		const range = findUniqueSelectedTextSourceRange(project.sourcePath, "pha beta");
+
+		assert.deepEqual(range, {
+			sourceFile: project.sourcePath,
+			startLine: 2,
+			startColumn: 2,
+			endLine: 2,
+			endColumn: 9,
+			startSourceLine: "alpha beta gamma",
+			endSourceLine: "alpha beta gamma",
+		});
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("selected text source range repair rejects absent and ambiguous selections", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, ["repeat", "missing", "repeat"].join("\n"));
+
+		assert.equal(findUniqueSelectedTextSourceRange(project.sourcePath, "repeat"), undefined);
+		assert.equal(findUniqueSelectedTextSourceRange(project.sourcePath, "absent"), undefined);
+		assert.equal(findUniqueSelectedTextSourceRange(project.sourcePath, ""), undefined);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

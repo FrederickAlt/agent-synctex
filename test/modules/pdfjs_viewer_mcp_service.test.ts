@@ -626,7 +626,8 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		assert.deepEqual(((secondRead.result as { details: { events: Array<Record<string, unknown>> } }).details.events).map((item) => item.sequence), [1]);
 		const text = (secondRead.result as { content?: Array<{ text: string }> }).content?.[0]?.text ?? "";
 		assert.match(text, /selected_text=First paragraph/);
-		assert.match(text, /selection_start=.*line=3:column=15/);
+		assert.match(text, /selection_start=.*line=3:column=0/);
+		assert.match(text, /selection_end=.*line=3:column=14/);
 
 		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({
 			type: "reverse_synctex",
@@ -657,6 +658,37 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		assert.equal(endpointFailureEvent?.selection_start_error, "stubbed endpoint mapping failure");
 		assert.equal(endpointFailureEvent?.selection_start, undefined);
 		assert.ok(endpointFailureEvent?.selection_end, "successful endpoint should still be exposed");
+
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({
+			type: "reverse_synctex",
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			selectedText: "text that should wrap",
+			selectionStartX: 999999,
+			selectionStartY: 999999,
+			selectionEndX: 999999,
+			selectionEndY: 999999,
+		})));
+		let repairedEndpointEvent: Record<string, unknown> | undefined;
+		await waitFor(async () => {
+			const response = await handleMcpRequest(JSON.stringify({
+				jsonrpc: "2.0",
+				id: 73,
+				method: "tools/call",
+				params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } },
+			}), service.pdfOperations);
+			assert.ok(response && "result" in response);
+			const nextEvents = ((response.result as { details?: { events?: Array<Record<string, unknown>> } }).details?.events) ?? [];
+			repairedEndpointEvent = nextEvents.at(-1);
+			return nextEvents.length === 3;
+		});
+		assert.equal(repairedEndpointEvent?.selected_text, "text that should wrap");
+		assert.equal((repairedEndpointEvent?.selection_start as Record<string, unknown>).line, 3);
+		assert.equal((repairedEndpointEvent?.selection_start as Record<string, unknown>).column, 16);
+		assert.equal((repairedEndpointEvent?.selection_end as Record<string, unknown>).line, 3);
+		assert.equal((repairedEndpointEvent?.selection_end as Record<string, unknown>).column, 36);
+		assert.equal(repairedEndpointEvent?.selection_start_error, undefined);
 		socket.end();
 	} finally {
 		await service.stop();
