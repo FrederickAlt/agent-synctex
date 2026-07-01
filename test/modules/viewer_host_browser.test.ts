@@ -21,7 +21,19 @@ function makeOnePagePdf(): Buffer {
 		chunks.push(object);
 		length += Buffer.byteLength(object, "binary");
 	}
-	const content = "BT\n/F1 18 Tf\n36 150 Td\n(First paragraph text that should wrap a little and create boxes.) Tj\nET\n";
+	const content = [
+		"BT",
+		"/F1 18 Tf",
+		"36 150 Td",
+		"(First paragraph text that should wrap a little and create boxes.) Tj",
+		"ET",
+		"BT",
+		"/F1 5 Tf",
+		"36 105 Td",
+		"(This prose line contains DRAGTOKENALPHA before the formulas so selection can be checked.) Tj",
+		"ET",
+		"",
+	].join("\n");
 	addObject(1, "<< /Type /Catalog /Pages 2 0 R >>");
 	addObject(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
 	addObject(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>");
@@ -286,6 +298,21 @@ async function dispatchRenderedPageMouseup(page: Page, x: number, y: number): Pr
 	}, { x, y });
 }
 
+async function latestReverseSynctexEvent(service: ViewerHostMcpService, id: number): Promise<Record<string, unknown> | undefined> {
+	const response = await callTool(id, "get_pdf_events", { pdf_id: 209, max_events: 30 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+	return (response.result?.details?.events ?? []).filter((candidate) => candidate.type === "reverse_synctex").at(-1);
+}
+
+async function waitForLatestReverseSynctexEvent(service: ViewerHostMcpService, id: number, predicate: (event: Record<string, unknown>) => boolean): Promise<Record<string, unknown> | undefined> {
+	let event: Record<string, unknown> | undefined;
+	for (let attempt = 0; attempt < 20; attempt += 1) {
+		event = await latestReverseSynctexEvent(service, id);
+		if (event && predicate(event)) return event;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	return event;
+}
+
 async function dispatchMouseupThenFinalizeSelection(page: Page, prefixText: string, finalText: string, x: number, y: number): Promise<void> {
 	await page.waitForSelector("#pages div[data-page-number='1'] .textLayer[data-rendered='true'] span", { state: "attached", timeout: 2_000 });
 	await page.evaluate(({ prefixText, finalText, x, y }) => {
@@ -321,7 +348,7 @@ async function dispatchMouseupThenFinalizeSelection(page: Page, prefixText: stri
 	}, { prefixText, finalText, x, y });
 }
 
-async function dragSelectRenderedPageText(page: Page, selectedText: string): Promise<void> {
+async function dragSelectRenderedPageText(page: Page, selectedText: string, direction: "forward" | "backward" = "forward"): Promise<string> {
 	await page.waitForSelector("#pages div[data-page-number='1'] .textLayer[data-rendered='true'] span", { state: "attached", timeout: 2_000 });
 	const points = await page.evaluate((needle) => {
 		const textLayer = document.querySelector("#pages div[data-page-number='1'] .textLayer") as HTMLElement | null;
@@ -354,10 +381,13 @@ async function dragSelectRenderedPageText(page: Page, selectedText: string): Pro
 		}
 		throw new Error(`text layer did not contain ${needle}`);
 	}, selectedText);
-	await page.mouse.move(points.startX, points.startY);
+	const from = direction === "forward" ? { x: points.startX, y: points.startY } : { x: points.endX, y: points.endY };
+	const to = direction === "forward" ? { x: points.endX, y: points.endY } : { x: points.startX, y: points.startY };
+	await page.mouse.move(from.x, from.y);
 	await page.mouse.down();
-	await page.mouse.move(points.endX, points.endY, { steps: 12 });
+	await page.mouse.move(to.x, to.y, { steps: 12 });
 	await page.mouse.up();
+	return await page.evaluate(() => window.getSelection()?.toString() ?? "");
 }
 
 async function waitForSynctexCircleStyle(page: Page, expected: { left: number; top: number }, tolerance = 1): Promise<void> {
@@ -568,6 +598,18 @@ test("Viewer Host-served Viewer Client connects viewer socket, sends reverse Syn
 		const dragDebugResponse = await callTool(6, "get_pdf_events", { pdf_id: 209, max_events: 80, stale: true, debug: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 		const dragDebugPhases = new Set((dragDebugResponse.result?.details?.events ?? []).filter((candidate) => candidate.type === "selection_debug").map((candidate) => candidate.phase));
 		assert.ok(dragDebugPhases.has("mousedown"), "drag selection diagnostics should include mousedown");
+
+		const exactDragText = "This prose line contains DRAGTOKENALPHA";
+		for (const direction of ["forward", "backward"] as const) {
+			const previousSequence = Number((await latestReverseSynctexEvent(service, 6))?.sequence ?? 0);
+			const rawSelectionText = await dragSelectRenderedPageText(page, exactDragText, direction);
+			assert.ok(rawSelectionText.includes(exactDragText), `${direction} real browser drag raw selection should include the exact intended phrase; selected ${JSON.stringify(rawSelectionText)}`);
+			const exactDragEvent = await waitForLatestReverseSynctexEvent(service, 6, (candidate) => Number(candidate.sequence) > previousSequence && typeof candidate.selected_text === "string");
+			assert.ok(
+				(exactDragEvent?.selected_text as string | undefined)?.includes(exactDragText),
+				`${direction} real browser drag reverse event should include the exact intended phrase; event text ${JSON.stringify(exactDragEvent?.selected_text)}`,
+			);
+		}
 
 		for (const mode of ["start-at-previous-end", "end-at-next-start", "element-offsets-between-spans"] as const) {
 			const boundaryText = await selectAdjacentTextLayerBoundary(page, mode);
