@@ -97,14 +97,7 @@ const PACKAGE_STALE_METADATA_TOKENS = [
 const REMOVED_IMPLEMENTED_DOC_PATHS = [
 	"docs/prd-desktop-viewer-host-v1.md",
 	"docs/tdd-desktop-viewer-host-v1.md",
-] as const;
-
-const ACTIVE_DOC_PATHS = [
-	"README.md",
-	"CONTEXT.md",
 	"docs/prd-tdd-synctex-native-parity-rectangles-reverse-quality.md",
-	"docs/prd-viewer-client-ux-followups.md",
-	"docs/tdd-viewer-client-ux-followups.md",
 	"docs/issues/synctex-native-parity/README.md",
 	"docs/issues/synctex-native-parity/TRACEABILITY.md",
 	"docs/issues/synctex-native-parity/001-native-forward-first-js-fallback.md",
@@ -113,6 +106,13 @@ const ACTIVE_DOC_PATHS = [
 	"docs/issues/synctex-native-parity/004-reverse-selection-context-parity.md",
 	"docs/issues/synctex-native-parity/005-formula-reverse-geometry-ranking.md",
 	"docs/issues/synctex-native-parity/006-synctex-diagnostics-and-acceptance.md",
+] as const;
+
+const ACTIVE_DOC_PATHS = [
+	"README.md",
+	"CONTEXT.md",
+	"docs/prd-viewer-client-ux-followups.md",
+	"docs/tdd-viewer-client-ux-followups.md",
 ] as const;
 const STALE_PI_EXTENSION_BRANDING_PATTERNS: Array<[RegExp, string]> = [
 	[/\bPi extension\b/gi, "stale Pi extension branding"],
@@ -717,7 +717,7 @@ test("Package metadata keeps approved production entrypoints", () => {
 });
 
 
-test("Active docs track current SyncTeX PRD/TDD and safe MCP startup commands", () => {
+test("Active docs track current Viewer Host guidance and safe MCP startup commands", () => {
 	const violations: GuardrailViolation[] = [];
 	let combinedDocs = "";
 
@@ -735,11 +735,9 @@ test("Active docs track current SyncTeX PRD/TDD and safe MCP startup commands", 
 
 	assert.match(combinedDocs, /stdio MCP/i, "active docs must identify the stdio MCP runtime");
 	assert.match(combinedDocs, /Viewer Host/i, "active docs must identify the Viewer Host boundary");
-	assert.match(combinedDocs, /PRD\/TDD: SyncTeX parity and quality roadmap/i, "active docs must include the current SyncTeX PRD/TDD");
-	assert.match(combinedDocs, /Native `synctex view` forward path is attempted before JS fallback/i, "active docs must guard native-first SyncTeX forward parity");
-	assert.match(combinedDocs, /Rectangle configured \+ native success renders rectangles/i, "active docs must guard rectangle indicator parity");
-	assert.match(combinedDocs, /Formula reverse click should not always resolve to `\\end\{\.\.\.\}`/i, "active docs must guard reverse-sync quality goals");
-	assert.match(combinedDocs, /Local issue drafts: SyncTeX native parity/i, "active docs must include the current SyncTeX issue drafts");
+	assert.match(combinedDocs, /Viewer Client UX Follow-ups/i, "active docs must include the current Viewer Client UX follow-up PRD/TDD");
+	assert.match(combinedDocs, /Viewer Client code must remain usable in a normal browser context/i, "active docs must preserve Viewer Client portability guidance");
+	assert.match(combinedDocs, /Core success criteria/i, "active docs must include the current Viewer Client UX test plan");
 	assert.doesNotMatch(readFileSync(join(REPO_ROOT, "README.md"), "utf8"), /reachable browser\/PDF\.js|browser-hosted PDF\.js|process-local PDF\.js HTTP serving/i, "README must not promise old reachable in-process PDF.js behavior");
 	assert.equal(
 		violations.length,
