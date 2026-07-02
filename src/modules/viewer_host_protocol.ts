@@ -45,6 +45,28 @@ export interface ViewerHostPdfMaybeUpdatedMessage {
 	pdf_id: number;
 }
 
+export type ViewerHostSynctexPrecision = "verified" | "text" | "line" | "raw";
+
+export interface ViewerHostReverseSynctexCandidateSummary {
+	source_file?: string;
+	line: number;
+	column?: number;
+	source_line?: string;
+	score?: number;
+	structural?: boolean;
+	distance?: number;
+	distance_x?: number;
+	distance_y?: number;
+}
+
+export interface ViewerHostReverseSynctexForwardVerificationSummary {
+	attempted: boolean;
+	contains_click: boolean;
+	boxes_considered?: number;
+	boxes_filtered?: number;
+	chosen_box?: ViewerHostSynctexForwardRange;
+}
+
 export interface ViewerHostReverseSynctexHoverResultMessage {
 	type: "reverse_synctex_hover_result";
 	pdf_id: number;
@@ -57,6 +79,11 @@ export interface ViewerHostReverseSynctexHoverResultMessage {
 	column?: number;
 	source_line?: string;
 	rect?: { left: number; top: number; right: number; bottom: number };
+	precision?: ViewerHostSynctexPrecision;
+	raw?: ViewerHostReverseSynctexCandidateSummary;
+	repaired?: ViewerHostReverseSynctexCandidateSummary & { precision?: ViewerHostSynctexPrecision };
+	candidates?: ViewerHostReverseSynctexCandidateSummary[];
+	forward?: ViewerHostReverseSynctexForwardVerificationSummary;
 	error?: string;
 }
 
@@ -253,6 +280,71 @@ function optionalSynctexRanges(value: unknown, field: string): ViewerHostSynctex
 	return value.map((entry, index) => parseSynctexForwardRange(entry, `${field}[${index}]`));
 }
 
+function optionalNumber(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		throw new Error(`${field} must be a finite number`);
+	}
+	return value;
+}
+
+function optionalPrecision(value: unknown, field: string): ViewerHostSynctexPrecision | undefined {
+	if (value === undefined) return undefined;
+	if (value !== "verified" && value !== "text" && value !== "line" && value !== "raw") {
+		throw new Error(`${field} must be a SyncTeX precision`);
+	}
+	return value;
+}
+
+function parseReverseSynctexCandidateSummary(value: unknown, field: string): ViewerHostReverseSynctexCandidateSummary {
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	const sourceFile = optionalNonEmptyString(value.source_file, `${field}.source_file`);
+	const column = value.column === undefined ? undefined : requireCoordinate(value.column, `${field}.column`);
+	const sourceLine = optionalString(value.source_line, `${field}.source_line`);
+	const score = optionalNumber(value.score, `${field}.score`);
+	const structural = optionalBoolean(value.structural, `${field}.structural`);
+	const distance = optionalNumber(value.distance, `${field}.distance`);
+	const distanceX = optionalNumber(value.distance_x, `${field}.distance_x`);
+	const distanceY = optionalNumber(value.distance_y, `${field}.distance_y`);
+	return {
+		...(sourceFile === undefined ? {} : { source_file: sourceFile }),
+		line: requirePositiveInteger(value.line, `${field}.line`),
+		...(column === undefined ? {} : { column }),
+		...(sourceLine === undefined ? {} : { source_line: sourceLine }),
+		...(score === undefined ? {} : { score }),
+		...(structural === undefined ? {} : { structural }),
+		...(distance === undefined ? {} : { distance }),
+		...(distanceX === undefined ? {} : { distance_x: distanceX }),
+		...(distanceY === undefined ? {} : { distance_y: distanceY }),
+	};
+}
+
+function optionalReverseSynctexCandidateSummary(value: unknown, field: string): ViewerHostReverseSynctexCandidateSummary | undefined {
+	if (value === undefined) return undefined;
+	return parseReverseSynctexCandidateSummary(value, field);
+}
+
+function optionalReverseSynctexCandidateSummaries(value: unknown, field: string): ViewerHostReverseSynctexCandidateSummary[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error(`${field} must be an array`);
+	return value.map((entry, index) => parseReverseSynctexCandidateSummary(entry, `${field}[${index}]`));
+}
+
+function optionalForwardVerificationSummary(value: unknown, field: string): ViewerHostReverseSynctexForwardVerificationSummary | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	const boxesConsidered = optionalNumber(value.boxes_considered, `${field}.boxes_considered`);
+	const boxesFiltered = optionalNumber(value.boxes_filtered, `${field}.boxes_filtered`);
+	const chosenBox = value.chosen_box === undefined ? undefined : parseSynctexForwardRange(value.chosen_box, `${field}.chosen_box`);
+	return {
+		attempted: optionalBoolean(value.attempted, `${field}.attempted`) ?? false,
+		contains_click: optionalBoolean(value.contains_click, `${field}.contains_click`) ?? false,
+		...(boxesConsidered === undefined ? {} : { boxes_considered: boxesConsidered }),
+		...(boxesFiltered === undefined ? {} : { boxes_filtered: boxesFiltered }),
+		...(chosenBox === undefined ? {} : { chosen_box: chosenBox }),
+	};
+}
+
 function requireNonEmptyString(value: unknown, field: string): string {
 	if (typeof value !== "string" || !value.trim()) {
 		throw new Error(`${field} must be a non-empty string`);
@@ -347,6 +439,13 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			const column = message.column === undefined ? undefined : requireCoordinate(message.column, "column");
 			const sourceLine = optionalString(message.source_line, "source_line");
 			const rect = optionalHoverRect(message.rect, "rect");
+			const precision = optionalPrecision(message.precision, "precision");
+			const raw = optionalReverseSynctexCandidateSummary(message.raw, "raw");
+			const repairedBase = optionalReverseSynctexCandidateSummary(message.repaired, "repaired");
+			const repairedPrecision = isRecord(message.repaired) ? optionalPrecision(message.repaired.precision, "repaired.precision") : undefined;
+			const repaired = repairedBase === undefined ? undefined : { ...repairedBase, ...(repairedPrecision === undefined ? {} : { precision: repairedPrecision }) };
+			const candidates = optionalReverseSynctexCandidateSummaries(message.candidates, "candidates");
+			const forward = optionalForwardVerificationSummary(message.forward, "forward");
 			const error = optionalString(message.error, "error");
 			if (error === undefined && (sourceFile === undefined || line === undefined || column === undefined || rect === undefined)) {
 				throw new Error("reverse_synctex_hover_result requires source_file, line, column, and rect unless error is set");
@@ -363,6 +462,11 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				...(column === undefined ? {} : { column }),
 				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
 				...(rect === undefined ? {} : { rect }),
+				...(precision === undefined ? {} : { precision }),
+				...(raw === undefined ? {} : { raw }),
+				...(repaired === undefined ? {} : { repaired }),
+				...(candidates === undefined ? {} : { candidates }),
+				...(forward === undefined ? {} : { forward }),
 				...(error === undefined ? {} : { error }),
 			};
 		}

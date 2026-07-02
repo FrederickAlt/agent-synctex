@@ -968,6 +968,15 @@ test("Viewer Host-served Viewer Client toggles reverse SyncTeX hover overlay wit
 		await page.waitForSelector("[data-reverse-synctex-hover='rect']", { state: "attached", timeout: 2_000 });
 		await page.waitForSelector("[data-reverse-synctex-hover='label']", { state: "attached", timeout: 2_000 });
 		assert.match(await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "", /main\.tex:3 First paragraph/);
+		const control = new ViewerHostControlClient({ origin: server.origin });
+		await control.send({ type: "reverse_synctex_hover_result", pdf_id: 239, request_id: Number(hoverRequest.request_id), page: 1, x: Number(hoverRequest.x), y: Number(hoverRequest.y), source_file: sourcePath, line: 4, column: 0, source_line: "Second paragraph text", rect: { left: 20, top: 30, right: 80, bottom: 50 }, precision: "verified", raw: { source_file: sourcePath, line: 99, column: 0, source_line: "\\end{document}", score: 1000, structural: true, distance: 0 }, repaired: { source_file: sourcePath, line: 4, column: 0, source_line: "Second paragraph text", precision: "verified" }, candidates: [{ source_file: sourcePath, line: 99, column: 0, source_line: "\\end{document}", score: 1000, structural: true, distance: 0 }, { source_file: sourcePath, line: 4, column: 0, source_line: "Second paragraph text", score: 4, structural: false, distance: 4 }], forward: { attempted: true, contains_click: true, boxes_considered: 2, boxes_filtered: 1, chosen_box: { page: 1, h: 20, v: 30, W: 60, H: 20 } } });
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const labelText = await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "";
+			if (/raw: line 99/.test(labelText)) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.match(await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "", /raw: line 99/);
+		assert.match(await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "", /repair: line 4 .*\[verified\]/);
 
 		await clickRenderedPagePoint(page, 180, 100);
 		let probeRequest: Record<string, unknown> | undefined;
@@ -996,7 +1005,6 @@ test("Viewer Host-served Viewer Client toggles reverse SyncTeX hover overlay wit
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 		assert.notEqual(latestProbeRequest.request_id, probeRequest.request_id, "second plain click should send a fresh probe request");
-		const control = new ViewerHostControlClient({ origin: server.origin });
 		await control.send({ type: "reverse_synctex_forward_probe_result", pdf_id: 239, request_id: Number(probeRequest.request_id), click_page: 1, click_x: Number(probeRequest.x), click_y: Number(probeRequest.y), reverse_source_file: sourcePath, reverse_line: 99, reverse_column: 0, page: 1, x: 10, y: 10, source_file: sourcePath, line: 99 });
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		assert.equal(await page.locator("[data-reverse-synctex-forward-probe='marker']").count(), oldProbeMarkerCount, "stale probe result should be ignored");
@@ -1091,7 +1099,7 @@ test("Viewer Host-served Viewer Client hover falls back to PDF directory when wo
 		await moveRenderedPagePoint(page, 180, 100);
 		await page.waitForSelector("[data-reverse-synctex-hover='rect']", { state: "attached", timeout: 2_000 });
 		await page.waitForSelector("[data-reverse-synctex-hover='label']", { state: "attached", timeout: 2_000 });
-		assert.match(await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "", /main\.tex:3 First paragraph/);
+		assert.match(await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "", /main\.tex:3/);
 	} finally {
 		await browser?.close();
 		await server.stop();

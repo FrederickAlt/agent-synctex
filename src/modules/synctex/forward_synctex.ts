@@ -1,10 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
-import { inspectSyncTeXToTeX, inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar, type ReverseSyncTeXCandidate, type ReverseSyncTeXCandidatesInspection } from "./latex_workshop/worker.ts";
+import { inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar, type ReverseSyncTeXCandidate, type ReverseSyncTeXCandidatesInspection } from "./latex_workshop/worker.ts";
 import { lineColumnForSourceIndex } from "./source_index.ts";
 import { readSourceLine } from "./source_line.ts";
-import { buildSourceSearchFragments, findSourceTextMatches, selectForwardVerifiedSourceMatch, type SourceTextMatchResult } from "./text_repair.ts";
+import { buildSourceSearchFragments, filterForwardBoxes, findSourceTextMatches, selectForwardVerifiedSourceMatch, type SourceTextMatchResult } from "./text_repair.ts";
 
 export interface ForwardSynctexTarget {
 	page: number;
@@ -173,9 +173,10 @@ export interface ReverseSynctexHoverInspection {
 	sourceLine?: string;
 	sidecarPath: string;
 	precision?: ReverseSynctexPrecision;
-	rawWinner?: ReverseSyncTeXCandidate;
-	topCandidates?: ReverseSyncTeXCandidate[];
+	rawWinner?: unknown;
+	topCandidates?: unknown[];
 	repairedWinner?: { sourceFile: string; line: number; column: number; sourceLine?: string; precision: ReverseSynctexPrecision };
+	forwardVerification?: ReverseSynctexDiagnostics["forwardVerification"];
 	rect: { left: number; top: number; right: number; bottom: number };
 	distanceFromCenter: number;
 }
@@ -433,7 +434,7 @@ export function mapReverseForwardSynctexProbe(input: ReverseForwardSynctexProbeI
 			...(input.synctexCommand === undefined ? {} : { synctexCommand: input.synctexCommand }),
 		}))
 		: input.inspectReverse({ pdfPath: input.pdfPath, page: input.page, x: input.x, y: input.y, cwd: input.cwd });
-	const forward = mapForward({
+	const mappedForward = mapForward({
 		pdfPath: input.pdfPath,
 		sourceFile: reverse.sourceFile,
 		line: reverse.line,
@@ -442,6 +443,17 @@ export function mapReverseForwardSynctexProbe(input: ReverseForwardSynctexProbeI
 		...(input.forwardJsFallback === undefined ? {} : { jsFallback: input.forwardJsFallback }),
 		...(input.synctexCommand === undefined ? {} : { synctexCommand: input.synctexCommand }),
 	});
+	const filtered = mappedForward.ranges === undefined ? undefined : filterForwardBoxes(mappedForward.ranges, { page: input.page, x: input.x, y: input.y });
+	const chosenBox = filtered?.chosenBox;
+	const forward = filtered === undefined || chosenBox === undefined ? mappedForward : {
+		...mappedForward,
+		page: chosenBox.page,
+		x: chosenBox.h,
+		y: chosenBox.v,
+		width: chosenBox.W,
+		height: chosenBox.H,
+		ranges: filtered.boxes,
+	};
 	return { reverse, forward };
 }
 
@@ -810,7 +822,10 @@ function reverseLocationToHoverInspection(location: ReverseSynctexLocation): Rev
 		...(location.sourceLine === undefined ? {} : { sourceLine: location.sourceLine }),
 		sidecarPath: location.sidecarPath,
 		precision: location.precision,
+		...(location.diagnostics.rawWinner === undefined ? {} : { rawWinner: location.diagnostics.rawWinner }),
+		...(location.diagnostics.topCandidates === undefined ? {} : { topCandidates: location.diagnostics.topCandidates }),
 		repairedWinner: { sourceFile: location.sourceFile, line: location.line, column: location.column, ...(location.sourceLine === undefined ? {} : { sourceLine: location.sourceLine }), precision: location.precision },
+		...(location.diagnostics.forwardVerification === undefined ? {} : { forwardVerification: location.diagnostics.forwardVerification }),
 		rect: rectFromDiagnostics(location.diagnostics),
 		distanceFromCenter: 0,
 	};
@@ -835,26 +850,30 @@ export function inspectReverseSynctexHover(input: { pdfPath: string; page: numbe
 	let inspected;
 	try {
 		process.chdir(input.cwd);
-		inspected = inspectSyncTeXToTeX(input.page, input.x, input.y, pdfPath);
+		inspected = inspectSyncTeXToTeXCandidates(input.page, input.x, input.y, pdfPath);
 	} finally {
 		process.chdir(previousCwd);
 	}
 	if (inspected === undefined) {
 		throw new Error(`No SyncTeX hover mapping found for page ${input.page} at ${input.x},${input.y}; primary JS lookup returned no result`);
 	}
-	const sourceFile = resolveReverseMappedSourceFile(inspected, input.cwd);
-	const sourceLine = readSourceLine(sourceFile, inspected.line, input.cwd);
+	const winner = inspected.rawWinner;
+	const sourceFile = resolveReverseMappedSourceFile(winner, input.cwd);
+	const sourceLine = readSourceLine(sourceFile, winner.line, input.cwd);
 	return {
 		page: input.page,
 		x: input.x,
 		y: input.y,
 		sourceFile,
-		line: inspected.line,
-		column: inspected.column,
+		line: winner.line,
+		column: winner.column,
 		...(sourceLine === undefined ? {} : { sourceLine }),
 		sidecarPath,
-		rect: inspected.rect,
-		distanceFromCenter: inspected.distanceFromCenter,
+		precision: inspected.rawWinner.structural ? "raw" : "line",
+		rawWinner: compactReverseCandidate(inspected.rawWinner),
+		topCandidates: inspected.candidates.map(compactReverseCandidate),
+		rect: winner.rect,
+		distanceFromCenter: 0,
 	};
 }
 

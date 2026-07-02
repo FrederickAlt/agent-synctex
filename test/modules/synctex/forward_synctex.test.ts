@@ -320,6 +320,54 @@ test("reverse-forward probe default path uses robust text context for forward Sy
 	}
 });
 
+test("reverse-forward probe filters garbage forward boxes before display", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const probe = mapReverseForwardSynctexProbe({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144,
+			y: 155,
+			cwd: project.dir,
+			inspectReverse: (input) => ({
+				page: input.page,
+				x: input.x,
+				y: input.y,
+				sourceFile: project.sourcePath,
+				line: 3,
+				column: 0,
+				sourceLine: "First paragraph text that should wrap a little and create boxes.",
+				sidecarPath: join(project.dir, "paper.synctex"),
+				rect: { left: 10, top: 20, right: 30, bottom: 40 },
+				distanceFromCenter: 0,
+			}),
+			mapForward: (input) => ({
+				page: 1,
+				x: 0,
+				y: 0,
+				ranges: [
+					{ page: 1, h: 0, v: 0, W: 10_000, H: 10_000 },
+					{ page: 1, h: 140, v: 150, W: 16, H: 10 },
+					{ page: 2, h: 144, v: 155, W: 5, H: 5 },
+				],
+				sourceFile: input.sourceFile,
+				line: input.line,
+				sourceLine: "First paragraph text that should wrap a little and create boxes.",
+				sidecarPath: join(project.dir, "paper.synctex"),
+				branch: "js_fallback",
+				diagnostics: { branch: "js_fallback", lookupInput: { pdfPath: project.pdfPath, sourceFile: input.sourceFile, line: input.line, sidecarPath: join(project.dir, "paper.synctex") }, native: { command: "synctex", args: [], cwd: project.dir, parsedRectangles: [] }, jsFallback: { attempted: true } },
+			}),
+		});
+
+		assert.deepEqual(probe.forward.ranges, [{ page: 1, h: 140, v: 150, W: 16, H: 10 }]);
+		assert.equal(probe.forward.page, 1);
+		assert.equal(probe.forward.x, 140);
+		assert.equal(probe.forward.y, 150);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse-forward probe maps JS reverse inspection result through forward SyncTeX", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
