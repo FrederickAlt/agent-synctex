@@ -41,8 +41,8 @@ test("Viewer Host protocol validates representative Host to MCP messages", () =>
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500, selectedText: "chosen", selectionStartX: 95, selectionStartY: 500, selectionEndX: 150, selectionEndY: 500 },
 		{ type: "selection_debug", pdf_id: 123, phase: "send", page: 2, text: "chosen", details: { phase: "send", selectionTextLength: 6 } },
-		{ type: "reverse_synctex_hover", pdf_id: 123, request_id: 7, page: 2, x: 100, y: 500 },
-		{ type: "reverse_synctex_forward_probe", pdf_id: 123, request_id: 8, page: 2, x: 100, y: 500 },
+		{ type: "reverse_synctex_hover", pdf_id: 123, request_id: 7, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
+		{ type: "reverse_synctex_forward_probe", pdf_id: 123, request_id: 8, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
 	];
 
 	for (const message of messages) {

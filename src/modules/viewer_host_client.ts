@@ -732,7 +732,7 @@ export class ViewerHostMcpService {
 		const record = this.getRecord(message.pdf_id);
 		const cwd = record.workspaceCwd || dirname(record.pdfPath);
 		try {
-			const hover = inspectReverseSynctexHover({ pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y, cwd });
+			const hover = inspectReverseSynctexHover({ pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y, cwd, ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) });
 			await this.sendWithReconnect({
 				type: "reverse_synctex_hover_result",
 				pdf_id: message.pdf_id,
@@ -819,6 +819,8 @@ export class ViewerHostMcpService {
 			...(location.sourceLine === undefined ? {} : { source_line: location.sourceLine }),
 			synctex_diagnostics: location.diagnostics,
 			timestamp: new Date().toISOString(),
+			precision: location.precision,
+			...(location.diagnostics.textRepair?.used === true ? { repair: "text_context" } : {}),
 			page: message.page,
 			x: message.x,
 			y: message.y,
@@ -827,11 +829,13 @@ export class ViewerHostMcpService {
 			...(repairedSelection.selectionEnd !== undefined ? { selection_end: repairedSelection.selectionEnd } : selectionEnd === undefined ? {} : { selection_end: { source_file: selectionEnd.sourceFile, line: selectionEnd.line, column: selectionEnd.column, ...(selectionEnd.sourceLine === undefined ? {} : { source_line: selectionEnd.sourceLine }), page: message.page, x: message.selectionEndX as number, y: message.selectionEndY as number } }),
 			...(selectionStartError === undefined ? {} : { selection_start_error: selectionStartError }),
 			...(selectionEndError === undefined ? {} : { selection_end_error: selectionEndError }),
-			...(location.normalizedFormulaSpan === undefined ? {} : {
+			...(location.rawMappedLine === undefined ? {} : {
 				raw_mapped_source_file: location.rawMappedSourceFile,
 				raw_mapped_line: location.rawMappedLine,
 				raw_mapped_column: location.rawMappedColumn,
 				...(location.rawMappedSourceLine === undefined ? {} : { raw_mapped_source_line: location.rawMappedSourceLine }),
+			}),
+			...(location.normalizedFormulaSpan === undefined ? {} : {
 				normalized_formula_span: {
 					source_file: location.normalizedFormulaSpan.sourceFile,
 					start_line: location.normalizedFormulaSpan.startLine,

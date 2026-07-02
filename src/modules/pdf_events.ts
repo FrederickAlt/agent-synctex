@@ -26,6 +26,8 @@ export interface ReverseSynctexPdfEventInput {
 	x?: number;
 	y?: number;
 	selected_text?: string;
+	precision?: "verified" | "text" | "line" | "raw";
+	repair?: string;
 	selection_start?: ReverseSynctexSourceLocationEvent;
 	selection_end?: ReverseSynctexSourceLocationEvent;
 	selection_start_error?: string;

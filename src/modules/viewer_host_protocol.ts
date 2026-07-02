@@ -139,6 +139,8 @@ export interface ViewerHostReverseSynctexHoverMessage {
 	page: number;
 	x: number;
 	y: number;
+	textBeforeSelection?: string;
+	textAfterSelection?: string;
 }
 
 export interface ViewerHostReverseSynctexForwardProbeMessage {
@@ -148,6 +150,8 @@ export interface ViewerHostReverseSynctexForwardProbeMessage {
 	page: number;
 	x: number;
 	y: number;
+	textBeforeSelection?: string;
+	textAfterSelection?: string;
 }
 
 export type ViewerHostToMcpMessage =
@@ -459,7 +463,9 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 			};
 		}
 		case "reverse_synctex_hover":
-		case "reverse_synctex_forward_probe":
+		case "reverse_synctex_forward_probe": {
+			const textBeforeSelection = optionalString(message.textBeforeSelection, "textBeforeSelection");
+			const textAfterSelection = optionalString(message.textAfterSelection, "textAfterSelection");
 			return {
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
@@ -467,7 +473,10 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				page: requirePositiveInteger(message.page, "page"),
 				x: requireCoordinate(message.x, "x"),
 				y: requireCoordinate(message.y, "y"),
+				...(textBeforeSelection === undefined ? {} : { textBeforeSelection }),
+				...(textAfterSelection === undefined ? {} : { textAfterSelection }),
 			};
+		}
 		default:
 			throw new Error(`unknown message type: ${type}`);
 	}

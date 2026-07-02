@@ -908,6 +908,13 @@ function formatReverseSynctexDiagnosticsSummary(diagnostics: unknown): string | 
 		if (typeof context.textAfterSelection === "string") contextParts.push(`after=${compactToolText(context.textAfterSelection, 48)}`);
 		if (contextParts.length > 0) parts.push(`context=${contextParts.join(";")}`);
 	}
+	if (typeof diagnostics.precision === "string") {
+		parts.push(`precision=${diagnostics.precision}`);
+	}
+	const textRepair = diagnostics.textRepair;
+	if (isRecord(textRepair) && textRepair.used === true) {
+		parts.push("repair=text_context");
+	}
 	if (Array.isArray(diagnostics.candidates)) {
 		parts.push(`candidates=${diagnostics.candidates.length}`);
 	}
@@ -936,6 +943,8 @@ function formatPdfEventForTool(event: PdfEvent): string {
 		fields.push(`source_line=${compactToolText(event.source_line)}`);
 	}
 	if (event.page !== undefined) fields.push(`page=${event.page}`);
+	if (event.precision !== undefined) fields.push(`precision=${event.precision}`);
+	if (event.repair !== undefined) fields.push(`repair=${event.repair}`);
 	const selectedText = formatMaybeTextField("selected_text", event.selected_text, 240);
 	if (selectedText !== undefined) fields.push(selectedText);
 	if (event.selection_start !== undefined) fields.push(`selection_start=${event.selection_start.source_file}:line=${event.selection_start.line}:column=${event.selection_start.column}`);

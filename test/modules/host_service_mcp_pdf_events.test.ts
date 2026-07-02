@@ -19,6 +19,8 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 		x: 110,
 		y: 220,
 		selected_text: "chosen formula",
+		precision: "verified",
+		repair: "text_context",
 		selection_start: { source_file: "/tmp/paper/main.tex", line: 40, column: 2, source_line: "\\begin{align}", page: 3, x: 100, y: 210 },
 		selection_end: { source_file: "/tmp/paper/main.tex", line: 42, column: 12, source_line: "  a &= b + c\\\\", page: 3, x: 130, y: 220 },
 		raw_mapped_line: 43,
@@ -32,6 +34,8 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 		normalized_formula_excerpt: "\\begin{align}\n  a &= b + c\\\\\n\\end{align}",
 		synctex_diagnostics: {
 			branch: "js_fallback",
+			precision: "verified",
+			textRepair: { used: true },
 			selected: { sourceFile: "/tmp/paper/main.tex", line: 42, column: 1, sourceLine: "\\section{Visible target}" },
 			context: { hasSelectionContext: true, textBeforeSelection: "formula body", textAfterSelection: "closing delimiter" },
 			candidates: [
@@ -61,6 +65,8 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	assert.match(text, /line=42/);
 	assert.match(text, /source_line=\\section\{Visible target\}/);
 	assert.match(text, /page=3/);
+	assert.match(text, /precision=verified/);
+	assert.match(text, /repair=text_context/);
 	assert.doesNotMatch(text, /\bx=110\b/);
 	assert.doesNotMatch(text, /\by=220\b/);
 	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.x, 110);

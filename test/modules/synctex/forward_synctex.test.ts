@@ -193,6 +193,133 @@ test("reverse SyncTeX candidate score weights x distance twice y distance", () =
 	}
 });
 
+test("robust reverse mapping repairs raw structural winner with unique text context and containing forward box", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["\\documentclass{article}", "\\begin{document}", "\\text{PAGETWODISPLAYINT}\\quad J=1", "\\end{document}"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 2,
+			x: 100,
+			y: 200,
+			cwd: dir,
+			textBeforeSelection: "PAGETWOD",
+			textAfterSelection: "ISPLAYINT",
+			jsFallback: () => ({ input: sourcePath, line: 4, column: 0 }),
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 4, column: 0, sourceLine: "\\end{document}", rect: { left: 99, top: 199, right: 101, bottom: 201 }, distanceX: 0, distanceY: 0, distance: 0, area: 4, containsClick: true, structural: true, structuralReason: "\\end{document}", areaPenalty: 0, structuralPenalty: 1000, score: 1000 },
+				rawWinner: { input: sourcePath, line: 4, column: 0, sourceLine: "\\end{document}", rect: { left: 99, top: 199, right: 101, bottom: 201 }, distanceX: 0, distanceY: 0, distance: 0, area: 4, containsClick: true, structural: true, structuralReason: "\\end{document}", areaPenalty: 0, structuralPenalty: 1000, score: 1000 },
+				candidates: [],
+			}),
+			forwardBoxesForLine: ({ line }) => line === 3 ? [{ page: 2, h: 90, v: 190, W: 30, H: 20 }] : [],
+		});
+		assert.equal(location.line, 3);
+		assert.equal(location.precision, "verified");
+		assert.equal(location.rawMappedLine, 4);
+		assert.equal(location.rawMappedSourceLine, "\\end{document}");
+		assert.equal(location.diagnostics.textRepair?.used, true);
+		assert.equal(location.diagnostics.forwardVerification?.containsClick, true);
+		assert.equal((location.diagnostics.rawWinner as { line?: number }).line, 4);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping uses unique text precision when forward boxes do not contain click", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-text-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", "FIGURETWOSMALLBOX", "\\end{document}"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "FIGURE",
+			textAfterSelection: "TWOSMALLBOX",
+			jsFallback: () => ({ input: sourcePath, line: 3, column: 0 }),
+			forwardBoxesForLine: () => [{ page: 1, h: 200, v: 200, W: 10, H: 10 }],
+		});
+		assert.equal(location.line, 2);
+		assert.equal(location.precision, "text");
+		assert.equal(location.rawMappedLine, 3);
+		assert.equal(location.diagnostics.forwardVerification?.containsClick, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping verifies same-line text repair and preserves raw diagnostics", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-same-line-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", "PAGETWODISPLAYINT", "ranked candidate should not replace verified same-line repair"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "PAGETWOD",
+			textAfterSelection: "ISPLAYINT",
+			jsFallback: () => ({ input: sourcePath, line: 2, column: 0 }),
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 3, column: 0, sourceLine: "ranked candidate should not replace verified same-line repair", rect: { left: 30, top: 30, right: 40, bottom: 40 }, distanceX: 20, distanceY: 20, distance: 28.28, area: 100, containsClick: false, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 60 },
+				rawWinner: { input: sourcePath, line: 2, column: 0, sourceLine: "PAGETWODISPLAYINT", rect: { left: 5, top: 5, right: 20, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 225, containsClick: true, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 0 },
+				candidates: [],
+			}),
+			forwardBoxesForLine: () => [{ page: 1, h: 5, v: 5, W: 20, H: 20 }],
+		});
+		assert.equal(location.line, 2);
+		assert.equal(location.column, 8);
+		assert.equal(location.precision, "verified");
+		assert.equal(location.rawMappedLine, 2);
+		assert.equal(location.diagnostics.textRepair?.used, true);
+		assert.equal(location.diagnostics.forwardVerification?.containsClick, true);
+		assert.equal((location.diagnostics.rawWinner as { line?: number }).line, 2);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse-forward probe default path uses robust text context for forward SyncTeX", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const forwardLines: number[] = [];
+		const probe = mapReverseForwardSynctexProbe({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			textBeforeSelection: "Second",
+			textAfterSelection: "",
+			mapForward: (input) => {
+				forwardLines.push(input.line);
+				assert.equal(input.line, 5);
+				return { page: 1, x: 90, y: 190, ranges: [{ page: 1, h: 90, v: 190, W: 20, H: 10 }], sourceFile: input.sourceFile, line: input.line, sourceLine: "Second paragraph text on a different source line for SyncTeX mapping.", sidecarPath: join(project.dir, "paper.synctex"), branch: "js_fallback", diagnostics: { branch: "js_fallback", lookupInput: { pdfPath: project.pdfPath, sourceFile: input.sourceFile, line: input.line, sidecarPath: join(project.dir, "paper.synctex") }, native: { command: "synctex", args: [], cwd: project.dir, parsedRectangles: [] }, jsFallback: { attempted: true } } };
+			},
+		});
+		assert.deepEqual(forwardLines, [5]);
+		assert.equal(probe.reverse.line, 5);
+		assert.equal(probe.reverse.precision, "text");
+		assert.equal(probe.forward.line, 5);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse-forward probe maps JS reverse inspection result through forward SyncTeX", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
