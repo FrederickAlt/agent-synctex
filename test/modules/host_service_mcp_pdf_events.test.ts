@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { PdfEventStore, type PdfEvent, type ReverseSynctexPdfEventInput } from "../../src/modules/pdf_events.ts";
 import { ViewerHostMcpService, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import type { ReverseSynctexLocation } from "../../src/modules/synctex/forward_synctex.ts";
 import type { McpToViewerHostMessage, ViewerHostControlResponse } from "../../src/modules/viewer_host_protocol.ts";
 
 test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
@@ -21,7 +25,7 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 		selected_text: "chosen formula",
 		precision: "verified",
 		repair: "text_context",
-		selection_start: { source_file: "/tmp/paper/main.tex", line: 40, column: 2, source_line: "\\begin{align}", page: 3, x: 100, y: 210, precision: "verified", repair: "text_context", raw_mapped_line: 43, raw_mapped_source_line: "\\end{align}", synctex_diagnostics: { topCandidates: [{ line: 43 }, { line: 40 }] } },
+		selection_start: { source_file: "/tmp/paper/main.tex", line: 40, column: 2, source_line: "\\begin{align}", page: 3, x: 100, y: 210, precision: "verified", repair: "text_context", raw_mapped_source_file: "/tmp/paper/raw.tex", raw_mapped_line: 43, raw_mapped_source_line: "\\end{align}", synctex_diagnostics: { topCandidates: [{ line: 43 }, { line: 40 }] } },
 		selection_end: { source_file: "/tmp/paper/main.tex", line: 42, column: 12, source_line: "  a &= b + c\\\\", page: 3, x: 130, y: 220, precision: "text", raw_mapped_line: 43, raw_mapped_source_line: "\\end{align}" },
 		raw_mapped_line: 43,
 		raw_mapped_column: 9,
@@ -72,7 +76,7 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.x, 110);
 	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.y, 220);
 	assert.match(text, /selected_text=chosen formula/);
-	assert.match(text, /selection_start=\/tmp\/paper\/main\.tex:line=40:column=2:precision=verified:repair=text_context:raw_mapped_line=43/);
+	assert.match(text, /selection_start=\/tmp\/paper\/main\.tex:line=40:column=2:precision=verified:repair=text_context:raw_mapped_source_file=\/tmp\/paper\/raw\.tex:raw_mapped_line=43/);
 	assert.match(text, /selection_end=\/tmp\/paper\/main\.tex:line=42:column=12:precision=text:raw_mapped_line=43/);
 	assert.doesNotMatch(text, /topCandidates/);
 	assert.match(text, /raw_mapped_line=43/);
@@ -159,6 +163,87 @@ test("Viewer Host MCP service accepts and stores selection debug messages", asyn
 	assert.equal(events[0]?.type, "selection_debug");
 	assert.equal(events[0]?.phase, "send");
 	assert.deepEqual(events[0]?.details, { selectionTextLength: 17, selectedPayloadTextLength: 17 });
+});
+
+function fakeReverseLocation(input: { pdfPath: string; page: number; x: number; y: number; textBeforeSelection?: string; textAfterSelection?: string }, sourcePath: string, line: number, rawLine?: number): ReverseSynctexLocation {
+	return {
+		page: input.page,
+		x: input.x,
+		y: input.y,
+		sourceFile: sourcePath,
+		line,
+		column: 4,
+		sourceLine: `line ${line}`,
+		sidecarPath: input.pdfPath.replace(/\.pdf$/i, ".synctex"),
+		precision: rawLine === undefined ? "line" : "verified",
+		...(rawLine === undefined ? {} : { rawMappedSourceFile: `${sourcePath}.raw`, rawMappedLine: rawLine, rawMappedColumn: 0, rawMappedSourceLine: "\\end{document}" }),
+		diagnostics: {
+			branch: "js",
+			lookupInput: { pdfPath: input.pdfPath, page: input.page, x: input.x, y: input.y, sidecarPath: input.pdfPath.replace(/\.pdf$/i, ".synctex") },
+			native: { command: "synctex", args: [], cwd: join(sourcePath, ".."), attempted: false, role: "fallback" },
+			js: { attempted: true, role: "primary" },
+			context: { hasSelectionContext: input.textBeforeSelection !== undefined || input.textAfterSelection !== undefined, ...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }), ...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }) },
+			candidates: [],
+			selected: { sourceFile: sourcePath, line, column: 4, sourceLine: `line ${line}` },
+			precision: rawLine === undefined ? "line" : "verified",
+			...(rawLine === undefined ? {} : { textRepair: { used: true, status: "unique", fragmentsTried: ["Browser EXACT"], matchCount: 1, selectedFragment: "Browser EXACT", line, column: 4 }, rawWinner: { line: rawLine, sourceLine: "\\end{document}" }, topCandidates: [{ line: rawLine, sourceLine: "\\end{document}" }] }),
+		},
+	};
+}
+
+test("Viewer Host MCP service maps selected range endpoints through robust reverse context and preserves exact selected_text", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "viewer-host-selection-robust-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(sourcePath, "source without browser exact selection\n");
+		const calls: Array<{ x: number; textBeforeSelection?: string; textAfterSelection?: string }> = [];
+		const service = new ViewerHostMcpService({
+			client: new SelectionDebugTestClient(),
+			makePdfId: () => 128,
+			reverseSynctexMapper: (input) => {
+				calls.push({ x: input.x, ...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }), ...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }) });
+				if (input.x === 10) return fakeReverseLocation(input, sourcePath, 66, 78);
+				if (input.x === 20) return fakeReverseLocation(input, sourcePath, 67, 79);
+				return fakeReverseLocation(input, sourcePath, 65);
+			},
+		});
+		await service.openPdf({ protocol_version: 1, request_id: "open", operation: "open_pdf", created_at_ns: 1, workspace_context: { cwd: dir }, details: { pdf_path: pdfPath } });
+		service.handleHostMessage({
+			type: "reverse_synctex",
+			pdf_id: 128,
+			page: 2,
+			x: 15,
+			y: 200,
+			textBeforeSelection: "Before ",
+			textAfterSelection: " After",
+			selectedText: "Browser EXACT",
+			selectionStartX: 10,
+			selectionStartY: 201,
+			selectionEndX: 20,
+			selectionEndY: 202,
+		});
+
+		const events = await service.getPdfEvents({ pdf_id: 128, max_events: 5 });
+		const event = events[0] as Extract<PdfEvent, { type: "reverse_synctex" }> | undefined;
+		assert.equal(event?.selected_text, "Browser EXACT");
+		assert.deepEqual(calls.map((call) => ({ x: call.x, before: call.textBeforeSelection, after: call.textAfterSelection })), [
+			{ x: 15, before: "Before ", after: " After" },
+			{ x: 10, before: "Before ", after: "Browser EXACT" },
+			{ x: 20, before: "Browser EXACT", after: " After" },
+		]);
+		assert.equal(event?.selection_start?.line, 66);
+		assert.equal(event?.selection_start?.precision, "verified");
+		assert.equal(event?.selection_start?.repair, "text_context");
+		assert.equal(event?.selection_start?.raw_mapped_source_file, `${sourcePath}.raw`);
+		assert.equal(event?.selection_start?.raw_mapped_line, 78);
+		assert.equal(event?.selection_start?.raw_mapped_source_line, "\\end{document}");
+		assert.equal(event?.selection_end?.line, 67);
+		assert.equal(event?.selection_end?.raw_mapped_line, 79);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("PdfEventStore default reads return unread events once while stale reads preserve old events", () => {

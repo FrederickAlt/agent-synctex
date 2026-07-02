@@ -921,10 +921,11 @@ function formatReverseSynctexDiagnosticsSummary(diagnostics: unknown): string | 
 	return parts.length > 0 ? `synctex_diagnostics=${parts.join(" ")}` : undefined;
 }
 
-function formatSelectionEndpointForTool(name: string, endpoint: { source_file: string; line: number; column: number; precision?: string; repair?: string; raw_mapped_line?: number; raw_mapped_column?: number; raw_mapped_source_line?: string }): string {
+function formatSelectionEndpointForTool(name: string, endpoint: { source_file: string; line: number; column: number; precision?: string; repair?: string; raw_mapped_source_file?: string; raw_mapped_line?: number; raw_mapped_column?: number; raw_mapped_source_line?: string }): string {
 	const parts = [`${name}=${endpoint.source_file}:line=${endpoint.line}:column=${endpoint.column}`];
 	if (endpoint.precision !== undefined) parts.push(`precision=${endpoint.precision}`);
 	if (endpoint.repair !== undefined) parts.push(`repair=${endpoint.repair}`);
+	if (endpoint.raw_mapped_source_file !== undefined && endpoint.raw_mapped_source_file !== endpoint.source_file) parts.push(`raw_mapped_source_file=${endpoint.raw_mapped_source_file}`);
 	if (endpoint.raw_mapped_line !== undefined) parts.push(`raw_mapped_line=${endpoint.raw_mapped_line}`);
 	if (endpoint.raw_mapped_column !== undefined) parts.push(`raw_mapped_column=${endpoint.raw_mapped_column}`);
 	if (endpoint.raw_mapped_source_line !== undefined) parts.push(`raw_mapped_source_line=${compactToolText(endpoint.raw_mapped_source_line)}`);

@@ -423,12 +423,15 @@ async function waitForProcessExitOrKill(child: ChildProcess, timeoutMs: number):
 	});
 }
 
+type ReverseSynctexMapper = typeof mapReverseSynctex;
+
 export interface ViewerHostMcpServiceOptions {
 	client?: ViewerHostClient;
 	clientFactory?: ViewerHostClientFactory;
 	eventStore?: PdfEventStore;
 	makePdfId?: () => number;
 	nowNs?: () => number;
+	reverseSynctexMapper?: ReverseSynctexMapper;
 }
 
 export class ViewerHostMcpService {
@@ -441,6 +444,7 @@ export class ViewerHostMcpService {
 	private readonly eventStore: PdfEventStore;
 	private readonly makePdfId: () => number;
 	private readonly nowNs: () => number;
+	private readonly reverseSynctexMapper: ReverseSynctexMapper;
 	private readonly recordsById = new Map<number, TrackedViewerHostPdf>();
 	private readonly recordsByPath = new Map<string, TrackedViewerHostPdf>();
 	readonly pdfOperations: HostServiceMcpPdfOperations;
@@ -458,6 +462,7 @@ export class ViewerHostMcpService {
 		this.eventStore = options.eventStore ?? new PdfEventStore();
 		this.makePdfId = options.makePdfId ?? (() => randomInt(MIN_PDF_ID, MAX_PDF_ID + 1));
 		this.nowNs = options.nowNs ?? (() => Date.now() * 1_000_000);
+		this.reverseSynctexMapper = options.reverseSynctexMapper ?? mapReverseSynctex;
 		this.pdfOperations = {
 			openPdf: (request) => this.openPdf(request),
 			jumpPdf: (request) => this.jumpPdf(request),
@@ -807,7 +812,7 @@ export class ViewerHostMcpService {
 	private appendReverseSynctexEvent(message: ViewerHostReverseSynctexMessage): void {
 		const record = this.getRecord(message.pdf_id);
 		const cwd = record.workspaceCwd || dirname(record.pdfPath);
-		const location = mapReverseSynctex({
+		const location = this.reverseSynctexMapper({
 			pdfPath: record.pdfPath,
 			page: message.page,
 			x: message.x,
@@ -823,7 +828,7 @@ export class ViewerHostMcpService {
 		let selectionStartError: string | undefined;
 		if (message.selectedText !== undefined && message.selectionStartX !== undefined && message.selectionStartY !== undefined) {
 			try {
-				selectionStart = mapReverseSynctex({
+				selectionStart = this.reverseSynctexMapper({
 					pdfPath: record.pdfPath,
 					page: message.page,
 					x: message.selectionStartX,
@@ -843,7 +848,7 @@ export class ViewerHostMcpService {
 		let selectionEndError: string | undefined;
 		if (message.selectedText !== undefined && message.selectionEndX !== undefined && message.selectionEndY !== undefined) {
 			try {
-				selectionEnd = mapReverseSynctex({
+				selectionEnd = this.reverseSynctexMapper({
 					pdfPath: record.pdfPath,
 					page: message.page,
 					x: message.selectionEndX,
