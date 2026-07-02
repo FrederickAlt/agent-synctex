@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
 import { inspectSyncTeXToTeX, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar } from "./latex_workshop/worker.ts";
+import { lineColumnForSourceIndex } from "./source_index.ts";
 import { readSourceLine } from "./source_line.ts";
 
 export interface ForwardSynctexTarget {
@@ -553,25 +554,6 @@ function lowQualityNativeReverseSourceLineReason(mapped: ReverseSynctexMappedRes
 	const sourceLine = readSourceLine(resolveReverseMappedSourceFile(mapped, cwd), mapped.line, cwd);
 	if (sourceLine?.trim() === "\\end{document}") return "native result is low-quality/end-document";
 	return undefined;
-}
-
-function lineColumnForSourceIndex(source: string, index: number): { line: number; column: number } {
-	let line = 1;
-	let column = 0;
-	for (let pos = 0; pos < index; pos += 1) {
-		const char = source[pos];
-		if (char === "\r") {
-			if (source[pos + 1] === "\n") pos += 1;
-			line += 1;
-			column = 0;
-		} else if (char === "\n") {
-			line += 1;
-			column = 0;
-		} else {
-			column += 1;
-		}
-	}
-	return { line, column };
 }
 
 export function findUniqueSelectedTextSourceRange(sourceFile: string, selectedText: string): SelectedTextSourceRange | undefined {
