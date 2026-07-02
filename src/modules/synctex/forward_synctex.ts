@@ -15,7 +15,7 @@ export interface ForwardSynctexTarget {
 }
 
 export type ForwardSynctexBranch = "native" | "js_fallback";
-export type ReverseSynctexBranch = "native" | "js_fallback";
+export type ReverseSynctexBranch = "js" | "native_fallback";
 
 export interface ForwardSynctexJump {
 	page: number;
@@ -150,6 +150,8 @@ export interface ReverseSynctexDiagnostics {
 		command: string;
 		args: string[];
 		cwd: string;
+		attempted: boolean;
+		role: "fallback";
 		status?: number | null;
 		stdout?: string;
 		stderr?: string;
@@ -157,8 +159,9 @@ export interface ReverseSynctexDiagnostics {
 		failureReason?: string;
 		parsedResult?: ReverseSynctexMappedResult;
 	};
-	jsFallback?: {
+	js: {
 		attempted: boolean;
+		role: "primary";
 		result?: ReverseSynctexMappedResult;
 		failureReason?: string;
 	};
@@ -663,6 +666,8 @@ function runNativeReverseSynctex(input: { page: number; x: number; y: number; pd
 			command: input.command,
 			args,
 			cwd,
+			attempted: true,
+			role: "fallback",
 			status: result.status,
 			stdout: result.stdout,
 			stderr: result.stderr,
@@ -697,56 +702,80 @@ export function mapReverseSynctex(input: {
 		throw new Error(`PDF ${pdfPath} is missing SyncTeX sidecar (${pdfPath.replace(/\.pdf$/i, "")}.synctex or .synctex.gz)`);
 	}
 
-	const native = runNativeReverseSynctex({
-		page: input.page,
-		x: input.x,
-		y: input.y,
-		pdfPath,
-		runner: input.nativeRunner ?? defaultNativeSynctexRunner,
-		command: input.synctexCommand ?? "synctex",
-	});
-	let mapped = native.mapped;
-	let nativeFailureReason = native.failureReason;
-	if (mapped !== undefined) {
-		const invalidReason = invalidReadableSourceLineReason(mapped, input.cwd) ?? lowQualityNativeReverseSourceLineReason(mapped, input.cwd);
-		if (invalidReason !== undefined) {
-			nativeFailureReason = invalidReason;
-			mapped = undefined;
-		}
-	}
-	let branch: ReverseSynctexBranch = "native";
-	let jsFallback: ReverseSynctexDiagnostics["jsFallback"] | undefined;
-	if (mapped === undefined) {
-		let jsMapped;
-		let jsFailureReason: string | undefined;
-		const previousCwd = process.cwd();
-		try {
-			process.chdir(input.cwd);
-			jsMapped = (input.jsFallback ?? syncTeXToTeX)(input.page, input.x, input.y, pdfPath);
-			if (jsMapped === undefined) jsFailureReason = "no result";
-			else {
-				const invalidReason = invalidReadableSourceLineReason(jsMapped, input.cwd);
-				if (invalidReason !== undefined) {
-					jsMapped = undefined;
-					jsFailureReason = invalidReason;
-				}
+	let jsMapped;
+	let jsResult: ReverseSynctexMappedResult | undefined;
+	let jsFailureReason: string | undefined;
+	let allowNativeFallback = false;
+	const previousCwd = process.cwd();
+	try {
+		process.chdir(input.cwd);
+		jsResult = (input.jsFallback ?? syncTeXToTeX)(input.page, input.x, input.y, pdfPath);
+		if (jsResult === undefined) {
+			jsFailureReason = "no result";
+			allowNativeFallback = true;
+		} else {
+			const invalidReason = invalidReadableSourceLineReason(jsResult, input.cwd);
+			if (invalidReason === undefined) {
+				jsMapped = jsResult;
+			} else {
+				jsFailureReason = invalidReason;
 			}
-		} catch (error) {
-			jsMapped = undefined;
-			jsFailureReason = error instanceof Error ? error.message : String(error);
-		} finally {
-			process.chdir(previousCwd);
 		}
-		jsFallback = {
+	} catch (error) {
+		jsMapped = undefined;
+		jsFailureReason = error instanceof Error ? error.message : String(error);
+		allowNativeFallback = true;
+	} finally {
+		process.chdir(previousCwd);
+	}
+	const jsDiagnostics: ReverseSynctexDiagnostics["js"] = {
+		attempted: true,
+		role: "primary",
+		...(jsResult === undefined ? {} : { result: jsResult }),
+		...(jsFailureReason === undefined ? {} : { failureReason: jsFailureReason }),
+	};
+	let mapped = jsMapped;
+	let branch: ReverseSynctexBranch = "js";
+	const nativeCommand = input.synctexCommand ?? "synctex";
+	const nativeArgs = ["edit", "-o", `${input.page}:${input.x}:${input.y}:${pdfPath}`];
+	const nativeCwd = dirname(pdfPath);
+	let nativeDiagnostics: ReverseSynctexDiagnostics["native"] = {
+		command: nativeCommand,
+		args: nativeArgs,
+		cwd: nativeCwd,
+		attempted: false,
+		role: "fallback",
+		failureReason: "not attempted because primary JS lookup succeeded",
+	};
+	if (mapped === undefined && allowNativeFallback) {
+		const native = runNativeReverseSynctex({
+			page: input.page,
+			x: input.x,
+			y: input.y,
+			pdfPath,
+			runner: input.nativeRunner ?? defaultNativeSynctexRunner,
+			command: nativeCommand,
+		});
+		let nativeFailureReason = native.failureReason;
+		mapped = native.mapped;
+		if (mapped !== undefined) {
+			const invalidReason = invalidReadableSourceLineReason(mapped, input.cwd) ?? lowQualityNativeReverseSourceLineReason(mapped, input.cwd);
+			if (invalidReason !== undefined) {
+				nativeFailureReason = invalidReason;
+				mapped = undefined;
+			}
+		}
+		nativeDiagnostics = {
+			...native.diagnostics,
 			attempted: true,
-			...(jsMapped === undefined ? {} : { result: jsMapped }),
-			...(jsFailureReason === undefined ? {} : { failureReason: jsFailureReason }),
+			role: "fallback",
+			...(nativeFailureReason === undefined ? {} : { failureReason: nativeFailureReason }),
 		};
-		mapped = jsMapped;
-		branch = "js_fallback";
+		branch = "native_fallback";
 	}
 	if (mapped === undefined) {
-		throw new Error(`No SyncTeX mapping found for page ${input.page} at ${input.x},${input.y}; native synctex edit returned ${nativeFailureReason ?? "no usable result"}; JS fallback returned ${jsFallback?.failureReason ?? "no result"}`);
+		const nativeFallbackResult = nativeDiagnostics.attempted ? `native fallback returned ${nativeDiagnostics.failureReason ?? "no usable result"}` : "native fallback was not attempted";
+		throw new Error(`No SyncTeX mapping found for page ${input.page} at ${input.x},${input.y}; primary JS lookup returned ${jsFailureReason ?? "no result"}; ${nativeFallbackResult}`);
 	}
 
 	const sourceFile = resolveReverseMappedSourceFile(mapped, input.cwd);
@@ -792,11 +821,8 @@ export function mapReverseSynctex(input: {
 	const diagnostics: ReverseSynctexDiagnostics = {
 		branch,
 		lookupInput: { pdfPath, page: input.page, x: input.x, y: input.y, sidecarPath },
-		native: {
-			...native.diagnostics,
-			...(nativeFailureReason === undefined ? {} : { failureReason: nativeFailureReason }),
-		},
-		...(jsFallback === undefined ? {} : { jsFallback }),
+		native: nativeDiagnostics,
+		js: jsDiagnostics,
 		context: {
 			hasSelectionContext,
 			...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }),

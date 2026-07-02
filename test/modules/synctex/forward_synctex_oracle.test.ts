@@ -288,7 +288,6 @@ function drawVisualArtifacts(fixture: { pdfPath: string; texPath: string }, view
 }
 
 const skipReason = oracleSkipReason();
-const reverseSkipReason = skipReason ?? (!executableOnPath("synctex") ? "requires synctex on PATH" : undefined);
 
 test("forward SyncTeX markers for align* fixtures intentionally follow LaTeX-Workshop point output", skipReason ? { skip: skipReason } : {}, async () => {
 	const fixture = compileFixture(SIMPLE_ALIGN_LINES);
@@ -328,7 +327,7 @@ test("forward SyncTeX markers for align* fixtures intentionally follow LaTeX-Wor
 	}
 });
 
-test("native reverse SyncTeX improves real aligned display math clicks over JS fallback", reverseSkipReason ? { skip: reverseSkipReason } : {}, async () => {
+test("reverse SyncTeX defaults to JS for real aligned display math clicks", skipReason ? { skip: skipReason } : {}, async () => {
 	const fixture = compileFixture();
 	try {
 		const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs") as unknown as PdfJsLibLike;
@@ -361,7 +360,7 @@ test("native reverse SyncTeX improves real aligned display math clicks over JS f
 					cwd: fixture.dir,
 					nativeRunner: forceJsFallbackNativeRunner,
 				});
-				const nativeLocation = mapReverseSynctex({
+				const defaultLocation = mapReverseSynctex({
 					pdfPath: fixture.pdfPath,
 					page: payload.page,
 					x: payload.x,
@@ -369,9 +368,10 @@ test("native reverse SyncTeX improves real aligned display math clicks over JS f
 					cwd: fixture.dir,
 				});
 
-				assert.equal(nativeLocation.diagnostics.branch, "native", `${label} should use native reverse branch`);
-				assert.equal(nativeLocation.line, expectedLine, `${label} native reverse should resolve the clicked aligned row`);
-				assert.notEqual(jsLocation.line, expectedLine, `${label} JS fallback should reproduce the aligned display-math mis-map this fixture guards`);
+				assert.equal(defaultLocation.diagnostics.branch, "js", `${label} should use JS as the default reverse branch`);
+				assert.equal(defaultLocation.diagnostics.native.attempted, false, `${label} should not run native when JS succeeds`);
+				assert.equal(defaultLocation.line, jsLocation.line, `${label} default reverse lookup should match the JS implementation`);
+				assert.notEqual(defaultLocation.line, expectedLine, `${label} JS parity preserves the aligned display-math point-only mapping`);
 			}
 		} finally {
 			await document.destroy?.();

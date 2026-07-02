@@ -358,10 +358,40 @@ test("LaTeX-Workshop-derived syncTeXToTeX maps realistic .synctex fixture coordi
 	}
 });
 
-test("native reverse SyncTeX success avoids JS fallback", () => {
+test("reverse SyncTeX defaults to the LaTeX-Workshop JS worker and avoids native when JS succeeds", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
-		const calls: Array<{ command: string; args: string[]; cwd: string }> = [];
+		let nativeCalls = 0;
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: () => {
+				nativeCalls += 1;
+				throw new Error("native fallback should not run after JS success");
+			},
+		});
+
+		assert.equal(nativeCalls, 0);
+		assert.equal(location.sourceFile, project.sourcePath);
+		assert.equal(location.line, 3);
+		assert.equal(location.column, 0);
+		assert.equal(location.diagnostics.branch, "js");
+		assert.deepEqual(location.diagnostics.js.result, { input: "main.tex", line: 3, column: 0 });
+		assert.equal(location.diagnostics.js.role, "primary");
+		assert.equal(location.diagnostics.native.attempted, false);
+		assert.equal(location.diagnostics.native.role, "fallback");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("native reverse SyncTeX is fallback only after JS returns no result", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const nativeCalls: Array<{ command: string; args: string[]; cwd: string }> = [];
 		const location = mapReverseSynctex({
 			pdfPath: project.pdfPath,
 			page: 1,
@@ -369,64 +399,93 @@ test("native reverse SyncTeX success avoids JS fallback", () => {
 			y: 155.27,
 			cwd: project.dir,
 			nativeRunner: (command, args, options) => {
-				calls.push({ command, args, cwd: options.cwd });
+				nativeCalls.push({ command, args, cwd: options.cwd });
 				return {
 					status: 0,
 					stdout: "SyncTeX result begin\nOutput:paper.pdf\nInput:main.tex\nLine:3\nColumn:-1\nOffset:0\nContext:\nSyncTeX result end\n",
 					stderr: "",
 				};
 			},
-			jsFallback: () => {
-				throw new Error("JS fallback should not be invoked after native success");
-			},
+			jsFallback: () => undefined,
 		});
 
-		assert.equal(calls.length, 1);
-		assert.equal(calls[0]?.command, "synctex");
-		assert.deepEqual(calls[0]?.args, ["edit", "-o", `1:144.27:155.27:${project.pdfPath}`]);
-		assert.equal(calls[0]?.cwd, dirname(project.pdfPath));
-		assert.equal(location.sourceFile, project.sourcePath);
-		assert.equal(location.line, 3);
-		assert.equal(location.column, 0);
-		assert.equal(location.diagnostics.branch, "native");
+		assert.deepEqual(nativeCalls, [{ command: "synctex", args: ["edit", "-o", `1:144.27:155.27:${project.pdfPath}`], cwd: dirname(project.pdfPath) }]);
+		assert.equal(location.diagnostics.branch, "native_fallback");
+		assert.equal(location.diagnostics.js.attempted, true);
+		assert.equal(location.diagnostics.js.role, "primary");
+		assert.equal(location.diagnostics.js.failureReason, "no result");
+		assert.equal(location.diagnostics.native.attempted, true);
 		assert.equal(location.diagnostics.native.status, 0);
 		assert.deepEqual(location.diagnostics.native.parsedResult, { input: "main.tex", line: 3, column: 0 });
-		assert.equal(location.diagnostics.jsFallback, undefined);
+		assert.equal(location.line, 3);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
 
-test("native reverse SyncTeX failure falls back to the existing LaTeX-Workshop JS parser", () => {
+test("native reverse SyncTeX is fallback after JS lookup throws", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
-		const fallbackCalls: Array<{ page: number; x: number; y: number; pdfPath: string }> = [];
+		let nativeCalls = 0;
 		const location = mapReverseSynctex({
 			pdfPath: project.pdfPath,
 			page: 1,
 			x: 144.27,
 			y: 155.27,
 			cwd: project.dir,
-			nativeRunner: () => ({ status: 1, stdout: "", stderr: "native failed" }),
-			jsFallback: (page, x, y, pdfPath) => {
-				fallbackCalls.push({ page, x, y, pdfPath });
-				return syncTeXToTeX(page, x, y, pdfPath);
+			nativeRunner: () => {
+				nativeCalls += 1;
+				return {
+					status: 0,
+					stdout: "SyncTeX result begin\nOutput:paper.pdf\nInput:main.tex\nLine:3\nColumn:0\nSyncTeX result end\n",
+					stderr: "",
+				};
+			},
+			jsFallback: () => {
+				throw new Error("JS sidecar parse failed");
 			},
 		});
 
-		assert.deepEqual(fallbackCalls, [{ page: 1, x: 144.27, y: 155.27, pdfPath: project.pdfPath }]);
-		assert.equal(location.diagnostics.branch, "js_fallback");
-		assert.equal(location.diagnostics.native.status, 1);
-		assert.match(location.diagnostics.native.failureReason ?? "", /native failed/);
-		assert.equal(location.diagnostics.jsFallback?.attempted, true);
-		assert.deepEqual(location.diagnostics.jsFallback?.result, { input: "main.tex", line: 3, column: 0 });
+		assert.equal(nativeCalls, 1);
+		assert.equal(location.diagnostics.branch, "native_fallback");
+		assert.equal(location.diagnostics.js.failureReason, "JS sidecar parse failed");
+		assert.equal(location.diagnostics.native.attempted, true);
 		assert.equal(location.line, 3);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
 
-test("native reverse SyncTeX invalid source line falls back before accepting the mapping", () => {
+test("native reverse SyncTeX is not fallback after JS returns an invalid source line", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		let nativeCalls = 0;
+		assert.throws(
+			() => mapReverseSynctex({
+				pdfPath: project.pdfPath,
+				page: 1,
+				x: 144.27,
+				y: 155.27,
+				cwd: project.dir,
+				nativeRunner: () => {
+					nativeCalls += 1;
+					return {
+						status: 0,
+						stdout: "SyncTeX result begin\nOutput:paper.pdf\nInput:main.tex\nLine:3\nColumn:0\nSyncTeX result end\n",
+						stderr: "",
+					};
+				},
+				jsFallback: () => ({ input: "main.tex", line: 8737, column: 0 }),
+			}),
+			/outside readable source line range.*native fallback was not attempted/,
+		);
+		assert.equal(nativeCalls, 0);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX JS primary result is accepted before native invalid source line is considered", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		let fallbackCalls = 0;
@@ -448,15 +507,16 @@ test("native reverse SyncTeX invalid source line falls back before accepting the
 		});
 
 		assert.equal(fallbackCalls, 1);
-		assert.equal(location.diagnostics.branch, "js_fallback");
-		assert.match(location.diagnostics.native.failureReason ?? "", /outside readable source line range/);
+		assert.equal(location.diagnostics.branch, "js");
+		assert.equal(location.diagnostics.native.attempted, false);
+		assert.deepEqual(location.diagnostics.js.result, { input: "main.tex", line: 3, column: 0 });
 		assert.equal(location.line, 3);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
 
-test("native reverse SyncTeX mapping to readable \\end{document} falls back before accepting the mapping", () => {
+test("reverse SyncTeX JS primary result is accepted before native low-quality end-document fallback", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		writeFileSync(project.sourcePath, [
@@ -485,17 +545,17 @@ test("native reverse SyncTeX mapping to readable \\end{document} falls back befo
 		});
 
 		assert.equal(fallbackCalls, 1);
-		assert.equal(location.diagnostics.branch, "js_fallback");
+		assert.equal(location.diagnostics.branch, "js");
+		assert.equal(location.diagnostics.native.attempted, false);
 		assert.equal(location.line, 3);
 		assert.equal(location.sourceLine, "Useful equation source line");
-		assert.match(location.diagnostics.native.failureReason ?? "", /low-quality\/end-document/);
-		assert.deepEqual(location.diagnostics.jsFallback?.result, { input: "main.tex", line: 3, column: 0 });
+		assert.deepEqual(location.diagnostics.js.result, { input: "main.tex", line: 3, column: 0 });
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
 
-test("native reverse SyncTeX no-result falls back to the existing LaTeX-Workshop JS parser", () => {
+test("reverse SyncTeX default uses LaTeX-Workshop JS parser before native no-result fallback", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		let fallbackCalls = 0;
@@ -513,20 +573,21 @@ test("native reverse SyncTeX no-result falls back to the existing LaTeX-Workshop
 		});
 
 		assert.equal(fallbackCalls, 1);
-		assert.equal(location.diagnostics.branch, "js_fallback");
-		assert.equal(location.diagnostics.native.failureReason, "no usable result");
+		assert.equal(location.diagnostics.branch, "js");
+		assert.equal(location.diagnostics.native.attempted, false);
 		assert.equal(location.line, 3);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
 
-test("native reverse SyncTeX can select a smoke-style formula source line when JS would select a closing line", () => {
+test("reverse SyncTeX keeps JS lookup semantics when formula normalization can enrich a closing line", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		writeFileSync(project.sourcePath, Array.from({ length: 20 }, (_, index) => {
 			const line = index + 1;
-			if (line === 16) return "  a &= b + c \\\\";
+			if (line === 16) return "\\begin{align}";
+			if (line === 17) return "  a &= b + c \\\\";
 			if (line === 20) return "\\end{align}";
 			return `% line ${line}`;
 		}).join("\n"));
@@ -544,10 +605,11 @@ test("native reverse SyncTeX can select a smoke-style formula source line when J
 			jsFallback: () => ({ input: "main.tex", line: 20, column: 0 }),
 		});
 
-		assert.equal(location.diagnostics.branch, "native");
-		assert.equal(location.line, 16);
-		assert.equal(location.sourceLine, "  a &= b + c \\\\ ".trimEnd());
-		assert.equal(location.diagnostics.jsFallback, undefined);
+		assert.equal(location.diagnostics.branch, "js");
+		assert.equal(location.diagnostics.native.attempted, false);
+		assert.equal(location.line, 20);
+		assert.equal(location.sourceLine, "\\end{align}");
+		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 16, endLine: 20 });
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -648,17 +710,13 @@ test("reverse SyncTeX adapter normalizes align and align* closing lines", () => 
 				x: 144.27,
 				y: 155.27,
 				cwd: project.dir,
-				nativeRunner: () => ({
-					status: 0,
-					stdout: `SyncTeX result begin\nOutput:paper.pdf\nInput:main.tex\nLine:3\nColumn:0\nSyncTeX result end\n`,
-					stderr: "",
-				}),
-				jsFallback: () => {
-					throw new Error("JS fallback should not be invoked after native success");
+				nativeRunner: () => {
+					throw new Error("native fallback should not be invoked after JS success");
 				},
+				jsFallback: () => ({ input: "main.tex", line: 3, column: 0 }),
 			});
 
-			assert.equal(location.diagnostics.branch, "native");
+			assert.equal(location.diagnostics.branch, "js");
 			assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
 			assert.equal(location.normalizedFormulaExcerpt, `\\begin{${environment}}\n  a &= b \\\\\n\\end{${environment}}`);
 		} finally {
