@@ -264,7 +264,7 @@ test("robust reverse mapping verifies same-line text repair and preserves raw di
 		const sourcePath = join(dir, "main.tex");
 		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
 		writeFileSync(join(dir, "paper.synctex"), "fixture");
-		writeFileSync(sourcePath, ["aaa", "PAGETWODISPLAYINT", "\\end{document}"].join("\n"));
+		writeFileSync(sourcePath, ["aaa", "PAGETWODISPLAYINT", "ranked candidate should not replace verified same-line repair"].join("\n"));
 		const location = mapReverseSynctex({
 			pdfPath,
 			page: 1,
@@ -275,7 +275,7 @@ test("robust reverse mapping verifies same-line text repair and preserves raw di
 			textAfterSelection: "ISPLAYINT",
 			jsFallback: () => ({ input: sourcePath, line: 2, column: 0 }),
 			inspectCandidates: () => ({
-				winner: { input: sourcePath, line: 2, column: 0, sourceLine: "PAGETWODISPLAYINT", rect: { left: 5, top: 5, right: 20, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 225, containsClick: true, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 0 },
+				winner: { input: sourcePath, line: 3, column: 0, sourceLine: "ranked candidate should not replace verified same-line repair", rect: { left: 30, top: 30, right: 40, bottom: 40 }, distanceX: 20, distanceY: 20, distance: 28.28, area: 100, containsClick: false, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 60 },
 				rawWinner: { input: sourcePath, line: 2, column: 0, sourceLine: "PAGETWODISPLAYINT", rect: { left: 5, top: 5, right: 20, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 225, containsClick: true, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 0 },
 				candidates: [],
 			}),

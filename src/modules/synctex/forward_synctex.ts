@@ -1028,7 +1028,8 @@ export function mapReverseSynctex(input: {
 		}
 	}
 
-	if (selectedMapped === mapped && branch === "js" && candidateInspection !== undefined && candidateInspection.winner.line !== rawMappedLine) {
+	const acceptedTextRepair = textRepair?.used === true || precision === "verified" || precision === "text";
+	if (!acceptedTextRepair && selectedMapped === mapped && branch === "js" && candidateInspection !== undefined && candidateInspection.winner.line !== rawMappedLine) {
 		selectedMapped = candidateToMapped(candidateInspection.winner);
 		sourceFile = resolveReverseMappedSourceFile(selectedMapped, input.cwd);
 		line = selectedMapped.line;
