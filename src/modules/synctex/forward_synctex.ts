@@ -980,6 +980,7 @@ export function mapReverseSynctex(input: {
 	const hasSelectionContext = input.textBeforeSelection !== undefined || input.textAfterSelection !== undefined;
 	let textRepair: ReverseSynctexDiagnostics["textRepair"] | undefined;
 	let forwardVerification: ReverseSynctexDiagnostics["forwardVerification"] | undefined;
+	let textRepairChangedLocation = false;
 
 	if (branch === "js" && hasSelectionContext) {
 		const fragments = buildSourceSearchFragments(input.textBeforeSelection ?? "", input.textAfterSelection ?? "");
@@ -1012,13 +1013,17 @@ export function mapReverseSynctex(input: {
 				...(verified.chosenBox === undefined ? {} : { chosenBox: verified.chosenBox }),
 				containsClick: verified.containsClick,
 			};
-			if (verified.match !== undefined && verified.match.line !== rawMappedLine && (matches.status === "unique" || verified.chosenBox !== undefined)) {
-				selectedMapped = { input: verified.match.sourceFile, line: verified.match.line, column: verified.match.column };
-				sourceFile = verified.match.sourceFile;
-				line = verified.match.line;
-				column = verified.match.column;
+			if (verified.match !== undefined && (matches.status === "unique" || verified.chosenBox !== undefined)) {
+				const sameRawLine = verified.match.sourceFile === rawSourceFile && verified.match.line === rawMappedLine;
+				if (!sameRawLine) {
+					selectedMapped = { input: verified.match.sourceFile, line: verified.match.line, column: verified.match.column };
+					sourceFile = verified.match.sourceFile;
+					line = verified.match.line;
+					column = verified.match.column;
+					textRepairChangedLocation = true;
+				}
 				precision = verified.precision;
-				textRepair = { ...textRepair, used: true, line, column };
+				textRepair = { ...textRepair, used: true, line: verified.match.line, column: verified.match.column };
 			}
 		}
 	}
@@ -1032,7 +1037,7 @@ export function mapReverseSynctex(input: {
 	}
 
 	const sourceLines = readSourceLines(sourceFile);
-	if (column === 0 && hasSelectionContext && sourceLines !== undefined && precision !== "verified" && precision !== "text") {
+	if (column === 0 && hasSelectionContext && sourceLines !== undefined && !textRepairChangedLocation) {
 		const [row, col] = getRowAndColumn(sourceLines, line - 1, input.textBeforeSelection ?? "", input.textAfterSelection ?? "");
 		line = row + 1;
 		column = col;
