@@ -6,7 +6,7 @@ import { gzipSync } from "node:zlib";
 import * as iconv from "iconv-lite";
 import { test } from "node:test";
 import { findUniqueSelectedTextSourceRange, mapForwardSynctex, mapReverseForwardSynctexProbe, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
-import { findInputFilePathForward, inspectSyncTeXToTeX, syncTeXToPDF, syncTeXToTeX } from "../../../src/modules/synctex/latex_workshop/worker.ts";
+import { collectReverseSyncTeXCandidatesFromParsed, findInputFilePathForward, inspectSyncTeXToTeX, inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX } from "../../../src/modules/synctex/latex_workshop/worker.ts";
 import type { PdfSyncObject } from "../../../src/modules/synctex/latex_workshop/synctexjs.ts";
 
 const FIXTURE_DIR = resolve("test/fixtures/synctex-forward");
@@ -30,6 +30,168 @@ function writeGzipSynctex(sidecarPath: string, body: string, encoding: BufferEnc
 }
 
 const failNativeRunner = () => ({ status: 1, stdout: "", stderr: "native disabled for JS fallback assertion" });
+
+function syntheticParsedReverseFixture(lines: string[], blocksByLine: Array<{ line: number; left: number; bottom: number; width: number; height: number; page?: number }>, options: { inputPath?: string } = {}): { dir: string; sourcePath: string; parsed: PdfSyncObject } {
+	const dir = mkdtempSync(join(tmpdir(), "reverse-synctex-candidates-"));
+	const sourcePath = join(dir, "main.tex");
+	const inputPath = options.inputPath ?? sourcePath;
+	writeFileSync(sourcePath, lines.join("\n"));
+	const blockNumberLine: PdfSyncObject["blockNumberLine"] = { [inputPath]: {} };
+	for (const spec of blocksByLine) {
+		const page = spec.page ?? 1;
+		blockNumberLine[inputPath]![spec.line] ??= {};
+		blockNumberLine[inputPath]![spec.line]![page] ??= [];
+		blockNumberLine[inputPath]![spec.line]![page]!.push({
+			type: "h",
+			parent: { page, blocks: [], type: "page" },
+			fileNumber: 1,
+			file: { path: inputPath },
+			line: spec.line,
+			left: spec.left,
+			bottom: spec.bottom,
+			width: spec.width,
+			height: spec.height,
+			page,
+		});
+	}
+	return {
+		dir,
+		sourcePath,
+		parsed: {
+			offset: { x: 0, y: 0 },
+			version: "synthetic",
+			files: { 1: { path: inputPath } },
+			pages: {},
+			blockNumberLine,
+			hBlocks: [],
+			numberPages: 1,
+		},
+	};
+}
+
+test("reverse SyncTeX candidate collection preserves current raw winner", () => {
+	const fixture = syntheticParsedReverseFixture(["one", "two", "three"], [
+		{ line: 1, left: 100, bottom: 110, width: 10, height: 10 },
+		{ line: 2, left: 0, bottom: 10, width: 10, height: 10 },
+	]);
+	try {
+		const inspection = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 5, 5, { minCandidates: 1, maxCandidates: 10, minDistance: 1 });
+		assert.ok(inspection, "expected reverse candidates");
+		assert.equal(inspection.rawWinner.line, 2);
+		assert.equal(inspection.winner.line, 2);
+		assert.equal(Number.isFinite(inspection.winner.distance), true);
+		assert.ok(inspection.candidates.length >= 1);
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX public raw inspection matches candidate rawWinner", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	const previousCwd = process.cwd();
+	try {
+		process.chdir(project.dir);
+		const publicRaw = inspectSyncTeXToTeX(1, 144.27, 155.27, project.pdfPath);
+		const candidates = inspectSyncTeXToTeXCandidates(1, 144.27, 155.27, project.pdfPath);
+		assert.ok(publicRaw);
+		assert.ok(candidates);
+		assert.deepEqual({ input: candidates.rawWinner.input, line: candidates.rawWinner.line, column: candidates.rawWinner.column }, { input: publicRaw.input, line: publicRaw.line, column: publicRaw.column });
+		assert.deepEqual(candidates.rawWinner.rect, publicRaw.rect);
+	} finally {
+		process.chdir(previousCwd);
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX candidate collection preserves rawWinner for unresolvable input paths", () => {
+	const inputPath = "/definitely/unresolvable/main.tex";
+	const fixture = syntheticParsedReverseFixture(["one", "two"], [
+		{ line: 1, left: 0, bottom: 10, width: 10, height: 10 },
+		{ line: 2, left: 100, bottom: 110, width: 10, height: 10 },
+	], { inputPath });
+	try {
+		const inspection = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 5, 5, { minCandidates: 1, maxCandidates: 10, minDistance: 1 });
+		assert.ok(inspection);
+		assert.equal(inspection.rawWinner.input, inputPath);
+		assert.equal(inspection.rawWinner.line, 1);
+		assert.equal(inspection.candidates.some((candidate) => candidate.input === inputPath && candidate.line === 1), true);
+		assert.equal(inspection.rawWinner.sourceLine, undefined);
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX candidate collection fills minCandidates from nearest blocks", () => {
+	const fixture = syntheticParsedReverseFixture(["one", "two", "three", "four", "five"], [
+		{ line: 1, left: 0, bottom: 10, width: 10, height: 10 },
+		{ line: 2, left: 20, bottom: 10, width: 10, height: 10 },
+		{ line: 3, left: 40, bottom: 10, width: 10, height: 10 },
+		{ line: 4, left: 60, bottom: 10, width: 10, height: 10 },
+		{ line: 5, left: 80, bottom: 10, width: 10, height: 10 },
+	]);
+	try {
+		const inspection = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 5, 5, { minCandidates: 4, maxCandidates: 10, minDistance: 1 });
+		assert.ok(inspection);
+		assert.equal(inspection.candidates.length, 4);
+		assert.deepEqual(inspection.candidates.map((candidate) => candidate.line), [1, 2, 3, 4]);
+		assert.ok(inspection.candidates.every((candidate, index, candidates) => index === 0 || candidate.score >= candidates[index - 1]!.score));
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX candidate collection keeps many nearby candidates up to maxCandidates", () => {
+	const fixture = syntheticParsedReverseFixture(["one", "two", "three", "four", "five"], [
+		{ line: 1, left: 0, bottom: 10, width: 10, height: 10 },
+		{ line: 2, left: 12, bottom: 10, width: 10, height: 10 },
+		{ line: 3, left: 24, bottom: 10, width: 10, height: 10 },
+		{ line: 4, left: 36, bottom: 10, width: 10, height: 10 },
+		{ line: 5, left: 200, bottom: 10, width: 10, height: 10 },
+	]);
+	try {
+		const inspection = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 5, 5, { minCandidates: 1, maxCandidates: 3, minDistance: 40 });
+		assert.ok(inspection);
+		assert.equal(inspection.candidates.length, 3);
+		assert.deepEqual(inspection.candidates.map((candidate) => candidate.line), [1, 2, 3]);
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX candidate scoring demotes structural lines but preserves raw diagnostics", () => {
+	const fixture = syntheticParsedReverseFixture(["useful", "\\end{document}"], [
+		{ line: 2, left: 0, bottom: 2, width: 2, height: 2 },
+		{ line: 1, left: 4, bottom: 10, width: 10, height: 10 },
+	]);
+	try {
+		const unpenalized = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 1, 1, { minCandidates: 1, maxCandidates: 10, minDistance: 20, structuralPenalty: 0 });
+		const penalized = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 1, 1, { minCandidates: 1, maxCandidates: 10, minDistance: 20, structuralPenalty: 1000 });
+		assert.ok(unpenalized);
+		assert.ok(penalized);
+		assert.equal(unpenalized.winner.line, 2);
+		assert.equal(penalized.winner.line, 1);
+		assert.equal(penalized.rawWinner.line, 2);
+		assert.ok(penalized.candidates.some((candidate) => candidate.line === 2 && candidate.structural && candidate.structuralReason === "\\end{document}"));
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX candidate score weights x distance twice y distance", () => {
+	const fixture = syntheticParsedReverseFixture(["x-far", "y-far"], [
+		{ line: 1, left: 10, bottom: 1, width: 1, height: 1 },
+		{ line: 2, left: 0, bottom: 10, width: 1, height: 1 },
+	]);
+	try {
+		const inspection = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 0, 0, { minCandidates: 1, maxCandidates: 10, minDistance: 20 });
+		assert.ok(inspection);
+		assert.deepEqual(inspection.candidates.map((candidate) => candidate.line), [2, 1]);
+		assert.equal(inspection.candidates.find((candidate) => candidate.line === 1)?.score, 20);
+		assert.equal(inspection.candidates.find((candidate) => candidate.line === 2)?.score, 9);
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
 
 test("reverse-forward probe maps JS reverse inspection result through forward SyncTeX", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });

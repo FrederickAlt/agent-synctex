@@ -57,6 +57,44 @@ export interface SyncTeXInspectionRecordToTeX extends SyncTeXRecordToTeX {
 	distanceFromCenter: number;
 }
 
+export interface ReverseSyncTeXCandidate extends SyncTeXRecordToTeX {
+	sourceLine?: string;
+	rect: SyncTeXInspectionRect;
+	distanceX: number;
+	distanceY: number;
+	distance: number;
+	area: number;
+	containsClick: boolean;
+	structural: boolean;
+	structuralReason?: string;
+	areaPenalty: number;
+	structuralPenalty: number;
+	score: number;
+}
+
+export interface ReverseSyncTeXCandidatesInspection {
+	winner: ReverseSyncTeXCandidate;
+	rawWinner: ReverseSyncTeXCandidate;
+	candidates: ReverseSyncTeXCandidate[];
+}
+
+export interface ReverseSyncTeXCandidatesOptions {
+	minCandidates?: number;
+	maxCandidates?: number;
+	minDistance?: number;
+	structuralPenalty?: number;
+	enrichSourceLines?: boolean;
+}
+
+const DEFAULT_REVERSE_CANDIDATE_OPTIONS = {
+	minCandidates: 8,
+	maxCandidates: 40,
+	minDistance: 12,
+	structuralPenalty: 1000,
+};
+
+const STRUCTURAL_SOURCE_LINES = new Set(["\\end{document}", "\\newpage", "\\end{minipage}", "\\end{figure}", "\\begin{document}"]);
+
 export class Rectangle {
 	readonly top: number;
 	readonly bottom: number;
@@ -74,12 +112,20 @@ export class Rectangle {
 		return this.left <= rect.left && this.right >= rect.right && this.bottom >= rect.bottom && this.top <= rect.top;
 	}
 
+	distanceX(x: number): number {
+		return this.left <= x && x <= this.right ? 0 : Math.min(Math.abs(this.left - x), Math.abs(this.right - x));
+	}
+
 	distanceY(y: number): number {
-		return Math.min(Math.abs(this.bottom - y), Math.abs(this.top - y));
+		return this.top <= y && y <= this.bottom ? 0 : Math.min(Math.abs(this.bottom - y), Math.abs(this.top - y));
+	}
+
+	containsPoint(x: number, y: number): boolean {
+		return this.left <= x && x <= this.right && this.top <= y && y <= this.bottom;
 	}
 
 	distanceXY(x: number, y: number): number {
-		return Math.sqrt(Math.pow(Math.min(Math.abs(this.bottom - y), Math.abs(this.top - y)), 2) + Math.pow(Math.min(Math.abs(this.left - x), Math.abs(this.right - x)), 2));
+		return Math.sqrt(Math.pow(this.distanceY(y), 2) + Math.pow(this.distanceX(x), 2));
 	}
 
 	distanceFromCenter(x: number, y: number): number {
@@ -220,19 +266,32 @@ export function syncTeXToPDF(line: number, filePath: string, pdfPath: string): S
 	return { page: blocks1[0].page, x: c1.left + parsed.pdfSyncObject.offset.x, y: bottom + parsed.pdfSyncObject.offset.y, indicator: true };
 }
 
-export function inspectSyncTeXToTeX(page: number, x: number, y: number, pdfPath: string): SyncTeXInspectionRecordToTeX | undefined {
-	const parsed = parseSyncTexForPdf(pdfPath);
-	if (!parsed) {
-		return undefined;
-	}
-	const pdfSyncObject = parsed.pdfSyncObject;
+function structuralSourceLineReason(sourceLine: string | undefined): string | undefined {
+	const trimmed = sourceLine?.trim();
+	return trimmed !== undefined && STRUCTURAL_SOURCE_LINES.has(trimmed) ? trimmed : undefined;
+}
+
+function compareReverseCandidates(a: ReverseSyncTeXCandidate, b: ReverseSyncTeXCandidate): number {
+	return a.score - b.score
+		|| a.distance - b.distance
+		|| a.distanceY - b.distanceY
+		|| a.distanceX - b.distanceX
+		|| a.area - b.area
+		|| a.line - b.line;
+}
+
+interface RawReverseCandidateRecord {
+	input: string;
+	line: number;
+	rect: Rectangle;
+	distanceFromCenter: number;
+}
+
+function scanRawReverseWinner(pdfSyncObject: PdfSyncObject, page: number, x: number, y: number): RawReverseCandidateRecord | undefined {
 	const y0 = y - pdfSyncObject.offset.y;
 	const x0 = x - pdfSyncObject.offset.x;
 	const fileNames = Object.keys(pdfSyncObject.blockNumberLine);
-
-	if (fileNames.length === 0) {
-		return undefined;
-	}
+	if (fileNames.length === 0) return undefined;
 
 	const record = {
 		input: "",
@@ -246,16 +305,12 @@ export function inspectSyncTeXToTeX(page: number, x: number, y: number, pdfPath:
 		for (const lineNum in linePageBlocks) {
 			const pageBlocks = linePageBlocks[Number(lineNum)];
 			for (const pageNum in pageBlocks) {
-				if (page !== Number(pageNum)) {
-					continue;
-				}
+				if (page !== Number(pageNum)) continue;
 				const blocks = pageBlocks[Number(pageNum)];
 				for (const block of blocks) {
 					// Skip a block if they have boxes inside, or their type is kern or rule.
 					// See also https://github.com/jlaurens/synctex/blob/c11fe00dbdc6423a0e54d4e531563be645f78679/synctex_parser.c#L4706-L4727 for types.
-					if (block.elements !== undefined || block.type === "k" || block.type === "r") {
-						continue;
-					}
+					if (block.elements !== undefined || block.type === "k" || block.type === "r") continue;
 					const rect = toRect(block);
 					const distFromCenter = rect.distanceFromCenter(x0, y0);
 					if (record.rect.include(rect) || (distFromCenter < record.distanceFromCenter && !rect.include(record.rect))) {
@@ -269,10 +324,135 @@ export function inspectSyncTeXToTeX(page: number, x: number, y: number, pdfPath:
 		}
 	}
 
-	if (record.input === "") {
-		return undefined;
+	return record.input === "" ? undefined : record;
+}
+
+function readSourceLinesForCandidate(inputFilePath: string, resolvedInputs: Map<string, string | undefined>, sourceLinesByInput: Map<string, string[] | undefined>): string[] | undefined {
+	if (sourceLinesByInput.has(inputFilePath)) return sourceLinesByInput.get(inputFilePath);
+	let lines: string[] | undefined;
+	const input = resolvedInputs.get(inputFilePath);
+	if (input !== undefined) {
+		try {
+			lines = fs.readFileSync(input, "utf8").split(/\r?\n/);
+		} catch { }
+	}
+	sourceLinesByInput.set(inputFilePath, lines);
+	return lines;
+}
+
+export function collectReverseSyncTeXCandidatesFromParsed(pdfSyncObject: PdfSyncObject, page: number, x: number, y: number, options: ReverseSyncTeXCandidatesOptions = {}): ReverseSyncTeXCandidatesInspection | undefined {
+	const minCandidates = options.minCandidates ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.minCandidates;
+	const maxCandidates = options.maxCandidates ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.maxCandidates;
+	const minDistance = options.minDistance ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.minDistance;
+	const enrichSourceLines = options.enrichSourceLines ?? true;
+	const structuralPenaltyValue = options.structuralPenalty ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.structuralPenalty;
+	const rawRecord = scanRawReverseWinner(pdfSyncObject, page, x, y);
+	if (rawRecord === undefined) return undefined;
+	const y0 = y - pdfSyncObject.offset.y;
+	const x0 = x - pdfSyncObject.offset.x;
+	const allCandidates: ReverseSyncTeXCandidate[] = [];
+	const resolvedInputs = new Map<string, string | undefined>();
+	const sourceLinesByInput = new Map<string, string[] | undefined>();
+
+	for (const fileName of Object.keys(pdfSyncObject.blockNumberLine)) {
+		resolvedInputs.set(fileName, convInputFilePath(fileName));
 	}
 
+	for (const fileName of Object.keys(pdfSyncObject.blockNumberLine)) {
+		const linePageBlocks = pdfSyncObject.blockNumberLine[fileName];
+		for (const lineNum in linePageBlocks) {
+			const pageBlocks = linePageBlocks[Number(lineNum)];
+			const blocks = pageBlocks[page];
+			if (blocks === undefined) continue;
+			for (const block of blocks) {
+				// Skip a block if they have boxes inside, or their type is kern or rule.
+				// See also https://github.com/jlaurens/synctex/blob/c11fe00dbdc6423a0e54d4e531563be645f78679/synctex_parser.c#L4706-L4727 for types.
+				if (block.elements !== undefined || block.type === "k" || block.type === "r") continue;
+				const rect = toRect(block);
+				const resolvedInput = resolvedInputs.get(fileName);
+				const sourceLine = enrichSourceLines ? readSourceLinesForCandidate(fileName, resolvedInputs, sourceLinesByInput)?.[Number(lineNum) - 1] : undefined;
+				const structuralReason = structuralSourceLineReason(sourceLine);
+				const distanceX = rect.distanceX(x0);
+				const distanceY = rect.distanceY(y0);
+				const distance = Math.sqrt(distanceY ** 2 + distanceX ** 2);
+				const area = Math.max(0, rect.right - rect.left) * Math.max(0, rect.bottom - rect.top);
+				const areaPenalty = 0;
+				const structuralPenalty = structuralReason === undefined ? 0 : structuralPenaltyValue;
+				allCandidates.push({
+					input: resolvedInput ?? fileName,
+					line: Number(lineNum),
+					column: 0,
+					...(sourceLine === undefined ? {} : { sourceLine }),
+					rect: {
+						left: rect.left + pdfSyncObject.offset.x,
+						top: rect.top + pdfSyncObject.offset.y,
+						right: rect.right + pdfSyncObject.offset.x,
+						bottom: rect.bottom + pdfSyncObject.offset.y,
+					},
+					distanceX,
+					distanceY,
+					distance,
+					area,
+					containsClick: rect.containsPoint(x0, y0),
+					structural: structuralReason !== undefined,
+					...(structuralReason === undefined ? {} : { structuralReason }),
+					areaPenalty,
+					structuralPenalty,
+					score: distanceY + 2 * distanceX + areaPenalty + structuralPenalty,
+				});
+			}
+		}
+	}
+
+	if (allCandidates.length === 0) return undefined;
+	const rawInput = resolvedInputs.get(rawRecord.input) ?? rawRecord.input;
+	const rawWinner = allCandidates.find((candidate) => candidate.input === rawInput && candidate.line === rawRecord.line && candidate.rect.left === rawRecord.rect.left + pdfSyncObject.offset.x && candidate.rect.top === rawRecord.rect.top + pdfSyncObject.offset.y) ?? {
+		input: rawInput,
+		line: rawRecord.line,
+		column: 0,
+		rect: {
+			left: rawRecord.rect.left + pdfSyncObject.offset.x,
+			top: rawRecord.rect.top + pdfSyncObject.offset.y,
+			right: rawRecord.rect.right + pdfSyncObject.offset.x,
+			bottom: rawRecord.rect.bottom + pdfSyncObject.offset.y,
+		},
+		distanceX: rawRecord.rect.distanceX(x0),
+		distanceY: rawRecord.rect.distanceY(y0),
+		distance: rawRecord.rect.distanceXY(x0, y0),
+		area: Math.max(0, rawRecord.rect.right - rawRecord.rect.left) * Math.max(0, rawRecord.rect.bottom - rawRecord.rect.top),
+		containsClick: rawRecord.rect.containsPoint(x0, y0),
+		structural: false,
+		areaPenalty: 0,
+		structuralPenalty: 0,
+		score: rawRecord.rect.distanceY(y0) + 2 * rawRecord.rect.distanceX(x0),
+	};
+	const byScore = [...allCandidates].sort(compareReverseCandidates);
+	const selected = new Set<ReverseSyncTeXCandidate>();
+	for (const candidate of byScore) {
+		if (candidate.distance <= minDistance) selected.add(candidate);
+	}
+	for (const candidate of byScore) {
+		if (selected.size >= minCandidates) break;
+		selected.add(candidate);
+	}
+	const candidates = [...selected].sort(compareReverseCandidates).slice(0, Math.max(1, maxCandidates));
+	return { winner: candidates[0] ?? rawWinner, rawWinner, candidates };
+}
+
+export function inspectSyncTeXToTeXCandidates(page: number, x: number, y: number, pdfPath: string, options: ReverseSyncTeXCandidatesOptions = {}): ReverseSyncTeXCandidatesInspection | undefined {
+	const parsed = parseSyncTexForPdf(pdfPath);
+	return parsed === undefined ? undefined : collectReverseSyncTeXCandidatesFromParsed(parsed.pdfSyncObject, page, x, y, options);
+}
+
+export function inspectSyncTeXToTeX(page: number, x: number, y: number, pdfPath: string): SyncTeXInspectionRecordToTeX | undefined {
+	const parsed = parseSyncTexForPdf(pdfPath);
+	if (!parsed) {
+		return undefined;
+	}
+	const record = scanRawReverseWinner(parsed.pdfSyncObject, page, x, y);
+	if (record === undefined) {
+		return undefined;
+	}
 	const input = convInputFilePath(record.input);
 	return input ? {
 		input,
@@ -280,10 +460,10 @@ export function inspectSyncTeXToTeX(page: number, x: number, y: number, pdfPath:
 		column: 0,
 		distanceFromCenter: record.distanceFromCenter,
 		rect: {
-			left: record.rect.left + pdfSyncObject.offset.x,
-			top: record.rect.top + pdfSyncObject.offset.y,
-			right: record.rect.right + pdfSyncObject.offset.x,
-			bottom: record.rect.bottom + pdfSyncObject.offset.y,
+			left: record.rect.left + parsed.pdfSyncObject.offset.x,
+			top: record.rect.top + parsed.pdfSyncObject.offset.y,
+			right: record.rect.right + parsed.pdfSyncObject.offset.x,
+			bottom: record.rect.bottom + parsed.pdfSyncObject.offset.y,
 		},
 	} : undefined;
 }
