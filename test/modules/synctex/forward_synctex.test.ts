@@ -387,6 +387,43 @@ test("robust reverse mapping caps JS candidate proposals before forward syncing"
 	}
 });
 
+test("robust reverse mapping does not privilege raw end-document when same-page geometry ties", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-enddoc-tie-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", "better same-page source", "\\end{document}"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 3, column: 0, sourceLine: "\\end{document}", rect: { left: 10, top: 10, right: 11, bottom: 11 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: true, structuralReason: "\\end{document}" },
+				rawWinner: { input: sourcePath, line: 3, column: 0, sourceLine: "\\end{document}", rect: { left: 10, top: 10, right: 11, bottom: 11 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: true, structuralReason: "\\end{document}" },
+				candidates: [
+					{ input: sourcePath, line: 3, column: 0, sourceLine: "\\end{document}", rect: { left: 10, top: 10, right: 11, bottom: 11 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: true, structuralReason: "\\end{document}" },
+					{ input: sourcePath, line: 2, column: 0, sourceLine: "better same-page source", rect: { left: 12, top: 10, right: 13, bottom: 11 }, distanceX: 1, distanceY: 0, distance: 1, area: 1, containsClick: false, structural: false },
+				],
+			}),
+			forwardBoxesForLine: ({ line }) => line === 3
+				? [{ page: 1, h: 8, v: 8, W: 4, H: 4 }, { page: 1, h: 40, v: 40, W: 4, H: 4 }]
+				: [{ page: 1, h: 8, v: 8, W: 4, H: 4 }],
+		});
+		const [winner, endDocument] = location.diagnostics.proposalScores ?? [];
+		assert.equal(location.line, 2);
+		assert.equal(winner?.line, 2);
+		assert.equal(endDocument?.line, 3);
+		assert.equal(winner?.score, endDocument?.score);
+		assert.equal(endDocument?.structural, true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("robust reverse mapping uses exact central forward geometry scoring formula", () => {
 	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-formula-"));
 	try {

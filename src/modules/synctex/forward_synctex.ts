@@ -735,6 +735,7 @@ function scoreReverseSynctexProposal(input: {
 function compareScoredReverseSynctexProposals(left: ScoredReverseSynctexProposal, right: ScoredReverseSynctexProposal): number {
 	return left.geometryTier - right.geometryTier
 		|| left.score - right.score
+		|| left.samePageBoxCount - right.samePageBoxCount
 		|| left.rank - right.rank
 		|| left.line - right.line
 		|| left.sourceFile.localeCompare(right.sourceFile);
