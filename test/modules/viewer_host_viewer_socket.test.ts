@@ -309,7 +309,7 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 		};
 		assert.equal(diagnostics.context.hasSelectionContext, true);
 		assert.equal(diagnostics.context.textBeforeSelection, "First paragraph");
-		assert.deepEqual(diagnostics.candidates.map((candidate) => candidate.kind), ["raw", "context_corrected"]);
+		assert.deepEqual(diagnostics.candidates.map((candidate) => candidate.kind), ["initial_candidate", "context_corrected"]);
 		assert.equal(diagnostics.selected.sourceFile, sourcePath);
 		assert.equal(diagnostics.selected.line, 3);
 		assert.equal(diagnostics.selected.column, 6);

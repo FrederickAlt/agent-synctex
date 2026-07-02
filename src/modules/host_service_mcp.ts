@@ -925,10 +925,10 @@ function formatSelectionEndpointForTool(name: string, endpoint: { source_file: s
 	const parts = [`${name}=${endpoint.source_file}:line=${endpoint.line}:column=${endpoint.column}`];
 	if (endpoint.precision !== undefined) parts.push(`precision=${endpoint.precision}`);
 	if (endpoint.repair !== undefined) parts.push(`repair=${endpoint.repair}`);
-	if (endpoint.raw_mapped_source_file !== undefined && endpoint.raw_mapped_source_file !== endpoint.source_file) parts.push(`raw_mapped_source_file=${endpoint.raw_mapped_source_file}`);
-	if (endpoint.raw_mapped_line !== undefined) parts.push(`raw_mapped_line=${endpoint.raw_mapped_line}`);
-	if (endpoint.raw_mapped_column !== undefined) parts.push(`raw_mapped_column=${endpoint.raw_mapped_column}`);
-	if (endpoint.raw_mapped_source_line !== undefined) parts.push(`raw_mapped_source_line=${compactToolText(endpoint.raw_mapped_source_line)}`);
+	if (endpoint.raw_mapped_source_file !== undefined && endpoint.raw_mapped_source_file !== endpoint.source_file) parts.push(`initial_candidate_source_file=${endpoint.raw_mapped_source_file}`);
+	if (endpoint.raw_mapped_line !== undefined) parts.push(`initial_candidate_line=${endpoint.raw_mapped_line}`);
+	if (endpoint.raw_mapped_column !== undefined) parts.push(`initial_candidate_column=${endpoint.raw_mapped_column}`);
+	if (endpoint.raw_mapped_source_line !== undefined) parts.push(`initial_candidate_source_line=${compactToolText(endpoint.raw_mapped_source_line)}`);
 	return parts.join(":");
 }
 
@@ -965,12 +965,12 @@ function formatPdfEventForTool(event: PdfEvent): string {
 	const selectionEndError = formatMaybeTextField("selection_end_error", event.selection_end_error, 180);
 	if (selectionEndError !== undefined) fields.push(selectionEndError);
 	if (event.raw_mapped_source_file !== undefined && event.raw_mapped_source_file !== event.source_file) {
-		fields.push(`raw_mapped_source_file=${event.raw_mapped_source_file}`);
+		fields.push(`initial_candidate_source_file=${event.raw_mapped_source_file}`);
 	}
-	if (event.raw_mapped_line !== undefined) fields.push(`raw_mapped_line=${event.raw_mapped_line}`);
-	if (event.raw_mapped_column !== undefined) fields.push(`raw_mapped_column=${event.raw_mapped_column}`);
-	const rawMappedSourceLine = formatMaybeTextField("raw_mapped_source_line", event.raw_mapped_source_line);
-	if (rawMappedSourceLine !== undefined) fields.push(rawMappedSourceLine);
+	if (event.raw_mapped_line !== undefined) fields.push(`initial_candidate_line=${event.raw_mapped_line}`);
+	if (event.raw_mapped_column !== undefined) fields.push(`initial_candidate_column=${event.raw_mapped_column}`);
+	const initialCandidateSourceLine = formatMaybeTextField("initial_candidate_source_line", event.raw_mapped_source_line);
+	if (initialCandidateSourceLine !== undefined) fields.push(initialCandidateSourceLine);
 	if (event.normalized_formula_span !== undefined) {
 		fields.push(`normalized_formula_span=${event.normalized_formula_span.start_line}-${event.normalized_formula_span.end_line}`);
 	}

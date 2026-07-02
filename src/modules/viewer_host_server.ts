@@ -600,9 +600,10 @@ function hoverCandidateLine(prefix, candidate) {
 function hoverDiagnosticsLabel(message) {
 	const file = String(message.source_file || "").split(/[\\/]/).pop() || "source";
 	const simple = file + ":" + message.line + " " + truncateHoverLabel(message.source_line);
-	if (message.raw || message.repaired || message.precision || Array.isArray(message.candidates) || message.forward) {
+	const nearestCandidate = message.nearest_candidate || message.raw;
+	if (nearestCandidate || message.repaired || message.precision || Array.isArray(message.candidates) || message.forward) {
 		const parts = [simple];
-		if (message.raw) parts.push(hoverCandidateLine("raw", message.raw));
+		if (nearestCandidate) parts.push(hoverCandidateLine("nearest candidate", nearestCandidate));
 		if (message.repaired) parts.push(hoverCandidateLine("repair", message.repaired));
 		else parts.push(hoverCandidateLine("result", { line: message.line, source_line: message.source_line, precision: message.precision }));
 		if (message.forward && message.forward.contains_click) parts.push("forward: verified");
@@ -1654,11 +1655,11 @@ iframe{width:100%;height:100%;border:0;background:white}
 	}
 
 	private hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Record<string, unknown> {
-		const raw = this.hoverCandidateSummary(hover.rawWinner);
+		const nearestCandidate = this.hoverCandidateSummary(hover.rawWinner);
 		const candidates = hover.topCandidates?.map((candidate) => this.hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
 		return {
 			...(hover.precision === undefined ? {} : { precision: hover.precision }),
-			...(raw === undefined ? {} : { raw }),
+			...(nearestCandidate === undefined ? {} : { nearest_candidate: nearestCandidate }),
 			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision } }),
 			...(candidates === undefined || candidates.length === 0 ? {} : { candidates }),
 			...(hover.forwardVerification === undefined ? {} : { forward: { attempted: hover.forwardVerification.attempted, contains_click: hover.forwardVerification.containsClick, boxes_considered: hover.forwardVerification.boxesConsidered, boxes_filtered: hover.forwardVerification.boxesFiltered, ...(hover.forwardVerification.chosenBox === undefined ? {} : { chosen_box: hover.forwardVerification.chosenBox }) } }),

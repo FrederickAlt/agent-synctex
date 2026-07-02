@@ -752,11 +752,11 @@ export class ViewerHostMcpService {
 	}
 
 	private hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Partial<ViewerHostReverseSynctexHoverResultMessage> {
-		const raw = this.hoverCandidateSummary(hover.rawWinner);
+		const nearestCandidate = this.hoverCandidateSummary(hover.rawWinner);
 		const candidates = hover.topCandidates?.map((candidate) => this.hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
 		return {
 			...(hover.precision === undefined ? {} : { precision: hover.precision }),
-			...(raw === undefined ? {} : { raw }),
+			...(nearestCandidate === undefined ? {} : { nearest_candidate: nearestCandidate }),
 			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision } }),
 			...(candidates === undefined || candidates.length === 0 ? {} : { candidates }),
 			...(hover.forwardVerification === undefined ? {} : { forward: { attempted: hover.forwardVerification.attempted, contains_click: hover.forwardVerification.containsClick, boxes_considered: hover.forwardVerification.boxesConsidered, boxes_filtered: hover.forwardVerification.boxesFiltered, ...(hover.forwardVerification.chosenBox === undefined ? {} : { chosen_box: hover.forwardVerification.chosenBox }) } }),

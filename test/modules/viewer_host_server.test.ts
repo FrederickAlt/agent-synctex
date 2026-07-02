@@ -213,9 +213,10 @@ test("Viewer Host Server hover WebSocket returns robust no-context diagnostics t
 		assert.equal(message.source_file, sourcePath);
 		assert.equal(message.line, 3);
 		assert.equal(message.source_line, "\\end{document}");
-		assert.equal((message.raw as { line?: number; structural?: boolean; source_line?: string }).line, 3);
-		assert.equal((message.raw as { line?: number; structural?: boolean; source_line?: string }).structural, true);
-		assert.equal((message.raw as { line?: number; structural?: boolean; source_line?: string }).source_line, "\\end{document}");
+		assert.equal(message.raw, undefined);
+		assert.equal((message.nearest_candidate as { line?: number; structural?: boolean; source_line?: string }).line, 3);
+		assert.equal((message.nearest_candidate as { line?: number; structural?: boolean; source_line?: string }).structural, true);
+		assert.equal((message.nearest_candidate as { line?: number; structural?: boolean; source_line?: string }).source_line, "\\end{document}");
 		assert.equal((message.repaired as { line?: number; source_line?: string }).line, 3);
 		assert.ok((message.candidates as Array<{ line?: number }>).some((candidate) => candidate.line === 5));
 		assert.ok((message.candidates as Array<{ line?: number }>).some((candidate) => candidate.line === 3));
