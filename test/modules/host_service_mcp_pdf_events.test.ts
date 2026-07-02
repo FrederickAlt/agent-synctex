@@ -21,8 +21,8 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 		selected_text: "chosen formula",
 		precision: "verified",
 		repair: "text_context",
-		selection_start: { source_file: "/tmp/paper/main.tex", line: 40, column: 2, source_line: "\\begin{align}", page: 3, x: 100, y: 210 },
-		selection_end: { source_file: "/tmp/paper/main.tex", line: 42, column: 12, source_line: "  a &= b + c\\\\", page: 3, x: 130, y: 220 },
+		selection_start: { source_file: "/tmp/paper/main.tex", line: 40, column: 2, source_line: "\\begin{align}", page: 3, x: 100, y: 210, precision: "verified", repair: "text_context", raw_mapped_line: 43, raw_mapped_source_line: "\\end{align}", synctex_diagnostics: { topCandidates: [{ line: 43 }, { line: 40 }] } },
+		selection_end: { source_file: "/tmp/paper/main.tex", line: 42, column: 12, source_line: "  a &= b + c\\\\", page: 3, x: 130, y: 220, precision: "text", raw_mapped_line: 43, raw_mapped_source_line: "\\end{align}" },
 		raw_mapped_line: 43,
 		raw_mapped_column: 9,
 		raw_mapped_source_line: "\\end{align}",
@@ -72,8 +72,9 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.x, 110);
 	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.y, 220);
 	assert.match(text, /selected_text=chosen formula/);
-	assert.match(text, /selection_start=\/tmp\/paper\/main\.tex:line=40:column=2/);
-	assert.match(text, /selection_end=\/tmp\/paper\/main\.tex:line=42:column=12/);
+	assert.match(text, /selection_start=\/tmp\/paper\/main\.tex:line=40:column=2:precision=verified:repair=text_context:raw_mapped_line=43/);
+	assert.match(text, /selection_end=\/tmp\/paper\/main\.tex:line=42:column=12:precision=text:raw_mapped_line=43/);
+	assert.doesNotMatch(text, /topCandidates/);
 	assert.match(text, /raw_mapped_line=43/);
 	assert.match(text, /raw_mapped_column=9/);
 	assert.match(text, /raw_mapped_source_line=\\end\{align\}/);

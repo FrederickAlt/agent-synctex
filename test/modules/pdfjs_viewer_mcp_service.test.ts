@@ -696,6 +696,96 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 	}
 });
 
+test("PDF.js MCP service maps selected range endpoints through robust reverse context and preserves exact selected_text", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-selection-robust-"));
+	const { pdfPath } = writeForwardSynctexFixture(baseDir);
+	const calls: Array<{ x: number; textBeforeSelection?: string; textAfterSelection?: string }> = [];
+	const sourcePath = join(baseDir, "main.tex");
+	const makeLocation = (input: { page: number; x: number; y: number; textBeforeSelection?: string; textAfterSelection?: string }, line: number, rawLine?: number) => ({
+		page: input.page,
+		x: input.x,
+		y: input.y,
+		sourceFile: sourcePath,
+		line,
+		column: 4,
+		sourceLine: `line ${line}`,
+		sidecarPath: join(baseDir, "paper.synctex"),
+		precision: rawLine === undefined ? "line" : "verified",
+		...(rawLine === undefined ? {} : { rawMappedSourceFile: sourcePath, rawMappedLine: rawLine, rawMappedColumn: 0, rawMappedSourceLine: "\\end{document}" }),
+		diagnostics: {
+			branch: "js",
+			lookupInput: { pdfPath, page: input.page, x: input.x, y: input.y, sidecarPath: join(baseDir, "paper.synctex") },
+			native: { command: "synctex", args: [], cwd: baseDir, attempted: false, role: "fallback" as const },
+			js: { attempted: true, role: "primary" as const },
+			context: { hasSelectionContext: input.textBeforeSelection !== undefined || input.textAfterSelection !== undefined, ...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }), ...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }) },
+			candidates: [],
+			selected: { sourceFile: sourcePath, line, column: 4, sourceLine: `line ${line}` },
+			precision: rawLine === undefined ? "line" : "verified",
+			...(rawLine === undefined ? {} : { textRepair: { used: true, status: "unique" as const, fragmentsTried: ["Browser EXACT"], matchCount: 1, selectedFragment: "Browser EXACT", line, column: 4 }, rawWinner: { line: rawLine, sourceLine: "\\end{document}" }, topCandidates: [{ line: rawLine, sourceLine: "\\end{document}" }] }),
+		},
+	}) as ReturnType<typeof mapReverseSynctex>;
+	const service = new PdfJsViewerMcpService({
+		browserLauncher: new FakeBrowserLauncher({ ok: true }),
+		registry: new PdfJsViewerRegistry({ makePdfId: () => 128 }),
+		pdfRefresh: { autoStart: false },
+		reverseSynctexMapper: (input) => {
+			calls.push({ x: input.x, ...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }), ...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }) });
+			if (input.x === 10) return makeLocation(input, 66, 78);
+			if (input.x === 20) return makeLocation(input, 67, 79);
+			return makeLocation(input, 65);
+		},
+	});
+	try {
+		const open = await service.openPdf({ protocol_version: 1, request_id: "open-selection-robust", operation: "open_pdf", created_at_ns: 1, workspace_context: { cwd: baseDir }, details: { pdf_path: pdfPath } });
+		const pdfId = open.status_details.pdf_id ?? 0;
+		const origin = new URL(open.status_details.viewer_url ?? "").origin;
+		const wsUrl = new URL(`/ws?pdf_id=${pdfId}`, origin);
+		wsUrl.protocol = "ws:";
+		const socket = await connectRawWebSocket(wsUrl);
+		socket.write(encodeClientWebSocketTextFrame(JSON.stringify({
+			type: "reverse_synctex",
+			page: 2,
+			x: 15,
+			y: 200,
+			textBeforeSelection: "Before ",
+			textAfterSelection: " After",
+			selectedText: "Browser EXACT",
+			selectionStartX: 10,
+			selectionStartY: 201,
+			selectionEndX: 20,
+			selectionEndY: 202,
+		})));
+
+		let event: Record<string, unknown> | undefined;
+		await waitFor(async () => {
+			const response = await handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id: 128, method: "tools/call", params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } } }), service.pdfOperations);
+			assert.ok(response && "result" in response);
+			event = ((response.result as { details?: { events?: Array<Record<string, unknown>> } }).details?.events ?? [])[0];
+			return event?.selected_text === "Browser EXACT";
+		});
+		assert.equal(event?.selected_text, "Browser EXACT");
+		assert.deepEqual(calls.map((call) => ({ x: call.x, before: call.textBeforeSelection, after: call.textAfterSelection })), [
+			{ x: 15, before: "Before ", after: " After" },
+			{ x: 10, before: "Before ", after: "Browser EXACT" },
+			{ x: 20, before: "Browser EXACT", after: " After" },
+		]);
+		const start = event?.selection_start as Record<string, unknown>;
+		assert.equal(start.line, 66);
+		assert.equal(start.precision, "verified");
+		assert.equal(start.repair, "text_context");
+		assert.equal(start.raw_mapped_line, 78);
+		assert.equal(start.raw_mapped_source_line, "\\end{document}");
+		assert.ok((start.synctex_diagnostics as Record<string, unknown>).topCandidates);
+		const end = event?.selection_end as Record<string, unknown>;
+		assert.equal(end.line, 67);
+		assert.equal(end.raw_mapped_line, 79);
+		socket.end();
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("PDF.js MCP service get_pdf_events details include normalized formula excerpt for closing delimiter hits", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-mcp-reverse-formula-"));
 	const { pdfPath, sourcePath } = writeForwardSynctexFixture(baseDir);

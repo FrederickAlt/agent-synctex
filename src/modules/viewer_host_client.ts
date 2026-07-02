@@ -759,13 +759,48 @@ export class ViewerHostMcpService {
 		}
 	}
 
+	private sourceLocationEventFromReverse(location: ReturnType<typeof mapReverseSynctex>, page: number, x: number, y: number): ReverseSynctexSourceLocationEvent {
+		return {
+			source_file: location.sourceFile,
+			line: location.line,
+			column: location.column,
+			...(location.sourceLine === undefined ? {} : { source_line: location.sourceLine }),
+			page,
+			x,
+			y,
+			precision: location.precision,
+			...(location.diagnostics.textRepair?.used === true ? { repair: "text_context" } : {}),
+			...(location.rawMappedLine === undefined ? {} : {
+				raw_mapped_source_file: location.rawMappedSourceFile,
+				raw_mapped_line: location.rawMappedLine,
+				raw_mapped_column: location.rawMappedColumn,
+				...(location.rawMappedSourceLine === undefined ? {} : { raw_mapped_source_line: location.rawMappedSourceLine }),
+			}),
+			synctex_diagnostics: location.diagnostics,
+		};
+	}
+
+	private withEndpointDiagnostics(repaired: ReverseSynctexSourceLocationEvent, mapped: ReturnType<typeof mapReverseSynctex> | undefined): ReverseSynctexSourceLocationEvent {
+		if (mapped === undefined) return repaired;
+		return {
+			...repaired,
+			...(mapped.rawMappedLine === undefined ? {} : {
+				raw_mapped_source_file: mapped.rawMappedSourceFile,
+				raw_mapped_line: mapped.rawMappedLine,
+				raw_mapped_column: mapped.rawMappedColumn,
+				...(mapped.rawMappedSourceLine === undefined ? {} : { raw_mapped_source_line: mapped.rawMappedSourceLine }),
+			}),
+			synctex_diagnostics: mapped.diagnostics,
+		};
+	}
+
 	private repairedSelectionEndpoints(location: ReturnType<typeof mapReverseSynctex>, selectedText: string | undefined, message: ViewerHostReverseSynctexMessage): { selectionStart?: ReverseSynctexSourceLocationEvent; selectionEnd?: ReverseSynctexSourceLocationEvent } {
 		if (selectedText === undefined) return {};
 		const range = findUniqueSelectedTextSourceRange(location.sourceFile, selectedText);
 		if (range === undefined) return {};
 		return {
-			selectionStart: { source_file: range.sourceFile, line: range.startLine, column: range.startColumn, ...(range.startSourceLine === undefined ? {} : { source_line: range.startSourceLine }), page: message.page, x: message.selectionStartX as number, y: message.selectionStartY as number },
-			selectionEnd: { source_file: range.sourceFile, line: range.endLine, column: range.endColumn, ...(range.endSourceLine === undefined ? {} : { source_line: range.endSourceLine }), page: message.page, x: message.selectionEndX as number, y: message.selectionEndY as number },
+			selectionStart: { source_file: range.sourceFile, line: range.startLine, column: range.startColumn, ...(range.startSourceLine === undefined ? {} : { source_line: range.startSourceLine }), page: message.page, x: message.selectionStartX as number, y: message.selectionStartY as number, precision: "text", repair: "selected_text" },
+			selectionEnd: { source_file: range.sourceFile, line: range.endLine, column: range.endColumn, ...(range.endSourceLine === undefined ? {} : { source_line: range.endSourceLine }), page: message.page, x: message.selectionEndX as number, y: message.selectionEndY as number, precision: "text", repair: "selected_text" },
 		};
 	}
 
@@ -788,12 +823,19 @@ export class ViewerHostMcpService {
 		let selectionStartError: string | undefined;
 		if (message.selectedText !== undefined && message.selectionStartX !== undefined && message.selectionStartY !== undefined) {
 			try {
-				selectionStart = mapReverseSynctex({ pdfPath: record.pdfPath, page: message.page, x: message.selectionStartX, y: message.selectionStartY, cwd });
+				selectionStart = mapReverseSynctex({
+					pdfPath: record.pdfPath,
+					page: message.page,
+					x: message.selectionStartX,
+					y: message.selectionStartY,
+					cwd,
+					...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }),
+					textAfterSelection: message.selectedText,
+				});
 			} catch (error) {
 				selectionStartError = error instanceof Error ? error.message : String(error);
 			}
 			if (repairedSelection.selectionStart !== undefined) {
-				selectionStart = undefined;
 				selectionStartError = undefined;
 			}
 		}
@@ -801,12 +843,19 @@ export class ViewerHostMcpService {
 		let selectionEndError: string | undefined;
 		if (message.selectedText !== undefined && message.selectionEndX !== undefined && message.selectionEndY !== undefined) {
 			try {
-				selectionEnd = mapReverseSynctex({ pdfPath: record.pdfPath, page: message.page, x: message.selectionEndX, y: message.selectionEndY, cwd });
+				selectionEnd = mapReverseSynctex({
+					pdfPath: record.pdfPath,
+					page: message.page,
+					x: message.selectionEndX,
+					y: message.selectionEndY,
+					cwd,
+					textBeforeSelection: message.selectedText,
+					...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }),
+				});
 			} catch (error) {
 				selectionEndError = error instanceof Error ? error.message : String(error);
 			}
 			if (repairedSelection.selectionEnd !== undefined) {
-				selectionEnd = undefined;
 				selectionEndError = undefined;
 			}
 		}
@@ -825,8 +874,8 @@ export class ViewerHostMcpService {
 			x: message.x,
 			y: message.y,
 			...(message.selectedText === undefined ? {} : { selected_text: message.selectedText }),
-			...(repairedSelection.selectionStart !== undefined ? { selection_start: repairedSelection.selectionStart } : selectionStart === undefined ? {} : { selection_start: { source_file: selectionStart.sourceFile, line: selectionStart.line, column: selectionStart.column, ...(selectionStart.sourceLine === undefined ? {} : { source_line: selectionStart.sourceLine }), page: message.page, x: message.selectionStartX as number, y: message.selectionStartY as number } }),
-			...(repairedSelection.selectionEnd !== undefined ? { selection_end: repairedSelection.selectionEnd } : selectionEnd === undefined ? {} : { selection_end: { source_file: selectionEnd.sourceFile, line: selectionEnd.line, column: selectionEnd.column, ...(selectionEnd.sourceLine === undefined ? {} : { source_line: selectionEnd.sourceLine }), page: message.page, x: message.selectionEndX as number, y: message.selectionEndY as number } }),
+			...(repairedSelection.selectionStart !== undefined ? { selection_start: this.withEndpointDiagnostics(repairedSelection.selectionStart, selectionStart) } : selectionStart === undefined ? {} : { selection_start: this.sourceLocationEventFromReverse(selectionStart, message.page, message.selectionStartX as number, message.selectionStartY as number) }),
+			...(repairedSelection.selectionEnd !== undefined ? { selection_end: this.withEndpointDiagnostics(repairedSelection.selectionEnd, selectionEnd) } : selectionEnd === undefined ? {} : { selection_end: this.sourceLocationEventFromReverse(selectionEnd, message.page, message.selectionEndX as number, message.selectionEndY as number) }),
 			...(selectionStartError === undefined ? {} : { selection_start_error: selectionStartError }),
 			...(selectionEndError === undefined ? {} : { selection_end_error: selectionEndError }),
 			...(location.rawMappedLine === undefined ? {} : {

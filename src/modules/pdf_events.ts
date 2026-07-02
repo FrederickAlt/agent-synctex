@@ -12,6 +12,13 @@ export interface ReverseSynctexSourceLocationEvent {
 	page: number;
 	x: number;
 	y: number;
+	precision?: "verified" | "text" | "line" | "raw";
+	repair?: string;
+	raw_mapped_source_file?: string;
+	raw_mapped_line?: number;
+	raw_mapped_column?: number;
+	raw_mapped_source_line?: string;
+	synctex_diagnostics?: unknown;
 }
 
 export interface ReverseSynctexPdfEventInput {

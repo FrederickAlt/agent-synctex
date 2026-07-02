@@ -921,6 +921,16 @@ function formatReverseSynctexDiagnosticsSummary(diagnostics: unknown): string | 
 	return parts.length > 0 ? `synctex_diagnostics=${parts.join(" ")}` : undefined;
 }
 
+function formatSelectionEndpointForTool(name: string, endpoint: { source_file: string; line: number; column: number; precision?: string; repair?: string; raw_mapped_line?: number; raw_mapped_column?: number; raw_mapped_source_line?: string }): string {
+	const parts = [`${name}=${endpoint.source_file}:line=${endpoint.line}:column=${endpoint.column}`];
+	if (endpoint.precision !== undefined) parts.push(`precision=${endpoint.precision}`);
+	if (endpoint.repair !== undefined) parts.push(`repair=${endpoint.repair}`);
+	if (endpoint.raw_mapped_line !== undefined) parts.push(`raw_mapped_line=${endpoint.raw_mapped_line}`);
+	if (endpoint.raw_mapped_column !== undefined) parts.push(`raw_mapped_column=${endpoint.raw_mapped_column}`);
+	if (endpoint.raw_mapped_source_line !== undefined) parts.push(`raw_mapped_source_line=${compactToolText(endpoint.raw_mapped_source_line)}`);
+	return parts.join(":");
+}
+
 function formatPdfEventForTool(event: PdfEvent): string {
 	if (event.type === "selection_debug") {
 		const fields = [
@@ -947,8 +957,8 @@ function formatPdfEventForTool(event: PdfEvent): string {
 	if (event.repair !== undefined) fields.push(`repair=${event.repair}`);
 	const selectedText = formatMaybeTextField("selected_text", event.selected_text, 240);
 	if (selectedText !== undefined) fields.push(selectedText);
-	if (event.selection_start !== undefined) fields.push(`selection_start=${event.selection_start.source_file}:line=${event.selection_start.line}:column=${event.selection_start.column}`);
-	if (event.selection_end !== undefined) fields.push(`selection_end=${event.selection_end.source_file}:line=${event.selection_end.line}:column=${event.selection_end.column}`);
+	if (event.selection_start !== undefined) fields.push(formatSelectionEndpointForTool("selection_start", event.selection_start));
+	if (event.selection_end !== undefined) fields.push(formatSelectionEndpointForTool("selection_end", event.selection_end));
 	const selectionStartError = formatMaybeTextField("selection_start_error", event.selection_start_error, 180);
 	if (selectionStartError !== undefined) fields.push(selectionStartError);
 	const selectionEndError = formatMaybeTextField("selection_end_error", event.selection_end_error, 180);
