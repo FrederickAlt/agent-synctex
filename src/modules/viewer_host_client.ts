@@ -20,6 +20,7 @@ import {
 	type McpToViewerHostMessage,
 	type ViewerHostControlResponse,
 	type ViewerHostReverseSynctexHoverMessage,
+	type ViewerHostReverseSynctexHoverResultMessage,
 	type ViewerHostReverseSynctexMessage,
 	type ViewerHostToMcpMessage,
 } from "./viewer_host_protocol.ts";
@@ -733,6 +734,35 @@ export class ViewerHostMcpService {
 		}
 	}
 
+	private hoverCandidateSummary(candidate: unknown): { source_file?: string; line: number; column?: number; source_line?: string; score?: number; structural?: boolean; distance?: number; distance_x?: number; distance_y?: number } | undefined {
+		if (typeof candidate !== "object" || candidate === null) return undefined;
+		const record = candidate as Record<string, unknown>;
+		if (typeof record.line !== "number") return undefined;
+		return {
+			...(typeof record.sourceFile === "string" ? { source_file: record.sourceFile } : typeof record.input === "string" ? { source_file: record.input } : {}),
+			line: record.line,
+			...(typeof record.column === "number" ? { column: record.column } : {}),
+			...(typeof record.sourceLine === "string" ? { source_line: record.sourceLine } : {}),
+			...(typeof record.score === "number" ? { score: record.score } : {}),
+			...(typeof record.structural === "boolean" ? { structural: record.structural } : {}),
+			...(typeof record.distance === "number" ? { distance: record.distance } : {}),
+			...(typeof record.distanceX === "number" ? { distance_x: record.distanceX } : {}),
+			...(typeof record.distanceY === "number" ? { distance_y: record.distanceY } : {}),
+		};
+	}
+
+	private hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Partial<ViewerHostReverseSynctexHoverResultMessage> {
+		const raw = this.hoverCandidateSummary(hover.rawWinner);
+		const candidates = hover.topCandidates?.map((candidate) => this.hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
+		return {
+			...(hover.precision === undefined ? {} : { precision: hover.precision }),
+			...(raw === undefined ? {} : { raw }),
+			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision } }),
+			...(candidates === undefined || candidates.length === 0 ? {} : { candidates }),
+			...(hover.forwardVerification === undefined ? {} : { forward: { attempted: hover.forwardVerification.attempted, contains_click: hover.forwardVerification.containsClick, boxes_considered: hover.forwardVerification.boxesConsidered, boxes_filtered: hover.forwardVerification.boxesFiltered, ...(hover.forwardVerification.chosenBox === undefined ? {} : { chosen_box: hover.forwardVerification.chosenBox }) } }),
+		};
+	}
+
 	private async sendReverseSynctexHoverResult(message: ViewerHostReverseSynctexHoverMessage): Promise<void> {
 		const record = this.getRecord(message.pdf_id);
 		const cwd = record.workspaceCwd || dirname(record.pdfPath);
@@ -750,6 +780,7 @@ export class ViewerHostMcpService {
 				column: hover.column,
 				...(hover.sourceLine === undefined ? {} : { source_line: hover.sourceLine }),
 				rect: hover.rect,
+				...this.hoverResultDiagnostics(hover),
 			}, { reregisterBeforeSend: true });
 		} catch (error) {
 			await this.sendWithReconnect({

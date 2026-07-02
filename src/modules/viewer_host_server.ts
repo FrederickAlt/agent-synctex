@@ -590,6 +590,28 @@ function truncateHoverLabel(value) {
 	return text.length > 100 ? text.slice(0, 97) + "…" : text;
 }
 
+function hoverCandidateLine(prefix, candidate) {
+	if (!candidate) return "";
+	const source = candidate.source_line ? " " + truncateHoverLabel(String(candidate.source_line)) : "";
+	const precision = candidate.precision ? " [" + String(candidate.precision) + "]" : "";
+	return prefix + ": line " + String(candidate.line || "?") + source + precision;
+}
+
+function hoverDiagnosticsLabel(message) {
+	const file = String(message.source_file || "").split(/[\\/]/).pop() || "source";
+	const simple = file + ":" + message.line + " " + truncateHoverLabel(message.source_line);
+	if (message.raw || message.repaired || message.precision || Array.isArray(message.candidates) || message.forward) {
+		const parts = [simple];
+		if (message.raw) parts.push(hoverCandidateLine("raw", message.raw));
+		if (message.repaired) parts.push(hoverCandidateLine("repair", message.repaired));
+		else parts.push(hoverCandidateLine("result", { line: message.line, source_line: message.source_line, precision: message.precision }));
+		if (message.forward && message.forward.contains_click) parts.push("forward: verified");
+		if (Array.isArray(message.candidates) && message.candidates.length > 0) parts.push("top: " + message.candidates.slice(0, 3).map((candidate) => "line " + String(candidate.line || "?") + (candidate.score === undefined ? "" : " score " + String(candidate.score))).join("; "));
+		return parts.filter(Boolean).join("\\n");
+	}
+	return simple;
+}
+
 function showReverseSynctexHoverResult(message) {
 	if (!reverseSynctexHoverEnabled || Number(message.request_id) !== reverseSynctexHoverLatestRequestId) return;
 	if (message.error || !message.rect) {
@@ -626,8 +648,8 @@ function showReverseSynctexHoverResult(message) {
 	label.style.background = "rgba(15,23,42,.9)";
 	label.style.color = "white";
 	label.style.font = "12px/1.3 sans-serif";
-	const file = String(message.source_file || "").split(/[\\/]/).pop() || "source";
-	label.textContent = file + ":" + message.line + " " + truncateHoverLabel(message.source_line);
+	label.style.whiteSpace = "pre-line";
+	label.textContent = hoverDiagnosticsLabel(message);
 	page.append(marker, label);
 }
 
@@ -643,21 +665,21 @@ function sendReverseSynctexForwardProbe(event, pageNumber, pageElement, canvas, 
 	viewerSocket.send(JSON.stringify({ type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageElement, canvas, viewport) }));
 }
 
-function scheduleReverseSynctexHover(event, pageNumber, canvas, viewport) {
+function scheduleReverseSynctexHover(event, pageNumber, pageElement, canvas, viewport) {
 	if (!reverseSynctexHoverEnabled || !viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
 	const rect = canvas.getBoundingClientRect();
 	const point = viewport.convertToPdfPoint(event.clientX - rect.left, canvas.offsetHeight - (event.clientY - rect.top));
 	const requestId = reverseSynctexHoverRequestId + 1;
 	reverseSynctexHoverRequestId = requestId;
 	reverseSynctexHoverLatestRequestId = requestId;
-	reverseSynctexHoverPending = { request_id: requestId, page: pageNumber, x: point[0], y: point[1] };
+	reverseSynctexHoverPending = { request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageElement, canvas, viewport) };
 	if (reverseSynctexHoverTimer !== undefined) return;
 	reverseSynctexHoverTimer = setTimeout(() => {
 		reverseSynctexHoverTimer = undefined;
 		const pending = reverseSynctexHoverPending;
 		reverseSynctexHoverPending = undefined;
 		if (!reverseSynctexHoverEnabled || !pending || !viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
-		viewerSocket.send(JSON.stringify({ type: "reverse_synctex_hover", request_id: pending.request_id, page: pending.page, x: pending.x, y: pending.y }));
+		viewerSocket.send(JSON.stringify({ type: "reverse_synctex_hover", request_id: pending.request_id, page: pending.page, x: pending.x, y: pending.y, ...(pending.textBeforeSelection ? { textBeforeSelection: pending.textBeforeSelection } : {}), ...(pending.textAfterSelection ? { textAfterSelection: pending.textAfterSelection } : {}) }));
 	}, REVERSE_SYNCTEX_HOVER_THROTTLE_MS);
 }
 
@@ -697,7 +719,7 @@ async function renderPdf(config) {
 			sendSelectionDebug("mouseup", pageNumber);
 			scheduleReverseSynctexSelectionSend(pageNumber, pageContainer, canvas, viewport);
 		}, true);
-		pageContainer.addEventListener("mousemove", (event) => scheduleReverseSynctexHover(event, pageNumber, canvas, viewport));
+		pageContainer.addEventListener("mousemove", (event) => scheduleReverseSynctexHover(event, pageNumber, pageContainer, canvas, viewport));
 		pageContainer.addEventListener("mouseleave", () => {
 			reverseSynctexHoverLatestRequestId += 1;
 			reverseSynctexHoverPending = undefined;
@@ -1614,6 +1636,35 @@ iframe{width:100%;height:100%;border:0;background:white}
 		}
 	}
 
+	private hoverCandidateSummary(candidate: unknown): { source_file?: string; line: number; column?: number; source_line?: string; score?: number; structural?: boolean; distance?: number; distance_x?: number; distance_y?: number } | undefined {
+		if (typeof candidate !== "object" || candidate === null) return undefined;
+		const record = candidate as Record<string, unknown>;
+		if (typeof record.line !== "number") return undefined;
+		return {
+			...(typeof record.sourceFile === "string" ? { source_file: record.sourceFile } : typeof record.input === "string" ? { source_file: record.input } : {}),
+			line: record.line,
+			...(typeof record.column === "number" ? { column: record.column } : {}),
+			...(typeof record.sourceLine === "string" ? { source_line: record.sourceLine } : {}),
+			...(typeof record.score === "number" ? { score: record.score } : {}),
+			...(typeof record.structural === "boolean" ? { structural: record.structural } : {}),
+			...(typeof record.distance === "number" ? { distance: record.distance } : {}),
+			...(typeof record.distanceX === "number" ? { distance_x: record.distanceX } : {}),
+			...(typeof record.distanceY === "number" ? { distance_y: record.distanceY } : {}),
+		};
+	}
+
+	private hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Record<string, unknown> {
+		const raw = this.hoverCandidateSummary(hover.rawWinner);
+		const candidates = hover.topCandidates?.map((candidate) => this.hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
+		return {
+			...(hover.precision === undefined ? {} : { precision: hover.precision }),
+			...(raw === undefined ? {} : { raw }),
+			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision } }),
+			...(candidates === undefined || candidates.length === 0 ? {} : { candidates }),
+			...(hover.forwardVerification === undefined ? {} : { forward: { attempted: hover.forwardVerification.attempted, contains_click: hover.forwardVerification.containsClick, boxes_considered: hover.forwardVerification.boxesConsidered, boxes_filtered: hover.forwardVerification.boxesFiltered, ...(hover.forwardVerification.chosenBox === undefined ? {} : { chosen_box: hover.forwardVerification.chosenBox }) } }),
+		};
+	}
+
 	private handleReverseSynctexForwardProbeMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_forward_probe" }>): void {
 		try {
 			const record = this.registry.getPdf(connection.pdfId);
@@ -1674,6 +1725,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 				column: hover.column,
 				...(hover.sourceLine === undefined ? {} : { source_line: hover.sourceLine }),
 				rect: hover.rect,
+				...this.hoverResultDiagnostics(hover),
 			});
 		} catch (error) {
 			sendViewerSocketJson(connection, { type: "reverse_synctex_hover_result", pdf_id: connection.pdfId, request_id: message.request_id, page: message.page, x: message.x, y: message.y, error: errorMessage(error) });
