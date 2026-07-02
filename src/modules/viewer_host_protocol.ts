@@ -80,6 +80,8 @@ export interface ViewerHostReverseSynctexHoverResultMessage {
 	source_line?: string;
 	rect?: { left: number; top: number; right: number; bottom: number };
 	precision?: ViewerHostSynctexPrecision;
+	nearest_candidate?: ViewerHostReverseSynctexCandidateSummary;
+	/** @deprecated Use nearest_candidate; retained only for older viewer frames. */
 	raw?: ViewerHostReverseSynctexCandidateSummary;
 	repaired?: ViewerHostReverseSynctexCandidateSummary & { precision?: ViewerHostSynctexPrecision };
 	candidates?: ViewerHostReverseSynctexCandidateSummary[];
@@ -440,7 +442,9 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			const sourceLine = optionalString(message.source_line, "source_line");
 			const rect = optionalHoverRect(message.rect, "rect");
 			const precision = optionalPrecision(message.precision, "precision");
+			const nearestCandidate = optionalReverseSynctexCandidateSummary(message.nearest_candidate, "nearest_candidate");
 			const raw = optionalReverseSynctexCandidateSummary(message.raw, "raw");
+			const initialCandidate = nearestCandidate ?? raw;
 			const repairedBase = optionalReverseSynctexCandidateSummary(message.repaired, "repaired");
 			const repairedPrecision = isRecord(message.repaired) ? optionalPrecision(message.repaired.precision, "repaired.precision") : undefined;
 			const repaired = repairedBase === undefined ? undefined : { ...repairedBase, ...(repairedPrecision === undefined ? {} : { precision: repairedPrecision }) };
@@ -463,7 +467,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
 				...(rect === undefined ? {} : { rect }),
 				...(precision === undefined ? {} : { precision }),
-				...(raw === undefined ? {} : { raw }),
+				...(initialCandidate === undefined ? {} : { nearest_candidate: initialCandidate }),
 				...(repaired === undefined ? {} : { repaired }),
 				...(candidates === undefined ? {} : { candidates }),
 				...(forward === undefined ? {} : { forward }),

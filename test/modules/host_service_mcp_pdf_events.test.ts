@@ -43,7 +43,7 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 			selected: { sourceFile: "/tmp/paper/main.tex", line: 42, column: 1, sourceLine: "\\section{Visible target}" },
 			context: { hasSelectionContext: true, textBeforeSelection: "formula body", textAfterSelection: "closing delimiter" },
 			candidates: [
-				{ kind: "raw", sourceFile: "/tmp/paper/main.tex", line: 43, column: 9 },
+				{ kind: "initial_candidate", sourceFile: "/tmp/paper/main.tex", line: 43, column: 9 },
 				{ kind: "formula_normalized", sourceFile: "/tmp/paper/main.tex", line: 42, column: 1 },
 			],
 		},
@@ -76,12 +76,13 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.x, 110);
 	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.y, 220);
 	assert.match(text, /selected_text=chosen formula/);
-	assert.match(text, /selection_start=\/tmp\/paper\/main\.tex:line=40:column=2:precision=verified:repair=text_context:raw_mapped_source_file=\/tmp\/paper\/raw\.tex:raw_mapped_line=43/);
-	assert.match(text, /selection_end=\/tmp\/paper\/main\.tex:line=42:column=12:precision=text:raw_mapped_line=43/);
+	assert.match(text, /selection_start=\/tmp\/paper\/main\.tex:line=40:column=2:precision=verified:repair=text_context:initial_candidate_source_file=\/tmp\/paper\/raw\.tex:initial_candidate_line=43/);
+	assert.match(text, /selection_end=\/tmp\/paper\/main\.tex:line=42:column=12:precision=text:initial_candidate_line=43/);
 	assert.doesNotMatch(text, /topCandidates/);
-	assert.match(text, /raw_mapped_line=43/);
-	assert.match(text, /raw_mapped_column=9/);
-	assert.match(text, /raw_mapped_source_line=\\end\{align\}/);
+	assert.doesNotMatch(text, /raw_mapped_/);
+	assert.match(text, /initial_candidate_line=43/);
+	assert.match(text, /initial_candidate_column=9/);
+	assert.match(text, /initial_candidate_source_line=\\end\{align\}/);
 	assert.match(text, /normalized_formula_span=40-43/);
 	assert.match(text, /normalized_formula_excerpt=\\begin\{align\} a &= b \+ c\\\\ \\end\{align\}/);
 	assert.match(text, /synctex_diagnostics=branch=js_fallback/);

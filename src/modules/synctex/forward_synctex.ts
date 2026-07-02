@@ -219,7 +219,7 @@ export interface ReverseSynctexDiagnostics {
 		line: number;
 		column: number;
 		sourceLine?: string;
-		kind: "raw" | "context_corrected" | "formula_normalized";
+		kind: "initial_candidate" | "context_corrected" | "formula_normalized";
 	}>;
 	selected: {
 		sourceFile: string;
@@ -257,6 +257,8 @@ export interface ReverseSynctexDiagnostics {
 		samePageBoxCount: number;
 		containsClick: boolean;
 		structural: boolean;
+		textContainmentBonus: number;
+		textContainment?: "full" | "partial";
 		distance?: number;
 		reason?: string;
 	}>;
@@ -677,6 +679,8 @@ interface ScoredReverseSynctexProposal extends ReverseSynctexProposal {
 	chosenBox?: ForwardSynctexRange;
 	containsClick: boolean;
 	samePageBoxCount: number;
+	textContainmentBonus: number;
+	textContainment?: "full" | "partial";
 	distance?: number;
 	reason?: string;
 }
@@ -689,10 +693,34 @@ function boxContainsClick(box: ForwardSynctexRange, click: { page: number; x: nu
 	return box.page === click.page && click.x >= box.h && click.x <= box.h + box.W && click.y >= box.v && click.y <= box.v + box.H;
 }
 
-function boxDistanceFromClick(box: ForwardSynctexRange, click: { x: number; y: number }): number {
+function boxDistanceComponentsFromClick(box: ForwardSynctexRange, click: { x: number; y: number }): { dx: number; dy: number; distance: number; weightedDistanceSquared: number } {
 	const nearestX = Math.max(box.h, Math.min(click.x, box.h + box.W));
 	const nearestY = Math.max(box.v, Math.min(click.y, box.v + box.H));
-	return Math.hypot(click.x - nearestX, click.y - nearestY);
+	const dx = Math.abs(click.x - nearestX);
+	const dy = Math.abs(click.y - nearestY);
+	return { dx, dy, distance: Math.hypot(dx, dy), weightedDistanceSquared: ((0.5 * dx) ** 2) + (dy ** 2) };
+}
+
+function buildPartialTextContainmentContext(textBeforeSelection: string | undefined, textAfterSelection: string | undefined): string | undefined {
+	const before = textBeforeSelection ?? "";
+	const after = textAfterSelection ?? "";
+	let beforeCount = Math.min(4, before.length);
+	let afterCount = Math.min(4, after.length);
+	if (beforeCount < 4) afterCount = Math.min(8 - beforeCount, after.length);
+	if (afterCount < 4) beforeCount = Math.min(8 - afterCount, before.length);
+	const context = `${before.slice(before.length - beforeCount)}${after.slice(0, afterCount)}`;
+	return context.length === 8 ? context : undefined;
+}
+
+function textContainmentBonus(input: { proposal: ReverseSynctexProposal; containsClick: boolean; fullTextFragment?: string; partialTextFragment?: string }): { bonus: number; containment?: "full" | "partial" } {
+	if (!input.containsClick || input.proposal.sourceLine === undefined) return { bonus: 0 };
+	if (input.fullTextFragment !== undefined && input.fullTextFragment.length > 0 && input.proposal.sourceLine.includes(input.fullTextFragment)) {
+		return { bonus: -50, containment: "full" };
+	}
+	if (input.partialTextFragment !== undefined && input.proposal.sourceLine.includes(input.partialTextFragment)) {
+		return { bonus: -20, containment: "partial" };
+	}
+	return { bonus: 0 };
 }
 
 function proposalPrecision(proposal: ReverseSynctexProposal, containsClick: boolean): ReverseSynctexPrecision {
@@ -704,13 +732,17 @@ function scoreReverseSynctexProposal(input: {
 	proposal: ReverseSynctexProposal;
 	click: { page: number; x: number; y: number };
 	boxes: ForwardSynctexRange[];
+	fullTextFragment?: string;
+	partialTextFragment?: string;
 }): ScoredReverseSynctexProposal {
 	const filtered = filterForwardBoxes(input.boxes, input.click);
 	const samePageBoxes = filtered.boxes.filter((box) => box.page === input.click.page);
 	const scoredSamePageBoxes = samePageBoxes.map((box) => {
-		const distance = boxDistanceFromClick(box, input.click);
+		const { distance, weightedDistanceSquared } = boxDistanceComponentsFromClick(box, input.click);
 		const area = Math.max(0, box.W) * Math.max(0, box.H);
-		return { box, distance, score: (distance * distance / 5) + Math.sqrt(area) };
+		const containsClick = boxContainsClick(box, input.click);
+		const containment = textContainmentBonus({ proposal: input.proposal, containsClick, fullTextFragment: input.fullTextFragment, partialTextFragment: input.partialTextFragment });
+		return { box, distance, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (weightedDistanceSquared / 5) + Math.sqrt(area) + containment.bonus };
 	}).sort((left, right) => left.score - right.score);
 	const chosen = scoredSamePageBoxes[0];
 	const chosenSamePageBox = chosen?.box;
@@ -718,6 +750,8 @@ function scoreReverseSynctexProposal(input: {
 	const distance = chosen?.distance;
 	const geometryTier = chosenSamePageBox === undefined ? 1 : 0;
 	const score = chosen?.score ?? 0;
+	const chosenTextContainmentBonus = chosen?.textContainmentBonus ?? 0;
+	const chosenTextContainment = chosen?.textContainment;
 	return {
 		...input.proposal,
 		precision: proposalPrecision(input.proposal, containsClick),
@@ -727,6 +761,8 @@ function scoreReverseSynctexProposal(input: {
 		...(chosenSamePageBox === undefined ? {} : { chosenBox: chosenSamePageBox }),
 		containsClick,
 		samePageBoxCount: samePageBoxes.length,
+		textContainmentBonus: chosenTextContainmentBonus,
+		...(chosenTextContainment === undefined ? {} : { textContainment: chosenTextContainment }),
 		...(distance === undefined ? {} : { distance }),
 		...(chosenSamePageBox === undefined ? { reason: "no-same-page-forward-box" } : containsClick ? { reason: "contains-click" } : { reason: "nearest-same-page-forward-box" }),
 	};
@@ -753,6 +789,8 @@ function compactProposalScore(proposal: ScoredReverseSynctexProposal): NonNullab
 		samePageBoxCount: proposal.samePageBoxCount,
 		containsClick: proposal.containsClick,
 		structural: proposal.structural,
+		textContainmentBonus: proposal.textContainmentBonus,
+		...(proposal.textContainment === undefined ? {} : { textContainment: proposal.textContainment }),
 		...(proposal.distance === undefined ? {} : { distance: proposal.distance }),
 		...(proposal.reason === undefined ? {} : { reason: proposal.reason }),
 	};
@@ -1133,8 +1171,12 @@ export function mapReverseSynctex(input: {
 			});
 		}
 		let textStatus: "unique" | "ambiguous-small" | undefined;
+		let fullTextFragment: string | undefined;
+		let partialTextFragment: string | undefined;
 		if (hasSelectionContext) {
 			const fragments = buildSourceSearchFragments(input.textBeforeSelection ?? "", input.textAfterSelection ?? "");
+			fullTextFragment = fragments[0];
+			partialTextFragment = buildPartialTextContainmentContext(input.textBeforeSelection, input.textAfterSelection);
 			const matches = findSourceTextMatches(rawSourceFile, fragments);
 			textRepair = {
 				used: false,
@@ -1165,6 +1207,8 @@ export function mapReverseSynctex(input: {
 			const scored = viableProposals.map((proposal) => scoreReverseSynctexProposal({
 				proposal,
 				click,
+				...(fullTextFragment === undefined ? {} : { fullTextFragment }),
+				...(partialTextFragment === undefined ? {} : { partialTextFragment }),
 				boxes: forwardBoxesForSourceLine({
 					sourceFile: proposal.sourceFile,
 					line: proposal.line,
@@ -1241,7 +1285,7 @@ export function mapReverseSynctex(input: {
 		line: rawMappedLine,
 		column: rawMappedColumn,
 		...(rawMappedSourceLine === undefined ? {} : { sourceLine: rawMappedSourceLine }),
-		kind: "raw",
+		kind: "initial_candidate",
 	}];
 	if (line !== rawMappedLine || column !== rawMappedColumn || sourceFile !== rawSourceFile) {
 		candidates.push({

@@ -424,7 +424,40 @@ test("robust reverse mapping does not privilege raw end-document when same-page 
 	}
 });
 
-test("robust reverse mapping uses exact central forward geometry scoring formula", () => {
+test("robust reverse mapping weights horizontal distance half as much as vertical distance", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-weighted-distance-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", "horizontal miss", "vertical miss"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 3, column: 0, sourceLine: "vertical miss", rect: { left: 10, top: 20, right: 20, bottom: 30 }, distanceX: 0, distanceY: 10, distance: 10, area: 100, containsClick: false, structural: false },
+				rawWinner: { input: sourcePath, line: 3, column: 0, sourceLine: "vertical miss", rect: { left: 10, top: 20, right: 20, bottom: 30 }, distanceX: 0, distanceY: 10, distance: 10, area: 100, containsClick: false, structural: false },
+				candidates: [
+					{ input: sourcePath, line: 3, column: 0, sourceLine: "vertical miss", rect: { left: 10, top: 20, right: 20, bottom: 30 }, distanceX: 0, distanceY: 10, distance: 10, area: 100, containsClick: false, structural: false },
+					{ input: sourcePath, line: 2, column: 0, sourceLine: "horizontal miss", rect: { left: 20, top: 10, right: 30, bottom: 20 }, distanceX: 10, distanceY: 0, distance: 10, area: 100, containsClick: false, structural: false },
+				],
+			}),
+			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 20, v: 10, W: 10, H: 10 }] : [{ page: 1, h: 10, v: 20, W: 10, H: 10 }],
+		});
+		assert.equal(location.line, 2);
+		assert.deepEqual(location.diagnostics.proposalScores?.map((proposal) => proposal.line), [2, 3]);
+		assert.equal(location.diagnostics.proposalScores?.[0]?.score, 15);
+		assert.equal(location.diagnostics.proposalScores?.[1]?.score, 30);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping uses exact weighted forward geometry scoring formula", () => {
 	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-formula-"));
 	try {
 		const pdfPath = join(dir, "paper.pdf");
@@ -441,7 +474,94 @@ test("robust reverse mapping uses exact central forward geometry scoring formula
 			jsFallback: () => ({ input: sourcePath, line: 2, column: 0 }),
 			forwardBoxesForLine: () => [{ page: 1, h: 0, v: 0, W: 6, H: 8 }],
 		});
-		assert.equal(location.diagnostics.proposalScores?.[0]?.score, (85 / 5) + Math.sqrt(48));
+		assert.equal(location.diagnostics.proposalScores?.[0]?.score, (((0.5 * 7) ** 2 + 6 ** 2) / 5) + Math.sqrt(48));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping applies full text containment bonus without partial bonus", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-full-text-bonus-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", "HELLOWORLD", "ranked candidate"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "HELLO",
+			textAfterSelection: "WORLD",
+			jsFallback: () => ({ input: sourcePath, line: 3, column: 0 }),
+			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 5, v: 5, W: 10, H: 10 }] : [{ page: 1, h: 5, v: 5, W: 10, H: 10 }],
+		});
+		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
+		assert.equal(location.line, 2);
+		assert.equal(textScore?.score, -40);
+		assert.equal(textScore?.textContainmentBonus, -50);
+		assert.equal(textScore?.textContainment, "full");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping applies partial 8-character text containment bonus with one-sided fill", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-partial-text-bonus-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", "KLM xxx FGHIJKLM", "ranked candidate"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "ABCDEFGHIJ",
+			textAfterSelection: "KLM",
+			jsFallback: () => ({ input: sourcePath, line: 3, column: 0 }),
+			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 5, v: 5, W: 10, H: 10 }] : [{ page: 1, h: 5, v: 5, W: 10, H: 10 }],
+		});
+		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
+		assert.equal(location.line, 2);
+		assert.equal(textScore?.score, -10);
+		assert.equal(textScore?.textContainmentBonus, -20);
+		assert.equal(textScore?.textContainment, "partial");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping grants no partial text containment bonus when fewer than eight context characters are available", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-no-short-partial-bonus-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", "DEFG", "ranked candidate"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "ABC",
+			textAfterSelection: "DEFG",
+			jsFallback: () => ({ input: sourcePath, line: 3, column: 0 }),
+			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 5, v: 5, W: 10, H: 10 }] : [{ page: 1, h: 5, v: 5, W: 10, H: 10 }],
+		});
+		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
+		assert.equal(location.line, 3);
+		assert.equal(textScore?.score, 10);
+		assert.equal(textScore?.textContainmentBonus, 0);
+		assert.equal(textScore?.textContainment, undefined);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -1573,7 +1693,7 @@ test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct c
 		assert.equal(location.sourceLine, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(location.diagnostics.context.hasSelectionContext, true);
 		assert.equal(location.diagnostics.context.textBeforeSelection, "First paragraph");
-		assert.deepEqual(location.diagnostics.candidates.map((candidate) => candidate.kind), ["raw", "context_corrected"]);
+		assert.deepEqual(location.diagnostics.candidates.map((candidate) => candidate.kind), ["initial_candidate", "context_corrected"]);
 		assert.deepEqual(location.diagnostics.selected, {
 			sourceFile: project.sourcePath,
 			line: 3,
@@ -1601,7 +1721,7 @@ test("reverse SyncTeX adapter leaves no-context fallback mapping unchanged", () 
 		assert.equal(location.line, 3);
 		assert.equal(location.column, 0);
 		assert.equal(location.diagnostics.context.hasSelectionContext, false);
-		assert.deepEqual(location.diagnostics.candidates.map((candidate) => candidate.kind), ["raw"]);
+		assert.deepEqual(location.diagnostics.candidates.map((candidate) => candidate.kind), ["initial_candidate"]);
 		assert.deepEqual(location.diagnostics.selected, {
 			sourceFile: project.sourcePath,
 			line: 3,
