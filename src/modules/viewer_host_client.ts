@@ -4,7 +4,7 @@ import { existsSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertReadablePdfFile, assertReadableSourceFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
-import { findUniqueSelectedTextSourceRange, mapForwardSynctex, mapReverseSynctex } from "./synctex/forward_synctex.ts";
+import { findUniqueSelectedTextSourceRange, inspectReverseSynctexHover, mapForwardSynctex, mapReverseSynctex } from "./synctex/forward_synctex.ts";
 import { PdfEventStore, type GetPdfEventsRequest, type PdfEvent, type ReverseSynctexSourceLocationEvent } from "./pdf_events.ts";
 import type {
 	HostServiceJumpRequest,
@@ -19,6 +19,7 @@ import {
 	validateViewerHostToMcpMessage,
 	type McpToViewerHostMessage,
 	type ViewerHostControlResponse,
+	type ViewerHostReverseSynctexHoverMessage,
 	type ViewerHostReverseSynctexMessage,
 	type ViewerHostToMcpMessage,
 } from "./viewer_host_protocol.ts";
@@ -484,7 +485,7 @@ export class ViewerHostMcpService {
 
 				const session = await this.ensureSession();
 				const record = this.createPdfRecord(pdfPath, request.workspace_context.cwd, session.client);
-				const registeredSession = await this.sendWithReconnectLocked({ type: "open_pdf", pdf_id: record.pdfId, pdf_path: record.pdfPath, title: basename(record.pdfPath) }, { reregisterBeforeSend: false });
+				const registeredSession = await this.sendWithReconnectLocked({ type: "open_pdf", pdf_id: record.pdfId, pdf_path: record.pdfPath, title: basename(record.pdfPath), workspace_cwd: record.workspaceCwd }, { reregisterBeforeSend: false });
 				this.setRecordViewerUrl(record, registeredSession);
 				this.commitPdfRecord(record);
 				return { record, reused: false };
@@ -607,6 +608,8 @@ export class ViewerHostMcpService {
 		const parsed = validateViewerHostToMcpMessage(message);
 		if (parsed.type === "reverse_synctex") {
 			this.appendReverseSynctexEvent(parsed);
+		} else if (parsed.type === "reverse_synctex_hover") {
+			void this.sendReverseSynctexHoverResult(parsed).catch(() => undefined);
 		} else if (parsed.type === "selection_debug") {
 			this.eventStore.appendSelectionDebugEvent({
 				type: "selection_debug",
@@ -699,7 +702,7 @@ export class ViewerHostMcpService {
 		const reregistered: number[] = [];
 		for (const record of this.recordsById.values()) {
 			if (this.registeredGenerationByPdfId.get(record.pdfId) === session.generation) continue;
-			await this.sendToClient(session.client, { type: "open_pdf", pdf_id: record.pdfId, pdf_path: record.pdfPath, title: basename(record.pdfPath) });
+			await this.sendToClient(session.client, { type: "open_pdf", pdf_id: record.pdfId, pdf_path: record.pdfPath, title: basename(record.pdfPath), workspace_cwd: record.workspaceCwd });
 			reregistered.push(record.pdfId);
 		}
 		if (this.activeSession !== session) return;
@@ -722,6 +725,37 @@ export class ViewerHostMcpService {
 		const origin = session.client.origin.replace(/\/$/, "");
 		for (const record of this.recordsById.values()) {
 			record.viewerUrl = `${origin}/viewer/${record.pdfId}`;
+		}
+	}
+
+	private async sendReverseSynctexHoverResult(message: ViewerHostReverseSynctexHoverMessage): Promise<void> {
+		const record = this.getRecord(message.pdf_id);
+		const cwd = record.workspaceCwd || dirname(record.pdfPath);
+		try {
+			const hover = inspectReverseSynctexHover({ pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y, cwd });
+			await this.sendWithReconnect({
+				type: "reverse_synctex_hover_result",
+				pdf_id: message.pdf_id,
+				request_id: message.request_id,
+				page: message.page,
+				x: message.x,
+				y: message.y,
+				source_file: hover.sourceFile,
+				line: hover.line,
+				column: hover.column,
+				...(hover.sourceLine === undefined ? {} : { source_line: hover.sourceLine }),
+				rect: hover.rect,
+			}, { reregisterBeforeSend: true });
+		} catch (error) {
+			await this.sendWithReconnect({
+				type: "reverse_synctex_hover_result",
+				pdf_id: message.pdf_id,
+				request_id: message.request_id,
+				page: message.page,
+				x: message.x,
+				y: message.y,
+				error: error instanceof Error ? error.message : String(error),
+			}, { reregisterBeforeSend: true });
 		}
 	}
 

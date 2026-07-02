@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -286,6 +286,12 @@ async function clickRenderedPagePoint(page: Page, x: number, y: number, options:
 	} finally {
 		if (options.ctrl) await page.keyboard.up("Control");
 	}
+}
+
+async function moveRenderedPagePoint(page: Page, x: number, y: number): Promise<void> {
+	const box = await page.locator("#pages canvas[data-page-number='1']").boundingBox();
+	if (!box) throw new Error("missing rendered canvas box");
+	await page.mouse.move(box.x + x, box.y + y);
 }
 
 async function dispatchRenderedPageMouseup(page: Page, x: number, y: number): Promise<void> {
@@ -876,6 +882,162 @@ test("Viewer Host-served Viewer Client renders multiple native rectangle markers
 		assertApproximatelyEqual(zeroHeightMarker.height, 2, 0.5, "zero-height native rectangle should use the minimum visible fallback height");
 		assert.equal(zeroHeightMarker.border, "0px", "zero-height native rectangle highlight should not draw a red border");
 		assert.notEqual(zeroHeightMarker.background, "", "zero-height native rectangle should keep a background highlight");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host-served Viewer Client toggles reverse SyncTeX hover overlay without storing hover events", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-hover-"));
+	const outDir = join(baseDir, "out");
+	mkdirSync(outDir);
+	const pdfPath = join(outDir, "paper.pdf");
+	const sourcePath = join(baseDir, "main.tex");
+	writeFileSync(pdfPath, makeOnePagePdf());
+	const fixtureDir = resolve("test/fixtures/synctex-forward");
+	copyFileSync(join(fixtureDir, "main.tex"), sourcePath);
+	copyFileSync(join(fixtureDir, "paper.synctex"), join(outDir, "paper.synctex"));
+	const registry = new ViewerHostPdfRegistry();
+	let service: ViewerHostMcpService | undefined;
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	const consoleMessages: string[] = [];
+	const pageErrors: string[] = [];
+	const failedRequests: string[] = [];
+	const sentViewerMessages: Array<Record<string, unknown>> = [];
+	try {
+		await server.start();
+		service = new ViewerHostMcpService({ client: new HttpViewerHostClient(server.origin), makePdfId: () => 239 });
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 480, height: 360 } });
+		page.on("console", (message) => consoleMessages.push(`${message.type()}: ${message.text()}`));
+		page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}`));
+		page.on("requestfailed", (request: Request) => failedRequests.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "request failed"}`));
+		page.on("response", (response: Response) => {
+			if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`);
+		});
+		page.on("websocket", (socket) => {
+			socket.on("framesent", (frame: { payload: string | Buffer }) => {
+				try {
+					const payload = typeof frame.payload === "string" ? frame.payload : frame.payload.toString("utf8");
+					const parsed = JSON.parse(payload) as Record<string, unknown>;
+					sentViewerMessages.push(parsed);
+				} catch { }
+			});
+		});
+
+		await page.goto(`${server.origin}/viewer/239`, { waitUntil: "domcontentloaded" });
+		const outcome = await waitForViewerOutcome(page);
+		assert.equal(outcome.rendered, true, `viewer did not render first page; timedOut=${outcome.timedOut}; status=${JSON.stringify(outcome.status)}\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		for (let attempt = 0; attempt < 20 && server.getConnectedViewerCount(239) !== 1; attempt += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.equal(server.getConnectedViewerCount(239), 1);
+
+		const toggle = page.locator("#synctex-hover-toggle");
+		await assert.doesNotReject(() => toggle.waitFor({ state: "visible", timeout: 2_000 }));
+		assert.equal(await toggle.textContent(), "SyncTeX hover: off");
+		assert.equal(await toggle.getAttribute("aria-pressed"), "false");
+
+		await moveRenderedPagePoint(page, 160, 80);
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		assert.equal(sentViewerMessages.some((message) => message.type === "reverse_synctex_hover"), false, "mousemove while disabled should not send hover requests");
+		assert.equal(await page.locator("[data-reverse-synctex-hover]").count(), 0, "disabled hover should not draw overlay");
+
+		await toggle.click();
+		assert.equal(await toggle.getAttribute("aria-pressed"), "true");
+		await moveRenderedPagePoint(page, 180, 100);
+		let hoverRequest: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			hoverRequest = sentViewerMessages.find((message) => message.type === "reverse_synctex_hover");
+			if (hoverRequest) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(hoverRequest, `enabled hover did not send request\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		assert.equal(hoverRequest.page, 1);
+		assert.equal(typeof hoverRequest.request_id, "number");
+
+		await page.waitForSelector("[data-reverse-synctex-hover='rect']", { state: "attached", timeout: 2_000 });
+		await page.waitForSelector("[data-reverse-synctex-hover='label']", { state: "attached", timeout: 2_000 });
+		assert.match(await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "", /main\.tex:3 First paragraph/);
+
+		const control = new ViewerHostControlClient({ origin: server.origin });
+		await control.send({ type: "reverse_synctex_hover_result", pdf_id: 239, request_id: Number(hoverRequest.request_id), page: 1, x: Number(hoverRequest.x), y: Number(hoverRequest.y), error: "hover lookup failed" });
+		await page.waitForFunction(() => document.querySelectorAll("[data-reverse-synctex-hover]").length === 0, undefined, { timeout: 2_000 });
+
+		await moveRenderedPagePoint(page, 185, 105);
+		await control.send({ type: "reverse_synctex_hover_result", pdf_id: 239, request_id: Number(hoverRequest.request_id), page: 1, x: Number(hoverRequest.x), y: Number(hoverRequest.y), source_file: sourcePath, line: 3, column: 0, source_line: "STALE HOVER LABEL", rect: { left: 20, top: 30, right: 80, bottom: 50 } });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.equal(await page.locator("[data-reverse-synctex-hover='label']", { hasText: "STALE HOVER LABEL" }).count(), 0, "stale hover result after pointer move should be ignored");
+
+		const latestHoverRequest = sentViewerMessages.filter((message) => message.type === "reverse_synctex_hover").at(-1) ?? hoverRequest;
+		await page.evaluate(() => {
+			const pageElement = document.querySelector("#pages div[data-page-number='1']") as HTMLElement | null;
+			if (!pageElement) throw new Error("missing rendered page");
+			pageElement.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true }));
+		});
+		await control.send({ type: "reverse_synctex_hover_result", pdf_id: 239, request_id: Number(latestHoverRequest.request_id), page: 1, x: Number(latestHoverRequest.x), y: Number(latestHoverRequest.y), source_file: sourcePath, line: 3, column: 0, source_line: "LEFT PAGE HOVER LABEL", rect: { left: 20, top: 30, right: 80, bottom: 50 } });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.equal(await page.locator("[data-reverse-synctex-hover='label']", { hasText: "LEFT PAGE HOVER LABEL" }).count(), 0, "stale hover result after mouseleave should be ignored");
+		assert.equal(await page.locator("[data-reverse-synctex-hover]").count(), 0, "mouseleave should remove hover overlay");
+
+		const response = await callTool(2, "get_pdf_events", { pdf_id: 239, max_events: 20, stale: true, debug: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+		const events = response.result?.details?.events ?? [];
+		assert.equal(events.some((event) => event.type === "reverse_synctex_hover" || event.type === "reverse_synctex"), false, "hover requests/results should not be stored as PDF events");
+
+		await toggle.click();
+		assert.equal(await toggle.getAttribute("aria-pressed"), "false");
+		await control.send({ type: "reverse_synctex_hover_result", pdf_id: 239, request_id: Number(latestHoverRequest.request_id), page: 1, x: Number(latestHoverRequest.x), y: Number(latestHoverRequest.y), source_file: sourcePath, line: 3, column: 0, source_line: "TOGGLE OFF HOVER LABEL", rect: { left: 20, top: 30, right: 80, bottom: 50 } });
+		await page.waitForFunction(() => document.querySelectorAll("[data-reverse-synctex-hover]").length === 0, undefined, { timeout: 2_000 });
+		assert.equal(await page.locator("[data-reverse-synctex-hover='label']", { hasText: "TOGGLE OFF HOVER LABEL" }).count(), 0, "stale hover result after toggle off should be ignored");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host-served Viewer Client hover falls back to PDF directory when workspace_context is omitted", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-hover-dir-fallback-"));
+	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	let service: ViewerHostMcpService | undefined;
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	const consoleMessages: string[] = [];
+	const pageErrors: string[] = [];
+	const failedRequests: string[] = [];
+	try {
+		await server.start();
+		service = new ViewerHostMcpService({ client: new HttpViewerHostClient(server.origin), makePdfId: () => 249 });
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath }, service);
+
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 480, height: 360 } });
+		page.on("console", (message) => consoleMessages.push(`${message.type()}: ${message.text()}`));
+		page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}`));
+		page.on("requestfailed", (request: Request) => failedRequests.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "request failed"}`));
+		page.on("response", (response: Response) => {
+			if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`);
+		});
+
+		await page.goto(`${server.origin}/viewer/249`, { waitUntil: "domcontentloaded" });
+		const outcome = await waitForViewerOutcome(page);
+		assert.equal(outcome.rendered, true, `viewer did not render first page; timedOut=${outcome.timedOut}; status=${JSON.stringify(outcome.status)}\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		for (let attempt = 0; attempt < 20 && server.getConnectedViewerCount(249) !== 1; attempt += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.equal(server.getConnectedViewerCount(249), 1);
+
+		await page.locator("#synctex-hover-toggle").click();
+		await moveRenderedPagePoint(page, 180, 100);
+		await page.waitForSelector("[data-reverse-synctex-hover='rect']", { state: "attached", timeout: 2_000 });
+		await page.waitForSelector("[data-reverse-synctex-hover='label']", { state: "attached", timeout: 2_000 });
+		assert.match(await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "", /main\.tex:3 First paragraph/);
 	} finally {
 		await browser?.close();
 		await server.stop();

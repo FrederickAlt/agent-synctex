@@ -15,12 +15,14 @@ function assertValidationError(fn: () => unknown, pattern: RegExp): void {
 test("Viewer Host protocol validates representative MCP to Host messages", () => {
 	const messages: McpToViewerHostMessage[] = [
 		{ type: "hello", protocol_version: 1 },
-		{ type: "open_pdf", pdf_id: 123, pdf_path: "/tmp/main.pdf", title: "main.pdf" },
+		{ type: "open_pdf", pdf_id: 123, pdf_path: "/tmp/main.pdf", title: "main.pdf", workspace_cwd: "/tmp" },
 		{ type: "focus_pdf", pdf_id: 123 },
 		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, width: 250, height: 12, source_file: "/tmp/main.tex", line: 42 },
 		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, indicator: true, source_file: "/tmp/main.tex", line: 42 },
 		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, ranges: [{ page: 2, h: 10, v: 20, W: 30, H: 4 }, { page: 2, h: 30, v: 40, W: 10, H: 3 }], source_file: "/tmp/main.tex", line: 42 },
 		{ type: "pdf_maybe_updated", pdf_id: 123 },
+		{ type: "reverse_synctex_hover_result", pdf_id: 123, request_id: 7, page: 2, x: 100, y: 500, source_file: "/tmp/main.tex", line: 42, column: 0, source_line: "hello", rect: { left: 10, top: 20, right: 30, bottom: 40 } },
+		{ type: "reverse_synctex_hover_result", pdf_id: 123, request_id: 8, page: 2, x: 100, y: 500, error: "no result" },
 	];
 
 	for (const message of messages) {
@@ -37,6 +39,7 @@ test("Viewer Host protocol validates representative Host to MCP messages", () =>
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500, selectedText: "chosen", selectionStartX: 95, selectionStartY: 500, selectionEndX: 150, selectionEndY: 500 },
 		{ type: "selection_debug", pdf_id: 123, phase: "send", page: 2, text: "chosen", details: { phase: "send", selectionTextLength: 6 } },
+		{ type: "reverse_synctex_hover", pdf_id: 123, request_id: 7, page: 2, x: 100, y: 500 },
 	];
 
 	for (const message of messages) {
@@ -56,6 +59,7 @@ test("Viewer Host protocol validation rejects malformed boundary messages", () =
 		[{ type: "bogus" }, /unknown message type/],
 		[{ type: "open_pdf", pdf_id: 0, pdf_path: "/tmp/main.pdf" }, /pdf_id/],
 		[{ type: "open_pdf", pdf_id: 1, pdf_path: "" }, /pdf_path/],
+		[{ type: "open_pdf", pdf_id: 1, pdf_path: "/tmp/main.pdf", workspace_cwd: "" }, /workspace_cwd/],
 		[{ type: "synctex_forward", pdf_id: 1, page: 0, x: 1, y: 1, line: 1 }, /page/],
 		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: Number.NaN, y: 1, line: 1 }, /x/],
 		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: -1, line: 1 }, /y/],
@@ -64,6 +68,8 @@ test("Viewer Host protocol validation rejects malformed boundary messages", () =
 		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: 1, ranges: {} }, /ranges/],
 		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: 1, ranges: [{ page: 1, h: -1, v: 2, W: 3, H: 4 }] }, /ranges\[0\]\.h/],
 		[{ type: "synctex_forward", pdf_id: 1, page: 1, x: 1, y: 1, line: 0 }, /line/],
+		[{ type: "reverse_synctex_hover_result", pdf_id: 1, request_id: 1, page: 1, x: 1, y: 1 }, /requires source_file/],
+		[{ type: "reverse_synctex_hover_result", pdf_id: 1, request_id: 1, page: 1, x: 1, y: 1, source_file: "/tmp/main.tex", line: 1, column: 0, rect: { left: -1, top: 1, right: 2, bottom: 3 } }, /rect\.left/],
 	];
 
 	for (const [message, pattern] of invalidMcpMessages) {
@@ -81,6 +87,8 @@ test("Viewer Host protocol validation rejects malformed boundary messages", () =
 		[{ type: "selection_debug", pdf_id: 1, phase: "", text: "chosen", details: {} }, /phase/],
 		[{ type: "selection_debug", pdf_id: 1, phase: "send", text: 1, details: {} }, /text/],
 		[{ type: "selection_debug", pdf_id: 1, phase: "send", text: "chosen", details: [] }, /details/],
+		[{ type: "reverse_synctex_hover", pdf_id: 1, request_id: 0, page: 1, x: 1, y: 1 }, /request_id/],
+		[{ type: "reverse_synctex_hover", pdf_id: 1, request_id: 1, page: 1, x: -1, y: 1 }, /x/],
 	];
 
 	for (const [message, pattern] of invalidHostMessages) {

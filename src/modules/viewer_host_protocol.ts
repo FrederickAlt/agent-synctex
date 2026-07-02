@@ -10,6 +10,7 @@ export interface ViewerHostOpenPdfMessage {
 	pdf_id: number;
 	pdf_path: string;
 	title?: string;
+	workspace_cwd?: string;
 }
 
 export interface ViewerHostFocusPdfMessage {
@@ -44,12 +45,28 @@ export interface ViewerHostPdfMaybeUpdatedMessage {
 	pdf_id: number;
 }
 
+export interface ViewerHostReverseSynctexHoverResultMessage {
+	type: "reverse_synctex_hover_result";
+	pdf_id: number;
+	request_id: number;
+	page: number;
+	x: number;
+	y: number;
+	source_file?: string;
+	line?: number;
+	column?: number;
+	source_line?: string;
+	rect?: { left: number; top: number; right: number; bottom: number };
+	error?: string;
+}
+
 export type McpToViewerHostMessage =
 	| ViewerHostHelloMessage
 	| ViewerHostOpenPdfMessage
 	| ViewerHostFocusPdfMessage
 	| ViewerHostSynctexForwardMessage
-	| ViewerHostPdfMaybeUpdatedMessage;
+	| ViewerHostPdfMaybeUpdatedMessage
+	| ViewerHostReverseSynctexHoverResultMessage;
 
 export interface ViewerHostReadyMessage {
 	type: "ready";
@@ -91,12 +108,22 @@ export interface ViewerHostSelectionDebugMessage {
 	details: Record<string, unknown>;
 }
 
+export interface ViewerHostReverseSynctexHoverMessage {
+	type: "reverse_synctex_hover";
+	pdf_id: number;
+	request_id: number;
+	page: number;
+	x: number;
+	y: number;
+}
+
 export type ViewerHostToMcpMessage =
 	| ViewerHostReadyMessage
 	| ViewerHostViewerLoadedMessage
 	| ViewerHostViewerTabClosedMessage
 	| ViewerHostReverseSynctexMessage
-	| ViewerHostSelectionDebugMessage;
+	| ViewerHostSelectionDebugMessage
+	| ViewerHostReverseSynctexHoverMessage;
 
 export interface ViewerHostControlAcceptedResult {
 	type: McpToViewerHostMessage["type"];
@@ -158,6 +185,23 @@ function parseSynctexForwardRange(value: unknown, field: string): ViewerHostSync
 		W: requireCoordinate(value.W, `${field}.W`),
 		H: requireCoordinate(value.H, `${field}.H`),
 	};
+}
+
+function parseHoverRect(value: unknown, field: string): { left: number; top: number; right: number; bottom: number } {
+	if (!isRecord(value)) {
+		throw new Error(`${field} must be an object`);
+	}
+	return {
+		left: requireCoordinate(value.left, `${field}.left`),
+		top: requireCoordinate(value.top, `${field}.top`),
+		right: requireCoordinate(value.right, `${field}.right`),
+		bottom: requireCoordinate(value.bottom, `${field}.bottom`),
+	};
+}
+
+function optionalHoverRect(value: unknown, field: string): { left: number; top: number; right: number; bottom: number } | undefined {
+	if (value === undefined) return undefined;
+	return parseHoverRect(value, field);
 }
 
 function optionalSynctexRanges(value: unknown, field: string): ViewerHostSynctexForwardRange[] | undefined {
@@ -226,11 +270,13 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			return { type, protocol_version: requireProtocolVersion(message.protocol_version) };
 		case "open_pdf": {
 			const title = optionalNonEmptyString(message.title, "title");
+			const workspaceCwd = optionalNonEmptyString(message.workspace_cwd, "workspace_cwd");
 			return {
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
 				pdf_path: requireNonEmptyString(message.pdf_path, "pdf_path"),
 				...(title === undefined ? {} : { title }),
+				...(workspaceCwd === undefined ? {} : { workspace_cwd: workspaceCwd }),
 			};
 		}
 		case "focus_pdf":
@@ -257,6 +303,31 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 		}
 		case "pdf_maybe_updated":
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
+		case "reverse_synctex_hover_result": {
+			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
+			const line = message.line === undefined ? undefined : requirePositiveInteger(message.line, "line");
+			const column = message.column === undefined ? undefined : requireCoordinate(message.column, "column");
+			const sourceLine = optionalString(message.source_line, "source_line");
+			const rect = optionalHoverRect(message.rect, "rect");
+			const error = optionalString(message.error, "error");
+			if (error === undefined && (sourceFile === undefined || line === undefined || column === undefined || rect === undefined)) {
+				throw new Error("reverse_synctex_hover_result requires source_file, line, column, and rect unless error is set");
+			}
+			return {
+				type,
+				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
+				request_id: requirePositiveInteger(message.request_id, "request_id"),
+				page: requirePositiveInteger(message.page, "page"),
+				x: requireCoordinate(message.x, "x"),
+				y: requireCoordinate(message.y, "y"),
+				...(sourceFile === undefined ? {} : { source_file: sourceFile }),
+				...(line === undefined ? {} : { line }),
+				...(column === undefined ? {} : { column }),
+				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
+				...(rect === undefined ? {} : { rect }),
+				...(error === undefined ? {} : { error }),
+			};
+		}
 		default:
 			throw new Error(`unknown message type: ${type}`);
 	}
@@ -312,6 +383,15 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				details: requireRecord(message.details, "details"),
 			};
 		}
+		case "reverse_synctex_hover":
+			return {
+				type,
+				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
+				request_id: requirePositiveInteger(message.request_id, "request_id"),
+				page: requirePositiveInteger(message.page, "page"),
+				x: requireCoordinate(message.x, "x"),
+				y: requireCoordinate(message.y, "y"),
+			};
 		default:
 			throw new Error(`unknown message type: ${type}`);
 	}

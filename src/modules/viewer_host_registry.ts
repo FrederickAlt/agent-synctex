@@ -11,6 +11,7 @@ export interface ViewerHostPdfRegistration {
 	title: string;
 	revision: number;
 	fileSnapshot: ViewerHostFileSnapshot;
+	workspaceCwd?: string;
 }
 
 export interface ViewerHostPdfRecord {
@@ -19,6 +20,7 @@ export interface ViewerHostPdfRecord {
 	title: string;
 	revision: number;
 	fileSnapshot: ViewerHostFileSnapshot;
+	workspaceCwd?: string;
 	registeredAtNs: number;
 	updatedAtNs: number;
 }
@@ -41,6 +43,8 @@ export class ViewerHostPdfRegistry {
 			existing.title = input.title;
 			existing.revision = input.revision;
 			existing.fileSnapshot = { ...input.fileSnapshot };
+			if (input.workspaceCwd === undefined) delete existing.workspaceCwd;
+			else existing.workspaceCwd = resolve(input.workspaceCwd);
 			existing.updatedAtNs = nowNs;
 			return existing;
 		}
@@ -51,6 +55,7 @@ export class ViewerHostPdfRegistry {
 			title: input.title,
 			revision: input.revision,
 			fileSnapshot: { ...input.fileSnapshot },
+			...(input.workspaceCwd === undefined ? {} : { workspaceCwd: resolve(input.workspaceCwd) }),
 			registeredAtNs: nowNs,
 			updatedAtNs: nowNs,
 		};
@@ -94,6 +99,9 @@ function validateRegistration(input: ViewerHostPdfRegistration): void {
 	}
 	if (!Number.isInteger(input.revision) || input.revision <= 0) {
 		throw new Error("revision must be a positive integer");
+	}
+	if (input.workspaceCwd !== undefined && (typeof input.workspaceCwd !== "string" || !input.workspaceCwd.trim())) {
+		throw new Error("workspaceCwd must be a non-empty string when provided");
 	}
 	if (!input.fileSnapshot || typeof input.fileSnapshot !== "object") {
 		throw new Error("fileSnapshot is required");

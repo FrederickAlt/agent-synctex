@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
-import { syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar } from "./latex_workshop/worker.ts";
+import { inspectSyncTeXToTeX, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar } from "./latex_workshop/worker.ts";
 import { readSourceLine } from "./source_line.ts";
 
 export interface ForwardSynctexTarget {
@@ -135,6 +135,19 @@ export interface ReverseSynctexLocation {
 	normalizedFormulaSpan?: ReverseSynctexFormulaSpan;
 	normalizedFormulaExcerpt?: string;
 	diagnostics: ReverseSynctexDiagnostics;
+}
+
+export interface ReverseSynctexHoverInspection {
+	page: number;
+	x: number;
+	y: number;
+	sourceFile: string;
+	line: number;
+	column: number;
+	sourceLine?: string;
+	sidecarPath: string;
+	rect: { left: number; top: number; right: number; bottom: number };
+	distanceFromCenter: number;
 }
 
 export interface ReverseSynctexDiagnostics {
@@ -675,6 +688,45 @@ function runNativeReverseSynctex(input: { page: number; x: number; y: number; pd
 			...(failureReason === undefined ? {} : { failureReason }),
 			...(mapped === undefined ? {} : { parsedResult: mapped }),
 		},
+	};
+}
+
+export function inspectReverseSynctexHover(input: { pdfPath: string; page: number; x: number; y: number; cwd: string }): ReverseSynctexHoverInspection {
+	if (!Number.isInteger(input.page) || input.page < 1) {
+		throw new Error("page must be a positive integer");
+	}
+	if (!Number.isFinite(input.x) || input.x < 0 || !Number.isFinite(input.y) || input.y < 0) {
+		throw new Error("x and y must be non-negative finite numbers");
+	}
+	const pdfPath = resolve(input.pdfPath);
+	const sidecarPath = resolveSynctexSidecar(pdfPath);
+	if (sidecarPath === undefined) {
+		throw new Error(`PDF ${pdfPath} is missing SyncTeX sidecar (${pdfPath.replace(/\.pdf$/i, "")}.synctex or .synctex.gz)`);
+	}
+	const previousCwd = process.cwd();
+	let inspected;
+	try {
+		process.chdir(input.cwd);
+		inspected = inspectSyncTeXToTeX(input.page, input.x, input.y, pdfPath);
+	} finally {
+		process.chdir(previousCwd);
+	}
+	if (inspected === undefined) {
+		throw new Error(`No SyncTeX hover mapping found for page ${input.page} at ${input.x},${input.y}; primary JS lookup returned no result`);
+	}
+	const sourceFile = resolveReverseMappedSourceFile(inspected, input.cwd);
+	const sourceLine = readSourceLine(sourceFile, inspected.line, input.cwd);
+	return {
+		page: input.page,
+		x: input.x,
+		y: input.y,
+		sourceFile,
+		line: inspected.line,
+		column: inspected.column,
+		...(sourceLine === undefined ? {} : { sourceLine }),
+		sidecarPath,
+		rect: inspected.rect,
+		distanceFromCenter: inspected.distanceFromCenter,
 	};
 }
 

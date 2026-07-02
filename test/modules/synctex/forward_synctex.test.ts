@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import * as iconv from "iconv-lite";
 import { test } from "node:test";
 import { findUniqueSelectedTextSourceRange, mapForwardSynctex, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
-import { findInputFilePathForward, syncTeXToPDF, syncTeXToTeX } from "../../../src/modules/synctex/latex_workshop/worker.ts";
+import { findInputFilePathForward, inspectSyncTeXToTeX, syncTeXToPDF, syncTeXToTeX } from "../../../src/modules/synctex/latex_workshop/worker.ts";
 import type { PdfSyncObject } from "../../../src/modules/synctex/latex_workshop/synctexjs.ts";
 
 const FIXTURE_DIR = resolve("test/fixtures/synctex-forward");
@@ -352,6 +352,47 @@ test("LaTeX-Workshop-derived syncTeXToTeX maps realistic .synctex fixture coordi
 			line: 3,
 			column: 0,
 		});
+	} finally {
+		process.chdir(previousCwd);
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("LaTeX-Workshop-derived inspectSyncTeXToTeX matches syncTeXToTeX and exposes chosen rectangle", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	const previousCwd = process.cwd();
+	try {
+		process.chdir(project.dir);
+		const location = syncTeXToTeX(1, 144.27, 155.27, project.pdfPath);
+		const inspected = inspectSyncTeXToTeX(1, 144.27, 155.27, project.pdfPath);
+
+		assert.ok(inspected, "expected inspected reverse SyncTeX record");
+		assert.deepEqual({ input: inspected.input, line: inspected.line, column: inspected.column }, location);
+		assert.equal(inspected.line, 3);
+		assert.equal(Number.isFinite(inspected.distanceFromCenter), true);
+		assert.ok(inspected.distanceFromCenter >= 0);
+		assert.ok(inspected.rect.right >= inspected.rect.left, "inspection rect should have non-negative width");
+		assert.ok(inspected.rect.bottom >= inspected.rect.top, "inspection rect should have non-negative height");
+	} finally {
+		process.chdir(previousCwd);
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("LaTeX-Workshop SyncTeX parse cache invalidates when sidecar mtime changes without a size change", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	const previousCwd = process.cwd();
+	try {
+		process.chdir(project.dir);
+		assert.equal(inspectSyncTeXToTeX(1, 144.27, 155.27, project.pdfPath)?.line, 3);
+		const sidecarPath = join(project.dir, "paper.synctex");
+		const original = readFileSync(sidecarPath, "utf8");
+		const changed = original.replace(/1,3:/g, "1,9:");
+		assert.equal(Buffer.byteLength(changed), Buffer.byteLength(original));
+		writeFileSync(sidecarPath, changed);
+		const future = new Date(Date.now() + 10_000);
+		utimesSync(sidecarPath, future, future);
+		assert.equal(inspectSyncTeXToTeX(1, 144.27, 155.27, project.pdfPath)?.line, 9);
 	} finally {
 		process.chdir(previousCwd);
 		rmSync(project.dir, { recursive: true, force: true });

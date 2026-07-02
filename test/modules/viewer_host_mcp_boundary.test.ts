@@ -240,13 +240,13 @@ test("open_pdf uses an MCP-owned pdf_id and routes open/focus messages through V
 	const client = new FakeViewerHostClient({ origin: "http://127.0.0.1:43125" });
 	const service = new ViewerHostMcpService({ client, makePdfId: () => 77 });
 	try {
-		const first = await callTool(1, "open_pdf", { pdf_file_path: pdfPath }, service) as { result?: { details?: Record<string, unknown> } };
-		const second = await callTool(2, "open_pdf", { pdf_file_path: pdfPath }, service) as { result?: { details?: Record<string, unknown> } };
+		const first = await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
+		const second = await callTool(2, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 
 		assert.equal(first.result?.details?.pdf_id, 77);
 		assert.equal(second.result?.details?.pdf_id, 77);
 		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "focus_pdf"]);
-		assert.deepEqual(client.messages[0], { type: "open_pdf", pdf_id: 77, pdf_path: pdfPath, title: basename(pdfPath) });
+		assert.deepEqual(client.messages[0], { type: "open_pdf", pdf_id: 77, pdf_path: pdfPath, title: basename(pdfPath), workspace_cwd: baseDir });
 		assert.deepEqual(client.messages[1], { type: "focus_pdf", pdf_id: 77 });
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
@@ -376,7 +376,7 @@ test("MCP relaunches and re-registers known PDFs before focusing after a Viewer 
 		assert.equal(response.result?.details?.reused, true);
 		assert.deepEqual(clients[0].messages.map((message) => message.type), ["open_pdf"]);
 		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "focus_pdf"]);
-		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 41, pdf_path: pdfPath, title: basename(pdfPath) });
+		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 41, pdf_path: pdfPath, title: basename(pdfPath), workspace_cwd: baseDir });
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
@@ -403,7 +403,7 @@ test("jump_pdf relaunches, re-registers the existing pdf_id, then sends synctex_
 		assert.equal(response.result?.details?.handled, true);
 		assert.equal(response.result?.details?.pdf_id, 52);
 		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "synctex_forward"]);
-		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 52, pdf_path: pdfPath, title: basename(pdfPath) });
+		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 52, pdf_path: pdfPath, title: basename(pdfPath), workspace_cwd: baseDir });
 		assert.equal(clients[1].messages[1]?.type, "synctex_forward");
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
@@ -445,7 +445,7 @@ test("concurrent operations after Host failure share one relaunch and register b
 		assert.equal(second.result?.details?.pdf_id, 67);
 		assert.equal(launches, 2, "concurrent reconnects should coalesce onto one relaunched Host client");
 		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "focus_pdf", "focus_pdf"]);
-		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 67, pdf_path: pdfPath, title: basename(pdfPath) });
+		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 67, pdf_path: pdfPath, title: basename(pdfPath), workspace_cwd: baseDir });
 		assert.deepEqual(clients[2].messages, []);
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
@@ -507,8 +507,8 @@ test("new open racing with reconnect joins the same Host generation and register
 		assert.equal(second.result?.details?.viewer_url, "http://127.0.0.1:42602/viewer/71");
 		assert.equal(launches, 2, "new open must not launch a second Host while reconnect is in progress");
 		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "focus_pdf", "open_pdf"]);
-		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 70, pdf_path: firstPdfPath, title: basename(firstPdfPath) });
-		assert.deepEqual(clients[1].messages[2], { type: "open_pdf", pdf_id: 71, pdf_path: secondPdfPath, title: basename(secondPdfPath) });
+		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 70, pdf_path: firstPdfPath, title: basename(firstPdfPath), workspace_cwd: baseDir });
+		assert.deepEqual(clients[1].messages[2], { type: "open_pdf", pdf_id: 71, pdf_path: secondPdfPath, title: basename(secondPdfPath), workspace_cwd: baseDir });
 		assert.deepEqual(clients[2].messages, []);
 	} finally {
 		releaseReconnect?.();

@@ -45,6 +45,18 @@ export interface SyncTeXRecordToTeX {
 	column: number;
 }
 
+export interface SyncTeXInspectionRect {
+	left: number;
+	top: number;
+	right: number;
+	bottom: number;
+}
+
+export interface SyncTeXInspectionRecordToTeX extends SyncTeXRecordToTeX {
+	rect: SyncTeXInspectionRect;
+	distanceFromCenter: number;
+}
+
 export class Rectangle {
 	readonly top: number;
 	readonly bottom: number;
@@ -133,13 +145,23 @@ export function resolveLatexWorkshopSynctexSidecar(pdfPath: string): string | un
 	return undefined;
 }
 
+const parsedSyncTexCache = new Map<string, { sidecarPath: string; mtimeMs: number; size: number; parsed: ParsedSyncTexForPdf | undefined }>();
+
 export function parseSyncTexForPdf(pdfPath: string): ParsedSyncTexForPdf | undefined {
 	const sidecarPath = resolveLatexWorkshopSynctexSidecar(pdfPath);
 	if (sidecarPath === undefined) return undefined;
+	const status = fs.statSync(sidecarPath);
+	const cacheKey = path.resolve(pdfPath);
+	const cached = parsedSyncTexCache.get(cacheKey);
+	if (cached && cached.sidecarPath === sidecarPath && cached.mtimeMs === status.mtimeMs && cached.size === status.size) {
+		return cached.parsed;
+	}
 	const data = fs.readFileSync(sidecarPath);
 	const body = sidecarPath.endsWith(".gz") ? zlib.gunzipSync(data).toString("binary") : data.toString("utf8");
 	const pdfSyncObject = parseSyncTex(body);
-	return pdfSyncObject === undefined ? undefined : { pdfSyncObject, sidecarPath };
+	const parsed = pdfSyncObject === undefined ? undefined : { pdfSyncObject, sidecarPath };
+	parsedSyncTexCache.set(cacheKey, { sidecarPath, mtimeMs: status.mtimeMs, size: status.size, parsed });
+	return parsed;
 }
 
 export function findInputFilePathForward(filePath: string, pdfSyncObject: PdfSyncObject): string | undefined {
@@ -198,7 +220,7 @@ export function syncTeXToPDF(line: number, filePath: string, pdfPath: string): S
 	return { page: blocks1[0].page, x: c1.left + parsed.pdfSyncObject.offset.x, y: bottom + parsed.pdfSyncObject.offset.y, indicator: true };
 }
 
-export function syncTeXToTeX(page: number, x: number, y: number, pdfPath: string): SyncTeXRecordToTeX | undefined {
+export function inspectSyncTeXToTeX(page: number, x: number, y: number, pdfPath: string): SyncTeXInspectionRecordToTeX | undefined {
 	const parsed = parseSyncTexForPdf(pdfPath);
 	if (!parsed) {
 		return undefined;
@@ -215,7 +237,6 @@ export function syncTeXToTeX(page: number, x: number, y: number, pdfPath: string
 	const record = {
 		input: "",
 		line: 0,
-		distanceXY: 2e16,
 		distanceFromCenter: 2e16,
 		rect: new Rectangle({ top: 0, bottom: 2e16, left: 0, right: 2e16 }),
 	};
@@ -253,7 +274,23 @@ export function syncTeXToTeX(page: number, x: number, y: number, pdfPath: string
 	}
 
 	const input = convInputFilePath(record.input);
-	return input ? { input, line: record.line, column: 0 } : undefined;
+	return input ? {
+		input,
+		line: record.line,
+		column: 0,
+		distanceFromCenter: record.distanceFromCenter,
+		rect: {
+			left: record.rect.left + pdfSyncObject.offset.x,
+			top: record.rect.top + pdfSyncObject.offset.y,
+			right: record.rect.right + pdfSyncObject.offset.x,
+			bottom: record.rect.bottom + pdfSyncObject.offset.y,
+		},
+	} : undefined;
+}
+
+export function syncTeXToTeX(page: number, x: number, y: number, pdfPath: string): SyncTeXRecordToTeX | undefined {
+	const record = inspectSyncTeXToTeX(page, x, y, pdfPath);
+	return record ? { input: record.input, line: record.line, column: record.column } : undefined;
 }
 
 export function convInputFilePath(inputFilePath: string): string | undefined {

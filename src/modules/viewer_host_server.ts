@@ -4,10 +4,11 @@ import { stat as statFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import type { AddressInfo, Socket } from "node:net";
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { URL } from "node:url";
 import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
+import { inspectReverseSynctexHover } from "./synctex/forward_synctex.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
 
 const LOCAL_HOST = "127.0.0.1";
@@ -177,6 +178,12 @@ let lastSentSelectionGeneration;
 let pendingReverseSynctexSelectionSend;
 let pendingSelectionMouseDownDebug;
 let selectionDebugCount = 0;
+let reverseSynctexHoverEnabled = false;
+let reverseSynctexHoverRequestId = 0;
+let reverseSynctexHoverLatestRequestId = 0;
+let reverseSynctexHoverTimer;
+let reverseSynctexHoverPending;
+const REVERSE_SYNCTEX_HOVER_THROTTLE_MS = 150;
 const MAX_SELECTION_DEBUG_EVENTS = 200;
 const MAX_SELECTION_DEBUG_TEXT = 500;
 
@@ -538,6 +545,102 @@ function forwardSynctexMarkerFromPdfPoint(input) {
 	return { ...position, width: input.width * scale.x, height: input.height * scale.y };
 }
 
+function removeReverseSynctexHoverOverlay() {
+	for (const marker of document.querySelectorAll("[data-reverse-synctex-hover]")) marker.remove();
+}
+
+function setReverseSynctexHoverEnabled(enabled) {
+	reverseSynctexHoverEnabled = enabled;
+	const button = document.getElementById("synctex-hover-toggle");
+	if (button) {
+		button.setAttribute("aria-pressed", enabled ? "true" : "false");
+		button.textContent = enabled ? "SyncTeX hover: on" : "SyncTeX hover: off";
+	}
+	if (!enabled) {
+		reverseSynctexHoverLatestRequestId += 1;
+		reverseSynctexHoverPending = undefined;
+		if (reverseSynctexHoverTimer !== undefined) clearTimeout(reverseSynctexHoverTimer);
+		reverseSynctexHoverTimer = undefined;
+		removeReverseSynctexHoverOverlay();
+	}
+}
+
+function reverseSynctexHoverRectPosition(rect, page, viewport) {
+	const leftTop = viewport.convertToViewportPoint(Number(rect.left), Number(rect.top));
+	const rightBottom = viewport.convertToViewportPoint(Number(rect.right), Number(rect.bottom));
+	const pageHeight = page.getBoundingClientRect().height;
+	return {
+		left: Math.min(leftTop[0], rightBottom[0]),
+		top: pageHeight - Math.max(leftTop[1], rightBottom[1]),
+		width: visibleSynctexRectDimension(Math.abs(rightBottom[0] - leftTop[0])),
+		height: visibleSynctexRectDimension(Math.abs(leftTop[1] - rightBottom[1])),
+	};
+}
+
+function truncateHoverLabel(value) {
+	const text = String(value ?? "").trim();
+	return text.length > 100 ? text.slice(0, 97) + "…" : text;
+}
+
+function showReverseSynctexHoverResult(message) {
+	if (!reverseSynctexHoverEnabled || Number(message.request_id) !== reverseSynctexHoverLatestRequestId) return;
+	if (message.error || !message.rect) {
+		removeReverseSynctexHoverOverlay();
+		return;
+	}
+	const pageNumber = Number(message.page);
+	const page = pages.querySelector("[data-page-number='" + String(pageNumber) + "']");
+	const viewport = pageViewports.get(pageNumber);
+	if (!page || !viewport) return;
+	removeReverseSynctexHoverOverlay();
+	const position = reverseSynctexHoverRectPosition(message.rect, page, viewport);
+	const marker = document.createElement("div");
+	marker.dataset.reverseSynctexHover = "rect";
+	marker.style.position = "absolute";
+	marker.style.pointerEvents = "none";
+	marker.style.zIndex = "100001";
+	marker.style.left = String(position.left) + "px";
+	marker.style.top = String(position.top) + "px";
+	marker.style.width = String(position.width) + "px";
+	marker.style.height = String(position.height) + "px";
+	marker.style.outline = "2px solid rgba(14,165,233,.9)";
+	marker.style.background = "rgba(14,165,233,.18)";
+	const label = document.createElement("div");
+	label.dataset.reverseSynctexHover = "label";
+	label.style.position = "absolute";
+	label.style.pointerEvents = "none";
+	label.style.zIndex = "100002";
+	label.style.left = String(Math.max(0, position.left)) + "px";
+	label.style.top = String(Math.max(0, position.top - 28)) + "px";
+	label.style.maxWidth = "min(60ch, 80vw)";
+	label.style.padding = "3px 6px";
+	label.style.borderRadius = "4px";
+	label.style.background = "rgba(15,23,42,.9)";
+	label.style.color = "white";
+	label.style.font = "12px/1.3 sans-serif";
+	const file = String(message.source_file || "").split(/[\\/]/).pop() || "source";
+	label.textContent = file + ":" + message.line + " " + truncateHoverLabel(message.source_line);
+	page.append(marker, label);
+}
+
+function scheduleReverseSynctexHover(event, pageNumber, canvas, viewport) {
+	if (!reverseSynctexHoverEnabled || !viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
+	const rect = canvas.getBoundingClientRect();
+	const point = viewport.convertToPdfPoint(event.clientX - rect.left, canvas.offsetHeight - (event.clientY - rect.top));
+	const requestId = reverseSynctexHoverRequestId + 1;
+	reverseSynctexHoverRequestId = requestId;
+	reverseSynctexHoverLatestRequestId = requestId;
+	reverseSynctexHoverPending = { request_id: requestId, page: pageNumber, x: point[0], y: point[1] };
+	if (reverseSynctexHoverTimer !== undefined) return;
+	reverseSynctexHoverTimer = setTimeout(() => {
+		reverseSynctexHoverTimer = undefined;
+		const pending = reverseSynctexHoverPending;
+		reverseSynctexHoverPending = undefined;
+		if (!reverseSynctexHoverEnabled || !pending || !viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
+		viewerSocket.send(JSON.stringify({ type: "reverse_synctex_hover", request_id: pending.request_id, page: pending.page, x: pending.x, y: pending.y }));
+	}, REVERSE_SYNCTEX_HOVER_THROTTLE_MS);
+}
+
 async function renderPdf(config) {
 	activeConfig = config;
 	if (fallback) fallback.href = config.pdf_url;
@@ -574,6 +677,12 @@ async function renderPdf(config) {
 			sendSelectionDebug("mouseup", pageNumber);
 			scheduleReverseSynctexSelectionSend(pageNumber, pageContainer, canvas, viewport);
 		}, true);
+		pageContainer.addEventListener("mousemove", (event) => scheduleReverseSynctexHover(event, pageNumber, canvas, viewport));
+		pageContainer.addEventListener("mouseleave", () => {
+			reverseSynctexHoverLatestRequestId += 1;
+			reverseSynctexHoverPending = undefined;
+			removeReverseSynctexHoverOverlay();
+		});
 		pageContainer.addEventListener("click", (event) => {
 			if (!event.ctrlKey) return;
 			if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
@@ -731,9 +840,15 @@ function connectViewerSocket(config) {
 			void renderPdf(nextConfig).catch(reportViewerError);
 		} else if (message.type === "synctex_forward") {
 			showSynctexMarker(message);
+		} else if (message.type === "reverse_synctex_hover_result") {
+			showReverseSynctexHoverResult(message);
 		}
 	});
 }
+
+const hoverToggle = document.getElementById("synctex-hover-toggle");
+if (hoverToggle) hoverToggle.addEventListener("click", () => setReverseSynctexHoverEnabled(!reverseSynctexHoverEnabled));
+setReverseSynctexHoverEnabled(false);
 
 fetch(configUrl)
 	.then((response) => {
@@ -1149,7 +1264,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 <body data-config-url="/config/${pdfId}.json">
 <h1>PDF.js viewer</h1>
 <p id="status">Loading PDF.js viewer for pdf_id=${pdfId}…</p>
-<p><a id="fallback-link" href="${fallbackUrl}">Open registered PDF bytes directly</a></p>
+<p><button id="synctex-hover-toggle" type="button" aria-pressed="false">SyncTeX hover: off</button> <a id="fallback-link" href="${fallbackUrl}">Open registered PDF bytes directly</a></p>
 <div id="pages"></div>
 <script>
 (function () {
@@ -1262,6 +1377,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 					title: message.title ?? basename(message.pdf_path),
 					revision,
 					fileSnapshot: snapshot,
+					...(message.workspace_cwd === undefined ? {} : { workspaceCwd: message.workspace_cwd }),
 				});
 				this.pendingPdfRefreshSnapshots.delete(record.pdfId);
 				this.pdfRefreshDiagnostics.delete(record.pdfId);
@@ -1286,6 +1402,11 @@ iframe{width:100%;height:100%;border:0;background:white}
 				await this.verifyPdfChangesNow(record.pdfId);
 				await this.verifyPdfMaybeUpdated(record);
 				return { ok: true, result: { type: "pdf_maybe_updated", pdf_id: record.pdfId } };
+			}
+			case "reverse_synctex_hover_result": {
+				const record = this.registry.getPdf(message.pdf_id);
+				this.broadcastViewerSocketMessage(record.pdfId, message);
+				return { ok: true, result: { type: "reverse_synctex_hover_result", pdf_id: record.pdfId } };
 			}
 		}
 	}
@@ -1374,17 +1495,50 @@ iframe{width:100%;height:100%;border:0;background:white}
 		let payload: unknown;
 		try {
 			payload = JSON.parse(text);
-			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "selection_debug")) return;
+			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover")) return;
 			if (payload.pdf_id !== undefined && payload.pdf_id !== connection.pdfId) {
 				throw new Error(`${String(payload.type)} pdf_id=${String(payload.pdf_id)} does not match viewer socket pdf_id=${connection.pdfId}`);
 			}
 			const message = validateViewerHostToMcpMessage({ ...payload, pdf_id: connection.pdfId });
+			if (message.type === "reverse_synctex_hover") {
+				this.handleReverseSynctexHoverMessage(connection, message);
+				return;
+			}
 			this.mcpEventBacklog.push(message);
 			void Promise.resolve(this.mcpEventSink(message)).catch((error: unknown) => {
 				if (!connection.closed && message.type === "reverse_synctex") sendViewerSocketJson(connection, { type: "error", code: "reverse_synctex_failed", message: errorMessage(error) });
 			});
 		} catch (error) {
 			sendViewerSocketJson(connection, { type: "error", code: "invalid_viewer_message", message: errorMessage(error) });
+		}
+	}
+
+	private handleReverseSynctexHoverMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_hover" }>): void {
+		try {
+			const record = this.registry.getPdf(connection.pdfId);
+			const hoverInput = { pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y };
+			let hover;
+			try {
+				hover = inspectReverseSynctexHover({ ...hoverInput, cwd: record.workspaceCwd ?? dirname(record.pdfPath) });
+			} catch (error) {
+				if (record.workspaceCwd === undefined || record.workspaceCwd === dirname(record.pdfPath)) throw error;
+				hover = inspectReverseSynctexHover({ ...hoverInput, cwd: dirname(record.pdfPath) });
+			}
+			sendViewerSocketJson(connection, {
+				type: "reverse_synctex_hover_result",
+				pdf_id: connection.pdfId,
+				request_id: message.request_id,
+				page: message.page,
+				x: message.x,
+				y: message.y,
+				source_file: hover.sourceFile,
+				line: hover.line,
+				column: hover.column,
+				...(hover.sourceLine === undefined ? {} : { source_line: hover.sourceLine }),
+				rect: hover.rect,
+			});
+		} catch (error) {
+			sendViewerSocketJson(connection, { type: "reverse_synctex_hover_result", pdf_id: connection.pdfId, request_id: message.request_id, page: message.page, x: message.x, y: message.y, error: errorMessage(error) });
 		}
 	}
 
