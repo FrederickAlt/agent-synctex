@@ -8,7 +8,7 @@ import { basename, dirname, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { URL } from "node:url";
 import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
-import { inspectReverseSynctexHover } from "./synctex/forward_synctex.ts";
+import { inspectReverseSynctexHover, mapReverseForwardSynctexProbe } from "./synctex/forward_synctex.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
 
 const LOCAL_HOST = "127.0.0.1";
@@ -183,6 +183,8 @@ let reverseSynctexHoverRequestId = 0;
 let reverseSynctexHoverLatestRequestId = 0;
 let reverseSynctexHoverTimer;
 let reverseSynctexHoverPending;
+let reverseSynctexForwardProbeRequestId = 0;
+let reverseSynctexForwardProbeLatestRequestId = 0;
 const REVERSE_SYNCTEX_HOVER_THROTTLE_MS = 150;
 const MAX_SELECTION_DEBUG_EVENTS = 200;
 const MAX_SELECTION_DEBUG_TEXT = 500;
@@ -549,6 +551,10 @@ function removeReverseSynctexHoverOverlay() {
 	for (const marker of document.querySelectorAll("[data-reverse-synctex-hover]")) marker.remove();
 }
 
+function removeReverseSynctexForwardProbeOverlay() {
+	for (const marker of document.querySelectorAll("[data-reverse-synctex-forward-probe]")) marker.remove();
+}
+
 function setReverseSynctexHoverEnabled(enabled) {
 	reverseSynctexHoverEnabled = enabled;
 	const button = document.getElementById("synctex-hover-toggle");
@@ -561,7 +567,9 @@ function setReverseSynctexHoverEnabled(enabled) {
 		reverseSynctexHoverPending = undefined;
 		if (reverseSynctexHoverTimer !== undefined) clearTimeout(reverseSynctexHoverTimer);
 		reverseSynctexHoverTimer = undefined;
+		reverseSynctexForwardProbeLatestRequestId += 1;
 		removeReverseSynctexHoverOverlay();
+		removeReverseSynctexForwardProbeOverlay();
 	}
 }
 
@@ -621,6 +629,18 @@ function showReverseSynctexHoverResult(message) {
 	const file = String(message.source_file || "").split(/[\\/]/).pop() || "source";
 	label.textContent = file + ":" + message.line + " " + truncateHoverLabel(message.source_line);
 	page.append(marker, label);
+}
+
+function sendReverseSynctexForwardProbe(event, pageNumber, canvas, viewport) {
+	if (!reverseSynctexHoverEnabled || !viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
+	if ((window.getSelection()?.toString() ?? "").length > 0) return;
+	const rect = canvas.getBoundingClientRect();
+	const point = viewport.convertToPdfPoint(event.clientX - rect.left, canvas.offsetHeight - (event.clientY - rect.top));
+	const requestId = reverseSynctexForwardProbeRequestId + 1;
+	reverseSynctexForwardProbeRequestId = requestId;
+	reverseSynctexForwardProbeLatestRequestId = requestId;
+	removeReverseSynctexForwardProbeOverlay();
+	viewerSocket.send(JSON.stringify({ type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1] }));
 }
 
 function scheduleReverseSynctexHover(event, pageNumber, canvas, viewport) {
@@ -684,7 +704,10 @@ async function renderPdf(config) {
 			removeReverseSynctexHoverOverlay();
 		});
 		pageContainer.addEventListener("click", (event) => {
-			if (!event.ctrlKey) return;
+			if (!event.ctrlKey) {
+				sendReverseSynctexForwardProbe(event, pageNumber, canvas, viewport);
+				return;
+			}
 			if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
 			const rect = canvas.getBoundingClientRect();
 			const pendingTextSelection = pendingReverseSynctexContexts.get(pageContainer) || {};
@@ -758,6 +781,71 @@ function scrollToUnionInViewport(markers) {
 		left: window.scrollX + (left + right) / 2 - window.innerWidth / 2,
 		top: window.scrollY + (top + bottom) / 2 - window.innerHeight * 0.4,
 	});
+}
+
+function showReverseSynctexForwardProbeResult(message) {
+	if (!reverseSynctexHoverEnabled || Number(message.request_id) !== reverseSynctexForwardProbeLatestRequestId) return;
+	removeReverseSynctexForwardProbeOverlay();
+	if (message.error || message.page === undefined || message.x === undefined || message.y === undefined) return;
+	const pageNumber = Number(message.page);
+	const page = pages.querySelector("[data-page-number='" + String(pageNumber) + "']");
+	const viewport = pageViewports.get(pageNumber);
+	if (!page || !viewport) return;
+	const ranges = Array.isArray(message.ranges) ? message.ranges : [];
+	const rectRanges = ranges.filter((entry) => Number(entry.page) === pageNumber);
+	const scalarRectPosition = rectRanges.length === 0 && message.width !== undefined && message.height !== undefined
+		? forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, width: message.width, height: message.height, pageHeight: page.getBoundingClientRect().height, viewport })
+		: undefined;
+	const positions = scalarRectPosition === undefined ? rectRanges.map((range) => forwardSynctexMarkerFromPdfRange({
+		h: Number(range.h),
+		v: Number(range.v),
+		W: Number(range.W),
+		H: Number(range.H),
+		pageHeight: page.getBoundingClientRect().height,
+		viewport,
+	})) : [scalarRectPosition];
+	if (positions.length === 0) positions.push(forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, pageHeight: page.getBoundingClientRect().height, viewport }));
+	const markers = [];
+	for (const position of positions) {
+		const marker = document.createElement("div");
+		marker.dataset.reverseSynctexForwardProbe = "marker";
+		marker.style.position = "absolute";
+		marker.style.pointerEvents = "none";
+		marker.style.zIndex = "100003";
+		marker.style.left = String(position.left) + "px";
+		marker.style.top = String(position.top) + "px";
+		if (position.width === undefined || position.height === undefined) {
+			marker.dataset.synctexMarkerKind = "circle";
+			marker.style.border = "0.2em solid red";
+			marker.style.borderRadius = "50%";
+			marker.style.background = "rgba(255,0,0,0.4)";
+			marker.style.transform = "translate(-50%, -50%)";
+			marker.style.width = "0.5em";
+			marker.style.height = "0.5em";
+		} else {
+			marker.dataset.synctexMarkerKind = "rect";
+			marker.style.width = String(position.width) + "px";
+			marker.style.height = String(position.height) + "px";
+			marker.style.background = "rgba(239,68,68,.18)";
+		}
+		markers.push(marker);
+		page.appendChild(marker);
+	}
+	const label = document.createElement("div");
+	label.dataset.reverseSynctexForwardProbe = "label";
+	label.style.position = "absolute";
+	label.style.pointerEvents = "none";
+	label.style.zIndex = "100004";
+	label.style.left = String(Math.max(0, positions[0].left)) + "px";
+	label.style.top = String(Math.max(0, positions[0].top - 28)) + "px";
+	label.style.padding = "3px 6px";
+	label.style.borderRadius = "4px";
+	label.style.background = "rgba(127,29,29,.92)";
+	label.style.color = "white";
+	label.style.font = "12px/1.3 sans-serif";
+	label.textContent = "reverse line " + String(message.reverse_line || message.line || "?") + " -> forward boxes";
+	page.appendChild(label);
+	scrollToUnionInViewport(markers);
 }
 
 function showSynctexMarker(message) {
@@ -842,6 +930,8 @@ function connectViewerSocket(config) {
 			showSynctexMarker(message);
 		} else if (message.type === "reverse_synctex_hover_result") {
 			showReverseSynctexHoverResult(message);
+		} else if (message.type === "reverse_synctex_forward_probe_result") {
+			showReverseSynctexForwardProbeResult(message);
 		}
 	});
 }
@@ -1408,6 +1498,11 @@ iframe{width:100%;height:100%;border:0;background:white}
 				this.broadcastViewerSocketMessage(record.pdfId, message);
 				return { ok: true, result: { type: "reverse_synctex_hover_result", pdf_id: record.pdfId } };
 			}
+			case "reverse_synctex_forward_probe_result": {
+				const record = this.registry.getPdf(message.pdf_id);
+				this.broadcastViewerSocketMessage(record.pdfId, message);
+				return { ok: true, result: { type: "reverse_synctex_forward_probe_result", pdf_id: record.pdfId } };
+			}
 		}
 	}
 
@@ -1495,7 +1590,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 		let payload: unknown;
 		try {
 			payload = JSON.parse(text);
-			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover")) return;
+			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover" && payload.type !== "reverse_synctex_forward_probe")) return;
 			if (payload.pdf_id !== undefined && payload.pdf_id !== connection.pdfId) {
 				throw new Error(`${String(payload.type)} pdf_id=${String(payload.pdf_id)} does not match viewer socket pdf_id=${connection.pdfId}`);
 			}
@@ -1504,12 +1599,53 @@ iframe{width:100%;height:100%;border:0;background:white}
 				this.handleReverseSynctexHoverMessage(connection, message);
 				return;
 			}
+			if (message.type === "reverse_synctex_forward_probe") {
+				this.handleReverseSynctexForwardProbeMessage(connection, message);
+				return;
+			}
 			this.mcpEventBacklog.push(message);
 			void Promise.resolve(this.mcpEventSink(message)).catch((error: unknown) => {
 				if (!connection.closed && message.type === "reverse_synctex") sendViewerSocketJson(connection, { type: "error", code: "reverse_synctex_failed", message: errorMessage(error) });
 			});
 		} catch (error) {
 			sendViewerSocketJson(connection, { type: "error", code: "invalid_viewer_message", message: errorMessage(error) });
+		}
+	}
+
+	private handleReverseSynctexForwardProbeMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_forward_probe" }>): void {
+		try {
+			const record = this.registry.getPdf(connection.pdfId);
+			const probeInput = { pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y };
+			let probe;
+			try {
+				probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: record.workspaceCwd ?? dirname(record.pdfPath) });
+			} catch (error) {
+				if (record.workspaceCwd === undefined || record.workspaceCwd === dirname(record.pdfPath)) throw error;
+				probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: dirname(record.pdfPath) });
+			}
+			sendViewerSocketJson(connection, {
+				type: "reverse_synctex_forward_probe_result",
+				pdf_id: connection.pdfId,
+				request_id: message.request_id,
+				click_page: message.page,
+				click_x: message.x,
+				click_y: message.y,
+				reverse_source_file: probe.reverse.sourceFile,
+				reverse_line: probe.reverse.line,
+				reverse_column: probe.reverse.column,
+				...(probe.reverse.sourceLine === undefined ? {} : { reverse_source_line: probe.reverse.sourceLine }),
+				page: probe.forward.page,
+				x: probe.forward.x,
+				y: probe.forward.y,
+				...(probe.forward.width === undefined ? {} : { width: probe.forward.width }),
+				...(probe.forward.height === undefined ? {} : { height: probe.forward.height }),
+				...(probe.forward.ranges === undefined ? {} : { ranges: probe.forward.ranges }),
+				...(probe.forward.indicator === undefined ? {} : { indicator: probe.forward.indicator }),
+				source_file: probe.forward.sourceFile,
+				line: probe.forward.line,
+			});
+		} catch (error) {
+			sendViewerSocketJson(connection, { type: "reverse_synctex_forward_probe_result", pdf_id: connection.pdfId, request_id: message.request_id, click_page: message.page, click_x: message.x, click_y: message.y, error: errorMessage(error) });
 		}
 	}
 

@@ -113,6 +113,24 @@ export interface MapForwardSynctexInput {
 	synctexCommand?: string;
 }
 
+export interface ReverseForwardSynctexProbe {
+	reverse: ReverseSynctexHoverInspection;
+	forward: ForwardSynctexJump;
+}
+
+export interface ReverseForwardSynctexProbeInput {
+	pdfPath: string;
+	page: number;
+	x: number;
+	y: number;
+	cwd: string;
+	nativeRunner?: NativeSynctexRunner;
+	forwardJsFallback?: ForwardSynctexJsFallback;
+	synctexCommand?: string;
+	inspectReverse?: (input: { pdfPath: string; page: number; x: number; y: number; cwd: string }) => ReverseSynctexHoverInspection;
+	mapForward?: (input: MapForwardSynctexInput) => ForwardSynctexJump;
+}
+
 export interface ReverseSynctexFormulaSpan {
 	sourceFile: string;
 	startLine: number;
@@ -367,6 +385,22 @@ function withForwardGlue(input: { mapped: ForwardSynctexPoint; branch: ForwardSy
 		branch: input.branch,
 		diagnostics: input.diagnostics,
 	};
+}
+
+export function mapReverseForwardSynctexProbe(input: ReverseForwardSynctexProbeInput): ReverseForwardSynctexProbe {
+	const inspectReverse = input.inspectReverse ?? inspectReverseSynctexHover;
+	const mapForward = input.mapForward ?? mapForwardSynctex;
+	const reverse = inspectReverse({ pdfPath: input.pdfPath, page: input.page, x: input.x, y: input.y, cwd: input.cwd });
+	const forward = mapForward({
+		pdfPath: input.pdfPath,
+		sourceFile: reverse.sourceFile,
+		line: reverse.line,
+		cwd: input.cwd,
+		...(input.nativeRunner === undefined ? {} : { nativeRunner: input.nativeRunner }),
+		...(input.forwardJsFallback === undefined ? {} : { jsFallback: input.forwardJsFallback }),
+		...(input.synctexCommand === undefined ? {} : { synctexCommand: input.synctexCommand }),
+	});
+	return { reverse, forward };
 }
 
 export function mapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctexJump {

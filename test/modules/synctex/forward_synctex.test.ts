@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import * as iconv from "iconv-lite";
 import { test } from "node:test";
-import { findUniqueSelectedTextSourceRange, mapForwardSynctex, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
+import { findUniqueSelectedTextSourceRange, mapForwardSynctex, mapReverseForwardSynctexProbe, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
 import { findInputFilePathForward, inspectSyncTeXToTeX, syncTeXToPDF, syncTeXToTeX } from "../../../src/modules/synctex/latex_workshop/worker.ts";
 import type { PdfSyncObject } from "../../../src/modules/synctex/latex_workshop/synctexjs.ts";
 
@@ -30,6 +30,51 @@ function writeGzipSynctex(sidecarPath: string, body: string, encoding: BufferEnc
 }
 
 const failNativeRunner = () => ({ status: 1, stdout: "", stderr: "native disabled for JS fallback assertion" });
+
+test("reverse-forward probe maps JS reverse inspection result through forward SyncTeX", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const calls: string[] = [];
+		const probe = mapReverseForwardSynctexProbe({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144,
+			y: 155,
+			cwd: project.dir,
+			inspectReverse: (input) => {
+				calls.push(`reverse:${input.page}:${input.x}:${input.y}`);
+				return {
+					page: input.page,
+					x: input.x,
+					y: input.y,
+					sourceFile: project.sourcePath,
+					line: 3,
+					column: 0,
+					sourceLine: "First paragraph text that should wrap a little and create boxes.",
+					sidecarPath: join(project.dir, "paper.synctex"),
+					rect: { left: 10, top: 20, right: 30, bottom: 40 },
+					distanceFromCenter: 0,
+				};
+			},
+			mapForward: (input) => {
+				calls.push(`forward:${input.sourceFile}:${input.line}`);
+				assert.equal(input.sourceFile, project.sourcePath);
+				assert.equal(input.line, 3);
+				return mapForwardSynctex({ ...input, nativeRunner: failNativeRunner, jsFallback: syncTeXToPDF });
+			},
+		});
+
+		assert.deepEqual(calls, [`reverse:1:144:155`, `forward:${project.sourcePath}:3`]);
+		assert.equal(probe.reverse.sourceFile, project.sourcePath);
+		assert.equal(probe.reverse.line, 3);
+		assert.equal(probe.forward.sourceFile, project.sourcePath);
+		assert.equal(probe.forward.line, 3);
+		assert.equal(probe.forward.page, 1);
+		assert.equal(probe.forward.indicator, true);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
 
 test("LaTeX-Workshop-derived syncTeXToPDF reads realistic .synctex fixtures and maps source lines to page coordinates", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });

@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
+import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
 import { createDefaultViewerHostClientFactory, DesktopViewerAppProcessLauncher, FakeViewerHostClient, resolveDefaultDesktopViewerAppLaunchConfig, ViewerHostMcpService, type DesktopViewerAppLaunchTarget, type DesktopViewerAppLauncher, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
-import type { McpToViewerHostMessage } from "../../src/modules/viewer_host_protocol.ts";
+import type { McpToViewerHostMessage, ViewerHostControlResponse, ViewerHostToMcpMessage } from "../../src/modules/viewer_host_protocol.ts";
+import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
+import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
 
 function writeFakePdf(path: string, body = "1 0 obj"): void {
 	writeFileSync(path, `%PDF-1.4\n${body}\n%%EOF\n`);
@@ -97,6 +100,60 @@ function callTool(id: number, name: string, args: Record<string, unknown>, servi
 	return handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }), service.pdfOperations);
 }
 
+interface TestWebSocket {
+	readonly readyState: number;
+	send(data: string): void;
+	close(): void;
+	addEventListener(type: "open" | "message" | "error" | "close", listener: (event: { data?: unknown }) => void, options?: { once?: boolean }): void;
+}
+
+function socketCtor(): new (url: string) => TestWebSocket {
+	const ctor = (globalThis as { WebSocket?: new (url: string) => TestWebSocket }).WebSocket;
+	assert.ok(ctor, "global WebSocket must be available in the Node test runtime");
+	return ctor;
+}
+
+async function openViewerSocket(origin: string, pdfId: number): Promise<TestWebSocket> {
+	const configResponse = await fetch(`${origin}/config/${pdfId}.json`);
+	assert.equal(configResponse.status, 200);
+	const config = await configResponse.json() as { viewer_socket_token?: unknown };
+	assert.equal(typeof config.viewer_socket_token, "string");
+	const WebSocket = socketCtor();
+	const socket = new WebSocket(`${origin.replace(/^http:/, "ws:")}/viewer-socket?pdf_id=${pdfId}&token=${encodeURIComponent(String(config.viewer_socket_token))}`);
+	await new Promise<void>((resolveOpen, reject) => {
+		const timer = setTimeout(() => reject(new Error(`timed out opening viewer socket for pdf_id=${pdfId}`)), 2_000);
+		socket.addEventListener("open", () => { clearTimeout(timer); resolveOpen(); }, { once: true });
+		socket.addEventListener("error", () => { clearTimeout(timer); reject(new Error(`viewer socket errored before open for pdf_id=${pdfId}`)); }, { once: true });
+	});
+	return socket;
+}
+
+async function nextJsonMessage(socket: TestWebSocket): Promise<Record<string, unknown>> {
+	return await new Promise<Record<string, unknown>>((resolveMessage, reject) => {
+		const timer = setTimeout(() => reject(new Error("timed out waiting for viewer socket message")), 2_000);
+		socket.addEventListener("message", (event) => {
+			clearTimeout(timer);
+			const data = typeof event.data === "string" ? event.data : Buffer.from(event.data as ArrayBuffer).toString("utf8");
+			resolveMessage(JSON.parse(data) as Record<string, unknown>);
+		}, { once: true });
+	});
+}
+
+class HttpViewerHostClient implements ViewerHostClient {
+	readonly origin: string;
+	private readonly client: ViewerHostControlClient;
+
+	constructor(origin: string) {
+		this.origin = origin;
+		this.client = new ViewerHostControlClient({ origin });
+	}
+
+	async send(message: McpToViewerHostMessage): Promise<void> {
+		const response: ViewerHostControlResponse = await this.client.send(message);
+		if (!response.ok) throw new Error(response.error.message);
+	}
+}
+
 class ScriptedViewerHostClient implements ViewerHostClient {
 	readonly origin: string;
 	readonly messages: McpToViewerHostMessage[] = [];
@@ -122,6 +179,49 @@ class RecordingDesktopViewerAppLauncher implements DesktopViewerAppLauncher {
 		this.calls.push(target);
 	}
 }
+
+test("reverse-forward probe is handled by ViewerHostServer without mcpEventSink or PDF events", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-probe-boundary-"));
+	const { pdfPath, sourcePath } = writeForwardSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	let service: ViewerHostMcpService | undefined;
+	const sinkMessages: ViewerHostToMcpMessage[] = [];
+	const server = new ViewerHostServer({
+		registry,
+		mcpEventSink: (message) => {
+			sinkMessages.push(message);
+			return service?.handleHostMessage(message);
+		},
+	});
+	let socket: TestWebSocket | undefined;
+	try {
+		await server.start();
+		service = new ViewerHostMcpService({ client: new HttpViewerHostClient(server.origin), makePdfId: () => 812 });
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+		socket = await openViewerSocket(server.origin, 812);
+
+		socket.send(JSON.stringify({ type: "reverse_synctex_forward_probe", request_id: 1, page: 1, x: 144, y: 155 }));
+		const result = await nextJsonMessage(socket);
+
+		assert.equal(result.type, "reverse_synctex_forward_probe_result");
+		assert.equal(result.pdf_id, 812);
+		assert.equal(result.request_id, 1);
+		assert.equal(result.reverse_source_file, sourcePath);
+		assert.equal(result.reverse_line, 3);
+		assert.equal(result.source_file, sourcePath);
+		assert.equal(result.line, 3);
+		assert.equal(result.page, 1);
+		assert.equal(sinkMessages.length, 0, "debug probe must not be routed through mcpEventSink");
+
+		const eventsResponse = await callTool(2, "get_pdf_events", { pdf_id: 812, max_events: 10, stale: true, debug: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
+		assert.equal(eventsResponse.result?.details?.events?.length ?? 0, 0, "debug probe must not be appended to get_pdf_events");
+	} finally {
+		socket?.close();
+		await service?.stop();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
 
 test("desktop app process launcher passes the Host /app target through a configurable app command", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-app-process-contract-"));

@@ -946,7 +946,11 @@ test("Viewer Host-served Viewer Client toggles reverse SyncTeX hover overlay wit
 		await moveRenderedPagePoint(page, 160, 80);
 		await new Promise((resolve) => setTimeout(resolve, 250));
 		assert.equal(sentViewerMessages.some((message) => message.type === "reverse_synctex_hover"), false, "mousemove while disabled should not send hover requests");
+		await clickRenderedPagePoint(page, 180, 100);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.equal(sentViewerMessages.some((message) => message.type === "reverse_synctex_forward_probe"), false, "plain click while disabled should not send probe requests");
 		assert.equal(await page.locator("[data-reverse-synctex-hover]").count(), 0, "disabled hover should not draw overlay");
+		assert.equal(await page.locator("[data-reverse-synctex-forward-probe]").count(), 0, "disabled probe should not draw overlay");
 
 		await toggle.click();
 		assert.equal(await toggle.getAttribute("aria-pressed"), "true");
@@ -965,8 +969,56 @@ test("Viewer Host-served Viewer Client toggles reverse SyncTeX hover overlay wit
 		await page.waitForSelector("[data-reverse-synctex-hover='label']", { state: "attached", timeout: 2_000 });
 		assert.match(await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "", /main\.tex:3 First paragraph/);
 
+		await clickRenderedPagePoint(page, 180, 100);
+		let probeRequest: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			probeRequest = sentViewerMessages.find((message) => message.type === "reverse_synctex_forward_probe");
+			if (probeRequest) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(probeRequest, `enabled plain click did not send probe\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
+		assert.equal(probeRequest.page, 1);
+		assert.equal(typeof probeRequest.request_id, "number");
+		await page.waitForSelector("[data-reverse-synctex-forward-probe='marker']", { state: "attached", timeout: 2_000 });
+		await page.waitForSelector("[data-reverse-synctex-forward-probe='label']", { state: "attached", timeout: 2_000 });
+		assert.match(await page.locator("[data-reverse-synctex-forward-probe='label']").textContent() ?? "", /reverse line 3 -> forward boxes/);
+
+		const oldProbeMarkerCount = await page.locator("[data-reverse-synctex-forward-probe='marker']").count();
+		const previousProbeRequestCount = sentViewerMessages.filter((message) => message.type === "reverse_synctex_forward_probe").length;
+		await clickRenderedPagePoint(page, 181, 101);
+		let latestProbeRequest = probeRequest;
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const probeRequests = sentViewerMessages.filter((message) => message.type === "reverse_synctex_forward_probe");
+			if (probeRequests.length > previousProbeRequestCount) {
+				latestProbeRequest = probeRequests.at(-1) ?? probeRequest;
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.notEqual(latestProbeRequest.request_id, probeRequest.request_id, "second plain click should send a fresh probe request");
 		const control = new ViewerHostControlClient({ origin: server.origin });
-		await control.send({ type: "reverse_synctex_hover_result", pdf_id: 239, request_id: Number(hoverRequest.request_id), page: 1, x: Number(hoverRequest.x), y: Number(hoverRequest.y), error: "hover lookup failed" });
+		await control.send({ type: "reverse_synctex_forward_probe_result", pdf_id: 239, request_id: Number(probeRequest.request_id), click_page: 1, click_x: Number(probeRequest.x), click_y: Number(probeRequest.y), reverse_source_file: sourcePath, reverse_line: 99, reverse_column: 0, page: 1, x: 10, y: 10, source_file: sourcePath, line: 99 });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.equal(await page.locator("[data-reverse-synctex-forward-probe='marker']").count(), oldProbeMarkerCount, "stale probe result should be ignored");
+		await control.send({ type: "reverse_synctex_forward_probe_result", pdf_id: 239, request_id: Number(latestProbeRequest.request_id), click_page: 1, click_x: Number(latestProbeRequest.x), click_y: Number(latestProbeRequest.y), reverse_source_file: sourcePath, reverse_line: 4, reverse_column: 0, page: 1, x: 143.73, y: 154.69, ranges: [{ page: 1, h: 120, v: 160, W: 20, H: 8 }], source_file: sourcePath, line: 4 });
+		await page.waitForSelector("[data-reverse-synctex-forward-probe='label']", { state: "attached", timeout: 2_000 });
+		assert.match(await page.locator("[data-reverse-synctex-forward-probe='label']").textContent() ?? "", /reverse line 4 -> forward boxes/);
+
+		const probeCountBeforeCtrl = sentViewerMessages.filter((message) => message.type === "reverse_synctex_forward_probe").length;
+		await clickRenderedPagePoint(page, 180, 100, { ctrl: true });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.ok(sentViewerMessages.some((message) => message.type === "reverse_synctex"), "Ctrl+Click should still send a normal reverse event");
+		assert.equal(sentViewerMessages.filter((message) => message.type === "reverse_synctex_forward_probe").length, probeCountBeforeCtrl, "Ctrl+Click must not send a debug probe");
+
+		const probeCountBeforeDrag = sentViewerMessages.filter((message) => message.type === "reverse_synctex_forward_probe").length;
+		const selected = await dragSelectRenderedPageText(page, "paragraph text");
+		assert.equal(selected, "paragraph text");
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		assert.equal(sentViewerMessages.filter((message) => message.type === "reverse_synctex_forward_probe").length, probeCountBeforeDrag, "selection drag should not send a debug probe");
+		await page.evaluate(() => window.getSelection()?.removeAllRanges());
+
+		const activeHoverRequest = sentViewerMessages.filter((message) => message.type === "reverse_synctex_hover").at(-1) ?? hoverRequest;
+		await control.send({ type: "reverse_synctex_hover_result", pdf_id: 239, request_id: Number(activeHoverRequest.request_id), page: 1, x: Number(activeHoverRequest.x), y: Number(activeHoverRequest.y), error: "hover lookup failed" });
 		await page.waitForFunction(() => document.querySelectorAll("[data-reverse-synctex-hover]").length === 0, undefined, { timeout: 2_000 });
 
 		await moveRenderedPagePoint(page, 185, 105);
@@ -987,13 +1039,15 @@ test("Viewer Host-served Viewer Client toggles reverse SyncTeX hover overlay wit
 
 		const response = await callTool(2, "get_pdf_events", { pdf_id: 239, max_events: 20, stale: true, debug: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
 		const events = response.result?.details?.events ?? [];
-		assert.equal(events.some((event) => event.type === "reverse_synctex_hover" || event.type === "reverse_synctex"), false, "hover requests/results should not be stored as PDF events");
+		assert.equal(events.some((event) => event.type === "reverse_synctex_hover" || event.type === "reverse_synctex_forward_probe"), false, "hover/probe requests/results should not be stored as PDF events");
 
 		await toggle.click();
 		assert.equal(await toggle.getAttribute("aria-pressed"), "false");
 		await control.send({ type: "reverse_synctex_hover_result", pdf_id: 239, request_id: Number(latestHoverRequest.request_id), page: 1, x: Number(latestHoverRequest.x), y: Number(latestHoverRequest.y), source_file: sourcePath, line: 3, column: 0, source_line: "TOGGLE OFF HOVER LABEL", rect: { left: 20, top: 30, right: 80, bottom: 50 } });
 		await page.waitForFunction(() => document.querySelectorAll("[data-reverse-synctex-hover]").length === 0, undefined, { timeout: 2_000 });
+		await page.waitForFunction(() => document.querySelectorAll("[data-reverse-synctex-forward-probe]").length === 0, undefined, { timeout: 2_000 });
 		assert.equal(await page.locator("[data-reverse-synctex-hover='label']", { hasText: "TOGGLE OFF HOVER LABEL" }).count(), 0, "stale hover result after toggle off should be ignored");
+		assert.equal(await page.locator("[data-reverse-synctex-forward-probe]").count(), 0, "toggle off should clear probe overlay");
 	} finally {
 		await browser?.close();
 		await server.stop();
