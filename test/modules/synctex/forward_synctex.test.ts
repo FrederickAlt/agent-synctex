@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import * as iconv from "iconv-lite";
 import { test } from "node:test";
-import { findUniqueSelectedTextSourceRange, mapForwardSynctex, mapReverseForwardSynctexProbe, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
+import { findUniqueSelectedTextSourceRange, inspectReverseSynctexHover, mapForwardSynctex, mapReverseForwardSynctexProbe, mapReverseSynctex, resolveSynctexSidecar } from "../../../src/modules/synctex/forward_synctex.ts";
 import { collectReverseSyncTeXCandidatesFromParsed, findInputFilePathForward, inspectSyncTeXToTeX, inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX } from "../../../src/modules/synctex/latex_workshop/worker.ts";
 import type { PdfSyncObject } from "../../../src/modules/synctex/latex_workshop/synctexjs.ts";
 
@@ -1259,6 +1259,49 @@ test("reverse SyncTeX adapter leaves no-context fallback mapping unchanged", () 
 			column: 0,
 			sourceLine: "First paragraph text that should wrap a little and create boxes.",
 		});
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX hover without text context reports robust winner when raw structural candidate is demoted", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\documentclass{article}",
+			"\\begin{document}",
+			"\\end{document}",
+			"% filler",
+			"Second paragraph text on a different source line for SyncTeX mapping.",
+			"\\end{document}",
+		].join("\n"));
+
+		const hover = inspectReverseSynctexHover({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: failNativeRunner,
+		});
+
+		assert.equal(hover.sourceFile, project.sourcePath);
+		assert.equal(hover.line, 5);
+		assert.equal(hover.sourceLine, "Second paragraph text on a different source line for SyncTeX mapping.");
+		assert.equal(hover.precision, "line");
+		assert.deepEqual(hover.repairedWinner, {
+			sourceFile: project.sourcePath,
+			line: 5,
+			column: 0,
+			sourceLine: "Second paragraph text on a different source line for SyncTeX mapping.",
+			precision: "line",
+		});
+		assert.equal((hover.rawWinner as { line?: number; structural?: boolean; sourceLine?: string }).line, 3);
+		assert.equal((hover.rawWinner as { line?: number; structural?: boolean; sourceLine?: string }).structural, true);
+		assert.equal((hover.rawWinner as { line?: number; structural?: boolean; sourceLine?: string }).sourceLine, "\\end{document}");
+		assert.ok(hover.topCandidates?.some((candidate) => (candidate as { line?: number }).line === 5));
+		assert.ok(hover.topCandidates?.some((candidate) => (candidate as { line?: number }).line === 3));
+		assert.equal(hover.forwardVerification, undefined);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

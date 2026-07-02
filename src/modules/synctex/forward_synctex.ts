@@ -831,50 +831,20 @@ function reverseLocationToHoverInspection(location: ReverseSynctexLocation): Rev
 	};
 }
 
-export function inspectReverseSynctexHover(input: { pdfPath: string; page: number; x: number; y: number; cwd: string; textBeforeSelection?: string; textAfterSelection?: string }): ReverseSynctexHoverInspection {
-	if (!Number.isInteger(input.page) || input.page < 1) {
-		throw new Error("page must be a positive integer");
-	}
-	if (!Number.isFinite(input.x) || input.x < 0 || !Number.isFinite(input.y) || input.y < 0) {
-		throw new Error("x and y must be non-negative finite numbers");
-	}
-	if (input.textBeforeSelection !== undefined || input.textAfterSelection !== undefined) {
-		return reverseLocationToHoverInspection(mapReverseSynctex(input));
-	}
-	const pdfPath = resolve(input.pdfPath);
-	const sidecarPath = resolveSynctexSidecar(pdfPath);
-	if (sidecarPath === undefined) {
-		throw new Error(`PDF ${pdfPath} is missing SyncTeX sidecar (${pdfPath.replace(/\.pdf$/i, "")}.synctex or .synctex.gz)`);
-	}
-	const previousCwd = process.cwd();
-	let inspected;
-	try {
-		process.chdir(input.cwd);
-		inspected = inspectSyncTeXToTeXCandidates(input.page, input.x, input.y, pdfPath);
-	} finally {
-		process.chdir(previousCwd);
-	}
-	if (inspected === undefined) {
-		throw new Error(`No SyncTeX hover mapping found for page ${input.page} at ${input.x},${input.y}; primary JS lookup returned no result`);
-	}
-	const winner = inspected.rawWinner;
-	const sourceFile = resolveReverseMappedSourceFile(winner, input.cwd);
-	const sourceLine = readSourceLine(sourceFile, winner.line, input.cwd);
-	return {
-		page: input.page,
-		x: input.x,
-		y: input.y,
-		sourceFile,
-		line: winner.line,
-		column: winner.column,
-		...(sourceLine === undefined ? {} : { sourceLine }),
-		sidecarPath,
-		precision: inspected.rawWinner.structural ? "raw" : "line",
-		rawWinner: compactReverseCandidate(inspected.rawWinner),
-		topCandidates: inspected.candidates.map(compactReverseCandidate),
-		rect: winner.rect,
-		distanceFromCenter: 0,
-	};
+export function inspectReverseSynctexHover(input: {
+	pdfPath: string;
+	page: number;
+	x: number;
+	y: number;
+	cwd: string;
+	textBeforeSelection?: string;
+	textAfterSelection?: string;
+	nativeRunner?: NativeSynctexRunner;
+	inspectCandidates?: ReverseSynctexCandidateInspector;
+	forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine;
+	synctexCommand?: string;
+}): ReverseSynctexHoverInspection {
+	return reverseLocationToHoverInspection(mapReverseSynctex(input));
 }
 
 export function mapReverseSynctex(input: {

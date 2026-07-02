@@ -1099,7 +1099,9 @@ test("Viewer Host-served Viewer Client hover falls back to PDF directory when wo
 		await moveRenderedPagePoint(page, 180, 100);
 		await page.waitForSelector("[data-reverse-synctex-hover='rect']", { state: "attached", timeout: 2_000 });
 		await page.waitForSelector("[data-reverse-synctex-hover='label']", { state: "attached", timeout: 2_000 });
-		assert.match(await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "", /main\.tex:3/);
+		const labelText = await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "";
+		assert.match(labelText, /main\.tex:\d+/, "hover should map using the PDF directory fallback");
+		assert.match(labelText, /raw: line 3/, "fallback hover should retain raw diagnostics when robust ranking chooses another line");
 	} finally {
 		await browser?.close();
 		await server.stop();
