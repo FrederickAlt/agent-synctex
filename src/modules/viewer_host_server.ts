@@ -631,7 +631,7 @@ function showReverseSynctexHoverResult(message) {
 	page.append(marker, label);
 }
 
-function sendReverseSynctexForwardProbe(event, pageNumber, canvas, viewport) {
+function sendReverseSynctexForwardProbe(event, pageNumber, pageElement, canvas, viewport) {
 	if (!reverseSynctexHoverEnabled || !viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
 	if ((window.getSelection()?.toString() ?? "").length > 0) return;
 	const rect = canvas.getBoundingClientRect();
@@ -640,7 +640,7 @@ function sendReverseSynctexForwardProbe(event, pageNumber, canvas, viewport) {
 	reverseSynctexForwardProbeRequestId = requestId;
 	reverseSynctexForwardProbeLatestRequestId = requestId;
 	removeReverseSynctexForwardProbeOverlay();
-	viewerSocket.send(JSON.stringify({ type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1] }));
+	viewerSocket.send(JSON.stringify({ type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageElement, canvas, viewport) }));
 }
 
 function scheduleReverseSynctexHover(event, pageNumber, canvas, viewport) {
@@ -705,9 +705,11 @@ async function renderPdf(config) {
 		});
 		pageContainer.addEventListener("click", (event) => {
 			if (!event.ctrlKey) {
-				sendReverseSynctexForwardProbe(event, pageNumber, canvas, viewport);
+				sendReverseSynctexForwardProbe(event, pageNumber, pageContainer, canvas, viewport);
 				return;
 			}
+			removeReverseSynctexHoverOverlay();
+			removeReverseSynctexForwardProbeOverlay();
 			if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
 			const rect = canvas.getBoundingClientRect();
 			const pendingTextSelection = pendingReverseSynctexContexts.get(pageContainer) || {};
@@ -1615,7 +1617,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 	private handleReverseSynctexForwardProbeMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_forward_probe" }>): void {
 		try {
 			const record = this.registry.getPdf(connection.pdfId);
-			const probeInput = { pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y };
+			const probeInput = { pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y, ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) };
 			let probe;
 			try {
 				probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: record.workspaceCwd ?? dirname(record.pdfPath) });
@@ -1652,7 +1654,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 	private handleReverseSynctexHoverMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_hover" }>): void {
 		try {
 			const record = this.registry.getPdf(connection.pdfId);
-			const hoverInput = { pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y };
+			const hoverInput = { pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y, ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) };
 			let hover;
 			try {
 				hover = inspectReverseSynctexHover({ ...hoverInput, cwd: record.workspaceCwd ?? dirname(record.pdfPath) });

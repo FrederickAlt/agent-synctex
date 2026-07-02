@@ -277,7 +277,7 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 
 		assert.equal(details?.events?.length, 1);
 		const event = details?.events?.[0];
-		assert.deepEqual({ ...event, synctex_diagnostics: undefined, selection_start: undefined, selection_end: undefined }, {
+		assert.deepEqual({ ...event, synctex_diagnostics: undefined, selection_start: undefined, selection_end: undefined, precision: undefined, raw_mapped_source_file: undefined, raw_mapped_line: undefined, raw_mapped_column: undefined, raw_mapped_source_line: undefined }, {
 			type: "reverse_synctex",
 			sequence: 1,
 			pdf_id: 112,
@@ -293,6 +293,11 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 			synctex_diagnostics: undefined,
 			selection_start: undefined,
 			selection_end: undefined,
+			precision: undefined,
+			raw_mapped_source_file: undefined,
+			raw_mapped_line: undefined,
+			raw_mapped_column: undefined,
+			raw_mapped_source_line: undefined,
 		});
 		assert.equal((event?.selection_start as Record<string, unknown>).source_file, sourcePath);
 		assert.equal((event?.selection_end as Record<string, unknown>).source_file, sourcePath);
