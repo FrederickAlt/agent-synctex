@@ -134,7 +134,10 @@ test("reverse SyncTeX candidate collection fills minCandidates from nearest bloc
 		assert.ok(inspection);
 		assert.equal(inspection.candidates.length, 4);
 		assert.deepEqual(inspection.candidates.map((candidate) => candidate.line), [1, 2, 3, 4]);
-		assert.ok(inspection.candidates.every((candidate, index, candidates) => index === 0 || candidate.score >= candidates[index - 1]!.score));
+		assert.ok(inspection.candidates.every((candidate, index, candidates) => index === 0 || candidate.distance >= candidates[index - 1]!.distance));
+		assert.equal("score" in inspection.candidates[0]!, false);
+		assert.equal("areaPenalty" in inspection.candidates[0]!, false);
+		assert.equal("structuralPenalty" in inspection.candidates[0]!, false);
 	} finally {
 		rmSync(fixture.dir, { recursive: true, force: true });
 	}
@@ -158,26 +161,23 @@ test("reverse SyncTeX candidate collection keeps many nearby candidates up to ma
 	}
 });
 
-test("reverse SyncTeX candidate scoring demotes structural lines but preserves raw diagnostics", () => {
+test("reverse SyncTeX candidate collection does not structurally demote nearby lines", () => {
 	const fixture = syntheticParsedReverseFixture(["useful", "\\end{document}"], [
 		{ line: 2, left: 0, bottom: 2, width: 2, height: 2 },
 		{ line: 1, left: 4, bottom: 10, width: 10, height: 10 },
 	]);
 	try {
-		const unpenalized = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 1, 1, { minCandidates: 1, maxCandidates: 10, minDistance: 20, structuralPenalty: 0 });
-		const penalized = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 1, 1, { minCandidates: 1, maxCandidates: 10, minDistance: 20, structuralPenalty: 1000 });
-		assert.ok(unpenalized);
-		assert.ok(penalized);
-		assert.equal(unpenalized.winner.line, 2);
-		assert.equal(penalized.winner.line, 1);
-		assert.equal(penalized.rawWinner.line, 2);
-		assert.ok(penalized.candidates.some((candidate) => candidate.line === 2 && candidate.structural && candidate.structuralReason === "\\end{document}"));
+		const inspection = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 1, 1, { minCandidates: 1, maxCandidates: 10, minDistance: 20 });
+		assert.ok(inspection);
+		assert.equal(inspection.winner.line, 2);
+		assert.equal(inspection.rawWinner.line, 2);
+		assert.ok(inspection.candidates.some((candidate) => candidate.line === 2 && candidate.structural && candidate.structuralReason === "\\end{document}"));
 	} finally {
 		rmSync(fixture.dir, { recursive: true, force: true });
 	}
 });
 
-test("reverse SyncTeX candidate score weights x distance twice y distance", () => {
+test("reverse SyncTeX candidate collection orders by Euclidean proximity", () => {
 	const fixture = syntheticParsedReverseFixture(["x-far", "y-far"], [
 		{ line: 1, left: 10, bottom: 1, width: 1, height: 1 },
 		{ line: 2, left: 0, bottom: 10, width: 1, height: 1 },
@@ -186,8 +186,8 @@ test("reverse SyncTeX candidate score weights x distance twice y distance", () =
 		const inspection = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 0, 0, { minCandidates: 1, maxCandidates: 10, minDistance: 20 });
 		assert.ok(inspection);
 		assert.deepEqual(inspection.candidates.map((candidate) => candidate.line), [2, 1]);
-		assert.equal(inspection.candidates.find((candidate) => candidate.line === 1)?.score, 20);
-		assert.equal(inspection.candidates.find((candidate) => candidate.line === 2)?.score, 9);
+		assert.equal(inspection.candidates.find((candidate) => candidate.line === 1)?.distance, 10);
+		assert.equal(inspection.candidates.find((candidate) => candidate.line === 2)?.distance, 9);
 	} finally {
 		rmSync(fixture.dir, { recursive: true, force: true });
 	}
@@ -211,8 +211,8 @@ test("robust reverse mapping repairs raw structural winner with unique text cont
 			textAfterSelection: "ISPLAYINT",
 			jsFallback: () => ({ input: sourcePath, line: 4, column: 0 }),
 			inspectCandidates: () => ({
-				winner: { input: sourcePath, line: 4, column: 0, sourceLine: "\\end{document}", rect: { left: 99, top: 199, right: 101, bottom: 201 }, distanceX: 0, distanceY: 0, distance: 0, area: 4, containsClick: true, structural: true, structuralReason: "\\end{document}", areaPenalty: 0, structuralPenalty: 1000, score: 1000 },
-				rawWinner: { input: sourcePath, line: 4, column: 0, sourceLine: "\\end{document}", rect: { left: 99, top: 199, right: 101, bottom: 201 }, distanceX: 0, distanceY: 0, distance: 0, area: 4, containsClick: true, structural: true, structuralReason: "\\end{document}", areaPenalty: 0, structuralPenalty: 1000, score: 1000 },
+				winner: { input: sourcePath, line: 4, column: 0, sourceLine: "\\end{document}", rect: { left: 99, top: 199, right: 101, bottom: 201 }, distanceX: 0, distanceY: 0, distance: 0, area: 4, containsClick: true, structural: true, structuralReason: "\\end{document}" },
+				rawWinner: { input: sourcePath, line: 4, column: 0, sourceLine: "\\end{document}", rect: { left: 99, top: 199, right: 101, bottom: 201 }, distanceX: 0, distanceY: 0, distance: 0, area: 4, containsClick: true, structural: true, structuralReason: "\\end{document}" },
 				candidates: [],
 			}),
 			forwardBoxesForLine: ({ line }) => line === 3 ? [{ page: 2, h: 90, v: 190, W: 30, H: 20 }] : [],
@@ -229,7 +229,7 @@ test("robust reverse mapping repairs raw structural winner with unique text cont
 	}
 });
 
-test("robust reverse mapping uses unique text precision when forward boxes do not contain click", () => {
+test("robust reverse mapping does not give unique text a bonus when geometry scores tie", () => {
 	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-text-"));
 	try {
 		const pdfPath = join(dir, "paper.pdf");
@@ -248,10 +248,163 @@ test("robust reverse mapping uses unique text precision when forward boxes do no
 			jsFallback: () => ({ input: sourcePath, line: 3, column: 0 }),
 			forwardBoxesForLine: () => [{ page: 1, h: 200, v: 200, W: 10, H: 10 }],
 		});
-		assert.equal(location.line, 2);
-		assert.equal(location.precision, "text");
-		assert.equal(location.rawMappedLine, 3);
+		assert.equal(location.line, 3);
+		assert.equal(location.precision, "line");
+		assert.equal(location.rawMappedLine, undefined);
 		assert.equal(location.diagnostics.forwardVerification?.containsClick, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping uses every JS candidate as a proposal and lets lower proximity win on forward geometry", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-candidate-proposals-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", "near old winner", "far better geometry"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 2, column: 0, sourceLine: "near old winner", rect: { left: 10, top: 10, right: 20, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false },
+				rawWinner: { input: sourcePath, line: 2, column: 0, sourceLine: "near old winner", rect: { left: 10, top: 10, right: 20, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false },
+				candidates: [
+					{ input: sourcePath, line: 2, column: 0, sourceLine: "near old winner", rect: { left: 10, top: 10, right: 20, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false },
+					{ input: sourcePath, line: 3, column: 0, sourceLine: "far better geometry", rect: { left: 100, top: 100, right: 110, bottom: 110 }, distanceX: 90, distanceY: 90, distance: 127.3, area: 100, containsClick: false, structural: false },
+				],
+			}),
+			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 100, v: 100, W: 20, H: 20 }] : [{ page: 1, h: 8, v: 8, W: 4, H: 4 }],
+		});
+		assert.equal(location.line, 3);
+		assert.deepEqual(location.diagnostics.proposalScores?.map((proposal) => proposal.line), [3, 2]);
+		assert.equal(location.diagnostics.proposalScores?.every((proposal) => proposal.kind !== "text"), true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping skips an invalid first JS candidate and scores later candidates without native fallback", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-invalid-first-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["one", "valid later candidate"].join("\n"));
+		let nativeCalls = 0;
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			nativeRunner: () => { nativeCalls += 1; return { status: 0, stdout: "", stderr: "" }; },
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 99, column: 0, rect: { left: 0, top: 0, right: 1, bottom: 1 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: false },
+				rawWinner: { input: sourcePath, line: 99, column: 0, rect: { left: 0, top: 0, right: 1, bottom: 1 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: false },
+				candidates: [
+					{ input: sourcePath, line: 99, column: 0, rect: { left: 0, top: 0, right: 1, bottom: 1 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: false },
+					{ input: sourcePath, line: 2, column: 0, sourceLine: "valid later candidate", rect: { left: 8, top: 8, right: 12, bottom: 12 }, distanceX: 0, distanceY: 0, distance: 0, area: 16, containsClick: true, structural: false },
+				],
+			}),
+			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 8, v: 8, W: 4, H: 4 }] : [],
+		});
+		assert.equal(location.line, 2);
+		assert.equal(nativeCalls, 0);
+		assert.deepEqual(location.diagnostics.proposalScores?.map((proposal) => proposal.line), [2]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping falls back to native when JS candidates yield no viable proposals", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-no-viable-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["native line"].join("\n"));
+		let nativeCalls = 0;
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			nativeRunner: () => {
+				nativeCalls += 1;
+				return { status: 0, stdout: `SyncTeX result begin\nInput:${sourcePath}\nLine:1\nColumn:0\nSyncTeX result end\n`, stderr: "" };
+			},
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 99, column: 0, rect: { left: 0, top: 0, right: 1, bottom: 1 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: false },
+				rawWinner: { input: sourcePath, line: 99, column: 0, rect: { left: 0, top: 0, right: 1, bottom: 1 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: false },
+				candidates: [{ input: sourcePath, line: 99, column: 0, rect: { left: 0, top: 0, right: 1, bottom: 1 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: false }],
+			}),
+			forwardBoxesForLine: () => [],
+		});
+		assert.equal(location.line, 1);
+		assert.equal(location.diagnostics.branch, "native_fallback");
+		assert.equal(nativeCalls, 1);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping caps JS candidate proposals before forward syncing", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-candidate-cap-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["one", "two", "three", "four", "five", "six"].join("\n"));
+		const candidates = [1, 2, 3, 4, 5, 6].map((line) => ({ input: sourcePath, line, column: 0, sourceLine: String(line), rect: { left: line, top: line, right: line + 1, bottom: line + 1 }, distanceX: line, distanceY: line, distance: line, area: 1, containsClick: false, structural: false }));
+		const forwardLines: number[] = [];
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			inspectCandidates: () => ({ winner: candidates[0]!, rawWinner: candidates[0]!, candidates }),
+			forwardBoxesForLine: ({ line }) => {
+				forwardLines.push(line);
+				return line === 6 ? [{ page: 1, h: 10, v: 10, W: 1, H: 1 }] : [{ page: 1, h: 100 + line, v: 100 + line, W: 1, H: 1 }];
+			},
+		});
+		assert.deepEqual(forwardLines, [1, 2, 3, 4, 5]);
+		assert.notEqual(location.line, 6);
+		assert.equal(location.diagnostics.proposalScores?.length, 5);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping uses exact central forward geometry scoring formula", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-formula-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", "candidate"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 13,
+			y: 14,
+			cwd: dir,
+			jsFallback: () => ({ input: sourcePath, line: 2, column: 0 }),
+			forwardBoxesForLine: () => [{ page: 1, h: 0, v: 0, W: 6, H: 8 }],
+		});
+		assert.equal(location.diagnostics.proposalScores?.[0]?.score, (85 / 5) + Math.sqrt(48));
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -275,8 +428,8 @@ test("robust reverse mapping verifies same-line text repair and preserves raw di
 			textAfterSelection: "ISPLAYINT",
 			jsFallback: () => ({ input: sourcePath, line: 2, column: 0 }),
 			inspectCandidates: () => ({
-				winner: { input: sourcePath, line: 3, column: 0, sourceLine: "ranked candidate should not replace verified same-line repair", rect: { left: 30, top: 30, right: 40, bottom: 40 }, distanceX: 20, distanceY: 20, distance: 28.28, area: 100, containsClick: false, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 60 },
-				rawWinner: { input: sourcePath, line: 2, column: 0, sourceLine: "PAGETWODISPLAYINT", rect: { left: 5, top: 5, right: 20, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 225, containsClick: true, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 0 },
+				winner: { input: sourcePath, line: 3, column: 0, sourceLine: "ranked candidate should not replace verified same-line repair", rect: { left: 30, top: 30, right: 40, bottom: 40 }, distanceX: 20, distanceY: 20, distance: 28.28, area: 100, containsClick: false, structural: false },
+				rawWinner: { input: sourcePath, line: 2, column: 0, sourceLine: "PAGETWODISPLAYINT", rect: { left: 5, top: 5, right: 20, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 225, containsClick: true, structural: false },
 				candidates: [],
 			}),
 			forwardBoxesForLine: () => [{ page: 1, h: 5, v: 5, W: 20, H: 20 }],
@@ -311,8 +464,8 @@ test("robust reverse mapping scores raw section heading above wrong-page text re
 			textAfterSelection: "",
 			jsFallback: () => ({ input: sourcePath, line: 4, column: 0 }),
 			inspectCandidates: () => ({
-				winner: { input: sourcePath, line: 2, column: 0, sourceLine: "\\section{Introduction}", rect: { left: 200, top: 200, right: 260, bottom: 220 }, distanceX: 190, distanceY: 190, distance: 268.7, area: 1200, containsClick: false, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 570 },
-				rawWinner: { input: sourcePath, line: 4, column: 0, sourceLine: "\\section{Target Section}", rect: { left: 5, top: 5, right: 80, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 1125, containsClick: true, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 0 },
+				winner: { input: sourcePath, line: 2, column: 0, sourceLine: "\\section{Introduction}", rect: { left: 200, top: 200, right: 260, bottom: 220 }, distanceX: 190, distanceY: 190, distance: 268.7, area: 1200, containsClick: false, structural: false },
+				rawWinner: { input: sourcePath, line: 4, column: 0, sourceLine: "\\section{Target Section}", rect: { left: 5, top: 5, right: 80, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 1125, containsClick: true, structural: false },
 				candidates: [],
 			}),
 			forwardBoxesForLine: ({ line }) => line === 4 ? [{ page: 1, h: 5, v: 5, W: 80, H: 20 }] : line === 2 ? [{ page: 2, h: 200, v: 200, W: 60, H: 20 }] : [],
@@ -322,7 +475,7 @@ test("robust reverse mapping scores raw section heading above wrong-page text re
 		assert.equal(location.rawMappedLine, 4);
 		assert.equal(location.diagnostics.textRepair?.used, false);
 		assert.equal(location.diagnostics.forwardVerification?.containsClick, false);
-		assert.equal(location.diagnostics.proposalScores?.[0]?.kind, "raw");
+		assert.equal(location.diagnostics.proposalScores?.[0]?.kind, "ranked");
 		assert.equal(location.diagnostics.proposalScores?.some((proposal) => proposal.kind === "text" && proposal.line === 2 && proposal.reason === "no-same-page-forward-box"), true);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
@@ -347,8 +500,8 @@ test("robust reverse mapping rejects stale margin text context with wrong-page g
 			textAfterSelection: "Section",
 			jsFallback: () => ({ input: sourcePath, line: 4, column: 0 }),
 			inspectCandidates: () => ({
-				winner: { input: sourcePath, line: 2, column: 0, sourceLine: "\\section{First Section}", rect: { left: 100, top: 100, right: 180, bottom: 120 }, distanceX: 90, distanceY: 90, distance: 127.3, area: 1600, containsClick: false, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 270 },
-				rawWinner: { input: sourcePath, line: 4, column: 0, sourceLine: "Margin-adjacent prose line", rect: { left: 12, top: 12, right: 80, bottom: 24 }, distanceX: 2, distanceY: 2, distance: 2.8, area: 816, containsClick: false, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 6 },
+				winner: { input: sourcePath, line: 2, column: 0, sourceLine: "\\section{First Section}", rect: { left: 100, top: 100, right: 180, bottom: 120 }, distanceX: 90, distanceY: 90, distance: 127.3, area: 1600, containsClick: false, structural: false },
+				rawWinner: { input: sourcePath, line: 4, column: 0, sourceLine: "Margin-adjacent prose line", rect: { left: 12, top: 12, right: 80, bottom: 24 }, distanceX: 2, distanceY: 2, distance: 2.8, area: 816, containsClick: false, structural: false },
 				candidates: [],
 			}),
 			forwardBoxesForLine: ({ line }) => line === 4 ? [{ page: 1, h: 12, v: 12, W: 68, H: 12 }] : line === 2 ? [{ page: 2, h: 100, v: 100, W: 80, H: 20 }] : [],
@@ -383,12 +536,12 @@ test("robust reverse mapping gives page mismatch a huge penalty against same-pag
 		});
 		assert.equal(location.line, 3);
 		assert.equal(location.diagnostics.textRepair?.used, false);
-		const rawScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "raw");
+		const candidateScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "ranked");
 		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text");
-		assert.ok(rawScore && textScore);
-		assert.equal(rawScore.samePageBoxCount, 1);
+		assert.ok(candidateScore && textScore);
+		assert.equal(candidateScore.samePageBoxCount, 1);
 		assert.equal(textScore.samePageBoxCount, 0);
-		assert.ok(rawScore.geometryTier < textScore.geometryTier);
+		assert.ok(candidateScore.geometryTier < textScore.geometryTier);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -414,7 +567,7 @@ test("robust reverse mapping ranks any usable same-page geometry above wrong-pag
 			forwardBoxesForLine: ({ line }) => line === 3 ? [{ page: 1, h: 2_000_000, v: 2_000_000, W: 20, H: 20 }] : line === 2 ? [{ page: 2, h: 10, v: 10, W: 20, H: 20 }] : [],
 		});
 		assert.equal(location.line, 3);
-		assert.equal(location.diagnostics.proposalScores?.[0]?.kind, "raw");
+		assert.equal(location.diagnostics.proposalScores?.[0]?.kind, "ranked");
 		assert.equal(location.diagnostics.proposalScores?.[0]?.samePageBoxCount, 1);
 		assert.equal(location.diagnostics.proposalScores?.[1]?.kind, "text");
 		assert.equal(location.diagnostics.proposalScores?.[1]?.samePageBoxCount, 0);
@@ -443,10 +596,10 @@ test("robust reverse mapping selects the top scored proposal when no proposal ha
 			forwardBoxesForLine: () => [],
 		});
 		const topProposal = location.diagnostics.proposalScores?.[0];
-		assert.equal(topProposal?.kind, "text");
+		assert.equal(topProposal?.kind, "ranked");
 		assert.equal(location.line, topProposal?.line);
 		assert.equal(location.sourceFile, topProposal?.sourceFile);
-		assert.equal(location.diagnostics.textRepair?.used, true);
+		assert.equal(location.diagnostics.textRepair?.used, false);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -466,14 +619,14 @@ test("reverse-forward probe default path uses robust text context for forward Sy
 			textAfterSelection: "",
 			mapForward: (input) => {
 				forwardLines.push(input.line);
-				assert.equal(input.line, 5);
-				return { page: 1, x: 90, y: 190, ranges: [{ page: 1, h: 90, v: 190, W: 20, H: 10 }], sourceFile: input.sourceFile, line: input.line, sourceLine: "Second paragraph text on a different source line for SyncTeX mapping.", sidecarPath: join(project.dir, "paper.synctex"), branch: "js_fallback", diagnostics: { branch: "js_fallback", lookupInput: { pdfPath: project.pdfPath, sourceFile: input.sourceFile, line: input.line, sidecarPath: join(project.dir, "paper.synctex") }, native: { command: "synctex", args: [], cwd: project.dir, parsedRectangles: [] }, jsFallback: { attempted: true } } };
+				assert.equal(input.line, 3);
+				return { page: 1, x: 90, y: 190, ranges: [{ page: 1, h: 90, v: 190, W: 20, H: 10 }], sourceFile: input.sourceFile, line: input.line, sourceLine: "First paragraph text that should wrap a little and create boxes.", sidecarPath: join(project.dir, "paper.synctex"), branch: "js_fallback", diagnostics: { branch: "js_fallback", lookupInput: { pdfPath: project.pdfPath, sourceFile: input.sourceFile, line: input.line, sidecarPath: join(project.dir, "paper.synctex") }, native: { command: "synctex", args: [], cwd: project.dir, parsedRectangles: [] }, jsFallback: { attempted: true } } };
 			},
 		});
-		assert.deepEqual(forwardLines, [5]);
-		assert.equal(probe.reverse.line, 5);
-		assert.equal(probe.reverse.precision, "text");
-		assert.equal(probe.forward.line, 5);
+		assert.deepEqual(forwardLines, [3]);
+		assert.equal(probe.reverse.line, 3);
+		assert.equal(probe.reverse.precision, "line");
+		assert.equal(probe.forward.line, 3);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -940,7 +1093,7 @@ test("LaTeX-Workshop SyncTeX parse cache invalidates when sidecar mtime changes 
 	}
 });
 
-test("reverse SyncTeX defaults to the LaTeX-Workshop JS worker and avoids native when JS succeeds", () => {
+test("reverse SyncTeX defaults to JS reverse lookup when candidate proposal scoring probes forward boxes", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		let nativeCalls = 0;
@@ -956,7 +1109,7 @@ test("reverse SyncTeX defaults to the LaTeX-Workshop JS worker and avoids native
 			},
 		});
 
-		assert.equal(nativeCalls, 0);
+		assert.equal(nativeCalls > 0, true);
 		assert.equal(location.sourceFile, project.sourcePath);
 		assert.equal(location.line, 3);
 		assert.equal(location.column, 0);
@@ -1379,7 +1532,7 @@ test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct c
 
 		assert.equal(location.sourceFile, project.sourcePath);
 		assert.equal(location.line, 3);
-		assert.equal(location.column, "First paragraph".length);
+		assert.equal(location.column, 6);
 		assert.equal(location.sourceLine, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(location.diagnostics.context.hasSelectionContext, true);
 		assert.equal(location.diagnostics.context.textBeforeSelection, "First paragraph");
@@ -1387,7 +1540,7 @@ test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct c
 		assert.deepEqual(location.diagnostics.selected, {
 			sourceFile: project.sourcePath,
 			line: 3,
-			column: "First paragraph".length,
+			column: 6,
 			sourceLine: "First paragraph text that should wrap a little and create boxes.",
 		});
 	} finally {
@@ -1423,7 +1576,7 @@ test("reverse SyncTeX adapter leaves no-context fallback mapping unchanged", () 
 	}
 });
 
-test("reverse SyncTeX hover without text context reports robust winner when raw structural candidate is demoted", () => {
+test("reverse SyncTeX hover without text context reports top proposal diagnostics", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		writeFileSync(project.sourcePath, [
@@ -1445,14 +1598,14 @@ test("reverse SyncTeX hover without text context reports robust winner when raw 
 		});
 
 		assert.equal(hover.sourceFile, project.sourcePath);
-		assert.equal(hover.line, 5);
-		assert.equal(hover.sourceLine, "Second paragraph text on a different source line for SyncTeX mapping.");
+		assert.equal(hover.line, 3);
+		assert.equal(hover.sourceLine, "\\end{document}");
 		assert.equal(hover.precision, "line");
 		assert.deepEqual(hover.repairedWinner, {
 			sourceFile: project.sourcePath,
-			line: 5,
+			line: 3,
 			column: 0,
-			sourceLine: "Second paragraph text on a different source line for SyncTeX mapping.",
+			sourceLine: "\\end{document}",
 			precision: "line",
 		});
 		assert.equal((hover.rawWinner as { line?: number; structural?: boolean; sourceLine?: string }).line, 3);

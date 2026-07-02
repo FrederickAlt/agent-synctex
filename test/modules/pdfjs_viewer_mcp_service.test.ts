@@ -597,7 +597,7 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		assert.equal(event.pdf_id, pdfId);
 		assert.equal(event.source_file, sourcePath);
 		assert.equal(event.line, 3);
-		assert.equal(event.column, "First paragraph".length);
+		assert.equal(event.column, 6);
 		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(event.selected_text, "First paragraph");
 		assert.equal((event.selection_start as Record<string, unknown>).source_file, sourcePath);
@@ -610,7 +610,7 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		assert.equal(reverseDiagnostics.context.hasSelectionContext, true);
 		assert.equal(reverseDiagnostics.context.textBeforeSelection, "First paragraph");
 		assert.deepEqual(reverseDiagnostics.candidates.map((candidate) => candidate.kind), ["raw", "context_corrected"]);
-		assert.deepEqual(reverseDiagnostics.selected, { sourceFile: sourcePath, line: 3, column: "First paragraph".length, sourceLine: "First paragraph text that should wrap a little and create boxes." });
+		assert.deepEqual(reverseDiagnostics.selected, { sourceFile: sourcePath, line: 3, column: 6, sourceLine: "First paragraph text that should wrap a little and create boxes." });
 		assert.equal(typeof event.timestamp, "string");
 		assert.equal("callback" in event, false);
 		assert.equal("socket_path" in event, false);

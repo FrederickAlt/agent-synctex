@@ -247,7 +247,7 @@ export interface ReverseSynctexDiagnostics {
 		containsClick: boolean;
 	};
 	proposalScores?: Array<{
-		kind: "raw" | "text" | "ranked";
+		kind: "text" | "ranked";
 		sourceFile: string;
 		line: number;
 		column: number;
@@ -630,10 +630,10 @@ function compactReverseCandidate(candidate: ReverseSyncTeXCandidate): unknown {
 		distanceX: candidate.distanceX,
 		distanceY: candidate.distanceY,
 		distance: candidate.distance,
+		area: candidate.area,
 		containsClick: candidate.containsClick,
 		structural: candidate.structural,
 		...(candidate.structuralReason === undefined ? {} : { structuralReason: candidate.structuralReason }),
-		score: candidate.score,
 	};
 }
 
@@ -656,14 +656,17 @@ function forwardBoxesForSourceLine(input: { sourceFile: string; line: number; pd
 	}
 }
 
+const MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS = 5;
+
 interface ReverseSynctexProposal {
-	kind: "raw" | "text" | "ranked";
+	kind: "text" | "ranked";
 	sourceFile: string;
 	line: number;
 	column: number;
 	sourceLine?: string;
 	structural: boolean;
 	textStatus?: "unique" | "ambiguous-small";
+	rank: number;
 }
 
 interface ScoredReverseSynctexProposal extends ReverseSynctexProposal {
@@ -694,7 +697,6 @@ function boxDistanceFromClick(box: ForwardSynctexRange, click: { x: number; y: n
 
 function proposalPrecision(proposal: ReverseSynctexProposal, containsClick: boolean): ReverseSynctexPrecision {
 	if (proposal.kind === "text") return containsClick ? "verified" : "text";
-	if (proposal.kind === "raw" && proposal.structural) return "raw";
 	return "line";
 }
 
@@ -705,15 +707,17 @@ function scoreReverseSynctexProposal(input: {
 }): ScoredReverseSynctexProposal {
 	const filtered = filterForwardBoxes(input.boxes, input.click);
 	const samePageBoxes = filtered.boxes.filter((box) => box.page === input.click.page);
-	const chosenSamePageBox = samePageBoxes[0];
+	const scoredSamePageBoxes = samePageBoxes.map((box) => {
+		const distance = boxDistanceFromClick(box, input.click);
+		const area = Math.max(0, box.W) * Math.max(0, box.H);
+		return { box, distance, score: (distance * distance / 5) + Math.sqrt(area) };
+	}).sort((left, right) => left.score - right.score);
+	const chosen = scoredSamePageBoxes[0];
+	const chosenSamePageBox = chosen?.box;
 	const containsClick = chosenSamePageBox === undefined ? false : boxContainsClick(chosenSamePageBox, input.click);
-	const distance = chosenSamePageBox === undefined ? undefined : boxDistanceFromClick(chosenSamePageBox, input.click);
+	const distance = chosen?.distance;
 	const geometryTier = chosenSamePageBox === undefined ? 1 : 0;
-	let score = chosenSamePageBox === undefined ? 0 : containsClick ? 0 : distance ?? 0;
-	if (input.proposal.structural) score += 5_000;
-	if (input.proposal.kind === "raw") score -= 20;
-	else if (input.proposal.kind === "text") score += input.proposal.textStatus === "unique" ? -100 : 100;
-	else if (input.proposal.kind === "ranked") score += 25;
+	const score = chosen?.score ?? 0;
 	return {
 		...input.proposal,
 		precision: proposalPrecision(input.proposal, containsClick),
@@ -731,8 +735,9 @@ function scoreReverseSynctexProposal(input: {
 function compareScoredReverseSynctexProposals(left: ScoredReverseSynctexProposal, right: ScoredReverseSynctexProposal): number {
 	return left.geometryTier - right.geometryTier
 		|| left.score - right.score
-		|| (left.kind === "raw" ? -1 : 0) - (right.kind === "raw" ? -1 : 0)
-		|| left.line - right.line;
+		|| left.rank - right.rank
+		|| left.line - right.line
+		|| left.sourceFile.localeCompare(right.sourceFile);
 }
 
 function compactProposalScore(proposal: ScoredReverseSynctexProposal): NonNullable<ReverseSynctexDiagnostics["proposalScores"]>[number] {
@@ -998,16 +1003,17 @@ export function mapReverseSynctex(input: {
 	const previousCwd = process.cwd();
 	try {
 		process.chdir(input.cwd);
-		if (input.jsFallback === undefined) {
-			candidateInspection = (input.inspectCandidates ?? inspectSyncTeXToTeXCandidates)(input.page, input.x, input.y, pdfPath);
-			jsResult = candidateInspection === undefined ? undefined : candidateToMapped(candidateInspection.rawWinner);
-		} else {
+		if (input.jsFallback !== undefined && input.inspectCandidates === undefined) {
 			jsResult = input.jsFallback(input.page, input.x, input.y, pdfPath);
-			candidateInspection = input.inspectCandidates?.(input.page, input.x, input.y, pdfPath);
+		} else {
+			candidateInspection = (input.inspectCandidates ?? inspectSyncTeXToTeXCandidates)(input.page, input.x, input.y, pdfPath);
+			jsResult = candidateInspection?.candidates[0] === undefined ? input.jsFallback?.(input.page, input.x, input.y, pdfPath) : candidateToMapped(candidateInspection.candidates[0]);
 		}
 		if (jsResult === undefined) {
 			jsFailureReason = "no result";
 			allowNativeFallback = true;
+		} else if (candidateInspection !== undefined) {
+			jsMapped = jsResult;
 		} else {
 			const invalidReason = invalidReadableSourceLineReason(jsResult, input.cwd);
 			if (invalidReason === undefined) {
@@ -1081,8 +1087,8 @@ export function mapReverseSynctex(input: {
 	let sourceFile = rawSourceFile;
 	let line = mapped.line;
 	let column = mapped.column;
-	let precision: ReverseSynctexPrecision = branch === "native_fallback" ? "line" : candidateInspection?.rawWinner.structural === true ? "raw" : "line";
-	let selectedProposalKind: ReverseSynctexProposal["kind"] | undefined = branch === "js" ? "raw" : undefined;
+	let precision: ReverseSynctexPrecision = "line";
+	let selectedProposalKind: ReverseSynctexProposal["kind"] | undefined = branch === "js" ? "ranked" : undefined;
 	const hasSelectionContext = input.textBeforeSelection !== undefined || input.textAfterSelection !== undefined;
 	let textRepair: ReverseSynctexDiagnostics["textRepair"] | undefined;
 	let forwardVerification: ReverseSynctexDiagnostics["forwardVerification"] | undefined;
@@ -1090,14 +1096,41 @@ export function mapReverseSynctex(input: {
 	let proposalScores: ReverseSynctexDiagnostics["proposalScores"] | undefined;
 
 	if (branch === "js") {
-		const proposals: ReverseSynctexProposal[] = [{
-			kind: "raw",
-			sourceFile: rawSourceFile,
-			line: rawMappedLine,
-			column: rawMappedColumn,
-			...(rawMappedSourceLine === undefined ? {} : { sourceLine: rawMappedSourceLine }),
-			structural: candidateInspection?.rawWinner.structural === true || isStructuralReverseSourceLine(rawMappedSourceLine),
-		}];
+		const proposals: ReverseSynctexProposal[] = [];
+		const addProposal = (proposal: ReverseSynctexProposal): void => {
+			const existingIndex = proposals.findIndex((existing) => existing.sourceFile === proposal.sourceFile && existing.line === proposal.line);
+			if (existingIndex < 0) {
+				proposals.push(proposal);
+			} else if (proposal.kind === "text" && proposals[existingIndex]?.kind !== "text") {
+				proposals[existingIndex] = { ...proposal, rank: proposals[existingIndex]?.rank ?? proposal.rank };
+			}
+		};
+		let proposalRank = 0;
+		if (candidateInspection !== undefined) {
+			for (const candidate of candidateInspection.candidates.slice(0, MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS)) {
+				const candidateSourceFile = resolveReverseMappedSourceFile(candidateToMapped(candidate), input.cwd);
+				addProposal({
+					kind: "ranked",
+					rank: proposalRank++,
+					sourceFile: candidateSourceFile,
+					line: candidate.line,
+					column: candidate.column,
+					...(candidate.sourceLine === undefined ? {} : { sourceLine: candidate.sourceLine }),
+					structural: candidate.structural || isStructuralReverseSourceLine(candidate.sourceLine),
+				});
+			}
+		}
+		if (proposals.length === 0) {
+			addProposal({
+				kind: "ranked",
+				rank: proposalRank++,
+				sourceFile: rawSourceFile,
+				line: rawMappedLine,
+				column: rawMappedColumn,
+				...(rawMappedSourceLine === undefined ? {} : { sourceLine: rawMappedSourceLine }),
+				structural: isStructuralReverseSourceLine(rawMappedSourceLine),
+			});
+		}
 		let textStatus: "unique" | "ambiguous-small" | undefined;
 		if (hasSelectionContext) {
 			const fragments = buildSourceSearchFragments(input.textBeforeSelection ?? "", input.textAfterSelection ?? "");
@@ -1112,8 +1145,9 @@ export function mapReverseSynctex(input: {
 			if (matches.status === "unique" || matches.status === "ambiguous-small") {
 				textStatus = matches.status;
 				for (const match of matches.matches) {
-					proposals.push({
+					addProposal({
 						kind: "text",
+						rank: proposalRank++,
 						sourceFile: match.sourceFile,
 						line: match.line,
 						column: match.column,
@@ -1124,24 +1158,10 @@ export function mapReverseSynctex(input: {
 				}
 			}
 		}
-		if (candidateInspection !== undefined && candidateInspection.winner.line !== rawMappedLine) {
-			const rankedSourceFile = resolveReverseMappedSourceFile(candidateToMapped(candidateInspection.winner), input.cwd);
-			if (!proposals.some((proposal) => proposal.kind !== "raw" && proposal.sourceFile === rankedSourceFile && proposal.line === candidateInspection.winner.line)) {
-				proposals.push({
-					kind: "ranked",
-					sourceFile: rankedSourceFile,
-					line: candidateInspection.winner.line,
-					column: candidateInspection.winner.column,
-					...(candidateInspection.winner.sourceLine === undefined ? {} : { sourceLine: candidateInspection.winner.sourceLine }),
-					structural: candidateInspection.winner.structural || isStructuralReverseSourceLine(candidateInspection.winner.sourceLine),
-				});
-			}
-		}
-		if (proposals.length === 1) {
-			proposalScores = undefined;
-		} else {
+		{
 			const click = { page: input.page, x: input.x, y: input.y };
-			const scored = proposals.map((proposal) => scoreReverseSynctexProposal({
+			const viableProposals = proposals.filter((proposal) => invalidReadableSourceLineReason({ input: proposal.sourceFile, line: proposal.line, column: proposal.column }, input.cwd) === undefined);
+			const scored = viableProposals.map((proposal) => scoreReverseSynctexProposal({
 				proposal,
 				click,
 				boxes: forwardBoxesForSourceLine({
@@ -1178,13 +1198,34 @@ export function mapReverseSynctex(input: {
 						containsClick: representativeTextProposal?.containsClick === true,
 					};
 				}
+			} else {
+				const native = runNativeReverseSynctex({ page: input.page, x: input.x, y: input.y, pdfPath, runner: input.nativeRunner ?? defaultNativeSynctexRunner, command: nativeCommand });
+				let nativeFailureReason = native.failureReason;
+				let nativeMapped = native.mapped;
+				if (nativeMapped !== undefined) {
+					const invalidReason = invalidReadableSourceLineReason(nativeMapped, input.cwd) ?? lowQualityNativeReverseSourceLineReason(nativeMapped, input.cwd);
+					if (invalidReason !== undefined) {
+						nativeFailureReason = invalidReason;
+						nativeMapped = undefined;
+					}
+				}
+				nativeDiagnostics = { ...native.diagnostics, attempted: true, role: "fallback", ...(nativeFailureReason === undefined ? {} : { failureReason: nativeFailureReason }) };
+				if (nativeMapped === undefined) {
+					throw new Error(`No SyncTeX mapping found for page ${input.page} at ${input.x},${input.y}; primary JS lookup yielded no viable proposals; native fallback returned ${nativeFailureReason ?? "no usable result"}`);
+				}
+				branch = "native_fallback";
+				sourceFile = resolveReverseMappedSourceFile(nativeMapped, input.cwd);
+				line = nativeMapped.line;
+				column = nativeMapped.column;
+				precision = "line";
+				selectedProposalKind = undefined;
 			}
 		}
 	}
 
 	const sourceLines = readSourceLines(sourceFile);
 	if (column === 0 && hasSelectionContext && sourceLines !== undefined && !textRepairChangedLocation) {
-		if (selectedProposalKind === "raw" || selectedProposalKind === "ranked") {
+		if (selectedProposalKind === "ranked") {
 			column = getColumnBySurroundingText(sourceLines[line - 1] ?? "", input.textBeforeSelection ?? "", input.textAfterSelection ?? "") ?? column;
 		} else {
 			const [row, col] = getRowAndColumn(sourceLines, line - 1, input.textBeforeSelection ?? "", input.textAfterSelection ?? "");

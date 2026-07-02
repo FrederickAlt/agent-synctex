@@ -283,7 +283,7 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 			pdf_id: 112,
 			source_file: sourcePath,
 			line: 3,
-			column: "First paragraph".length,
+			column: 6,
 			source_line: "First paragraph text that should wrap a little and create boxes.",
 			timestamp: event?.timestamp,
 			page: 1,
@@ -312,7 +312,7 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 		assert.deepEqual(diagnostics.candidates.map((candidate) => candidate.kind), ["raw", "context_corrected"]);
 		assert.equal(diagnostics.selected.sourceFile, sourcePath);
 		assert.equal(diagnostics.selected.line, 3);
-		assert.equal(diagnostics.selected.column, "First paragraph".length);
+		assert.equal(diagnostics.selected.column, 6);
 		assert.match(String(details?.events?.[0]?.timestamp), /^\d{4}-\d{2}-\d{2}T/);
 	} finally {
 		socket?.close();
