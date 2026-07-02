@@ -4,7 +4,7 @@ import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
 import { inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar, type ReverseSyncTeXCandidate, type ReverseSyncTeXCandidatesInspection } from "./latex_workshop/worker.ts";
 import { lineColumnForSourceIndex } from "./source_index.ts";
 import { readSourceLine } from "./source_line.ts";
-import { buildSourceSearchFragments, filterForwardBoxes, findSourceTextMatches, type SourceTextMatchResult } from "./text_repair.ts";
+import { boxContainsClick, boxDistanceComponentsFromClick, buildSourceSearchFragments, filterForwardBoxes, findSourceTextMatches, type SourceTextMatchResult } from "./text_repair.ts";
 
 export interface ForwardSynctexTarget {
 	page: number;
@@ -175,7 +175,7 @@ export interface ReverseSynctexHoverInspection {
 	precision?: ReverseSynctexPrecision;
 	rawWinner?: unknown;
 	topCandidates?: unknown[];
-	repairedWinner?: { sourceFile: string; line: number; column: number; sourceLine?: string; precision: ReverseSynctexPrecision };
+	repairedWinner?: { sourceFile: string; line: number; column: number; sourceLine?: string; precision: ReverseSynctexPrecision; score?: number };
 	forwardVerification?: ReverseSynctexDiagnostics["forwardVerification"];
 	rect: { left: number; top: number; right: number; bottom: number };
 	distanceFromCenter: number;
@@ -226,6 +226,7 @@ export interface ReverseSynctexDiagnostics {
 		line: number;
 		column: number;
 		sourceLine?: string;
+		score?: number;
 	};
 	precision?: ReverseSynctexPrecision;
 	rawWinner?: unknown;
@@ -257,6 +258,7 @@ export interface ReverseSynctexDiagnostics {
 		samePageBoxCount: number;
 		containsClick: boolean;
 		structural: boolean;
+		clickContainmentBonus: number;
 		textContainmentBonus: number;
 		textContainment?: "full" | "partial";
 		distance?: number;
@@ -622,7 +624,9 @@ function isStructuralReverseSourceLine(sourceLine: string | undefined): boolean 
 	return trimmed !== undefined && STRUCTURAL_REVERSE_SOURCE_LINES.has(trimmed);
 }
 
-function compactReverseCandidate(candidate: ReverseSyncTeXCandidate): unknown {
+function compactReverseCandidate(candidate: ReverseSyncTeXCandidate, cwd?: string, proposalScores?: ReverseSynctexDiagnostics["proposalScores"]): unknown {
+	const sourceFile = cwd === undefined ? candidate.input : resolveReverseMappedSourceFile(candidateToMapped(candidate), cwd);
+	const proposalScore = proposalScores?.find((proposal) => proposal.sourceFile === sourceFile && proposal.line === candidate.line && proposal.column === candidate.column)?.score;
 	return {
 		sourceFile: candidate.input,
 		line: candidate.line,
@@ -635,6 +639,7 @@ function compactReverseCandidate(candidate: ReverseSyncTeXCandidate): unknown {
 		area: candidate.area,
 		containsClick: candidate.containsClick,
 		structural: candidate.structural,
+		...(proposalScore === undefined ? {} : { score: proposalScore }),
 		...(candidate.structuralReason === undefined ? {} : { structuralReason: candidate.structuralReason }),
 	};
 }
@@ -679,6 +684,7 @@ interface ScoredReverseSynctexProposal extends ReverseSynctexProposal {
 	chosenBox?: ForwardSynctexRange;
 	containsClick: boolean;
 	samePageBoxCount: number;
+	clickContainmentBonus: number;
 	textContainmentBonus: number;
 	textContainment?: "full" | "partial";
 	distance?: number;
@@ -687,18 +693,6 @@ interface ScoredReverseSynctexProposal extends ReverseSynctexProposal {
 
 function sameSourceLocation(left: { sourceFile: string; line: number }, right: { sourceFile: string; line: number }): boolean {
 	return left.sourceFile === right.sourceFile && left.line === right.line;
-}
-
-function boxContainsClick(box: ForwardSynctexRange, click: { page: number; x: number; y: number }): boolean {
-	return box.page === click.page && click.x >= box.h && click.x <= box.h + box.W && click.y >= box.v && click.y <= box.v + box.H;
-}
-
-function boxDistanceComponentsFromClick(box: ForwardSynctexRange, click: { x: number; y: number }): { dx: number; dy: number; distance: number; weightedDistanceSquared: number } {
-	const nearestX = Math.max(box.h, Math.min(click.x, box.h + box.W));
-	const nearestY = Math.max(box.v, Math.min(click.y, box.v + box.H));
-	const dx = Math.abs(click.x - nearestX);
-	const dy = Math.abs(click.y - nearestY);
-	return { dx, dy, distance: Math.hypot(dx, dy), weightedDistanceSquared: ((0.5 * dx) ** 2) + (dy ** 2) };
 }
 
 function buildPartialTextContainmentContext(textBeforeSelection: string | undefined, textAfterSelection: string | undefined): string | undefined {
@@ -715,10 +709,10 @@ function buildPartialTextContainmentContext(textBeforeSelection: string | undefi
 function textContainmentBonus(input: { proposal: ReverseSynctexProposal; containsClick: boolean; fullTextFragment?: string; partialTextFragment?: string }): { bonus: number; containment?: "full" | "partial" } {
 	if (!input.containsClick || input.proposal.sourceLine === undefined) return { bonus: 0 };
 	if (input.fullTextFragment !== undefined && input.fullTextFragment.length > 0 && input.proposal.sourceLine.includes(input.fullTextFragment)) {
-		return { bonus: -50, containment: "full" };
+		return { bonus: -500, containment: "full" };
 	}
 	if (input.partialTextFragment !== undefined && input.proposal.sourceLine.includes(input.partialTextFragment)) {
-		return { bonus: -20, containment: "partial" };
+		return { bonus: -200, containment: "partial" };
 	}
 	return { bonus: 0 };
 }
@@ -738,11 +732,12 @@ function scoreReverseSynctexProposal(input: {
 	const filtered = filterForwardBoxes(input.boxes, input.click);
 	const samePageBoxes = filtered.boxes.filter((box) => box.page === input.click.page);
 	const scoredSamePageBoxes = samePageBoxes.map((box) => {
-		const { distance, weightedDistanceSquared } = boxDistanceComponentsFromClick(box, input.click);
+		const { distance, distanceSquared } = boxDistanceComponentsFromClick(box, input.click);
 		const area = Math.max(0, box.W) * Math.max(0, box.H);
 		const containsClick = boxContainsClick(box, input.click);
 		const containment = textContainmentBonus({ proposal: input.proposal, containsClick, fullTextFragment: input.fullTextFragment, partialTextFragment: input.partialTextFragment });
-		return { box, distance, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (weightedDistanceSquared / 5) + Math.sqrt(area) + containment.bonus };
+		const clickContainmentBonus = containsClick ? -1000 : 0;
+		return { box, distance, clickContainmentBonus, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (distanceSquared * 1.2) + Math.sqrt(area) + clickContainmentBonus + containment.bonus };
 	}).sort((left, right) => left.score - right.score);
 	const chosen = scoredSamePageBoxes[0];
 	const chosenSamePageBox = chosen?.box;
@@ -750,6 +745,7 @@ function scoreReverseSynctexProposal(input: {
 	const distance = chosen?.distance;
 	const geometryTier = chosenSamePageBox === undefined ? 1 : 0;
 	const score = chosen?.score ?? 0;
+	const chosenClickContainmentBonus = chosen?.clickContainmentBonus ?? 0;
 	const chosenTextContainmentBonus = chosen?.textContainmentBonus ?? 0;
 	const chosenTextContainment = chosen?.textContainment;
 	return {
@@ -761,6 +757,7 @@ function scoreReverseSynctexProposal(input: {
 		...(chosenSamePageBox === undefined ? {} : { chosenBox: chosenSamePageBox }),
 		containsClick,
 		samePageBoxCount: samePageBoxes.length,
+		clickContainmentBonus: chosenClickContainmentBonus,
 		textContainmentBonus: chosenTextContainmentBonus,
 		...(chosenTextContainment === undefined ? {} : { textContainment: chosenTextContainment }),
 		...(distance === undefined ? {} : { distance }),
@@ -789,6 +786,7 @@ function compactProposalScore(proposal: ScoredReverseSynctexProposal): NonNullab
 		samePageBoxCount: proposal.samePageBoxCount,
 		containsClick: proposal.containsClick,
 		structural: proposal.structural,
+		clickContainmentBonus: proposal.clickContainmentBonus,
 		textContainmentBonus: proposal.textContainmentBonus,
 		...(proposal.textContainment === undefined ? {} : { textContainment: proposal.textContainment }),
 		...(proposal.distance === undefined ? {} : { distance: proposal.distance }),
@@ -985,7 +983,7 @@ function reverseLocationToHoverInspection(location: ReverseSynctexLocation): Rev
 		precision: location.precision,
 		...(location.diagnostics.rawWinner === undefined ? {} : { rawWinner: location.diagnostics.rawWinner }),
 		...(location.diagnostics.topCandidates === undefined ? {} : { topCandidates: location.diagnostics.topCandidates }),
-		repairedWinner: { sourceFile: location.sourceFile, line: location.line, column: location.column, ...(location.sourceLine === undefined ? {} : { sourceLine: location.sourceLine }), precision: location.precision },
+		repairedWinner: { sourceFile: location.sourceFile, line: location.line, column: location.column, ...(location.sourceLine === undefined ? {} : { sourceLine: location.sourceLine }), precision: location.precision, ...(location.diagnostics.selected.score === undefined ? {} : { score: location.diagnostics.selected.score }) },
 		...(location.diagnostics.forwardVerification === undefined ? {} : { forwardVerification: location.diagnostics.forwardVerification }),
 		rect: rectFromDiagnostics(location.diagnostics),
 		distanceFromCenter: 0,
@@ -1133,6 +1131,7 @@ export function mapReverseSynctex(input: {
 	let forwardVerification: ReverseSynctexDiagnostics["forwardVerification"] | undefined;
 	let textRepairChangedLocation = false;
 	let proposalScores: ReverseSynctexDiagnostics["proposalScores"] | undefined;
+	let selectedScore: number | undefined;
 
 	if (branch === "js") {
 		const proposals: ReverseSynctexProposal[] = [];
@@ -1226,6 +1225,7 @@ export function mapReverseSynctex(input: {
 				line = selectedProposal.line;
 				column = selectedProposal.column;
 				precision = selectedProposal.precision;
+				selectedScore = selectedProposal.score;
 				selectedProposalKind = selectedProposal.kind;
 				textRepairChangedLocation = selectedProposal.kind === "text" && !sameSourceLocation(selectedProposal, { sourceFile: rawSourceFile, line: rawMappedLine });
 				if (selectedProposal.kind === "text" && textRepair !== undefined) {
@@ -1321,9 +1321,10 @@ export function mapReverseSynctex(input: {
 			line,
 			column,
 			...(sourceLine === undefined ? {} : { sourceLine }),
+			...(selectedScore === undefined ? {} : { score: selectedScore }),
 		},
 		precision,
-		...(candidateInspection === undefined ? {} : { rawWinner: compactReverseCandidate(candidateInspection.rawWinner), topCandidates: candidateInspection.candidates.map(compactReverseCandidate) }),
+		...(candidateInspection === undefined ? {} : { rawWinner: compactReverseCandidate(candidateInspection.rawWinner, input.cwd, proposalScores), topCandidates: candidateInspection.candidates.map((candidate) => compactReverseCandidate(candidate, input.cwd, proposalScores)) }),
 		...(textRepair === undefined ? {} : { textRepair }),
 		...(forwardVerification === undefined ? {} : { forwardVerification }),
 		...(proposalScores === undefined ? {} : { proposalScores }),

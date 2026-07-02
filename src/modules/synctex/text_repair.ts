@@ -136,14 +136,24 @@ function isAbsurdBox(box: ForwardSynctexRange): boolean {
 	return boxArea(box) >= ABSURD_BOX_AREA || box.W >= ABSURD_BOX_SIDE || box.H >= ABSURD_BOX_SIDE;
 }
 
-function boxContainsClick(box: ForwardSynctexRange, click: PdfClickPoint): boolean {
-	return box.page === click.page && click.x >= box.h && click.x <= box.h + box.W && click.y >= box.v && click.y <= box.v + box.H;
+export function boxContainsClick(box: ForwardSynctexRange, click: PdfClickPoint): boolean {
+	return box.page === click.page
+		&& click.x >= box.h
+		&& click.x <= box.h + box.W
+		&& click.y >= box.v - box.H
+		&& click.y <= box.v;
+}
+
+export function boxDistanceComponentsFromClick(box: ForwardSynctexRange, click: PdfClickPoint): { dx: number; dy: number; distance: number; distanceSquared: number } {
+	const nearestX = Math.max(box.h, Math.min(click.x, box.h + box.W));
+	const nearestY = Math.max(box.v - box.H, Math.min(click.y, box.v));
+	const dx = Math.abs(click.x - nearestX);
+	const dy = Math.abs(click.y - nearestY);
+	return { dx, dy, distance: Math.hypot(dx, dy), distanceSquared: (dx ** 2) + (dy ** 2) };
 }
 
 function boxDistance(box: ForwardSynctexRange, click: PdfClickPoint): number {
-	const nearestX = Math.max(box.h, Math.min(click.x, box.h + box.W));
-	const nearestY = Math.max(box.v, Math.min(click.y, box.v + box.H));
-	return Math.hypot(click.x - nearestX, click.y - nearestY);
+	return boxDistanceComponentsFromClick(box, click).distance;
 }
 
 function compareBoxes(click: PdfClickPoint): (left: ForwardSynctexRange, right: ForwardSynctexRange) => number {

@@ -110,11 +110,29 @@ test("forward verification selects the smallest containing box", () => {
 		],
 		click: { page: 2, x: 55, y: 55 },
 		forwardBoxesForMatch: (match) => match.line === 10
-			? [{ page: 2, h: 0, v: 0, W: 200, H: 200 }]
+			? [{ page: 2, h: 0, v: 200, W: 200, H: 200 }]
+			: [{ page: 2, h: 50, v: 70, W: 20, H: 20 }],
+	});
+
+	assert.equal(result.precision, "verified");
+	assert.equal(result.match?.line, 20);
+	assert.deepEqual(result.chosenBox, { page: 2, h: 50, v: 70, W: 20, H: 20 });
+});
+
+test("forward verification treats forward box v as the lower edge", () => {
+	const result = selectForwardVerifiedSourceMatch({
+		matches: [
+			{ sourceFile: "main.tex", line: 10, column: 0, fragment: "TOKEN" },
+			{ sourceFile: "main.tex", line: 20, column: 0, fragment: "TOKEN" },
+		],
+		click: { page: 2, x: 55, y: 45 },
+		forwardBoxesForMatch: (match) => match.line === 10
+			? [{ page: 2, h: 0, v: 0, W: 10, H: 10 }]
 			: [{ page: 2, h: 50, v: 50, W: 20, H: 20 }],
 	});
 
 	assert.equal(result.precision, "verified");
+	assert.equal(result.containsClick, true);
 	assert.equal(result.match?.line, 20);
 	assert.deepEqual(result.chosenBox, { page: 2, h: 50, v: 50, W: 20, H: 20 });
 });
@@ -127,33 +145,33 @@ test("forward verification falls back to nearest filtered box when none contain 
 		],
 		click: { page: 2, x: 100, y: 100 },
 		forwardBoxesForMatch: (match) => match.line === 10
-			? [{ page: 2, h: 10, v: 10, W: 5, H: 5 }]
-			: [{ page: 2, h: 92, v: 92, W: 5, H: 5 }],
+			? [{ page: 2, h: 10, v: 15, W: 5, H: 5 }]
+			: [{ page: 2, h: 92, v: 97, W: 5, H: 5 }],
 	});
 
 	assert.equal(result.precision, "text");
 	assert.equal(result.match?.line, 20);
-	assert.deepEqual(result.chosenBox, { page: 2, h: 92, v: 92, W: 5, H: 5 });
+	assert.deepEqual(result.chosenBox, { page: 2, h: 92, v: 97, W: 5, H: 5 });
 });
 
 test("forward box filtering penalizes realistic page-sized containing boxes", () => {
 	const filtered = filterForwardBoxes([
-		{ page: 2, h: 0, v: 0, W: 612, H: 792 },
-		{ page: 2, h: 90, v: 90, W: 12, H: 12 },
+		{ page: 2, h: 0, v: 792, W: 612, H: 792 },
+		{ page: 2, h: 90, v: 102, W: 12, H: 12 },
 	], { page: 2, x: 100, y: 100 });
 
-	assert.deepEqual(filtered.boxes, [{ page: 2, h: 90, v: 90, W: 12, H: 12 }]);
-	assert.deepEqual(filtered.chosenBox, { page: 2, h: 90, v: 90, W: 12, H: 12 });
+	assert.deepEqual(filtered.boxes, [{ page: 2, h: 90, v: 102, W: 12, H: 12 }]);
+	assert.deepEqual(filtered.chosenBox, { page: 2, h: 90, v: 102, W: 12, H: 12 });
 });
 
 test("forward box filtering prefers same-page useful boxes and penalizes giant garbage boxes", () => {
 	const filtered = filterForwardBoxes([
 		{ page: 2, h: 0, v: 0, W: 10000, H: 10000 },
-		{ page: 2, h: 90, v: 90, W: 12, H: 12 },
+		{ page: 2, h: 90, v: 102, W: 12, H: 12 },
 		{ page: 3, h: 95, v: 95, W: 2, H: 2 },
 		{ page: 2, h: Number.NaN, v: 0, W: 10, H: 10 },
 	], { page: 2, x: 100, y: 100 });
 
-	assert.deepEqual(filtered.boxes, [{ page: 2, h: 90, v: 90, W: 12, H: 12 }]);
-	assert.deepEqual(filtered.chosenBox, { page: 2, h: 90, v: 90, W: 12, H: 12 });
+	assert.deepEqual(filtered.boxes, [{ page: 2, h: 90, v: 102, W: 12, H: 12 }]);
+	assert.deepEqual(filtered.chosenBox, { page: 2, h: 90, v: 102, W: 12, H: 12 });
 });

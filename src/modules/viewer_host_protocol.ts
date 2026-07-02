@@ -80,6 +80,7 @@ export interface ViewerHostReverseSynctexHoverResultMessage {
 	source_line?: string;
 	rect?: { left: number; top: number; right: number; bottom: number };
 	precision?: ViewerHostSynctexPrecision;
+	selected_score?: number;
 	nearest_candidate?: ViewerHostReverseSynctexCandidateSummary;
 	/** @deprecated Use nearest_candidate; retained only for older viewer frames. */
 	raw?: ViewerHostReverseSynctexCandidateSummary;
@@ -442,6 +443,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			const sourceLine = optionalString(message.source_line, "source_line");
 			const rect = optionalHoverRect(message.rect, "rect");
 			const precision = optionalPrecision(message.precision, "precision");
+			const selectedScore = optionalNumber(message.selected_score, "selected_score");
 			const nearestCandidate = optionalReverseSynctexCandidateSummary(message.nearest_candidate, "nearest_candidate");
 			const raw = optionalReverseSynctexCandidateSummary(message.raw, "raw");
 			const initialCandidate = nearestCandidate ?? raw;
@@ -467,6 +469,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
 				...(rect === undefined ? {} : { rect }),
 				...(precision === undefined ? {} : { precision }),
+				...(selectedScore === undefined ? {} : { selected_score: selectedScore }),
 				...(initialCandidate === undefined ? {} : { nearest_candidate: initialCandidate }),
 				...(repaired === undefined ? {} : { repaired }),
 				...(candidates === undefined ? {} : { candidates }),

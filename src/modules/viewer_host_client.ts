@@ -756,8 +756,9 @@ export class ViewerHostMcpService {
 		const candidates = hover.topCandidates?.map((candidate) => this.hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
 		return {
 			...(hover.precision === undefined ? {} : { precision: hover.precision }),
+			...(hover.repairedWinner?.score === undefined ? {} : { selected_score: hover.repairedWinner.score }),
 			...(nearestCandidate === undefined ? {} : { nearest_candidate: nearestCandidate }),
-			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision } }),
+			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision, ...(hover.repairedWinner.score === undefined ? {} : { score: hover.repairedWinner.score }) } }),
 			...(candidates === undefined || candidates.length === 0 ? {} : { candidates }),
 			...(hover.forwardVerification === undefined ? {} : { forward: { attempted: hover.forwardVerification.attempted, contains_click: hover.forwardVerification.containsClick, boxes_considered: hover.forwardVerification.boxesConsidered, boxes_filtered: hover.forwardVerification.boxesFiltered, ...(hover.forwardVerification.chosenBox === undefined ? {} : { chosen_box: hover.forwardVerification.chosenBox }) } }),
 		};

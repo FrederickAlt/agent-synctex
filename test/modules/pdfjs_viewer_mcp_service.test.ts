@@ -605,12 +605,13 @@ test("PDF.js MCP service maps reverse_synctex WebSocket clicks into stored get_p
 		const reverseDiagnostics = event.synctex_diagnostics as {
 			context: { hasSelectionContext: boolean; textBeforeSelection?: string; textAfterSelection?: string };
 			candidates: Array<{ kind: string; line: number; column: number }>;
-			selected: { line: number; column: number; sourceFile: string };
+			selected: { line: number; column: number; sourceFile: string; score?: number };
 		};
 		assert.equal(reverseDiagnostics.context.hasSelectionContext, true);
 		assert.equal(reverseDiagnostics.context.textBeforeSelection, "First paragraph");
 		assert.deepEqual(reverseDiagnostics.candidates.map((candidate) => candidate.kind), ["initial_candidate", "context_corrected"]);
-		assert.deepEqual(reverseDiagnostics.selected, { sourceFile: sourcePath, line: 3, column: 6, sourceLine: "First paragraph text that should wrap a little and create boxes." });
+		assert.equal(typeof reverseDiagnostics.selected.score, "number");
+		assert.deepEqual({ ...reverseDiagnostics.selected, score: undefined }, { sourceFile: sourcePath, line: 3, column: 6, sourceLine: "First paragraph text that should wrap a little and create boxes.", score: undefined });
 		assert.equal(typeof event.timestamp, "string");
 		assert.equal("callback" in event, false);
 		assert.equal("socket_path" in event, false);

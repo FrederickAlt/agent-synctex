@@ -594,7 +594,9 @@ function hoverCandidateLine(prefix, candidate) {
 	if (!candidate) return "";
 	const source = candidate.source_line ? " " + truncateHoverLabel(String(candidate.source_line)) : "";
 	const precision = candidate.precision ? " [" + String(candidate.precision) + "]" : "";
-	return prefix + ": line " + String(candidate.line || "?") + source + precision;
+	const score = candidate.score === undefined ? "" : " score " + String(candidate.score);
+	const distance = candidate.score === undefined && candidate.distance !== undefined ? " distance " + String(candidate.distance) : "";
+	return prefix + ": line " + String(candidate.line || "?") + score + distance + source + precision;
 }
 
 function hoverDiagnosticsLabel(message) {
@@ -605,7 +607,7 @@ function hoverDiagnosticsLabel(message) {
 		const parts = [simple];
 		if (nearestCandidate) parts.push(hoverCandidateLine("nearest candidate", nearestCandidate));
 		if (message.repaired) parts.push(hoverCandidateLine("repair", message.repaired));
-		else parts.push(hoverCandidateLine("result", { line: message.line, source_line: message.source_line, precision: message.precision }));
+		else parts.push(hoverCandidateLine("result", { line: message.line, source_line: message.source_line, precision: message.precision, score: message.selected_score }));
 		if (message.forward && message.forward.contains_click) parts.push("forward: verified");
 		if (Array.isArray(message.candidates) && message.candidates.length > 0) parts.push("top: " + message.candidates.slice(0, 3).map((candidate) => "line " + String(candidate.line || "?") + (candidate.score === undefined ? "" : " score " + String(candidate.score))).join("; "));
 		return parts.filter(Boolean).join("\\n");
@@ -1659,8 +1661,9 @@ iframe{width:100%;height:100%;border:0;background:white}
 		const candidates = hover.topCandidates?.map((candidate) => this.hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
 		return {
 			...(hover.precision === undefined ? {} : { precision: hover.precision }),
+			...(hover.repairedWinner?.score === undefined ? {} : { selected_score: hover.repairedWinner.score }),
 			...(nearestCandidate === undefined ? {} : { nearest_candidate: nearestCandidate }),
-			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision } }),
+			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision, ...(hover.repairedWinner.score === undefined ? {} : { score: hover.repairedWinner.score }) } }),
 			...(candidates === undefined || candidates.length === 0 ? {} : { candidates }),
 			...(hover.forwardVerification === undefined ? {} : { forward: { attempted: hover.forwardVerification.attempted, contains_click: hover.forwardVerification.containsClick, boxes_considered: hover.forwardVerification.boxesConsidered, boxes_filtered: hover.forwardVerification.boxesFiltered, ...(hover.forwardVerification.chosenBox === undefined ? {} : { chosen_box: hover.forwardVerification.chosenBox }) } }),
 		};
