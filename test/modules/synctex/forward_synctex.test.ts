@@ -293,6 +293,165 @@ test("robust reverse mapping verifies same-line text repair and preserves raw di
 	}
 });
 
+test("robust reverse mapping scores raw section heading above wrong-page text repair", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-section-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["\\documentclass{article}", "\\section{Introduction}", "Body", "\\section{Target Section}"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "Introduction",
+			textAfterSelection: "",
+			jsFallback: () => ({ input: sourcePath, line: 4, column: 0 }),
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 2, column: 0, sourceLine: "\\section{Introduction}", rect: { left: 200, top: 200, right: 260, bottom: 220 }, distanceX: 190, distanceY: 190, distance: 268.7, area: 1200, containsClick: false, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 570 },
+				rawWinner: { input: sourcePath, line: 4, column: 0, sourceLine: "\\section{Target Section}", rect: { left: 5, top: 5, right: 80, bottom: 20 }, distanceX: 0, distanceY: 0, distance: 0, area: 1125, containsClick: true, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 0 },
+				candidates: [],
+			}),
+			forwardBoxesForLine: ({ line }) => line === 4 ? [{ page: 1, h: 5, v: 5, W: 80, H: 20 }] : line === 2 ? [{ page: 2, h: 200, v: 200, W: 60, H: 20 }] : [],
+		});
+		assert.equal(location.line, 4);
+		assert.equal(location.precision, "line");
+		assert.equal(location.rawMappedLine, 4);
+		assert.equal(location.diagnostics.textRepair?.used, false);
+		assert.equal(location.diagnostics.forwardVerification?.containsClick, false);
+		assert.equal(location.diagnostics.proposalScores?.[0]?.kind, "raw");
+		assert.equal(location.diagnostics.proposalScores?.some((proposal) => proposal.kind === "text" && proposal.line === 2 && proposal.reason === "no-same-page-forward-box"), true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping rejects stale margin text context with wrong-page geometry", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-margin-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["\\documentclass{article}", "\\section{First Section}", "Body", "Margin-adjacent prose line"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "First",
+			textAfterSelection: "Section",
+			jsFallback: () => ({ input: sourcePath, line: 4, column: 0 }),
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 2, column: 0, sourceLine: "\\section{First Section}", rect: { left: 100, top: 100, right: 180, bottom: 120 }, distanceX: 90, distanceY: 90, distance: 127.3, area: 1600, containsClick: false, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 270 },
+				rawWinner: { input: sourcePath, line: 4, column: 0, sourceLine: "Margin-adjacent prose line", rect: { left: 12, top: 12, right: 80, bottom: 24 }, distanceX: 2, distanceY: 2, distance: 2.8, area: 816, containsClick: false, structural: false, areaPenalty: 0, structuralPenalty: 0, score: 6 },
+				candidates: [],
+			}),
+			forwardBoxesForLine: ({ line }) => line === 4 ? [{ page: 1, h: 12, v: 12, W: 68, H: 12 }] : line === 2 ? [{ page: 2, h: 100, v: 100, W: 80, H: 20 }] : [],
+		});
+		assert.equal(location.line, 4);
+		assert.equal(location.precision, "line");
+		assert.equal(location.rawMappedLine, undefined);
+		assert.equal(location.diagnostics.textRepair?.used, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping gives page mismatch a huge penalty against same-page raw geometry", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-page-penalty-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["\\documentclass{article}", "WRONGPAGEUNIQUE", "same page raw line"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "WRONGPAGE",
+			textAfterSelection: "UNIQUE",
+			jsFallback: () => ({ input: sourcePath, line: 3, column: 0 }),
+			forwardBoxesForLine: ({ line }) => line === 3 ? [{ page: 1, h: 400, v: 400, W: 20, H: 20 }] : line === 2 ? [{ page: 2, h: 10, v: 10, W: 20, H: 20 }] : [],
+		});
+		assert.equal(location.line, 3);
+		assert.equal(location.diagnostics.textRepair?.used, false);
+		const rawScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "raw");
+		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text");
+		assert.ok(rawScore && textScore);
+		assert.equal(rawScore.samePageBoxCount, 1);
+		assert.equal(textScore.samePageBoxCount, 0);
+		assert.ok(rawScore.geometryTier < textScore.geometryTier);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping ranks any usable same-page geometry above wrong-page unique text", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-page-tier-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["\\documentclass{article}", "WRONGPAGEUNIQUE", "very far same page raw line"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "WRONGPAGE",
+			textAfterSelection: "UNIQUE",
+			jsFallback: () => ({ input: sourcePath, line: 3, column: 0 }),
+			forwardBoxesForLine: ({ line }) => line === 3 ? [{ page: 1, h: 2_000_000, v: 2_000_000, W: 20, H: 20 }] : line === 2 ? [{ page: 2, h: 10, v: 10, W: 20, H: 20 }] : [],
+		});
+		assert.equal(location.line, 3);
+		assert.equal(location.diagnostics.proposalScores?.[0]?.kind, "raw");
+		assert.equal(location.diagnostics.proposalScores?.[0]?.samePageBoxCount, 1);
+		assert.equal(location.diagnostics.proposalScores?.[1]?.kind, "text");
+		assert.equal(location.diagnostics.proposalScores?.[1]?.samePageBoxCount, 0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping selects the top scored proposal when no proposal has forward geometry", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-no-geometry-order-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["\\documentclass{article}", "UNIQUEWITHOUTGEOMETRY", "raw line without geometry"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: "UNIQUEWITHOUT",
+			textAfterSelection: "GEOMETRY",
+			jsFallback: () => ({ input: sourcePath, line: 3, column: 0 }),
+			forwardBoxesForLine: () => [],
+		});
+		const topProposal = location.diagnostics.proposalScores?.[0];
+		assert.equal(topProposal?.kind, "text");
+		assert.equal(location.line, topProposal?.line);
+		assert.equal(location.sourceFile, topProposal?.sourceFile);
+		assert.equal(location.diagnostics.textRepair?.used, true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse-forward probe default path uses robust text context for forward SyncTeX", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
