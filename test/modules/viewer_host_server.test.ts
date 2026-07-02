@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Socket } from "node:net";
 import { test } from "node:test";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
@@ -51,6 +51,24 @@ async function assertPortCanBeRebound(port: number): Promise<void> {
 	} finally {
 		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 	}
+}
+
+async function waitForWebSocketMessage(socket: WebSocket): Promise<Record<string, unknown>> {
+	return await new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("timed out waiting for WebSocket message")), 2_000);
+		socket.addEventListener("message", (event) => {
+			clearTimeout(timeout);
+			try {
+				resolve(JSON.parse(String(event.data)) as Record<string, unknown>);
+			} catch (error) {
+				reject(error);
+			}
+		}, { once: true });
+		socket.addEventListener("error", () => {
+			clearTimeout(timeout);
+			reject(new Error("WebSocket error"));
+		}, { once: true });
+	});
 }
 
 test("Viewer Host Server binds to 127.0.0.1 only and serves registered PDF bytes by pdf_id and revision", async () => {
@@ -152,6 +170,57 @@ test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer 
 		assert.equal((await readHttp(`${server.origin}/viewer/999`)).status, 404);
 		assert.equal((await readHttp(`${server.origin}/config/999.json`)).status, 404);
 	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host Server hover WebSocket returns robust no-context diagnostics through production backend", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-hover-robust-"));
+	const outDir = join(baseDir, "out");
+	mkdirSync(outDir);
+	const pdfPath = join(outDir, "paper.pdf");
+	const sourcePath = join(baseDir, "main.tex");
+	writeFakePdf(pdfPath);
+	copyFileSync(resolve("test/fixtures/synctex-forward/paper.synctex"), join(outDir, "paper.synctex"));
+	writeFileSync(sourcePath, [
+		"\\documentclass{article}",
+		"\\begin{document}",
+		"\\end{document}",
+		"% filler",
+		"Second paragraph text on a different source line for SyncTeX mapping.",
+		"\\end{document}",
+	].join("\n"));
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: WebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 124, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		const config = JSON.parse((await readHttp(`${server.origin}/config/124.json`)).body.toString("utf8")) as { viewer_socket_url: string };
+		socket = new WebSocket(config.viewer_socket_url);
+		await new Promise<void>((resolveOpen, rejectOpen) => {
+			socket!.addEventListener("open", () => resolveOpen(), { once: true });
+			socket!.addEventListener("error", () => rejectOpen(new Error("WebSocket open failed")), { once: true });
+		});
+
+		socket.send(JSON.stringify({ type: "reverse_synctex_hover", request_id: 7, page: 1, x: 144.27, y: 155.27 }));
+		const message = await waitForWebSocketMessage(socket);
+
+		assert.equal(message.type, "reverse_synctex_hover_result");
+		assert.equal(message.pdf_id, 124);
+		assert.equal(message.request_id, 7);
+		assert.equal(message.source_file, sourcePath);
+		assert.equal(message.line, 5);
+		assert.equal(message.source_line, "Second paragraph text on a different source line for SyncTeX mapping.");
+		assert.equal((message.raw as { line?: number; structural?: boolean; source_line?: string }).line, 3);
+		assert.equal((message.raw as { line?: number; structural?: boolean; source_line?: string }).structural, true);
+		assert.equal((message.raw as { line?: number; structural?: boolean; source_line?: string }).source_line, "\\end{document}");
+		assert.equal((message.repaired as { line?: number; source_line?: string }).line, 5);
+		assert.ok((message.candidates as Array<{ line?: number }>).some((candidate) => candidate.line === 5));
+		assert.ok((message.candidates as Array<{ line?: number }>).some((candidate) => candidate.line === 3));
+	} finally {
+		socket?.close();
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
 	}
