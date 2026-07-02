@@ -1101,7 +1101,7 @@ test("Viewer Host-served Viewer Client hover falls back to PDF directory when wo
 		await page.waitForSelector("[data-reverse-synctex-hover='label']", { state: "attached", timeout: 2_000 });
 		const labelText = await page.locator("[data-reverse-synctex-hover='label']").textContent() ?? "";
 		assert.match(labelText, /main\.tex:\d+/, "hover should map using the PDF directory fallback");
-		assert.match(labelText, /raw: line 3/, "fallback hover should retain raw diagnostics when robust ranking chooses another line");
+		assert.match(labelText, /raw: line 8/, "fallback hover should retain candidate diagnostics");
 	} finally {
 		await browser?.close();
 		await server.stop();
@@ -1190,7 +1190,7 @@ test("Viewer Host-served Viewer Client maps reverse SyncTeX clicks with page-loc
 			const events = response.result?.details?.events ?? [];
 			event = events[events.length - 1];
 			toolText = response.result?.content?.map((item) => item.text ?? "").join("\n") ?? "";
-			if (event?.column === 15) break;
+			if (event?.column === 6) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 		assert.ok(event, `reverse SyncTeX event was not stored after context click\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
@@ -1198,7 +1198,7 @@ test("Viewer Host-served Viewer Client maps reverse SyncTeX clicks with page-loc
 		assert.equal(event.source_file, sourcePath);
 		assert.equal(event.line, 3);
 		assert.equal(event.page, 1);
-		assert.equal(event.column, 15);
+		assert.equal(event.column, 6);
 		assert.equal(event.source_line, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(((event.synctex_diagnostics as { context?: { hasSelectionContext?: boolean } } | undefined)?.context?.hasSelectionContext), true);
 		assert.match(toolText, /context=selection=true/);

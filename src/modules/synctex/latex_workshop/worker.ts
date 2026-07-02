@@ -67,9 +67,6 @@ export interface ReverseSyncTeXCandidate extends SyncTeXRecordToTeX {
 	containsClick: boolean;
 	structural: boolean;
 	structuralReason?: string;
-	areaPenalty: number;
-	structuralPenalty: number;
-	score: number;
 }
 
 export interface ReverseSyncTeXCandidatesInspection {
@@ -82,7 +79,7 @@ export interface ReverseSyncTeXCandidatesOptions {
 	minCandidates?: number;
 	maxCandidates?: number;
 	minDistance?: number;
-	structuralPenalty?: number;
+	maxRadius?: number;
 	enrichSourceLines?: boolean;
 }
 
@@ -90,7 +87,7 @@ const DEFAULT_REVERSE_CANDIDATE_OPTIONS = {
 	minCandidates: 8,
 	maxCandidates: 40,
 	minDistance: 12,
-	structuralPenalty: 1000,
+	maxRadius: 192,
 };
 
 const STRUCTURAL_SOURCE_LINES = new Set(["\\end{document}", "\\newpage", "\\end{minipage}", "\\end{figure}", "\\begin{document}"]);
@@ -272,12 +269,13 @@ function structuralSourceLineReason(sourceLine: string | undefined): string | un
 }
 
 function compareReverseCandidates(a: ReverseSyncTeXCandidate, b: ReverseSyncTeXCandidate): number {
-	return a.score - b.score
-		|| a.distance - b.distance
+	return a.distance - b.distance
+		|| Number(b.containsClick) - Number(a.containsClick)
 		|| a.distanceY - b.distanceY
 		|| a.distanceX - b.distanceX
 		|| a.area - b.area
-		|| a.line - b.line;
+		|| a.line - b.line
+		|| a.input.localeCompare(b.input);
 }
 
 interface RawReverseCandidateRecord {
@@ -344,10 +342,8 @@ export function collectReverseSyncTeXCandidatesFromParsed(pdfSyncObject: PdfSync
 	const minCandidates = options.minCandidates ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.minCandidates;
 	const maxCandidates = options.maxCandidates ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.maxCandidates;
 	const minDistance = options.minDistance ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.minDistance;
+	const maxRadius = options.maxRadius ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.maxRadius;
 	const enrichSourceLines = options.enrichSourceLines ?? true;
-	const structuralPenaltyValue = options.structuralPenalty ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.structuralPenalty;
-	const rawRecord = scanRawReverseWinner(pdfSyncObject, page, x, y);
-	if (rawRecord === undefined) return undefined;
 	const y0 = y - pdfSyncObject.offset.y;
 	const x0 = x - pdfSyncObject.offset.x;
 	const allCandidates: ReverseSyncTeXCandidate[] = [];
@@ -376,8 +372,6 @@ export function collectReverseSyncTeXCandidatesFromParsed(pdfSyncObject: PdfSync
 				const distanceY = rect.distanceY(y0);
 				const distance = Math.sqrt(distanceY ** 2 + distanceX ** 2);
 				const area = Math.max(0, rect.right - rect.left) * Math.max(0, rect.bottom - rect.top);
-				const areaPenalty = 0;
-				const structuralPenalty = structuralReason === undefined ? 0 : structuralPenaltyValue;
 				allCandidates.push({
 					input: resolvedInput ?? fileName,
 					line: Number(lineNum),
@@ -396,47 +390,22 @@ export function collectReverseSyncTeXCandidatesFromParsed(pdfSyncObject: PdfSync
 					containsClick: rect.containsPoint(x0, y0),
 					structural: structuralReason !== undefined,
 					...(structuralReason === undefined ? {} : { structuralReason }),
-					areaPenalty,
-					structuralPenalty,
-					score: distanceY + 2 * distanceX + areaPenalty + structuralPenalty,
 				});
 			}
 		}
 	}
 
 	if (allCandidates.length === 0) return undefined;
-	const rawInput = resolvedInputs.get(rawRecord.input) ?? rawRecord.input;
-	const rawWinner = allCandidates.find((candidate) => candidate.input === rawInput && candidate.line === rawRecord.line && candidate.rect.left === rawRecord.rect.left + pdfSyncObject.offset.x && candidate.rect.top === rawRecord.rect.top + pdfSyncObject.offset.y) ?? {
-		input: rawInput,
-		line: rawRecord.line,
-		column: 0,
-		rect: {
-			left: rawRecord.rect.left + pdfSyncObject.offset.x,
-			top: rawRecord.rect.top + pdfSyncObject.offset.y,
-			right: rawRecord.rect.right + pdfSyncObject.offset.x,
-			bottom: rawRecord.rect.bottom + pdfSyncObject.offset.y,
-		},
-		distanceX: rawRecord.rect.distanceX(x0),
-		distanceY: rawRecord.rect.distanceY(y0),
-		distance: rawRecord.rect.distanceXY(x0, y0),
-		area: Math.max(0, rawRecord.rect.right - rawRecord.rect.left) * Math.max(0, rawRecord.rect.bottom - rawRecord.rect.top),
-		containsClick: rawRecord.rect.containsPoint(x0, y0),
-		structural: false,
-		areaPenalty: 0,
-		structuralPenalty: 0,
-		score: rawRecord.rect.distanceY(y0) + 2 * rawRecord.rect.distanceX(x0),
-	};
-	const byScore = [...allCandidates].sort(compareReverseCandidates);
-	const selected = new Set<ReverseSyncTeXCandidate>();
-	for (const candidate of byScore) {
-		if (candidate.distance <= minDistance) selected.add(candidate);
+	const sortedCandidates = [...allCandidates].sort(compareReverseCandidates);
+	let radius = Math.max(0, minDistance);
+	let selected = sortedCandidates.filter((candidate) => candidate.distance <= radius);
+	while (selected.length < minCandidates && radius < maxRadius) {
+		radius = radius === 0 ? 1 : Math.min(maxRadius, radius * 2);
+		selected = sortedCandidates.filter((candidate) => candidate.distance <= radius);
 	}
-	for (const candidate of byScore) {
-		if (selected.size >= minCandidates) break;
-		selected.add(candidate);
-	}
-	const candidates = [...selected].sort(compareReverseCandidates).slice(0, Math.max(1, maxCandidates));
-	return { winner: candidates[0] ?? rawWinner, rawWinner, candidates };
+	const candidates = selected.slice(0, Math.max(1, maxCandidates));
+	if (candidates.length === 0) return undefined;
+	return { winner: candidates[0], rawWinner: candidates[0], candidates };
 }
 
 export function inspectSyncTeXToTeXCandidates(page: number, x: number, y: number, pdfPath: string, options: ReverseSyncTeXCandidatesOptions = {}): ReverseSyncTeXCandidatesInspection | undefined {
