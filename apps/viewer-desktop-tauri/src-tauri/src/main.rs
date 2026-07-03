@@ -7,6 +7,29 @@ use std::thread;
 use std::time::Duration;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+const WINDOW_CHROME_SCRIPT: &str = r#"
+(() => {
+  function bindWindowChrome() {
+    const internals = window.__TAURI_INTERNALS__;
+    const label = internals?.metadata?.currentWindow?.label;
+    if (!internals?.invoke || !label || !document.body) return;
+    const invokeWindow = (command) => internals.invoke(`plugin:window|${command}`, { label });
+    document.body.setAttribute("data-desktop-window", "true");
+    document.getElementById("titlebar-minimize")?.addEventListener("click", () => { invokeWindow("minimize"); });
+    document.getElementById("titlebar-maximize")?.addEventListener("click", () => { invokeWindow("toggle_maximize"); });
+    document.getElementById("titlebar-close")?.addEventListener("click", () => { invokeWindow("close"); });
+    for (const dragRegion of document.querySelectorAll("[data-window-drag-region]")) {
+      dragRegion.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0 || event.target.closest?.("button, [role='tab']")) return;
+        invokeWindow("start_dragging");
+      });
+    }
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bindWindowChrome, { once: true });
+  else bindWindowChrome();
+})();
+"#;
+
 #[derive(Debug, Deserialize)]
 struct ReadyLine {
     #[serde(rename = "type")]
@@ -244,6 +267,8 @@ fn main() {
             let url = validate_host_app_url(&app_url).map_err(setup_error)?;
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("PDF Preview Viewer")
+                .decorations(false)
+                .initialization_script(WINDOW_CHROME_SCRIPT)
                 .build()?;
             if let Some(host_process) = host_process {
                 app.manage(host_process);

@@ -7,6 +7,31 @@ const app = document.getElementById("viewer-client-app");
 const tabList = document.getElementById("tab-list");
 const panels = document.getElementById("viewer-panels");
 const emptyState = document.getElementById("empty-state");
+const tabScrollLeftButton = document.getElementById("tab-scroll-left");
+const tabScrollRightButton = document.getElementById("tab-scroll-right");
+
+function updateTabScrollButtons() {
+	const maxScrollLeft = Math.max(0, tabList.scrollWidth - tabList.clientWidth);
+	const canScroll = maxScrollLeft > 1;
+	if (tabScrollLeftButton) tabScrollLeftButton.disabled = !canScroll || tabList.scrollLeft <= 1;
+	if (tabScrollRightButton) tabScrollRightButton.disabled = !canScroll || tabList.scrollLeft >= maxScrollLeft - 1;
+}
+
+function scheduleTabScrollButtonUpdate() {
+	requestAnimationFrame(updateTabScrollButtons);
+}
+
+function scrollTabs(direction) {
+	tabList.scrollLeft += direction * Math.max(120, Math.floor(tabList.clientWidth * 0.75));
+	scheduleTabScrollButtonUpdate();
+}
+
+function bindTabOverflowControls() {
+	tabScrollLeftButton?.addEventListener("click", () => scrollTabs(-1));
+	tabScrollRightButton?.addEventListener("click", () => scrollTabs(1));
+	tabList.addEventListener("scroll", updateTabScrollButtons, { passive: true });
+	window.addEventListener("resize", scheduleTabScrollButtonUpdate);
+}
 
 function pdfIdKey(pdfId) {
 	return String(pdfId);
@@ -169,8 +194,11 @@ function closeTab(pdfId) {
 
 function renderTabs() {
 	const existingPanels = new Map(Array.from(panels.querySelectorAll("[role='tabpanel'][data-pdf-id]"), (panel) => [panel.dataset.pdfId, panel]));
+	const visiblePdfIds = new Set(state.tabs.map((tab) => pdfIdKey(tab.pdfId)));
 	tabList.replaceChildren();
-	panels.replaceChildren();
+	for (const [pdfId, panel] of existingPanels) {
+		if (!visiblePdfIds.has(pdfId)) panel.remove();
+	}
 	if (state.activePdfId === undefined || !state.tabs.some((tab) => tab.pdfId === state.activePdfId)) {
 		state.activePdfId = state.tabs[0] ? state.tabs[0].pdfId : undefined;
 	}
@@ -184,7 +212,7 @@ function renderTabs() {
 	for (const tab of state.tabs) {
 		const selected = tab.pdfId === state.activePdfId;
 		const tabItem = document.createElement("div");
-		tabItem.className = "tab-item";
+		tabItem.className = selected ? "tab-item is-active" : "tab-item";
 		const tabButton = document.createElement("button");
 		tabButton.type = "button";
 		tabButton.role = "tab";
@@ -192,6 +220,7 @@ function renderTabs() {
 		tabButton.setAttribute("aria-selected", selected ? "true" : "false");
 		tabButton.textContent = tab.title;
 		tabButton.addEventListener("click", () => {
+			if (state.activePdfId === tab.pdfId) return;
 			state.activePdfId = tab.pdfId;
 			renderTabs();
 		});
@@ -200,7 +229,10 @@ function renderTabs() {
 		closeButton.setAttribute("data-close-pdf-id", pdfIdKey(tab.pdfId));
 		closeButton.setAttribute("aria-label", "Close " + tab.title);
 		closeButton.textContent = "×";
-		closeButton.addEventListener("click", () => closeTab(tab.pdfId));
+		closeButton.addEventListener("click", (event) => {
+			event.stopPropagation();
+			closeTab(tab.pdfId);
+		});
 		tabItem.append(tabButton, closeButton);
 		tabList.appendChild(tabItem);
 
@@ -219,8 +251,10 @@ function renderTabs() {
 		panel.hidden = !selected;
 		iframe.title = tab.title;
 		if (iframe.getAttribute("src") !== tab.viewerUrl) iframe.src = tab.viewerUrl;
-		panels.appendChild(panel);
+		if (!panel.isConnected) panels.appendChild(panel);
 	}
+	if (tabList.scrollLeft > tabList.scrollWidth - tabList.clientWidth) tabList.scrollLeft = Math.max(0, tabList.scrollWidth - tabList.clientWidth);
+	scheduleTabScrollButtonUpdate();
 }
 
 function connectAppEvents() {
@@ -234,6 +268,7 @@ function connectAppEvents() {
 }
 
 window.__hostAppShellRawMouseDebug = () => recentAppShellRawMouseEvents.slice();
+bindTabOverflowControls();
 bindAppShellViewerShortcuts();
 renderTabs();
 connectAppEvents();
