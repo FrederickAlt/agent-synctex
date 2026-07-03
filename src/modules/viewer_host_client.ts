@@ -526,6 +526,7 @@ export class ViewerHostMcpService {
 				...(jump.indicator === undefined ? {} : { indicator: jump.indicator }),
 				source_file: jump.sourceFile,
 				line: jump.line,
+				source_line: jump.sourceLine,
 			}, { reregisterBeforeSend: true });
 			return {
 				protocol_version: request.protocol_version,
@@ -612,6 +613,20 @@ export class ViewerHostMcpService {
 		const parsed = validateViewerHostToMcpMessage(message);
 		if (parsed.type === "reverse_synctex") {
 			this.appendReverseSynctexEvent(parsed);
+		} else if (parsed.type === "pdf_annotation") {
+			this.eventStore.appendPdfAnnotationEvent({
+				type: "pdf_annotation",
+				pdf_id: parsed.pdf_id,
+				annotation_id: parsed.annotation_id,
+				timestamp: new Date().toISOString(),
+				source_file: parsed.source_file,
+				line: parsed.line,
+				...(parsed.source_line === undefined ? {} : { source_line: parsed.source_line }),
+				page: parsed.page,
+				x: parsed.x,
+				y: parsed.y,
+				...(parsed.comment === undefined ? {} : { comment: parsed.comment }),
+			});
 		} else if (parsed.type === "reverse_synctex_hover") {
 			void this.sendReverseSynctexHoverResult(parsed).catch(() => undefined);
 		} else if (parsed.type === "selection_debug") {

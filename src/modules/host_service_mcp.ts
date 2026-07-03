@@ -974,6 +974,20 @@ function formatSelectionEndpointForTool(name: string, endpoint: { source_file: s
 }
 
 function formatPdfEventForTool(event: PdfEvent): string {
+	if (event.type === "pdf_annotation") {
+		const fields = [
+			`type=${event.type}`,
+			`pdf_id=${event.pdf_id}`,
+			`annotation_id=${event.annotation_id}`,
+			`source_file=${event.source_file}`,
+			`line=${event.line}`,
+		];
+		if (event.source_line !== undefined) fields.push(`source_line=${compactToolText(event.source_line)}`);
+		fields.push(`page=${event.page}`);
+		const comment = formatMaybeTextField("comment", event.comment, 500);
+		if (comment !== undefined) fields.push(comment);
+		return fields.join(", ");
+	}
 	if (event.type === "selection_debug") {
 		const fields = [
 			`type=${event.type}`,

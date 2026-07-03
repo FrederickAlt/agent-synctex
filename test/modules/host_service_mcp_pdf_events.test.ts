@@ -91,6 +91,40 @@ test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
 	assert.match(text, /candidates=2/);
 });
 
+test("get_pdf_events text exposes PDF annotation comments", async () => {
+	const event: PdfEvent = {
+		type: "pdf_annotation",
+		sequence: 8,
+		pdf_id: 34942382,
+		annotation_id: "annotation-1",
+		timestamp: "2026-06-29T12:00:00.000Z",
+		source_file: "/tmp/paper/main.tex",
+		line: 42,
+		source_line: "E = mc^2",
+		page: 3,
+		x: 110,
+		y: 220,
+		comment: "Please justify this step.",
+	};
+
+	const response = await handleMcpRequest(JSON.stringify({
+		jsonrpc: "2.0",
+		id: 2,
+		method: "tools/call",
+		params: { name: "get_pdf_events", arguments: { pdf_id: event.pdf_id, max_events: 5 } },
+	}), {
+		getPdfEvents: () => [event],
+	});
+
+	assert.ok(response && "result" in response);
+	assert.deepEqual((response.result as { details?: { events?: PdfEvent[] } }).details, { events: [event] });
+	const text = (response.result as { content?: Array<{ type: string; text: string }> }).content?.[0]?.text ?? "";
+	assert.match(text, /pdf_annotation/);
+	assert.match(text, /annotation_id=annotation-1/);
+	assert.match(text, /source_line=E = mc\^2/);
+	assert.match(text, /comment=Please justify this step\./);
+});
+
 function eventInput(pdfId: number, line: number): ReverseSynctexPdfEventInput {
 	return {
 		type: "reverse_synctex",

@@ -236,6 +236,38 @@ test("synctex_forward and pdf_refresh messages are delivered only to viewer sock
 	}
 });
 
+test("PDF annotation socket payloads are coalesced for MCP drain and clear viewer annotations", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-annotation-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 33, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath) });
+		await server.start();
+		const token = await getViewerSocketToken(server.origin, 33);
+		socket = await openViewerSocket(server.origin, 33, token);
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, source_line: "old", comment: "old" }));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, source_line: "new", comment: "new" }));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a2", page: 1, x: 30, y: 40, source_file: join(baseDir, "main.tex"), line: 8, comment: "removed" }));
+		socket.send(JSON.stringify({ type: "pdf_annotation_deleted", annotation_id: "a2" }));
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		const clearMessage = nextJsonMessage(socket);
+		const response = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
+		assert.equal(response.status, 200);
+		const payload = await response.json() as { ok?: boolean; events?: unknown[] };
+		assert.equal(payload.ok, true);
+		assert.deepEqual(payload.events, [{ type: "pdf_annotation", pdf_id: 33, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, source_line: "new", comment: "new" }]);
+		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 33 });
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("reverse SyncTeX viewer socket payloads flow through Host to MCP event store and get_pdf_events details", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-reverse-"));
 	const { pdfPath, sourcePath } = writeSynctexFixture(baseDir);

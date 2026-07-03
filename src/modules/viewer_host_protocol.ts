@@ -38,6 +38,7 @@ export interface ViewerHostSynctexForwardMessage {
 	indicator?: boolean;
 	source_file?: string;
 	line: number;
+	source_line?: string;
 }
 
 export interface ViewerHostPdfMaybeUpdatedMessage {
@@ -110,6 +111,7 @@ export interface ViewerHostReverseSynctexForwardProbeResultMessage {
 	indicator?: boolean;
 	source_file?: string;
 	line?: number;
+	source_line?: string;
 	error?: string;
 }
 
@@ -153,6 +155,25 @@ export interface ViewerHostReverseSynctexMessage {
 	selectionEndY?: number;
 }
 
+export interface ViewerHostPdfAnnotationMessage {
+	type: "pdf_annotation";
+	pdf_id: number;
+	annotation_id: string;
+	page: number;
+	x: number;
+	y: number;
+	source_file: string;
+	line: number;
+	source_line?: string;
+	comment?: string;
+}
+
+export interface ViewerHostPdfAnnotationDeletedMessage {
+	type: "pdf_annotation_deleted";
+	pdf_id: number;
+	annotation_id: string;
+}
+
 export interface ViewerHostSelectionDebugMessage {
 	type: "selection_debug";
 	pdf_id: number;
@@ -189,6 +210,8 @@ export type ViewerHostToMcpMessage =
 	| ViewerHostViewerLoadedMessage
 	| ViewerHostViewerTabClosedMessage
 	| ViewerHostReverseSynctexMessage
+	| ViewerHostPdfAnnotationMessage
+	| ViewerHostPdfAnnotationDeletedMessage
 	| ViewerHostSelectionDebugMessage
 	| ViewerHostReverseSynctexHoverMessage
 	| ViewerHostReverseSynctexForwardProbeMessage;
@@ -416,6 +439,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
 		case "synctex_forward": {
 			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
+			const sourceLine = optionalString(message.source_line, "source_line");
 			const width = optionalCoordinate(message.width, "width");
 			const height = optionalCoordinate(message.height, "height");
 			const ranges = optionalSynctexRanges(message.ranges, "ranges");
@@ -432,6 +456,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				...(indicator === undefined ? {} : { indicator }),
 				...(sourceFile === undefined ? {} : { source_file: sourceFile }),
 				line: requirePositiveInteger(message.line, "line"),
+				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
 			};
 		}
 		case "pdf_maybe_updated":
@@ -491,6 +516,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			const indicator = optionalBoolean(message.indicator, "indicator");
 			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
 			const line = message.line === undefined ? undefined : requirePositiveInteger(message.line, "line");
+			const sourceLine = optionalString(message.source_line, "source_line");
 			const error = optionalString(message.error, "error");
 			if (error === undefined && (reverseSourceFile === undefined || reverseLine === undefined || reverseColumn === undefined || page === undefined || x === undefined || y === undefined || sourceFile === undefined || line === undefined)) {
 				throw new Error("reverse_synctex_forward_probe_result requires reverse source and forward mapping fields unless error is set");
@@ -515,6 +541,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				...(indicator === undefined ? {} : { indicator }),
 				...(sourceFile === undefined ? {} : { source_file: sourceFile }),
 				...(line === undefined ? {} : { line }),
+				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
 				...(error === undefined ? {} : { error }),
 			};
 		}
@@ -562,6 +589,28 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				...(selectionEndY === undefined ? {} : { selectionEndY }),
 			};
 		}
+		case "pdf_annotation": {
+			const sourceLine = optionalString(message.source_line, "source_line");
+			const comment = optionalString(message.comment, "comment");
+			return {
+				type,
+				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
+				annotation_id: requireNonEmptyString(message.annotation_id, "annotation_id"),
+				page: requirePositiveInteger(message.page, "page"),
+				x: requireCoordinate(message.x, "x"),
+				y: requireCoordinate(message.y, "y"),
+				source_file: requireNonEmptyString(message.source_file, "source_file"),
+				line: requirePositiveInteger(message.line, "line"),
+				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
+				...(comment === undefined ? {} : { comment }),
+			};
+		}
+		case "pdf_annotation_deleted":
+			return {
+				type,
+				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
+				annotation_id: requireNonEmptyString(message.annotation_id, "annotation_id"),
+			};
 		case "selection_debug": {
 			const page = message.page === undefined ? undefined : requirePositiveInteger(message.page, "page");
 			return {

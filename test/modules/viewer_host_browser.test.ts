@@ -1177,7 +1177,7 @@ test("LaTeX Workshop viewer selection reverse SyncTeX payload preserves selected
 	}
 });
 
-test("LaTeX Workshop viewer toolbar highlight button toggles hover mode and renders returned highlight overlay", async () => {
+test("LaTeX Workshop viewer annotation is active by default and debug menu gates hover overlay", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-hover-"));
 	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
 	const registry = new ViewerHostPdfRegistry();
@@ -1191,18 +1191,145 @@ test("LaTeX Workshop viewer toolbar highlight button toggles hover mode and rend
 		await page.goto(`${server.origin}/viewer-lw/149`, { waitUntil: "domcontentloaded" });
 		await waitForLwPageReady(page);
 
-		await page.locator("#hostSynctexHoverButton").click();
-		await page.waitForFunction(() => document.body.dataset.hostLwHoverEnabled === "true", undefined, { timeout: 2_000 });
+		await page.waitForFunction(() => document.body.dataset.hostLwHoverEnabled === "true" && document.body.dataset.hostLwDebugSynctexEnabled === "false", undefined, { timeout: 2_000 });
 		const point = await lwCanvasPoint(page, 1, 120, 70);
 		await page.mouse.move(point.clientX, point.clientY);
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		assert.equal(await page.locator("[data-reverse-synctex-hover='rect']").count(), 0, "hover debug overlay should be hidden by default");
+		await page.locator("#secondaryToolbarToggleButton").click();
+		await page.locator("#hostSynctexDebugButton").click();
+		await page.waitForFunction(() => document.body.dataset.hostLwDebugSynctexEnabled === "true", undefined, { timeout: 2_000 });
+		await page.mouse.move(point.clientX + 1, point.clientY + 1);
 		await page.waitForSelector("[data-reverse-synctex-hover='rect']", { state: "attached", timeout: 5_000 });
 		const overlay = await page.locator("[data-reverse-synctex-hover='rect']").evaluate((element) => ({
 			width: Number.parseFloat((element as HTMLElement).style.width),
 			height: Number.parseFloat((element as HTMLElement).style.height),
 			pressed: document.getElementById("hostSynctexHoverButton")?.getAttribute("aria-pressed"),
+			debugPressed: document.getElementById("hostSynctexDebugButton")?.getAttribute("aria-pressed"),
 		}));
 		assert.equal(overlay.pressed, "true");
+		assert.equal(overlay.debugPressed, "true");
 		assert.ok(overlay.width > 0 && overlay.height > 0, "hover result should render a visible overlay");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("LaTeX Workshop annotation comment bubble can extend outside the PDF page and accept typing", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-annotation-bubble-"));
+	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 150, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		await page.goto(`${server.origin}/viewer-lw/150`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+
+		await page.evaluate((source) => {
+			(globalThis as typeof globalThis & { __hostLwSynctexDebug?: { showSynctexMarker: (message: unknown, options?: unknown) => boolean } }).__hostLwSynctexDebug?.showSynctexMarker({
+				type: "synctex_forward",
+				pdf_id: 150,
+				page: 1,
+				x: 560,
+				y: 120,
+				ranges: [
+					{ page: 1, h: 560, v: 120, W: 28, H: 16 },
+					{ page: 1, h: 560, v: 145, W: 46, H: 16 },
+				],
+				source_file: source,
+				line: 3,
+				source_line: "First paragraph text that should wrap a little and create boxes.",
+			}, { scroll: false });
+		}, sourcePath);
+		await page.locator("[data-synctex-marker]").first().click();
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1);
+		assert.equal(await page.locator("[data-pdf-annotation-box]").count(), 2);
+
+		await page.evaluate((source) => {
+			(globalThis as typeof globalThis & { __hostLwSynctexDebug?: { showSynctexMarker: (message: unknown, options?: unknown) => boolean } }).__hostLwSynctexDebug?.showSynctexMarker({
+				type: "synctex_forward",
+				pdf_id: 150,
+				page: 1,
+				x: 560,
+				y: 120,
+				ranges: [
+					{ page: 1, h: 560, v: 120, W: 28, H: 16 },
+					{ page: 1, h: 560, v: 145, W: 46, H: 16 },
+				],
+				source_file: source,
+				line: 3,
+				source_line: "First paragraph text that should wrap a little and create boxes.",
+			}, { scroll: false });
+		}, sourcePath);
+		await page.locator("[data-synctex-marker]").first().evaluate((element) => (element as HTMLElement).click());
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "same source line should reuse the existing annotation");
+		assert.equal(await page.locator("[data-pdf-annotation-box]").count(), 2);
+
+		await page.evaluate((source) => {
+			(globalThis as typeof globalThis & { __hostLwSynctexDebug?: { showSynctexMarker: (message: unknown, options?: unknown) => boolean } }).__hostLwSynctexDebug?.showSynctexMarker({
+				type: "synctex_forward",
+				pdf_id: 150,
+				page: 1,
+				x: 560,
+				y: 120,
+				ranges: [{ page: 1, h: 560, v: 120, W: 28, H: 16 }],
+				source_file: source,
+				line: 4,
+				source_line: "Overlapping candidate.",
+			}, { scroll: false });
+		}, sourcePath);
+		await page.locator("[data-synctex-marker]").first().evaluate((element) => (element as HTMLElement).click());
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "overlapping boxes should reuse the existing annotation");
+		assert.equal(await page.locator("[data-pdf-annotation-box]").count(), 2);
+
+		await page.locator("[data-pdf-annotation-box]").first().click();
+		await page.locator("button[title='Add comment']").click();
+		assert.equal(await page.locator("[data-pdf-annotation-bubble]").count(), 1);
+		await page.locator("[data-pdf-annotation-bubble] textarea").fill("This comment should be editable outside the page edge.");
+
+		const state = await page.locator("[data-pdf-annotation-bubble]").evaluate((bubble) => {
+			const bubbleRect = bubble.getBoundingClientRect();
+			const pageElement = bubble.closest(".page") as HTMLElement;
+			const pageRect = pageElement.getBoundingClientRect();
+			const textarea = bubble.querySelector("textarea") as HTMLTextAreaElement;
+			return {
+				bubbleParentIsPage: bubble.parentElement?.parentElement === pageElement,
+				bubbleRight: bubbleRect.right,
+				bubbleWidth: bubbleRect.width,
+				pageRight: pageRect.right,
+				viewportRight: window.innerWidth,
+				value: textarea.value,
+			};
+		});
+		assert.equal(state.bubbleParentIsPage, true);
+		assert.ok(state.bubbleRight > state.pageRight, "comment bubble should extend beyond the PDF page boundary");
+		assert.ok(state.bubbleRight <= state.viewportRight, "comment bubble should fit within the window when above its minimum width");
+		assert.ok(state.bubbleWidth > 300, "comment bubble should default wider than the minimum width");
+		assert.equal(state.value, "This comment should be editable outside the page edge.");
+
+		const beforeDrag = await page.locator("[data-pdf-annotation-connector] line").evaluate((line) => ({
+			x2: Number(line.getAttribute("x2")),
+			y2: Number(line.getAttribute("y2")),
+		}));
+		const handle = await page.locator("[title='Drag comment bubble']").boundingBox();
+		assert.ok(handle, "drag handle should be visible");
+		await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+		await page.mouse.down();
+		await page.mouse.move(handle.x + handle.width / 2 + 40, handle.y + handle.height / 2 + 30);
+		await page.mouse.up();
+		const afterDrag = await page.locator("[data-pdf-annotation-connector] line").evaluate((line) => ({
+			x2: Number(line.getAttribute("x2")),
+			y2: Number(line.getAttribute("y2")),
+		}));
+		assert.ok(afterDrag.x2 > beforeDrag.x2 + 30, "connector should follow the dragged bubble horizontally");
+		assert.ok(afterDrag.y2 > beforeDrag.y2 + 20, "connector should follow the dragged bubble vertically");
 	} finally {
 		await browser?.close();
 		await server.stop();

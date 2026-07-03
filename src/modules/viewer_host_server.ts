@@ -398,6 +398,7 @@ export class ViewerHostServer {
 			return;
 		}
 		const events = this.mcpEventBacklog.splice(0);
+		this.broadcastAnnotationsCleared();
 		jsonResponse(response, 200, { ok: true, events });
 	}
 
@@ -668,7 +669,7 @@ export class ViewerHostServer {
 		let payload: unknown;
 		try {
 			payload = JSON.parse(text);
-			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover" && payload.type !== "reverse_synctex_forward_probe")) return;
+			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "pdf_annotation" && payload.type !== "pdf_annotation_deleted" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover" && payload.type !== "reverse_synctex_forward_probe")) return;
 			if (payload.pdf_id !== undefined && payload.pdf_id !== connection.pdfId) {
 				throw new Error(`${String(payload.type)} pdf_id=${String(payload.pdf_id)} does not match viewer socket pdf_id=${connection.pdfId}`);
 			}
@@ -681,12 +682,34 @@ export class ViewerHostServer {
 				this.handleReverseSynctexForwardProbeMessage(connection, message);
 				return;
 			}
-			this.mcpEventBacklog.push(message);
+			this.queueMcpEvent(message);
 			void Promise.resolve(this.mcpEventSink(message)).catch((error: unknown) => {
 				if (!connection.closed && message.type === "reverse_synctex") sendViewerSocketJson(connection, { type: "error", code: "reverse_synctex_failed", message: errorMessage(error) });
 			});
 		} catch (error) {
 			sendViewerSocketJson(connection, { type: "error", code: "invalid_viewer_message", message: errorMessage(error) });
+		}
+	}
+
+	private queueMcpEvent(message: ViewerHostToMcpMessage): void {
+		if (message.type === "pdf_annotation_deleted") {
+			const existingIndex = this.mcpEventBacklog.findIndex((event) => event.type === "pdf_annotation" && event.pdf_id === message.pdf_id && event.annotation_id === message.annotation_id);
+			if (existingIndex >= 0) this.mcpEventBacklog.splice(existingIndex, 1);
+			return;
+		}
+		if (message.type === "pdf_annotation") {
+			const existingIndex = this.mcpEventBacklog.findIndex((event) => event.type === "pdf_annotation" && event.pdf_id === message.pdf_id && event.annotation_id === message.annotation_id);
+			if (existingIndex >= 0) {
+				this.mcpEventBacklog[existingIndex] = message;
+				return;
+			}
+		}
+		this.mcpEventBacklog.push(message);
+	}
+
+	private broadcastAnnotationsCleared(): void {
+		for (const pdfId of this.viewerSocketClientsByPdfId.keys()) {
+			this.broadcastViewerSocketMessage(pdfId, { type: "annotations_cleared", pdf_id: pdfId });
 		}
 	}
 

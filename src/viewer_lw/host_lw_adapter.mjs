@@ -35,6 +35,10 @@ const initialConfig = await response.json();
 const HOVER_THROTTLE_MS = 60;
 const NAVIGATION_SETTLE_MS = 200;
 const MIN_HISTORY_SCROLL_DELTA = 24;
+const ANNOTATION_BUBBLE_MAX_HEIGHT_PX = 140;
+const ANNOTATION_BUBBLE_MIN_WIDTH_PX = 220;
+const ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX = 360;
+const ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX = 12;
 
 const hostState = {
   config: initialConfig,
@@ -43,7 +47,8 @@ const hostState = {
   refreshSerial: 0,
   socketStatus: "disconnected",
   lastError: undefined,
-  hoverEnabled: false,
+  hoverEnabled: true,
+  debugSynctexEnabled: false,
 };
 let activeRefreshLoadingTask;
 let activeSocket;
@@ -66,6 +71,9 @@ const synctexOverlayState = {
   probeResult: undefined,
   redrawTimer: undefined,
 };
+const annotations = new Map();
+let nextAnnotationNumber = 1;
+let selectedAnnotationId;
 
 const navigationHistory = {
   back: [],
@@ -389,6 +397,7 @@ function updateHostDataset() {
   document.body.dataset.hostLwLatestRevision = String(hostState.latestRevision ?? "");
   document.body.dataset.hostLwLastError = hostState.lastError ?? "";
   document.body.dataset.hostLwHoverEnabled = hostState.hoverEnabled ? "true" : "false";
+  document.body.dataset.hostLwDebugSynctexEnabled = hostState.debugSynctexEnabled ? "true" : "false";
 }
 
 function captureRefreshState() {
@@ -640,6 +649,20 @@ function forwardMarkerFromPdfRange({ viewport, h, v, W, H }) {
   };
 }
 
+function synctexOverlayPositions(message) {
+  const pageNumber = Number(message.page);
+  const page = pageElement(pageNumber);
+  const viewport = pageViewport(pageNumber);
+  if (!page || !viewport) return undefined;
+  const ranges = Array.isArray(message.ranges) ? message.ranges.filter((range) => Number(range.page) === pageNumber) : [];
+  const scalarPosition = ranges.length === 0 && message.width !== undefined && message.height !== undefined
+    ? forwardMarkerFromPdfPoint({ viewport, pdfX: message.x, pdfY: message.y, width: message.width, height: message.height })
+    : undefined;
+  const positions = scalarPosition ? [scalarPosition] : ranges.map((range) => forwardMarkerFromPdfRange({ viewport, ...range }));
+  if (positions.length === 0) positions.push(forwardMarkerFromPdfPoint({ viewport, pdfX: message.x, pdfY: message.y }));
+  return { pageNumber, page, overlayParent: pageOverlayParent(page), positions };
+}
+
 function removeOverlays(selector) {
   for (const marker of document.querySelectorAll(selector)) marker.remove();
 }
@@ -654,49 +677,42 @@ function scrollOverlayIntoView(markers) {
   if (pdfViewer()?.scrollMode === 1) container.scrollLeft += markerRect.left - containerRect.left - container.clientWidth * 0.2;
 }
 
-function usesForwardSynctexBoxStyle(datasetName) {
-  return datasetName === "synctexMarker" || datasetName === "reverseSynctexForwardProbe";
-}
-
 function renderSynctexOverlay(message, { selector, datasetName, label, scroll = true } = {}) {
-  const pageNumber = Number(message.page);
-  const page = pageElement(pageNumber);
-  const viewport = pageViewport(pageNumber);
-  if (!page || !viewport) return false;
+  const overlay = synctexOverlayPositions(message);
+  if (!overlay) return false;
   if (selector) removeOverlays(selector);
-  const overlayParent = pageOverlayParent(page);
-  const ranges = Array.isArray(message.ranges) ? message.ranges.filter((range) => Number(range.page) === pageNumber) : [];
-  const scalarPosition = ranges.length === 0 && message.width !== undefined && message.height !== undefined
-    ? forwardMarkerFromPdfPoint({ viewport, pdfX: message.x, pdfY: message.y, width: message.width, height: message.height })
-    : undefined;
-  const positions = scalarPosition ? [scalarPosition] : ranges.map((range) => forwardMarkerFromPdfRange({ viewport, ...range }));
-  if (positions.length === 0) positions.push(forwardMarkerFromPdfPoint({ viewport, pdfX: message.x, pdfY: message.y }));
-  const markers = positions.map((position) => {
+  const markers = overlay.positions.map((position) => {
     const marker = document.createElement("div");
     if (datasetName) marker.dataset[datasetName] = position.width === undefined ? "circle" : "rect";
     marker.style.position = "absolute";
-    marker.style.pointerEvents = "none";
+    marker.style.pointerEvents = datasetName === "synctexMarker" ? "auto" : "none";
     marker.style.zIndex = "100000";
     marker.style.left = `${position.left}px`;
     marker.style.top = `${position.top}px`;
     if (position.width === undefined || position.height === undefined) {
       marker.style.width = "0.5em";
       marker.style.height = "0.5em";
-      marker.style.border = "0.2em solid red";
+      marker.style.border = datasetName === "synctexMarker" ? "0" : "0.2em solid red";
       marker.style.borderRadius = "50%";
+      marker.style.background = datasetName === "synctexMarker" ? "rgba(34,197,94,.32)" : "transparent";
       marker.style.opacity = "0.8";
       marker.style.transform = "translate(-50%, -50%)";
       marker.className = "show";
     } else {
       marker.style.width = `${position.width}px`;
       marker.style.height = `${position.height}px`;
-      marker.style.background = usesForwardSynctexBoxStyle(datasetName) ? "rgba(239,68,68,.18)" : "rgba(0,0,255,.35)";
-      marker.style.outline = usesForwardSynctexBoxStyle(datasetName) ? "2px solid rgba(239,68,68,.9)" : "1px solid rgba(37,99,235,.85)";
+      if (datasetName === "synctexMarker") {
+        marker.style.background = "rgba(34,197,94,.28)";
+        marker.style.outline = "0";
+      } else {
+        marker.style.background = "rgba(239,68,68,.18)";
+        marker.style.outline = "2px solid rgba(239,68,68,.9)";
+      }
     }
-    overlayParent.appendChild(marker);
+    overlay.overlayParent.appendChild(marker);
     return marker;
   });
-  if (label) overlayParent.appendChild(label);
+  if (label) overlay.overlayParent.appendChild(label);
   if (scroll) scrollOverlayIntoView(markers);
   return true;
 }
@@ -705,7 +721,7 @@ function redrawSynctexOverlays() {
   synctexOverlayState.redrawTimer = undefined;
   if (synctexOverlayState.forwardMessage) renderSynctexOverlay(synctexOverlayState.forwardMessage, { selector: "[data-synctex-marker]", datasetName: "synctexMarker", scroll: false });
   if (synctexOverlayState.hoverResult) showHoverResult(synctexOverlayState.hoverResult, { scroll: false, remember: false });
-  if (synctexOverlayState.probeResult) showProbeResult(synctexOverlayState.probeResult, { scroll: false, remember: false });
+  renderAnnotations(false);
 }
 
 function scheduleSynctexOverlayRedraw() {
@@ -723,6 +739,395 @@ function installSynctexOverlayRedrawHandlers() {
 function showSynctexMarker(message, options = {}) {
   if (options.remember !== false) synctexOverlayState.forwardMessage = message;
   return renderSynctexOverlay(message, { selector: "[data-synctex-marker]", datasetName: "synctexMarker", scroll: options.scroll !== false });
+}
+
+function annotationSourceLine(message) {
+  return message.source_line ?? message.reverse_source_line;
+}
+
+function annotationPayload(annotation) {
+  const message = annotation.message;
+  const sourceFile = message.source_file ?? message.reverse_source_file;
+  const line = Number(message.line ?? message.reverse_line);
+  if (!sourceFile || !Number.isInteger(line) || line <= 0) return undefined;
+  return {
+    type: "pdf_annotation",
+    annotation_id: annotation.id,
+    page: Number(message.page ?? message.click_page),
+    x: Number(message.x ?? message.click_x),
+    y: Number(message.y ?? message.click_y),
+    source_file: sourceFile,
+    line,
+    ...(annotationSourceLine(message) === undefined ? {} : { source_line: annotationSourceLine(message) }),
+    ...(annotation.comment ? { comment: annotation.comment } : {}),
+  };
+}
+
+function sendAnnotationUpdate(annotation) {
+  const payload = annotationPayload(annotation);
+  if (payload) sendViewerSocketPayload(payload);
+}
+
+function clearAnnotations() {
+  annotations.clear();
+  selectedAnnotationId = undefined;
+  removeOverlays("[data-pdf-annotation]");
+}
+
+function selectAnnotation(annotationId, redraw = true) {
+  const alreadySelected = selectedAnnotationId === annotationId;
+  selectedAnnotationId = annotationId;
+  if (redraw && !alreadySelected) renderAnnotations(false);
+}
+
+function focusAnnotationTextarea(annotationId) {
+  const textarea = document.querySelector(`[data-pdf-annotation-bubble='${annotationId}'] textarea`);
+  if (textarea instanceof HTMLTextAreaElement) textarea.focus();
+}
+
+function selectAnnotationFromBubble(annotationId, preserveTextareaFocus) {
+  const changed = selectedAnnotationId !== annotationId;
+  selectedAnnotationId = annotationId;
+  if (!changed) return;
+  renderAnnotations(false);
+  if (preserveTextareaFocus) requestAnimationFrame(() => focusAnnotationTextarea(annotationId));
+}
+
+function removeAnnotation(annotationId) {
+  if (!annotations.has(annotationId)) return;
+  annotations.delete(annotationId);
+  sendViewerSocketPayload({ type: "pdf_annotation_deleted", annotation_id: annotationId });
+  if (selectedAnnotationId === annotationId) selectedAnnotationId = undefined;
+  renderAnnotations(false);
+}
+
+function pageRelativeOverlayOffset(overlay) {
+  const pageRect = overlay.page.getBoundingClientRect();
+  const parentRect = overlay.overlayParent.getBoundingClientRect();
+  return { left: parentRect.left - pageRect.left, top: parentRect.top - pageRect.top };
+}
+
+function annotationAnchorPosition(positions) {
+  const first = positions[0];
+  if (!first) return undefined;
+  let left = first.left;
+  let top = first.top;
+  let right = first.left + (first.width ?? 0);
+  let bottom = first.top + (first.height ?? 0);
+  for (const position of positions.slice(1)) {
+    left = Math.min(left, position.left);
+    top = Math.min(top, position.top);
+    right = Math.max(right, position.left + (position.width ?? 0));
+    bottom = Math.max(bottom, position.top + (position.height ?? 0));
+  }
+  return { left, top, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
+}
+
+function bubbleLayout(annotation, anchor, page) {
+  if (typeof annotation.bubbleLeft === "number" && typeof annotation.bubbleTop === "number") {
+    return {
+      left: annotation.bubbleLeft,
+      top: annotation.bubbleTop,
+      width: annotation.bubbleWidth ?? ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX,
+    };
+  }
+  const pageRect = page.getBoundingClientRect();
+  const preferredLeft = anchor.left + (anchor.width ?? 0) + 8;
+  const desiredWidth = annotation.bubbleWidth ?? ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX;
+  const availableWindowWidth = window.innerWidth - ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX * 2;
+  const width = Math.max(ANNOTATION_BUBBLE_MIN_WIDTH_PX, Math.min(desiredWidth, Math.max(0, availableWindowWidth)));
+  let left = preferredLeft;
+  const maxLeft = window.innerWidth - pageRect.left - width - ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX;
+  if (pageRect.left + left + width > window.innerWidth - ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX) {
+    left = Math.max(ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX - pageRect.left, maxLeft);
+  }
+  return { left, top: anchor.top, width };
+}
+
+function startBubbleDrag(event, annotation, bubble) {
+  if (!(event instanceof PointerEvent) || event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  selectAnnotation(annotation.id, false);
+  const startX = event.clientX;
+  const startY = event.clientY;
+  const startLeft = Number.parseFloat(bubble.style.left) || 0;
+  const startTop = Number.parseFloat(bubble.style.top) || 0;
+  const connectorLine = bubble.parentElement?.querySelector(`[data-pdf-annotation-connector='${annotation.id}'] line`);
+  const onMove = (moveEvent) => {
+    annotation.bubbleLeft = startLeft + moveEvent.clientX - startX;
+    annotation.bubbleTop = startTop + moveEvent.clientY - startY;
+    bubble.style.left = `${annotation.bubbleLeft}px`;
+    bubble.style.top = `${annotation.bubbleTop}px`;
+    connectorLine?.setAttribute("x2", String(annotation.bubbleLeft));
+    connectorLine?.setAttribute("y2", String(annotation.bubbleTop + 22));
+  };
+  const onUp = () => {
+    annotation.bubbleWidth = bubble.offsetWidth;
+    window.removeEventListener("pointermove", onMove, true);
+    window.removeEventListener("pointerup", onUp, true);
+  };
+  window.addEventListener("pointermove", onMove, true);
+  window.addEventListener("pointerup", onUp, true);
+}
+
+function renderAnnotationConnector(annotation, root, anchor, bubbleLayoutValue) {
+  const selected = selectedAnnotationId === annotation.id;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.dataset.pdfAnnotationConnector = annotation.id;
+  svg.style.position = "absolute";
+  svg.style.left = "0px";
+  svg.style.top = "0px";
+  svg.style.width = "1px";
+  svg.style.height = "1px";
+  svg.style.overflow = "visible";
+  svg.style.pointerEvents = "none";
+  svg.style.zIndex = selected ? "100020" : "100008";
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  const anchorX = anchor.left + (anchor.width ?? 0);
+  const anchorY = anchor.top + Math.max(6, (anchor.height ?? 12) / 2);
+  line.setAttribute("x1", String(anchorX));
+  line.setAttribute("y1", String(anchorY));
+  line.setAttribute("x2", String(bubbleLayoutValue.left));
+  line.setAttribute("y2", String(bubbleLayoutValue.top + 22));
+  line.setAttribute("stroke", selected ? "rgba(239,68,68,.85)" : "rgba(239,68,68,.38)");
+  line.setAttribute("stroke-width", selected ? "2" : "1.25");
+  line.setAttribute("stroke-linecap", "round");
+  line.setAttribute("stroke-dasharray", selected ? "" : "3 3");
+  svg.appendChild(line);
+  root.appendChild(svg);
+}
+
+function renderAnnotationBubble(annotation, root, anchor, page) {
+  const selected = selectedAnnotationId === annotation.id;
+  const layout = bubbleLayout(annotation, anchor, page);
+  renderAnnotationConnector(annotation, root, anchor, layout);
+  const bubble = document.createElement("div");
+  bubble.dataset.pdfAnnotationBubble = annotation.id;
+  bubble.style.position = "absolute";
+  bubble.style.left = `${layout.left}px`;
+  bubble.style.top = `${layout.top}px`;
+  bubble.style.width = `${layout.width}px`;
+  bubble.style.minWidth = `${ANNOTATION_BUBBLE_MIN_WIDTH_PX}px`;
+  bubble.style.boxSizing = "border-box";
+  bubble.style.maxHeight = selected ? "none" : `${ANNOTATION_BUBBLE_MAX_HEIGHT_PX}px`;
+  bubble.style.overflow = selected ? "auto" : "hidden";
+  bubble.style.resize = selected ? "horizontal" : "none";
+  bubble.style.background = "rgba(255,255,255,.96)";
+  bubble.style.border = selected ? "1px solid rgba(239,68,68,.65)" : "1px solid rgba(31,41,55,.28)";
+  bubble.style.borderRadius = "8px";
+  bubble.style.boxShadow = selected ? "0 12px 28px rgba(0,0,0,.26), 0 0 0 3px rgba(239,68,68,.12)" : "0 8px 18px rgba(0,0,0,.16)";
+  bubble.style.padding = "22px 8px 8px";
+  bubble.style.zIndex = selected ? "100030" : "100010";
+  bubble.style.pointerEvents = "auto";
+  bubble.addEventListener("mouseup", () => { annotation.bubbleWidth = bubble.offsetWidth; });
+  for (const eventName of ["pointerdown", "mousedown", "mouseup", "click"]) {
+    bubble.addEventListener(eventName, (event) => {
+      event.stopPropagation();
+      if (event.target instanceof Element && event.target.closest("[data-pdf-annotation-bubble-close]")) return;
+      selectAnnotationFromBubble(annotation.id, event.target instanceof HTMLTextAreaElement);
+    });
+  }
+
+  const dragHandle = document.createElement("div");
+  dragHandle.textContent = "Comment";
+  dragHandle.title = "Drag comment bubble";
+  dragHandle.style.position = "absolute";
+  dragHandle.style.left = "8px";
+  dragHandle.style.right = "24px";
+  dragHandle.style.top = "2px";
+  dragHandle.style.height = "18px";
+  dragHandle.style.font = "11px sans-serif";
+  dragHandle.style.color = selected ? "rgba(153,27,27,.95)" : "rgba(31,41,55,.62)";
+  dragHandle.style.cursor = "move";
+  dragHandle.style.userSelect = "none";
+  dragHandle.addEventListener("pointerdown", (event) => startBubbleDrag(event, annotation, bubble));
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.textContent = "×";
+  close.title = "Remove comment bubble";
+  close.dataset.pdfAnnotationBubbleClose = annotation.id;
+  close.style.position = "absolute";
+  close.style.right = "4px";
+  close.style.top = "2px";
+  close.style.border = "0";
+  close.style.background = "transparent";
+  close.style.cursor = "pointer";
+  close.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    annotation.hasBubble = false;
+    annotation.comment = "";
+    sendAnnotationUpdate(annotation);
+    renderAnnotations(false);
+  });
+  const textarea = document.createElement("textarea");
+  textarea.value = annotation.comment;
+  textarea.placeholder = "Comment…";
+  textarea.rows = selected ? 5 : 3;
+  textarea.style.width = "100%";
+  textarea.style.minHeight = "64px";
+  textarea.style.resize = "vertical";
+  textarea.style.boxSizing = "border-box";
+  textarea.addEventListener("focus", () => selectAnnotationFromBubble(annotation.id, true));
+  textarea.addEventListener("keydown", (event) => event.stopPropagation());
+  textarea.addEventListener("keyup", (event) => event.stopPropagation());
+  textarea.addEventListener("input", () => {
+    annotation.comment = textarea.value;
+    sendAnnotationUpdate(annotation);
+  });
+  bubble.append(dragHandle, close, textarea);
+  root.appendChild(bubble);
+}
+
+function renderAnnotationControls(annotation, root, anchor) {
+  const controls = document.createElement("div");
+  controls.style.position = "absolute";
+  controls.style.left = `${anchor.left + (anchor.width ?? 0) + 4}px`;
+  controls.style.top = `${Math.max(0, anchor.top - 24)}px`;
+  controls.style.display = "flex";
+  controls.style.gap = "4px";
+  controls.style.pointerEvents = "auto";
+  for (const [label, title, handler] of [["×", "Remove annotation", () => removeAnnotation(annotation.id)], ["💬", "Add comment", () => { annotation.hasBubble = true; renderAnnotations(false); }]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.title = title;
+    button.style.border = "1px solid rgba(31,41,55,.25)";
+    button.style.borderRadius = "999px";
+    button.style.background = "white";
+    button.style.cursor = "pointer";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      handler();
+    });
+    controls.appendChild(button);
+  }
+  root.appendChild(controls);
+}
+
+function renderAnnotation(annotation, scroll = false) {
+  const overlay = synctexOverlayPositions(annotation.message);
+  if (!overlay) return false;
+  const selected = selectedAnnotationId === annotation.id;
+  const pageOffset = pageRelativeOverlayOffset(overlay);
+  const pagePositions = overlay.positions.map((position) => ({ ...position, left: position.left + pageOffset.left, top: position.top + pageOffset.top }));
+  const anchor = annotationAnchorPosition(pagePositions);
+  if (!anchor) return false;
+  const root = document.createElement("div");
+  root.dataset.pdfAnnotation = annotation.id;
+  root.style.position = "absolute";
+  root.style.left = "0px";
+  root.style.top = "0px";
+  root.style.zIndex = selected ? "100025" : "100005";
+  root.style.pointerEvents = "none";
+  const markers = pagePositions.map((pagePosition) => {
+    const marker = document.createElement("div");
+    marker.dataset.pdfAnnotationBox = annotation.id;
+    marker.style.position = "absolute";
+    marker.style.left = `${pagePosition.left}px`;
+    marker.style.top = `${pagePosition.top}px`;
+    marker.style.width = pagePosition.width === undefined ? "0.75em" : `${pagePosition.width}px`;
+    marker.style.height = pagePosition.height === undefined ? "0.75em" : `${pagePosition.height}px`;
+    marker.style.transform = pagePosition.width === undefined ? "translate(-50%, -50%)" : "";
+    marker.style.background = selected ? "rgba(239,68,68,.20)" : "rgba(239,68,68,.07)";
+    marker.style.outline = selected ? "2px solid rgba(239,68,68,.95)" : "1px solid rgba(239,68,68,.42)";
+    marker.style.boxShadow = selected ? "0 0 0 3px rgba(239,68,68,.16), 0 6px 18px rgba(0,0,0,.16)" : "none";
+    marker.style.borderRadius = pagePosition.width === undefined ? "50%" : "2px";
+    marker.style.pointerEvents = "auto";
+    marker.style.cursor = "pointer";
+    marker.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      selectAnnotation(annotation.id);
+    });
+    root.appendChild(marker);
+    return marker;
+  });
+  if (selected) renderAnnotationControls(annotation, root, anchor);
+  if (annotation.hasBubble) renderAnnotationBubble(annotation, root, anchor, overlay.page);
+  overlay.page.style.overflow = "visible";
+  overlay.page.appendChild(root);
+  if (scroll) scrollOverlayIntoView(markers);
+  return true;
+}
+
+function renderAnnotations(scroll = false) {
+  removeOverlays("[data-pdf-annotation]");
+  for (const annotation of annotations.values()) renderAnnotation(annotation, scroll && selectedAnnotationId === annotation.id);
+}
+
+function annotationSourceKey(message) {
+  const sourceFile = message.source_file ?? message.reverse_source_file;
+  const line = Number(message.line ?? message.reverse_line);
+  return sourceFile && Number.isInteger(line) && line > 0 ? `${sourceFile}:${line}` : undefined;
+}
+
+function annotationRects(message) {
+  const overlay = synctexOverlayPositions(message);
+  if (!overlay) return [];
+  return overlay.positions.map((position) => {
+    const width = position.width ?? 8;
+    const height = position.height ?? 8;
+    const left = position.width === undefined ? position.left - width / 2 : position.left;
+    const top = position.height === undefined ? position.top - height / 2 : position.top;
+    return { pageNumber: overlay.pageNumber, left, top, right: left + width, bottom: top + height };
+  });
+}
+
+function rectsOverlap(left, right) {
+  if (left.pageNumber !== right.pageNumber) return false;
+  return Math.min(left.right, right.right) - Math.max(left.left, right.left) > 1
+    && Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top) > 1;
+}
+
+function findExistingAnnotationForMessage(message) {
+  const key = annotationSourceKey(message);
+  if (key) {
+    for (const annotation of annotations.values()) {
+      if (annotationSourceKey(annotation.message) === key) return annotation;
+    }
+  }
+  const candidateRects = annotationRects(message);
+  if (candidateRects.length === 0) return undefined;
+  for (const annotation of annotations.values()) {
+    const existingRects = annotationRects(annotation.message);
+    if (candidateRects.some((candidate) => existingRects.some((existing) => rectsOverlap(candidate, existing)))) return annotation;
+  }
+  return undefined;
+}
+
+function createAnnotationFromMessage(message, { select = true, bubble = false, scroll = true } = {}) {
+  if (message.error) return false;
+  const existing = findExistingAnnotationForMessage(message);
+  if (existing) {
+    if (bubble) existing.hasBubble = true;
+    if (select) selectedAnnotationId = existing.id;
+    renderAnnotations(scroll);
+    return true;
+  }
+  const id = `annotation-${Date.now()}-${nextAnnotationNumber}`;
+  nextAnnotationNumber += 1;
+  const annotation = { id, message, comment: "", hasBubble: bubble };
+  annotations.set(id, annotation);
+  if (select) selectedAnnotationId = id;
+  renderAnnotations(scroll);
+  sendAnnotationUpdate(annotation);
+  return true;
+}
+
+function clearForwardSynctexMarker() {
+  synctexOverlayState.forwardMessage = undefined;
+  removeOverlays("[data-synctex-marker]");
+}
+
+function convertForwardMarkerToAnnotation() {
+  const message = synctexOverlayState.forwardMessage;
+  if (!message) return false;
+  clearForwardSynctexMarker();
+  return createAnnotationFromMessage(message, { select: true, bubble: false, scroll: false });
 }
 
 function clientPointToPdfPoint(event, pageNumber) {
@@ -913,7 +1318,7 @@ function setHoverEnabled(enabled) {
   const button = document.getElementById("hostSynctexHoverButton");
   if (button) {
     button.setAttribute("aria-pressed", enabled ? "true" : "false");
-    button.title = enabled ? "Disable SyncTeX highlight/hover mode" : "Enable SyncTeX highlight/hover mode";
+    button.title = enabled ? "Disable annotation mode" : "Enable annotation mode";
     button.setAttribute("aria-label", button.title);
   }
   if (!enabled) {
@@ -923,7 +1328,26 @@ function setHoverEnabled(enabled) {
     if (hoverTimer !== undefined) clearTimeout(hoverTimer);
     hoverTimer = undefined;
     removeOverlays("[data-reverse-synctex-hover]");
-    removeOverlays("[data-reverse-synctex-forward-probe]");
+  }
+  updateHostDataset();
+}
+
+function setDebugSynctexEnabled(enabled) {
+  hostState.debugSynctexEnabled = enabled;
+  const button = document.getElementById("hostSynctexDebugButton");
+  if (button) {
+    button.setAttribute("aria-pressed", enabled ? "true" : "false");
+    button.classList.toggle("toggled", enabled);
+    button.title = enabled ? "Disable SyncTeX debug overlays" : "Enable SyncTeX debug overlays";
+    button.setAttribute("aria-label", button.title);
+  }
+  if (!enabled) {
+    latestHoverRequestId += 1;
+    pendingHover = undefined;
+    if (hoverTimer !== undefined) clearTimeout(hoverTimer);
+    hoverTimer = undefined;
+    synctexOverlayState.hoverResult = undefined;
+    removeOverlays("[data-reverse-synctex-hover]");
   }
   updateHostDataset();
 }
@@ -944,6 +1368,10 @@ function invokeHistoryShortcut(direction, originalTarget) {
 }
 
 function handleHistoryKeydown(event) {
+  if (event.key === "Escape" && !hasEditableFocus()) {
+    clearForwardSynctexMarker();
+    return;
+  }
   if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
   const key = event.key.toLowerCase();
   if (key !== "o" && key !== "i") return;
@@ -1053,15 +1481,39 @@ function installNavigationHistoryControls() {
   updateNavigationButtons();
 }
 
+function installDebugSynctexMenuButton() {
+  if (document.getElementById("hostSynctexDebugButton")) return;
+  const container = document.getElementById("secondaryToolbarButtonContainer");
+  if (!container) return;
+  const separator = document.createElement("div");
+  separator.className = "horizontalToolbarSeparator hostSynctexDebugSeparator";
+  const button = document.createElement("button");
+  button.id = "hostSynctexDebugButton";
+  button.className = "toolbarButton labeled";
+  button.type = "button";
+  button.tabIndex = 0;
+  const label = document.createElement("span");
+  label.textContent = "SyncTeX debug overlays";
+  button.appendChild(label);
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDebugSynctexEnabled(!hostState.debugSynctexEnabled);
+  });
+  container.append(separator, button);
+  setDebugSynctexEnabled(false);
+}
+
 function installHoverToolbarButton() {
   if (document.getElementById("hostSynctexHoverButton")) return;
   const button = document.createElement("button");
   button.id = "hostSynctexHoverButton";
-  button.className = "toolbarButton";
+  button.className = "toolbarButton hostAnnotationButton";
   button.type = "button";
   button.tabIndex = 0;
   const label = document.createElement("span");
-  label.textContent = "SyncTeX highlight";
+  label.textContent = "💬";
+  label.setAttribute("aria-hidden", "true");
   button.appendChild(label);
   button.addEventListener("click", (event) => {
     event.preventDefault();
@@ -1073,11 +1525,11 @@ function installHoverToolbarButton() {
   const anchor = document.getElementById("toolbarViewerRight")?.firstElementChild ?? document.getElementById("toolbarViewerRight");
   anchor?.parentNode?.insertBefore(separator, anchor);
   anchor?.parentNode?.insertBefore(button, anchor);
-  setHoverEnabled(false);
+  setHoverEnabled(true);
 }
 
 function scheduleHover(event, pageNumber) {
-  if (!hostState.hoverEnabled || !viewerSocketOpen()) return;
+  if (!hostState.debugSynctexEnabled || !viewerSocketOpen()) return;
   const point = clientPointToPdfPoint(event, pageNumber);
   if (!point) return;
   const requestId = hoverRequestId + 1;
@@ -1089,7 +1541,7 @@ function scheduleHover(event, pageNumber) {
     hoverTimer = undefined;
     const payload = pendingHover;
     pendingHover = undefined;
-    if (!hostState.hoverEnabled || !payload) return;
+    if (!hostState.debugSynctexEnabled || !payload) return;
     sendViewerSocketPayload(payload);
   }, HOVER_THROTTLE_MS);
 }
@@ -1124,7 +1576,7 @@ function hoverRectPosition(rect, page, viewport) {
 }
 
 function showHoverResult(message, options = {}) {
-  if (!hostState.hoverEnabled || Number(message.request_id) !== latestHoverRequestId) return;
+  if (!hostState.debugSynctexEnabled || Number(message.request_id) !== latestHoverRequestId) return;
   if (options.remember !== false) synctexOverlayState.hoverResult = message;
   removeOverlays("[data-reverse-synctex-hover]");
   if (message.error || !message.rect) return;
@@ -1156,14 +1608,21 @@ function showHoverResult(message, options = {}) {
 
 function showProbeResult(message, options = {}) {
   if (Number(message.request_id) !== latestProbeRequestId) return;
-  if (options.remember !== false) synctexOverlayState.probeResult = message;
-  const label = document.createElement("div");
-  label.dataset.reverseSynctexForwardProbe = "label";
-  label.className = "hostSynctexOverlayLabel";
-  label.textContent = message.error ? String(message.error) : `reverse line ${String(message.reverse_line || message.line || "?")} -> forward boxes`;
-  label.style.left = "0px";
-  label.style.top = "0px";
-  renderSynctexOverlay(message, { selector: "[data-reverse-synctex-forward-probe]", datasetName: "reverseSynctexForwardProbe", label, scroll: options.scroll !== false });
+  if (message.error) {
+    const label = document.createElement("div");
+    label.dataset.reverseSynctexForwardProbe = "label";
+    label.className = "hostSynctexOverlayLabel";
+    label.textContent = String(message.error);
+    label.style.left = "0px";
+    label.style.top = "0px";
+    renderSynctexOverlay(message, { selector: "[data-reverse-synctex-forward-probe]", datasetName: "reverseSynctexForwardProbe", label, scroll: options.scroll !== false });
+    return;
+  }
+  if (options.remember === false) {
+    renderAnnotations(false);
+    return;
+  }
+  createAnnotationFromMessage(message, { select: true, bubble: false, scroll: options.scroll !== false });
 }
 
 function installPageEventHandlers() {
@@ -1171,8 +1630,18 @@ function installPageEventHandlers() {
   if (!viewer || viewer.dataset.hostSynctexHandlers === "true") return;
   viewer.dataset.hostSynctexHandlers = "true";
   viewer.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : undefined;
+    if (target?.closest("[data-pdf-annotation]")) return;
+    if (target?.closest("[data-synctex-marker]")) {
+      event.preventDefault();
+      event.stopPropagation();
+      convertForwardMarkerToAnnotation();
+      return;
+    }
     const pageNumber = pageNumberFromElement(event.target);
     if (!pageNumber) return;
+    selectedAnnotationId = undefined;
+    renderAnnotations(false);
     if (sendReverseSynctexClick(event, pageNumber)) {
       event.preventDefault();
       event.stopPropagation();
@@ -1211,6 +1680,9 @@ function handleHostMessage(message) {
   } else if (message.type === "synctex_forward") {
     pushNavigationHistory();
     showSynctexMarker(message);
+  } else if (message.type === "annotations_cleared") {
+    clearForwardSynctexMarker();
+    clearAnnotations();
   } else if (message.type === "reverse_synctex_hover_result") {
     showHoverResult(message);
   } else if (message.type === "reverse_synctex_forward_probe_result") {
@@ -1289,6 +1761,7 @@ forceShowLaTeXWorkshopChrome();
 installNavigationHistoryControls();
 installSynctexOverlayRedrawHandlers();
 installHoverToolbarButton();
+installDebugSynctexMenuButton();
 installToolsHitboxFallback();
 installPageEventHandlers();
 connectViewerSocket();
