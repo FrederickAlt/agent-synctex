@@ -236,7 +236,7 @@ test("robust reverse mapping does not give unique text a bonus when geometry sco
 		const sourcePath = join(dir, "main.tex");
 		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
 		writeFileSync(join(dir, "paper.synctex"), "fixture");
-		writeFileSync(sourcePath, ["aaa", "FIGURETWOSMALLBOX", "\\end{document}"].join("\n"));
+		writeFileSync(sourcePath, ["aaa", "FIGURETWOSMALLBOX", "ranked candidate"].join("\n"));
 		const location = mapReverseSynctex({
 			pdfPath,
 			page: 1,
@@ -450,6 +450,40 @@ test("robust reverse mapping caps JS candidate proposals before forward syncing"
 	}
 });
 
+test("robust reverse mapping puts end-document in the least-preferred geometry tier", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-enddoc-geometry-tier-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["usable fallback", "\\end{document}"].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 2, column: 0, sourceLine: "\\end{document}", rect: { left: 8, top: 8, right: 12, bottom: 12 }, distanceX: 0, distanceY: 0, distance: 0, area: 16, containsClick: true, structural: true, structuralReason: "\\end{document}" },
+				rawWinner: { input: sourcePath, line: 2, column: 0, sourceLine: "\\end{document}", rect: { left: 8, top: 8, right: 12, bottom: 12 }, distanceX: 0, distanceY: 0, distance: 0, area: 16, containsClick: true, structural: true, structuralReason: "\\end{document}" },
+				candidates: [
+					{ input: sourcePath, line: 2, column: 0, sourceLine: "\\end{document}", rect: { left: 8, top: 8, right: 12, bottom: 12 }, distanceX: 0, distanceY: 0, distance: 0, area: 16, containsClick: true, structural: true, structuralReason: "\\end{document}" },
+					{ input: sourcePath, line: 1, column: 0, sourceLine: "usable fallback", rect: { left: 200, top: 200, right: 220, bottom: 220 }, distanceX: 190, distanceY: 190, distance: 268.7, area: 400, containsClick: false, structural: false },
+				],
+			}),
+			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 8, v: 12, W: 4, H: 4 }] : [],
+		});
+		const usable = location.diagnostics.proposalScores?.find((proposal) => proposal.line === 1);
+		const endDocument = location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2);
+		assert.equal(location.line, 1);
+		assert.equal(usable?.geometryTier, 1);
+		assert.equal(endDocument?.geometryTier, 2);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("robust reverse mapping does not privilege raw end-document when same-page geometry ties", () => {
 	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-enddoc-tie-"));
 	try {
@@ -568,6 +602,44 @@ test("robust reverse mapping applies full text containment bonus without partial
 		assert.equal(textScore?.clickContainmentBonus, -1000);
 		assert.equal(textScore?.textContainmentBonus, -500);
 		assert.equal(textScore?.textContainment, "full");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping caps full text containment scoring to 30 characters per side", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-capped-full-text-bonus-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		const beforePrefix = "A".repeat(36);
+		const beforeTail = "B".repeat(30);
+		const afterHead = "C".repeat(30);
+		const afterSuffix = "D".repeat(36);
+		const cappedContext = `${beforeTail}${afterHead}`;
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["aaa", cappedContext].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 10,
+			y: 10,
+			cwd: dir,
+			textBeforeSelection: `${beforePrefix}${beforeTail}`,
+			textAfterSelection: `${afterHead}${afterSuffix}`,
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 2, column: 0, sourceLine: cappedContext, rect: { left: 5, top: 5, right: 15, bottom: 15 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false },
+				rawWinner: { input: sourcePath, line: 2, column: 0, sourceLine: cappedContext, rect: { left: 5, top: 5, right: 15, bottom: 15 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false },
+				candidates: [{ input: sourcePath, line: 2, column: 0, sourceLine: cappedContext, rect: { left: 5, top: 5, right: 15, bottom: 15 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false }],
+			}),
+			forwardBoxesForLine: () => [{ page: 1, h: 5, v: 15, W: 10, H: 10 }],
+		});
+		const score = location.diagnostics.proposalScores?.[0] as { score?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
+		assert.equal(location.line, 2);
+		assert.equal(score?.score, -1490);
+		assert.equal(score?.textContainmentBonus, -500);
+		assert.equal(score?.textContainment, "full");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -1683,6 +1755,66 @@ test("reverse SyncTeX adapter normalizes align and align* closing lines", () => 
 	}
 });
 
+test("forward SyncTeX maps display math delimiter lines to the formula body", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"before",
+			"\\[",
+			"  x^2 + y^2 = z^2",
+			"\\]",
+			"after",
+		].join("\n"));
+		const requestedLines: number[] = [];
+		const jump = mapForwardSynctex({
+			pdfPath: project.pdfPath,
+			sourceFile: project.sourcePath,
+			line: 2,
+			cwd: project.dir,
+			nativeRunner: failNativeRunner,
+			jsFallback: (line) => {
+				requestedLines.push(line);
+				return { page: 1, x: 10, y: 20, width: 30, height: 4 };
+			},
+		});
+
+		assert.deepEqual(requestedLines, [3]);
+		assert.equal(jump.line, 3);
+		assert.equal(jump.sourceLine, "  x^2 + y^2 = z^2");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX adapter normalizes display math opener to the full formula span", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\[",
+			"  x^2 + y^2 = z^2",
+			"\\]",
+			"",
+		].join("\n"));
+
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: () => { throw new Error("native fallback should not be invoked after JS success"); },
+			jsFallback: () => ({ input: "main.tex", line: 1, column: 0 }),
+		});
+
+		assert.equal(location.line, 1);
+		assert.equal(location.sourceLine, "\\[");
+		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+		assert.equal(location.normalizedFormulaExcerpt, "\\[\n  x^2 + y^2 = z^2\n\\]");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse SyncTeX adapter normalizes \\] to the matching display math opener", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
@@ -1823,14 +1955,14 @@ test("reverse SyncTeX hover without text context reports top proposal diagnostic
 		});
 
 		assert.equal(hover.sourceFile, project.sourcePath);
-		assert.equal(hover.line, 3);
-		assert.equal(hover.sourceLine, "\\end{document}");
+		assert.equal(hover.line, 5);
+		assert.equal(hover.sourceLine, "Second paragraph text on a different source line for SyncTeX mapping.");
 		assert.equal(hover.precision, "line");
 		assert.deepEqual(hover.repairedWinner, {
 			sourceFile: project.sourcePath,
-			line: 3,
+			line: 5,
 			column: 0,
-			sourceLine: "\\end{document}",
+			sourceLine: "Second paragraph text on a different source line for SyncTeX mapping.",
 			precision: "line",
 			score: 0,
 		});

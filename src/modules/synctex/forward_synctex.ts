@@ -486,21 +486,22 @@ export function mapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctex
 	}
 
 	const sourceFile = isAbsolute(input.sourceFile) ? resolve(input.sourceFile) : resolve(input.cwd, input.sourceFile);
-	const sourceLine = readSourceLine(sourceFile, input.line, input.cwd);
+	const effectiveLine = forwardSynctexLineForSourceLine(sourceFile, input.line);
+	const sourceLine = readSourceLine(sourceFile, effectiveLine, input.cwd);
 	if (sourceLine === undefined) {
-		throw new Error(`Cannot read source_file line ${sourceFile}:${input.line}`);
+		throw new Error(`Cannot read source_file line ${sourceFile}:${effectiveLine}`);
 	}
 
 	const native = runNativeForwardSynctex({
-		line: input.line,
+		line: effectiveLine,
 		sourceFile,
 		pdfPath,
 		runner: input.nativeRunner ?? defaultNativeSynctexRunner,
 		command: input.synctexCommand ?? "synctex",
 	});
 	if (native.mapped !== undefined) {
-		const diagnostics = buildForwardDiagnostics({ branch: "native", pdfPath, sourceFile, line: input.line, sidecarPath, native: native.diagnostics });
-		return withForwardGlue({ mapped: native.mapped, branch: "native", sourceFile, line: input.line, sourceLine, sidecarPath, diagnostics });
+		const diagnostics = buildForwardDiagnostics({ branch: "native", pdfPath, sourceFile, line: effectiveLine, sidecarPath, native: native.diagnostics });
+		return withForwardGlue({ mapped: native.mapped, branch: "native", sourceFile, line: effectiveLine, sourceLine, sidecarPath, diagnostics });
 	}
 
 	let mapped;
@@ -508,7 +509,7 @@ export function mapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctex
 	const previousCwd = process.cwd();
 	try {
 		process.chdir(input.cwd);
-		mapped = (input.jsFallback ?? syncTeXToPDF)(input.line, sourceFile, pdfPath);
+		mapped = (input.jsFallback ?? syncTeXToPDF)(effectiveLine, sourceFile, pdfPath);
 		if (mapped === undefined) jsFailureReason = "no result";
 	} catch (error) {
 		mapped = undefined;
@@ -522,11 +523,11 @@ export function mapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctex
 		...(jsFailureReason === undefined ? {} : { failureReason: jsFailureReason }),
 	};
 	if (mapped === undefined) {
-		throw new Error(`No usable SyncTeX mapping found for ${sourcePathLabel(sourceFile)}:${input.line}; native synctex view returned ${native.failureReason ?? "no usable result"}; JS fallback returned no result`);
+		throw new Error(`No usable SyncTeX mapping found for ${sourcePathLabel(sourceFile)}:${effectiveLine}; native synctex view returned ${native.failureReason ?? "no usable result"}; JS fallback returned no result`);
 	}
 
-	const diagnostics = buildForwardDiagnostics({ branch: "js_fallback", pdfPath, sourceFile, line: input.line, sidecarPath, native: native.diagnostics, jsFallback });
-	return withForwardGlue({ mapped, branch: "js_fallback", sourceFile, line: input.line, sourceLine, sidecarPath, diagnostics });
+	const diagnostics = buildForwardDiagnostics({ branch: "js_fallback", pdfPath, sourceFile, line: effectiveLine, sidecarPath, native: native.diagnostics, jsFallback });
+	return withForwardGlue({ mapped, branch: "js_fallback", sourceFile, line: effectiveLine, sourceLine, sidecarPath, diagnostics });
 }
 
 function indexes(source: string, find: string): number[] {
@@ -664,6 +665,8 @@ function forwardBoxesForSourceLine(input: { sourceFile: string; line: number; pd
 }
 
 const MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS = 5;
+const FULL_TEXT_CONTAINMENT_CONTEXT_CHARS = 30;
+const END_DOCUMENT_GEOMETRY_TIER = 2;
 
 interface ReverseSynctexProposal {
 	kind: "text" | "ranked";
@@ -693,6 +696,10 @@ interface ScoredReverseSynctexProposal extends ReverseSynctexProposal {
 
 function sameSourceLocation(left: { sourceFile: string; line: number }, right: { sourceFile: string; line: number }): boolean {
 	return left.sourceFile === right.sourceFile && left.line === right.line;
+}
+
+function buildFullTextContainmentContext(textBeforeSelection: string | undefined, textAfterSelection: string | undefined): string | undefined {
+	return buildSourceSearchFragments((textBeforeSelection ?? "").slice(-FULL_TEXT_CONTAINMENT_CONTEXT_CHARS), (textAfterSelection ?? "").slice(0, FULL_TEXT_CONTAINMENT_CONTEXT_CHARS))[0];
 }
 
 function buildPartialTextContainmentContext(textBeforeSelection: string | undefined, textAfterSelection: string | undefined): string | undefined {
@@ -743,7 +750,8 @@ function scoreReverseSynctexProposal(input: {
 	const chosenSamePageBox = chosen?.box;
 	const containsClick = chosenSamePageBox === undefined ? false : boxContainsClick(chosenSamePageBox, input.click);
 	const distance = chosen?.distance;
-	const geometryTier = chosenSamePageBox === undefined ? 1 : 0;
+	const baseGeometryTier = chosenSamePageBox === undefined ? 1 : 0;
+	const geometryTier = input.proposal.sourceLine?.trim() === "\\end{document}" ? END_DOCUMENT_GEOMETRY_TIER : baseGeometryTier;
 	const score = chosen?.score ?? 0;
 	const chosenClickContainmentBonus = chosen?.clickContainmentBonus ?? 0;
 	const chosenTextContainmentBonus = chosen?.textContainmentBonus ?? 0;
@@ -875,7 +883,7 @@ function findFormulaEnvironmentSpan(lines: string[], closeLineIndex: number, env
 	return undefined;
 }
 
-function findDisplayMathSpan(lines: string[], closeLineIndex: number): { startLine: number; endLine: number; excerpt: string } | undefined {
+function findDisplayMathSpanFromClose(lines: string[], closeLineIndex: number): { startLine: number; endLine: number; excerpt: string } | undefined {
 	let depth = 0;
 	for (let index = closeLineIndex; index >= 0; index -= 1) {
 		const trimmed = (lines[index] ?? "").trim();
@@ -888,17 +896,47 @@ function findDisplayMathSpan(lines: string[], closeLineIndex: number): { startLi
 	return undefined;
 }
 
-function normalizeFormulaClosingSpan(sourceFile: string, line: number, sourceLines: string[] | undefined): { span: ReverseSynctexFormulaSpan; excerpt: string } | undefined {
+function findDisplayMathSpanFromOpen(lines: string[], openLineIndex: number): { startLine: number; endLine: number; excerpt: string } | undefined {
+	let depth = 0;
+	for (let index = openLineIndex; index < lines.length; index += 1) {
+		const trimmed = (lines[index] ?? "").trim();
+		if (trimmed === "\\[") depth += 1;
+		else if (trimmed === "\\]") {
+			depth -= 1;
+			if (depth === 0) return { startLine: openLineIndex + 1, endLine: index + 1, excerpt: lines.slice(openLineIndex, index + 1).join("\n") };
+		}
+	}
+	return undefined;
+}
+
+function firstFormulaContentLine(span: { startLine: number; endLine: number }, sourceLines: string[]): number | undefined {
+	for (let line = span.startLine + 1; line < span.endLine; line += 1) {
+		if ((sourceLines[line - 1] ?? "").trim()) return line;
+	}
+	return undefined;
+}
+
+function normalizeFormulaSpan(sourceFile: string, line: number, sourceLines: string[] | undefined): { span: ReverseSynctexFormulaSpan; excerpt: string; contentLine?: number } | undefined {
 	if (sourceLines === undefined) return undefined;
-	const closeLineIndex = line - 1;
-	const sourceLine = sourceLines[closeLineIndex];
+	const lineIndex = line - 1;
+	const sourceLine = sourceLines[lineIndex];
 	if (sourceLine === undefined) return undefined;
-	const environment = formulaEnvironmentClose(sourceLine);
-	const span = environment === undefined
-		? sourceLine.trim() === "\\]" ? findDisplayMathSpan(sourceLines, closeLineIndex) : undefined
-		: findFormulaEnvironmentSpan(sourceLines, closeLineIndex, environment);
+	const trimmed = sourceLine.trim();
+	let span: { startLine: number; endLine: number; excerpt: string } | undefined;
+	if (trimmed === "\\]") span = findDisplayMathSpanFromClose(sourceLines, lineIndex);
+	else if (trimmed === "\\[") span = findDisplayMathSpanFromOpen(sourceLines, lineIndex);
+	else {
+		const environment = formulaEnvironmentClose(sourceLine);
+		span = environment === undefined ? undefined : findFormulaEnvironmentSpan(sourceLines, lineIndex, environment);
+	}
 	if (span === undefined) return undefined;
-	return { span: { sourceFile, startLine: span.startLine, endLine: span.endLine }, excerpt: span.excerpt };
+	return { span: { sourceFile, startLine: span.startLine, endLine: span.endLine }, excerpt: span.excerpt, ...(firstFormulaContentLine(span, sourceLines) === undefined ? {} : { contentLine: firstFormulaContentLine(span, sourceLines) }) };
+}
+
+function forwardSynctexLineForSourceLine(sourceFile: string, line: number): number {
+	const sourceLines = readSourceLines(sourceFile);
+	const normalizedFormula = normalizeFormulaSpan(sourceFile, line, sourceLines);
+	return normalizedFormula?.contentLine ?? line;
 }
 
 function parseNativeReverseResult(stdout: string): ReverseSynctexMappedResult | undefined {
@@ -1174,7 +1212,7 @@ export function mapReverseSynctex(input: {
 		let partialTextFragment: string | undefined;
 		if (hasSelectionContext) {
 			const fragments = buildSourceSearchFragments(input.textBeforeSelection ?? "", input.textAfterSelection ?? "");
-			fullTextFragment = fragments[0];
+			fullTextFragment = buildFullTextContainmentContext(input.textBeforeSelection, input.textAfterSelection);
 			partialTextFragment = buildPartialTextContainmentContext(input.textBeforeSelection, input.textAfterSelection);
 			const matches = findSourceTextMatches(rawSourceFile, fragments);
 			textRepair = {
@@ -1279,7 +1317,7 @@ export function mapReverseSynctex(input: {
 		}
 	}
 	const sourceLine = readSourceLine(sourceFile, line, input.cwd);
-	const normalizedFormula = normalizeFormulaClosingSpan(rawSourceFile, rawMappedLine, readSourceLines(rawSourceFile));
+	const normalizedFormula = normalizeFormulaSpan(rawSourceFile, rawMappedLine, readSourceLines(rawSourceFile));
 	const candidates: ReverseSynctexDiagnostics["candidates"] = [{
 		sourceFile: rawSourceFile,
 		line: rawMappedLine,

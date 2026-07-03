@@ -259,5 +259,6 @@ export function reverseSynctexForwardProbeResult(input: { message: ViewerHostRev
 		...(probe.forward.indicator === undefined ? {} : { indicator: probe.forward.indicator }),
 		source_file: probe.forward.sourceFile,
 		line: probe.forward.line,
+		source_line: probe.forward.sourceLine,
 	};
 }
