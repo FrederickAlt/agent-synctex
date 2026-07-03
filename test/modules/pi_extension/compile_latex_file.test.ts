@@ -482,14 +482,14 @@ function readCompileFailureLog(error: unknown): string {
 	return readFileSync(logPath, "utf8");
 }
 
-test("session_start copies project preambles into independent per-session runtime dirs", async () => {
+test("session_start copies single-root preambles into independent per-session runtime dirs", async () => {
 	await captureTools();
 	const projectA = mkdtempSync(resolve(tmpdir(), "pdf-preview-preamble-A-"));
 	const projectB = mkdtempSync(resolve(tmpdir(), "pdf-preview-preamble-B-"));
-	const preambleA = "\\usepackage{array}";
-	const preambleB = "\\usepackage{booktabs}";
-	writeFileSync(resolve(projectA, "preamble.tex"), preambleA);
-	writeFileSync(resolve(projectB, "preamble.tex"), preambleB);
+	const preambleA = "\\documentclass{article}\n\\usepackage{array}";
+	const preambleB = "\\documentclass{article}\n\\usepackage{booktabs}";
+	writeFileSync(resolve(projectA, "main.tex"), `${preambleA}\n\\begin{document}\nA\n\\end{document}\n`);
+	writeFileSync(resolve(projectB, "main.tex"), `${preambleB}\n\\begin{document}\nB\n\\end{document}\n`);
 	const contextA = createSessionContext(projectA, "compile-session-A");
 	const contextB = createSessionContext(projectB, "compile-session-B");
 	const preamblePathA = resolve(MCP_TMPDIR, "agents", "compile-session-A", "preamble.tex");

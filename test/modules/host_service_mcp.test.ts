@@ -608,7 +608,7 @@ test("daemon rejects invalid set_latex_preamble arguments", async () => {
 		});
 		const response = (await sendFramedRequest(socketPath, payload)) as { error: { code: number; message: string } };
 		assert.equal(response.error.code, -32602);
-		assert.equal(response.error.message, "set_latex_preamble requires latex_preamble to be a string");
+		assert.equal(response.error.message, "set_latex_preamble requires exactly one of latex_preamble or root_file");
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });

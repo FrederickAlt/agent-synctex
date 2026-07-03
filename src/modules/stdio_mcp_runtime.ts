@@ -115,7 +115,14 @@ export class TexActionsStdioMcpRuntime {
 			if (!STDIO_WORKSPACE_CONTEXT_TOOL_NAMES.has(parsed.params.name)) {
 				return payload;
 			}
-			const currentArguments = isRecord(parsed.params.arguments) ? parsed.params.arguments : {};
+			const rawArguments = parsed.params.arguments;
+			const currentArguments = isRecord(rawArguments)
+				? rawArguments
+				: typeof rawArguments === "string" && parsed.params.name === "show_latex"
+					? { source: rawArguments }
+					: typeof rawArguments === "string" && parsed.params.name === "set_latex_preamble"
+						? { latex_preamble: rawArguments }
+						: {};
 			const nextArguments = { ...currentArguments };
 			delete nextArguments.workspace_context;
 			return JSON.stringify({

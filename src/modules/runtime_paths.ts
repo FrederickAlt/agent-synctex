@@ -1,8 +1,9 @@
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 const resolveMcpRuntimeDir = (): string =>
 	process.env.MCP_TMPDIR
-		?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "tex-actions");
+		?? resolve(tmpdir(), "tex-actions");
 
 export function getMcpTmpDir(): string {
 	return resolveMcpRuntimeDir();

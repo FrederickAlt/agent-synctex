@@ -1,8 +1,9 @@
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { getLatexPreambleFilePath } from "./runtime_preamble.ts";
 import { writeLatexPreambleToTmpdir } from "./runtime_preamble.ts";
 import { resolveTexActionsAgentRuntimeDir } from "./agent_runtime_context.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
+import { buildLatexPreambleIndex } from "./latex/latex_preamble_index.ts";
 import type { GetPdfEventsRequest, PdfEvent } from "./pdf_events.ts";
 import type {
 	HostServiceCloseRequest,
@@ -472,6 +473,10 @@ function parseToolCallParams(params: unknown): { name: string; args: Record<stri
 	if (rawArguments === undefined) {
 		return { name: rawName, args: {} };
 	}
+	if (typeof rawArguments === "string") {
+		if (rawName === "show_latex") return { name: rawName, args: { source: rawArguments } };
+		if (rawName === "set_latex_preamble") return { name: rawName, args: { latex_preamble: rawArguments } };
+	}
 	if (!isRecord(rawArguments)) {
 		throw new McpRequestError(MCP_ERROR_INVALID_PARAMS, null, "tools/call arguments must be an object");
 	}
@@ -540,9 +545,9 @@ function mcpPreamblePath(runtimeDirectory?: string): string {
 	return getLatexPreambleFilePath(runtimeDirectory);
 }
 
-function resolveSetPreambleRuntimeDirectory(rawWorkspaceContext: unknown): string | undefined {
+function resolveSetPreambleWorkspace(rawWorkspaceContext: unknown): { workspaceContext: HostServiceWorkspaceContext; runtimeDirectory?: string } {
 	if (rawWorkspaceContext === undefined) {
-		return undefined;
+		return { workspaceContext: MCP_DEFAULT_WORKSPACE_CONTEXT };
 	}
 	const workspaceContext = normalizeWorkspaceContext(rawWorkspaceContext);
 	if (workspaceContext.workspace_root === undefined) {
@@ -555,7 +560,7 @@ function resolveSetPreambleRuntimeDirectory(rawWorkspaceContext: unknown): strin
 	if (resolve(workspaceContext.workspace_root) !== expectedRuntimeDirectory) {
 		throw new Error("set_latex_preamble workspace_context.workspace_root must match the agent runtime directory");
 	}
-	return expectedRuntimeDirectory;
+	return { workspaceContext, runtimeDirectory: expectedRuntimeDirectory };
 }
 
 function workspaceContextSchema(): { type: "object"; properties: Record<string, unknown>; required: string[]; additionalProperties: boolean } {
@@ -575,11 +580,11 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 	return [
 		{
 			name: "show_latex",
-			description: "Render a LaTeX snippet as a temporary PDF and route its viewer open request through the Viewer Host Client boundary.",
+			description: "Render a LaTeX snippet as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Raw string/FREEFORM tool arguments are accepted as LaTeX source; callers may pass a full document, a \\begin{document}...\\end{document} body, or just document body content.",
 			inputSchema: {
 				type: "object",
 				properties: {
-					source: { type: "string", minLength: 1 },
+					source: { type: "string", minLength: 1, description: "LaTeX source. May be a full document, a \\begin{document}...\\end{document} body, or only document body content." },
 					compiler: { type: "string" },
 					workspace_context: workspaceContextSchema(),
 				},
@@ -638,14 +643,15 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 		},
 		{
 			name: "set_latex_preamble",
-			description: "Set the active LaTeX preview preamble in the provided workspace runtime.",
+			description: "Set the active LaTeX preview preamble in the provided workspace runtime. Pass raw LaTeX preamble text directly, or pass root_file to activate the discovered preamble for a LaTeX root when auto-load skipped because multiple roots exist.",
 			inputSchema: {
 				type: "object",
 				properties: {
-					latex_preamble: { type: "string" },
+					latex_preamble: { type: "string", description: "Raw LaTeX preamble to activate. In FREEFORM/raw calls, pass the preamble text directly." },
+					root_file: { type: "string", minLength: 1, description: "LaTeX root file whose discovered preamble should be activated." },
 					workspace_context: workspaceContextSchema(),
 				},
-				required: ["latex_preamble"],
+				required: [],
 				additionalProperties: false,
 			},
 		},
@@ -818,15 +824,48 @@ async function handleSetLatexPreambleTool(
 	_pdfOperations: HostServiceMcpPdfOperations,
 	_mcpCompileService: HostServiceCompileService,
 ): Promise<McpResponsePayload> {
-	const preamble = args.latex_preamble;
-	if (typeof preamble !== "string") {
-		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble requires latex_preamble to be a string");
+	for (const key of Object.keys(args)) {
+		if (!["latex_preamble", "root_file", "workspace_context"].includes(key)) {
+			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, `set_latex_preamble unknown argument: ${key}`);
+		}
+	}
+	const hasRawPreamble = Object.prototype.hasOwnProperty.call(args, "latex_preamble");
+	const hasRootFile = Object.prototype.hasOwnProperty.call(args, "root_file");
+	if (hasRawPreamble === hasRootFile) {
+		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble requires exactly one of latex_preamble or root_file");
 	}
 	let runtimeDirectory: string | undefined;
+	let workspaceContext: HostServiceWorkspaceContext;
 	try {
-		runtimeDirectory = resolveSetPreambleRuntimeDirectory(args.workspace_context);
+		const resolvedWorkspace = resolveSetPreambleWorkspace(args.workspace_context);
+		runtimeDirectory = resolvedWorkspace.runtimeDirectory;
+		workspaceContext = resolvedWorkspace.workspaceContext;
 	} catch (error) {
 		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, error instanceof Error ? error.message : String(error));
+	}
+	let preamble: string;
+	let sourceRoot: string | undefined;
+	if (hasRawPreamble) {
+		if (typeof args.latex_preamble !== "string") {
+			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble latex_preamble must be a string");
+		}
+		preamble = args.latex_preamble;
+	} else {
+		if (typeof args.root_file !== "string" || !args.root_file.trim()) {
+			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble root_file must be a non-empty string");
+		}
+		try {
+			const timeoutMs = Number(process.env.LATEX_PREAMBLE_TIMEOUT_MS ?? "5000");
+			const index = buildLatexPreambleIndex(workspaceContext.cwd, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5_000);
+			if (index.timedOut) {
+				return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble could not scan root files before the timeout");
+			}
+			const root = index.getRoot(args.root_file);
+			preamble = root.preamble;
+			sourceRoot = root.rootFile;
+		} catch (error) {
+			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, error instanceof Error ? error.message : String(error));
+		}
 	}
 	try {
 		const preambleLength = writeLatexPreambleToTmpdir(
@@ -834,11 +873,13 @@ async function handleSetLatexPreambleTool(
 			runtimeDirectory === undefined ? {} : { runtimeDirectory },
 		);
 		const preamblePath = mcpPreamblePath(runtimeDirectory);
+		const sourceText = sourceRoot === undefined ? "" : ` from ${relative(workspaceContext.cwd, sourceRoot)}`;
 		const resultText = preambleLength
-			? `LaTeX preamble set (${preambleLength} characters) at ${preamblePath}`
+			? `LaTeX preamble set${sourceText} (${preambleLength} characters) at ${preamblePath}`
 			: `LaTeX preamble cleared at ${preamblePath}`;
 		const toolResult: McpToolResult = {
 			content: [{ type: "text", text: resultText }],
+			details: { preambleLength, preamblePath, ...(sourceRoot === undefined ? {} : { root_file: sourceRoot }) },
 		};
 		return buildSuccess(requestId, toolResult);
 	} catch (error) {
