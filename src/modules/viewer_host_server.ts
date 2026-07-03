@@ -7,13 +7,16 @@ import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath, URL } from "node:url";
 import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
-import { inspectReverseSynctexHover, mapReverseForwardSynctexProbe } from "./synctex/forward_synctex.ts";
+import { reverseSynctexForwardProbeResult, reverseSynctexHoverResult } from "./synctex/synctex_resolution.ts";
+import { DEFAULT_VIEWER_HOST_ACCESS_POLICY, type ViewerHostAccessPolicy, type ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
+export type { ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
 
 const LOCAL_HOST = "127.0.0.1";
 const DEFAULT_PORT = 0;
 const MAX_VIEWER_SOCKET_MESSAGE_BYTES = 64 * 1024;
 const LW_VIEWER_ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "viewer_lw");
+const VIEWER_CLIENT_ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "viewer_client");
 const LW_PDFJS_BUILD_ASSETS = new Map<string, { path: string; polyfillModernPromiseHelpers?: boolean }>([
 	["/viewer-lw/build/pdf.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.mjs"), polyfillModernPromiseHelpers: true }],
 	["/viewer-lw/build/pdf.worker.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.worker.mjs"), polyfillModernPromiseHelpers: true }],
@@ -35,248 +38,6 @@ if (typeof Promise.try !== "function") {
 		return new Promise(resolve => resolve(callback(...args)));
 	};
 }
-`;
-
-const VIEWER_CLIENT_TABS_SCRIPT = `
-const state = {
-	tabs: [],
-	activePdfId: undefined,
-};
-
-const app = document.getElementById("viewer-client-app");
-const tabList = document.getElementById("tab-list");
-const panels = document.getElementById("viewer-panels");
-const emptyState = document.getElementById("empty-state");
-
-function pdfIdKey(pdfId) {
-	return String(pdfId);
-}
-
-function titleFor(message) {
-	return message.title || "PDF " + message.pdf_id;
-}
-
-function viewerUrlFor(message) {
-	return message.viewer_url || "/viewer-lw/" + encodeURIComponent(String(message.pdf_id));
-}
-
-function isEditableAppShellTarget(target) {
-	if (!(target instanceof Element)) return false;
-	if (target.isContentEditable) return true;
-	return Boolean(target.closest("input, textarea, select, button, a[href], [contenteditable], [role='button'], [role='textbox'], [role='combobox'], [role='listbox'], [role='slider'], [role='spinbutton']"));
-}
-
-function activeViewerIframe() {
-	if (state.activePdfId === undefined) return undefined;
-	return document.querySelector("iframe[data-pdf-id='" + pdfIdKey(state.activePdfId) + "']");
-}
-
-function postNavigationToActiveViewer(direction) {
-	const iframe = activeViewerIframe();
-	if (!iframe || !iframe.contentWindow) return false;
-	iframe.contentWindow.postMessage({ type: "host_lw_navigation", direction }, location.origin);
-	return true;
-}
-
-const recentAppShellRawMouseEvents = [];
-const MAX_APP_SHELL_RAW_MOUSE_EVENTS = 20;
-
-function describeAppShellEventTarget(target) {
-	if (target instanceof Element) return { tag: target.tagName, id: target.id || undefined, className: typeof target.className === "string" ? target.className : undefined };
-	if (target === document) return { tag: "#document" };
-	if (target === window) return { tag: "#window" };
-	return undefined;
-}
-
-function appShellHistoryDirectionFromMouseEvent(event) {
-	if (event.button === 3) return "back";
-	if (event.button === 4) return "forward";
-	if (event.button === 8) return "back";
-	if (event.button === 16) return "forward";
-	if (event.button === 1 || event.button === 2 || event.which === 2 || event.which === 3) return undefined;
-	if ((event.buttons & 8) === 8) return "back";
-	if ((event.buttons & 16) === 16) return "forward";
-	if (event.button === 0 && event.buttons === 0 && event.which === 4) return "back";
-	if (event.button === 0 && event.buttons === 0 && event.which === 5) return "forward";
-	return undefined;
-}
-
-function rememberAppShellRawMouseEvent(event, handledDirection) {
-	const diagnostic = {
-		type: event.type,
-		button: event.button,
-		buttons: event.buttons,
-		which: event.which,
-		detail: event.detail,
-		pointerType: event.pointerType,
-		target: describeAppShellEventTarget(event.target),
-		defaultPrevented: event.defaultPrevented,
-		altKey: event.altKey,
-		ctrlKey: event.ctrlKey,
-		metaKey: event.metaKey,
-		shiftKey: event.shiftKey,
-		handledDirection,
-	};
-	recentAppShellRawMouseEvents.push(diagnostic);
-	while (recentAppShellRawMouseEvents.length > MAX_APP_SHELL_RAW_MOUSE_EVENTS) recentAppShellRawMouseEvents.shift();
-	return diagnostic;
-}
-
-function appShellSideButtonDedupeKey(event, direction) {
-	return direction + ":" + event.button + ":" + event.buttons + ":" + event.which;
-}
-
-function postNavigationDiagnosticToActiveViewer(diagnostic) {
-	const iframe = activeViewerIframe();
-	if (!iframe || !iframe.contentWindow) return false;
-	iframe.contentWindow.postMessage({ type: "host_lw_app_shell_mouse_diagnostic", diagnostic }, location.origin);
-	return true;
-}
-
-function handleAppShellHistoryKeydown(event) {
-	if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
-	const key = event.key.toLowerCase();
-	if (key !== "o" && key !== "i") return;
-	if (isEditableAppShellTarget(event.target) || isEditableAppShellTarget(document.activeElement)) return;
-	event.preventDefault();
-	event.stopImmediatePropagation?.();
-	event.stopPropagation();
-	postNavigationToActiveViewer(key === "o" ? "back" : "forward");
-}
-
-let lastAppShellSideButtonNavigation;
-function handleAppShellHistoryMouseButton(event) {
-	const direction = appShellHistoryDirectionFromMouseEvent(event);
-	const rawDiagnostic = rememberAppShellRawMouseEvent(event, direction);
-	if (!direction) {
-		postNavigationDiagnosticToActiveViewer(rawDiagnostic);
-		return;
-	}
-	if (isEditableAppShellTarget(event.target) || isEditableAppShellTarget(document.activeElement)) return;
-	event.preventDefault();
-	event.stopImmediatePropagation?.();
-	event.stopPropagation();
-	rawDiagnostic.defaultPrevented = event.defaultPrevented;
-	postNavigationDiagnosticToActiveViewer(rawDiagnostic);
-	const now = performance.now();
-	const recent = lastAppShellSideButtonNavigation;
-	const key = appShellSideButtonDedupeKey(event, direction);
-	if (recent && recent.key === key && recent.type !== event.type && now - recent.time < 250) return;
-	lastAppShellSideButtonNavigation = { key, type: event.type, time: now };
-	postNavigationToActiveViewer(direction);
-}
-
-function bindAppShellViewerShortcuts() {
-	for (const target of [window, document]) {
-		target.addEventListener("keydown", handleAppShellHistoryKeydown, true);
-	}
-	for (const eventName of ["pointerdown", "pointerup", "mousedown", "mouseup", "auxclick"]) {
-		for (const target of [window, document]) target.addEventListener(eventName, handleAppShellHistoryMouseButton, true);
-	}
-}
-
-function openOrFocusTab(message) {
-	const pdfId = Number(message.pdf_id);
-	const existing = state.tabs.find((tab) => tab.pdfId === pdfId);
-	if (existing) {
-		existing.title = titleFor(message);
-		existing.revision = message.revision;
-		existing.viewerUrl = viewerUrlFor(message);
-		existing.visibleTabToken = message.visible_tab_token;
-	} else {
-		state.tabs.push({ pdfId, title: titleFor(message), revision: message.revision, viewerUrl: viewerUrlFor(message), visibleTabToken: message.visible_tab_token });
-	}
-	state.activePdfId = pdfId;
-	renderTabs();
-}
-
-function closeTab(pdfId) {
-	const index = state.tabs.findIndex((tab) => tab.pdfId === pdfId);
-	if (index === -1) return;
-	const closedTab = state.tabs[index];
-	state.tabs.splice(index, 1);
-	void fetch("/app-tab-closed", {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ pdf_id: pdfId, revision: closedTab.revision, viewer_url: closedTab.viewerUrl, visible_tab_token: closedTab.visibleTabToken }),
-	}).catch(() => undefined);
-	if (state.activePdfId === pdfId) {
-		const next = state.tabs[Math.min(index, state.tabs.length - 1)];
-		state.activePdfId = next ? next.pdfId : undefined;
-	}
-	renderTabs();
-}
-
-function renderTabs() {
-	const existingPanels = new Map(Array.from(panels.querySelectorAll("[role='tabpanel'][data-pdf-id]"), (panel) => [panel.dataset.pdfId, panel]));
-	tabList.replaceChildren();
-	panels.replaceChildren();
-	if (state.activePdfId === undefined || !state.tabs.some((tab) => tab.pdfId === state.activePdfId)) {
-		state.activePdfId = state.tabs[0] ? state.tabs[0].pdfId : undefined;
-	}
-	if (state.activePdfId === undefined) {
-		app.removeAttribute("data-active-pdf-id");
-		emptyState.hidden = false;
-	} else {
-		app.setAttribute("data-active-pdf-id", pdfIdKey(state.activePdfId));
-		emptyState.hidden = true;
-	}
-	for (const tab of state.tabs) {
-		const selected = tab.pdfId === state.activePdfId;
-		const tabItem = document.createElement("div");
-		tabItem.className = "tab-item";
-		const tabButton = document.createElement("button");
-		tabButton.type = "button";
-		tabButton.role = "tab";
-		tabButton.dataset.pdfId = pdfIdKey(tab.pdfId);
-		tabButton.setAttribute("aria-selected", selected ? "true" : "false");
-		tabButton.textContent = tab.title;
-		tabButton.addEventListener("click", () => {
-			state.activePdfId = tab.pdfId;
-			renderTabs();
-		});
-		const closeButton = document.createElement("button");
-		closeButton.type = "button";
-		closeButton.setAttribute("data-close-pdf-id", pdfIdKey(tab.pdfId));
-		closeButton.setAttribute("aria-label", "Close " + tab.title);
-		closeButton.textContent = "×";
-		closeButton.addEventListener("click", () => closeTab(tab.pdfId));
-		tabItem.append(tabButton, closeButton);
-		tabList.appendChild(tabItem);
-
-		let panel = existingPanels.get(pdfIdKey(tab.pdfId));
-		let iframe;
-		if (panel) {
-			iframe = panel.querySelector("iframe[data-pdf-id]");
-		} else {
-			panel = document.createElement("section");
-			panel.role = "tabpanel";
-			panel.dataset.pdfId = pdfIdKey(tab.pdfId);
-			iframe = document.createElement("iframe");
-			iframe.dataset.pdfId = pdfIdKey(tab.pdfId);
-			panel.appendChild(iframe);
-		}
-		panel.hidden = !selected;
-		iframe.title = tab.title;
-		if (iframe.getAttribute("src") !== tab.viewerUrl) iframe.src = tab.viewerUrl;
-		panels.appendChild(panel);
-	}
-}
-
-function connectAppEvents() {
-	const events = new EventSource("/app-events");
-	events.addEventListener("open", () => document.body.setAttribute("data-app-events", "connected"));
-	events.addEventListener("error", () => document.body.setAttribute("data-app-events", "disconnected"));
-	events.addEventListener("message", (event) => {
-		const message = JSON.parse(event.data);
-		if (message.type === "open_pdf" || message.type === "focus_pdf") openOrFocusTab(message);
-	});
-}
-
-window.__hostAppShellRawMouseDebug = () => recentAppShellRawMouseEvents.slice();
-bindAppShellViewerShortcuts();
-renderTabs();
-connectAppEvents();
 `;
 
 export interface ViewerHostFileSystem {
@@ -337,11 +98,7 @@ export interface ViewerHostServerOptions {
 	verifyPdfMaybeUpdated?: (record: ViewerHostPdfRecord) => Promise<void> | void;
 	mcpEventSink?: (message: ViewerHostToMcpMessage) => Promise<void> | void;
 	pdfChangeDetection?: ViewerHostPdfChangeDetectionOptions;
-}
-
-export interface ViewerHostServerAddress {
-	host: "127.0.0.1";
-	port: number;
+	accessPolicy?: ViewerHostAccessPolicy;
 }
 
 export class ViewerHostServer {
@@ -354,6 +111,7 @@ export class ViewerHostServer {
 	private readonly pdfChangeDebounceMs: number;
 	private readonly pdfChangePollIntervalMs: number;
 	private readonly nowMs: () => number;
+	private readonly accessPolicy: ViewerHostAccessPolicy;
 	private controlReady = false;
 	private controlProtocolVersion: number | undefined;
 	private server: Server | undefined;
@@ -381,6 +139,7 @@ export class ViewerHostServer {
 		this.pdfChangeDebounceMs = nonNegativeNumber(options.pdfChangeDetection?.debounceMs, 250);
 		this.pdfChangePollIntervalMs = nonNegativeNumber(options.pdfChangeDetection?.pollIntervalMs, 1_000);
 		this.nowMs = options.pdfChangeDetection?.nowMs ?? (() => Date.now());
+		this.accessPolicy = options.accessPolicy ?? DEFAULT_VIEWER_HOST_ACCESS_POLICY;
 	}
 
 	get origin(): string {
@@ -393,6 +152,10 @@ export class ViewerHostServer {
 		return this.addressValue;
 	}
 
+	get appUrl(): string {
+		return this.accessPolicy.appUrl(this.origin);
+	}
+
 	get controlStatus(): ViewerHostControlStatus {
 		return {
 			ready: this.controlReady,
@@ -401,7 +164,7 @@ export class ViewerHostServer {
 	}
 
 	pdfUrl(pdfId: number, revision: number): string {
-		return `${this.origin}/pdf/${pdfId}?revision=${revision}`;
+		return this.accessPolicy.pdfUrl(this.origin, pdfId, revision);
 	}
 
 	getConnectedViewerCount(pdfId: number): number {
@@ -449,7 +212,7 @@ export class ViewerHostServer {
 		try {
 			await new Promise<void>((resolve, reject) => {
 				server.once("error", reject);
-				server.listen({ host: LOCAL_HOST, port: this.port }, () => {
+				server.listen({ host: this.accessPolicy.bindHost, port: this.port }, () => {
 					server.off("error", reject);
 					resolve();
 				});
@@ -465,8 +228,8 @@ export class ViewerHostServer {
 		if (!address || typeof address === "string") {
 			throw new Error("Viewer Host Server did not expose a TCP address");
 		}
-		this.addressValue = { host: LOCAL_HOST, port: address.port };
-		this.originValue = `http://${LOCAL_HOST}:${address.port}`;
+		this.addressValue = { host: this.accessPolicy.bindHost, port: address.port };
+		this.originValue = this.accessPolicy.originForAddress(this.addressValue);
 		this.startPdfChangePolling();
 	}
 
@@ -559,7 +322,7 @@ export class ViewerHostServer {
 		}
 
 		if (requestUrl.pathname === "/assets/viewer-client-tabs.js") {
-			textResponse(response, 200, "text/javascript; charset=utf-8", VIEWER_CLIENT_TABS_SCRIPT, request.method === "HEAD");
+			this.serveViewerClientAsset(response, "viewer-client-tabs.js", request.method === "HEAD");
 			return;
 		}
 
@@ -639,46 +402,11 @@ export class ViewerHostServer {
 	}
 
 	private serveAppShell(response: ServerResponse, headOnly: boolean): void {
-		const body = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Viewer Client</title>
-<style>
-*{box-sizing:border-box}
-html,body{width:100%;height:100%;min-width:0;min-height:0;margin:0;overflow:hidden}
-body{font-family:sans-serif;background:#f7f7f7;color:#222;position:fixed;inset:0}
-#viewer-client-app{display:flex;flex-direction:column;width:100%;height:100vh;min-width:0;min-height:0;overflow:hidden}
-header{flex:0 0 auto;display:flex;align-items:center;gap:1rem;min-width:0;padding:.5rem .75rem;background:#1f2937;color:white}
-h1{font-size:1rem;margin:0;white-space:nowrap}
-[role=tablist]{display:flex;gap:.25rem;min-width:0;overflow:auto}
-.tab-item{display:flex;background:#374151;border-radius:.25rem;overflow:hidden}
-button{font:inherit}
-[role=tab],button[data-close-pdf-id]{border:0;color:white;background:transparent;padding:.35rem .55rem;cursor:pointer}
-[role=tab][aria-selected=true]{background:#f7f7f7;color:#111827}
-button[data-close-pdf-id]{border-left:1px solid #4b5563}
-#empty-state{flex:0 0 auto;margin:2rem;text-align:center;color:#555}
-#empty-state[hidden]{display:none!important}
-#viewer-panels{flex:1 1 auto;display:block;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
-[role=tabpanel]{display:block;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
-[role=tabpanel][hidden]{display:none!important}
-iframe{display:block;width:100%;height:100%;min-width:0;min-height:0;border:0;background:white;vertical-align:top}
-</style>
-</head>
-<body>
-<main id="viewer-client-app">
-<header>
-<h1>Viewer Client</h1>
-<nav id="tab-list" role="tablist" aria-label="Open PDFs"></nav>
-</header>
-<p id="empty-state">No PDF is open.</p>
-<div id="viewer-panels"></div>
-</main>
-<script type="module" src="/assets/viewer-client-tabs.js"></script>
-</body>
-</html>`;
-		textResponse(response, 200, "text/html; charset=utf-8", body, headOnly);
+		this.serveViewerClientAsset(response, "app.html", headOnly);
+	}
+
+	private serveViewerClientAsset(response: ServerResponse, relativeAssetPath: string, headOnly: boolean): void {
+		this.serveStaticFile(response, VIEWER_CLIENT_ASSET_ROOT, relativeAssetPath, headOnly);
 	}
 
 	private serveLaTeXWorkshopViewerShell(response: ServerResponse, pdfId: number, headOnly: boolean): void {
@@ -733,7 +461,7 @@ iframe{display:block;width:100%;height:100%;min-width:0;min-height:0;border:0;ba
 			return;
 		}
 		const token = this.viewerSocketTokenForPdf(record.pdfId);
-		const viewerSocketUrl = `${this.origin.replace(/^http:/, "ws:")}/viewer-socket?pdf_id=${record.pdfId}&token=${encodeURIComponent(token)}`;
+		const viewerSocketUrl = this.accessPolicy.viewerSocketUrl(this.origin, record.pdfId, token);
 		const body = JSON.stringify({
 			pdf_id: record.pdfId,
 			title: record.title,
@@ -863,7 +591,7 @@ iframe{display:block;width:100%;height:100%;min-width:0;min-height:0;border:0;ba
 			rejectWebSocketUpgrade(socket, 404, "unknown pdf_id");
 			return;
 		}
-		if (!isAllowedViewerSocketOrigin(request.headers.origin, this.origin)) {
+		if (!this.accessPolicy.isAllowedViewerSocketOrigin(request.headers.origin, this.origin)) {
 			rejectWebSocketUpgrade(socket, 403, "forbidden origin");
 			return;
 		}
@@ -962,68 +690,10 @@ iframe{display:block;width:100%;height:100%;min-width:0;min-height:0;border:0;ba
 		}
 	}
 
-	private hoverCandidateSummary(candidate: unknown): { source_file?: string; line: number; column?: number; source_line?: string; score?: number; structural?: boolean; distance?: number; distance_x?: number; distance_y?: number } | undefined {
-		if (typeof candidate !== "object" || candidate === null) return undefined;
-		const record = candidate as Record<string, unknown>;
-		if (typeof record.line !== "number") return undefined;
-		return {
-			...(typeof record.sourceFile === "string" ? { source_file: record.sourceFile } : typeof record.input === "string" ? { source_file: record.input } : {}),
-			line: record.line,
-			...(typeof record.column === "number" ? { column: record.column } : {}),
-			...(typeof record.sourceLine === "string" ? { source_line: record.sourceLine } : {}),
-			...(typeof record.score === "number" ? { score: record.score } : {}),
-			...(typeof record.structural === "boolean" ? { structural: record.structural } : {}),
-			...(typeof record.distance === "number" ? { distance: record.distance } : {}),
-			...(typeof record.distanceX === "number" ? { distance_x: record.distanceX } : {}),
-			...(typeof record.distanceY === "number" ? { distance_y: record.distanceY } : {}),
-		};
-	}
-
-	private hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Record<string, unknown> {
-		const nearestCandidate = this.hoverCandidateSummary(hover.rawWinner);
-		const candidates = hover.topCandidates?.map((candidate) => this.hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
-		return {
-			...(hover.precision === undefined ? {} : { precision: hover.precision }),
-			...(hover.repairedWinner?.score === undefined ? {} : { selected_score: hover.repairedWinner.score }),
-			...(nearestCandidate === undefined ? {} : { nearest_candidate: nearestCandidate }),
-			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision, ...(hover.repairedWinner.score === undefined ? {} : { score: hover.repairedWinner.score }) } }),
-			...(candidates === undefined || candidates.length === 0 ? {} : { candidates }),
-			...(hover.forwardVerification === undefined ? {} : { forward: { attempted: hover.forwardVerification.attempted, contains_click: hover.forwardVerification.containsClick, boxes_considered: hover.forwardVerification.boxesConsidered, boxes_filtered: hover.forwardVerification.boxesFiltered, ...(hover.forwardVerification.chosenBox === undefined ? {} : { chosen_box: hover.forwardVerification.chosenBox }) } }),
-		};
-	}
-
 	private handleReverseSynctexForwardProbeMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_forward_probe" }>): void {
 		try {
 			const record = this.registry.getPdf(connection.pdfId);
-			const probeInput = { pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y, ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) };
-			let probe;
-			try {
-				probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: record.workspaceCwd ?? dirname(record.pdfPath) });
-			} catch (error) {
-				if (record.workspaceCwd === undefined || record.workspaceCwd === dirname(record.pdfPath)) throw error;
-				probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: dirname(record.pdfPath) });
-			}
-			sendViewerSocketJson(connection, {
-				type: "reverse_synctex_forward_probe_result",
-				pdf_id: connection.pdfId,
-				request_id: message.request_id,
-				click_page: message.page,
-				click_x: message.x,
-				click_y: message.y,
-				reverse_source_file: probe.reverse.sourceFile,
-				reverse_line: probe.reverse.line,
-				reverse_column: probe.reverse.column,
-				...(probe.reverse.sourceLine === undefined ? {} : { reverse_source_line: probe.reverse.sourceLine }),
-				page: probe.forward.page,
-				x: probe.forward.x,
-				y: probe.forward.y,
-				...(probe.forward.width === undefined ? {} : { width: probe.forward.width }),
-				...(probe.forward.height === undefined ? {} : { height: probe.forward.height }),
-				...(probe.forward.ranges === undefined ? {} : { ranges: probe.forward.ranges }),
-				...(probe.forward.indicator === undefined ? {} : { indicator: probe.forward.indicator }),
-				source_file: probe.forward.sourceFile,
-				line: probe.forward.line,
-			});
+			sendViewerSocketJson(connection, reverseSynctexForwardProbeResult({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } }));
 		} catch (error) {
 			sendViewerSocketJson(connection, { type: "reverse_synctex_forward_probe_result", pdf_id: connection.pdfId, request_id: message.request_id, click_page: message.page, click_x: message.x, click_y: message.y, error: errorMessage(error) });
 		}
@@ -1032,28 +702,7 @@ iframe{display:block;width:100%;height:100%;min-width:0;min-height:0;border:0;ba
 	private handleReverseSynctexHoverMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_hover" }>): void {
 		try {
 			const record = this.registry.getPdf(connection.pdfId);
-			const hoverInput = { pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y, ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) };
-			let hover;
-			try {
-				hover = inspectReverseSynctexHover({ ...hoverInput, cwd: record.workspaceCwd ?? dirname(record.pdfPath) });
-			} catch (error) {
-				if (record.workspaceCwd === undefined || record.workspaceCwd === dirname(record.pdfPath)) throw error;
-				hover = inspectReverseSynctexHover({ ...hoverInput, cwd: dirname(record.pdfPath) });
-			}
-			sendViewerSocketJson(connection, {
-				type: "reverse_synctex_hover_result",
-				pdf_id: connection.pdfId,
-				request_id: message.request_id,
-				page: message.page,
-				x: message.x,
-				y: message.y,
-				source_file: hover.sourceFile,
-				line: hover.line,
-				column: hover.column,
-				...(hover.sourceLine === undefined ? {} : { source_line: hover.sourceLine }),
-				rect: hover.rect,
-				...this.hoverResultDiagnostics(hover),
-			});
+			sendViewerSocketJson(connection, reverseSynctexHoverResult({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } }));
 		} catch (error) {
 			sendViewerSocketJson(connection, { type: "reverse_synctex_hover_result", pdf_id: connection.pdfId, request_id: message.request_id, page: message.page, x: message.x, y: message.y, error: errorMessage(error) });
 		}
@@ -1101,7 +750,7 @@ iframe{display:block;width:100%;height:100%;min-width:0;min-height:0;border:0;ba
 			pdf_id: record.pdfId,
 			title: record.title,
 			revision: record.revision,
-			viewer_url: `/viewer-lw/${record.pdfId}?revision=${record.revision}`,
+			viewer_url: this.accessPolicy.viewerUrl(record.pdfId, record.revision),
 			visible_tab_token: this.createVisibleTabToken(),
 		};
 		this.visibleViewerClientTabs.delete(record.pdfId);
@@ -1314,10 +963,6 @@ function validateWebSocketUpgradeHeaders(request: IncomingMessage): string | und
 	const key = request.headers["sec-websocket-key"];
 	if (typeof key !== "string" || Buffer.from(key, "base64").length !== 16) return "invalid sec-websocket-key";
 	return undefined;
-}
-
-function isAllowedViewerSocketOrigin(origin: string | undefined, expectedOrigin: string): boolean {
-	return origin === undefined || origin === expectedOrigin;
 }
 
 function webSocketRejectReason(status: number): string {

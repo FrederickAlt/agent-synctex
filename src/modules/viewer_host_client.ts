@@ -1,11 +1,12 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomInt } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertReadablePdfFile, assertReadableSourceFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
-import { findUniqueSelectedTextSourceRange, inspectReverseSynctexHover, mapForwardSynctex, mapReverseSynctex } from "./synctex/forward_synctex.ts";
-import { PdfEventStore, type GetPdfEventsRequest, type PdfEvent, type ReverseSynctexSourceLocationEvent } from "./pdf_events.ts";
+import { mapReverseSynctex } from "./synctex/forward_synctex.ts";
+import { resolveForwardSynctexJump, reverseSynctexHoverResult, reverseSynctexPdfEventFromViewerMessage, type ReverseSynctexMapper } from "./synctex/synctex_resolution.ts";
+import { PdfEventStore, type GetPdfEventsRequest, type PdfEvent } from "./pdf_events.ts";
 import type {
 	HostServiceJumpRequest,
 	HostServiceJumpResponseEnvelope,
@@ -20,7 +21,6 @@ import {
 	type McpToViewerHostMessage,
 	type ViewerHostControlResponse,
 	type ViewerHostReverseSynctexHoverMessage,
-	type ViewerHostReverseSynctexHoverResultMessage,
 	type ViewerHostReverseSynctexMessage,
 	type ViewerHostToMcpMessage,
 } from "./viewer_host_protocol.ts";
@@ -424,8 +424,6 @@ async function waitForProcessExitOrKill(child: ChildProcess, timeoutMs: number):
 	});
 }
 
-type ReverseSynctexMapper = typeof mapReverseSynctex;
-
 export interface ViewerHostMcpServiceOptions {
 	client?: ViewerHostClient;
 	clientFactory?: ViewerHostClientFactory;
@@ -515,7 +513,7 @@ export class ViewerHostMcpService {
 			sourceFile = isAbsolute(sourceFile) ? resolve(sourceFile) : resolve(request.workspace_context.cwd, sourceFile);
 			assertReadableSourceFile(sourceFile);
 			assertReadablePdfFile(record.pdfPath);
-			const jump = mapForwardSynctex({ pdfPath: record.pdfPath, sourceFile, line: request.line, cwd: request.workspace_context.cwd });
+			const jump = resolveForwardSynctexJump({ pdfPath: record.pdfPath, sourceFile, line: request.line, cwd: request.workspace_context.cwd });
 			await this.sendWithReconnect({
 				type: "synctex_forward",
 				pdf_id: record.pdfId,
@@ -734,55 +732,10 @@ export class ViewerHostMcpService {
 		}
 	}
 
-	private hoverCandidateSummary(candidate: unknown): { source_file?: string; line: number; column?: number; source_line?: string; score?: number; structural?: boolean; distance?: number; distance_x?: number; distance_y?: number } | undefined {
-		if (typeof candidate !== "object" || candidate === null) return undefined;
-		const record = candidate as Record<string, unknown>;
-		if (typeof record.line !== "number") return undefined;
-		return {
-			...(typeof record.sourceFile === "string" ? { source_file: record.sourceFile } : typeof record.input === "string" ? { source_file: record.input } : {}),
-			line: record.line,
-			...(typeof record.column === "number" ? { column: record.column } : {}),
-			...(typeof record.sourceLine === "string" ? { source_line: record.sourceLine } : {}),
-			...(typeof record.score === "number" ? { score: record.score } : {}),
-			...(typeof record.structural === "boolean" ? { structural: record.structural } : {}),
-			...(typeof record.distance === "number" ? { distance: record.distance } : {}),
-			...(typeof record.distanceX === "number" ? { distance_x: record.distanceX } : {}),
-			...(typeof record.distanceY === "number" ? { distance_y: record.distanceY } : {}),
-		};
-	}
-
-	private hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Partial<ViewerHostReverseSynctexHoverResultMessage> {
-		const nearestCandidate = this.hoverCandidateSummary(hover.rawWinner);
-		const candidates = hover.topCandidates?.map((candidate) => this.hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
-		return {
-			...(hover.precision === undefined ? {} : { precision: hover.precision }),
-			...(hover.repairedWinner?.score === undefined ? {} : { selected_score: hover.repairedWinner.score }),
-			...(nearestCandidate === undefined ? {} : { nearest_candidate: nearestCandidate }),
-			...(hover.repairedWinner === undefined ? {} : { repaired: { source_file: hover.repairedWinner.sourceFile, line: hover.repairedWinner.line, column: hover.repairedWinner.column, ...(hover.repairedWinner.sourceLine === undefined ? {} : { source_line: hover.repairedWinner.sourceLine }), precision: hover.repairedWinner.precision, ...(hover.repairedWinner.score === undefined ? {} : { score: hover.repairedWinner.score }) } }),
-			...(candidates === undefined || candidates.length === 0 ? {} : { candidates }),
-			...(hover.forwardVerification === undefined ? {} : { forward: { attempted: hover.forwardVerification.attempted, contains_click: hover.forwardVerification.containsClick, boxes_considered: hover.forwardVerification.boxesConsidered, boxes_filtered: hover.forwardVerification.boxesFiltered, ...(hover.forwardVerification.chosenBox === undefined ? {} : { chosen_box: hover.forwardVerification.chosenBox }) } }),
-		};
-	}
-
 	private async sendReverseSynctexHoverResult(message: ViewerHostReverseSynctexHoverMessage): Promise<void> {
 		const record = this.getRecord(message.pdf_id);
-		const cwd = record.workspaceCwd || dirname(record.pdfPath);
 		try {
-			const hover = inspectReverseSynctexHover({ pdfPath: record.pdfPath, page: message.page, x: message.x, y: message.y, cwd, ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) });
-			await this.sendWithReconnect({
-				type: "reverse_synctex_hover_result",
-				pdf_id: message.pdf_id,
-				request_id: message.request_id,
-				page: message.page,
-				x: message.x,
-				y: message.y,
-				source_file: hover.sourceFile,
-				line: hover.line,
-				column: hover.column,
-				...(hover.sourceLine === undefined ? {} : { source_line: hover.sourceLine }),
-				rect: hover.rect,
-				...this.hoverResultDiagnostics(hover),
-			}, { reregisterBeforeSend: true });
+			await this.sendWithReconnect(reverseSynctexHoverResult({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } }), { reregisterBeforeSend: true });
 		} catch (error) {
 			await this.sendWithReconnect({
 				type: "reverse_synctex_hover_result",
@@ -796,140 +749,13 @@ export class ViewerHostMcpService {
 		}
 	}
 
-	private sourceLocationEventFromReverse(location: ReturnType<typeof mapReverseSynctex>, page: number, x: number, y: number): ReverseSynctexSourceLocationEvent {
-		return {
-			source_file: location.sourceFile,
-			line: location.line,
-			column: location.column,
-			...(location.sourceLine === undefined ? {} : { source_line: location.sourceLine }),
-			page,
-			x,
-			y,
-			precision: location.precision,
-			...(location.diagnostics.textRepair?.used === true ? { repair: "text_context" } : {}),
-			...(location.rawMappedLine === undefined ? {} : {
-				raw_mapped_source_file: location.rawMappedSourceFile,
-				raw_mapped_line: location.rawMappedLine,
-				raw_mapped_column: location.rawMappedColumn,
-				...(location.rawMappedSourceLine === undefined ? {} : { raw_mapped_source_line: location.rawMappedSourceLine }),
-			}),
-			synctex_diagnostics: location.diagnostics,
-		};
-	}
-
-	private withEndpointDiagnostics(repaired: ReverseSynctexSourceLocationEvent, mapped: ReturnType<typeof mapReverseSynctex> | undefined): ReverseSynctexSourceLocationEvent {
-		if (mapped === undefined) return repaired;
-		return {
-			...repaired,
-			...(mapped.rawMappedLine === undefined ? {} : {
-				raw_mapped_source_file: mapped.rawMappedSourceFile,
-				raw_mapped_line: mapped.rawMappedLine,
-				raw_mapped_column: mapped.rawMappedColumn,
-				...(mapped.rawMappedSourceLine === undefined ? {} : { raw_mapped_source_line: mapped.rawMappedSourceLine }),
-			}),
-			synctex_diagnostics: mapped.diagnostics,
-		};
-	}
-
-	private repairedSelectionEndpoints(location: ReturnType<typeof mapReverseSynctex>, selectedText: string | undefined, message: ViewerHostReverseSynctexMessage): { selectionStart?: ReverseSynctexSourceLocationEvent; selectionEnd?: ReverseSynctexSourceLocationEvent } {
-		if (selectedText === undefined) return {};
-		const range = findUniqueSelectedTextSourceRange(location.sourceFile, selectedText);
-		if (range === undefined) return {};
-		return {
-			selectionStart: { source_file: range.sourceFile, line: range.startLine, column: range.startColumn, ...(range.startSourceLine === undefined ? {} : { source_line: range.startSourceLine }), page: message.page, x: message.selectionStartX as number, y: message.selectionStartY as number, precision: "text", repair: "selected_text" },
-			selectionEnd: { source_file: range.sourceFile, line: range.endLine, column: range.endColumn, ...(range.endSourceLine === undefined ? {} : { source_line: range.endSourceLine }), page: message.page, x: message.selectionEndX as number, y: message.selectionEndY as number, precision: "text", repair: "selected_text" },
-		};
-	}
-
 	private appendReverseSynctexEvent(message: ViewerHostReverseSynctexMessage): void {
 		const record = this.getRecord(message.pdf_id);
-		const cwd = record.workspaceCwd || dirname(record.pdfPath);
-		const location = this.reverseSynctexMapper({
-			pdfPath: record.pdfPath,
-			page: message.page,
-			x: message.x,
-			y: message.y,
-			cwd,
-			...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }),
-			...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }),
-		});
-		const repairedSelection = message.selectedText !== undefined && message.selectionStartX !== undefined && message.selectionStartY !== undefined && message.selectionEndX !== undefined && message.selectionEndY !== undefined
-			? this.repairedSelectionEndpoints(location, message.selectedText, message)
-			: {};
-		let selectionStart: ReturnType<typeof mapReverseSynctex> | undefined;
-		let selectionStartError: string | undefined;
-		if (message.selectedText !== undefined && message.selectionStartX !== undefined && message.selectionStartY !== undefined) {
-			try {
-				selectionStart = this.reverseSynctexMapper({
-					pdfPath: record.pdfPath,
-					page: message.page,
-					x: message.selectionStartX,
-					y: message.selectionStartY,
-					cwd,
-					...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }),
-					textAfterSelection: message.selectedText,
-				});
-			} catch (error) {
-				selectionStartError = error instanceof Error ? error.message : String(error);
-			}
-			if (repairedSelection.selectionStart !== undefined) {
-				selectionStartError = undefined;
-			}
-		}
-		let selectionEnd: ReturnType<typeof mapReverseSynctex> | undefined;
-		let selectionEndError: string | undefined;
-		if (message.selectedText !== undefined && message.selectionEndX !== undefined && message.selectionEndY !== undefined) {
-			try {
-				selectionEnd = this.reverseSynctexMapper({
-					pdfPath: record.pdfPath,
-					page: message.page,
-					x: message.selectionEndX,
-					y: message.selectionEndY,
-					cwd,
-					textBeforeSelection: message.selectedText,
-					...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }),
-				});
-			} catch (error) {
-				selectionEndError = error instanceof Error ? error.message : String(error);
-			}
-			if (repairedSelection.selectionEnd !== undefined) {
-				selectionEndError = undefined;
-			}
-		}
-		this.eventStore.appendReverseSynctexEvent({
-			type: "reverse_synctex",
-			pdf_id: message.pdf_id,
-			source_file: location.sourceFile,
-			line: location.line,
-			column: location.column,
-			...(location.sourceLine === undefined ? {} : { source_line: location.sourceLine }),
-			synctex_diagnostics: location.diagnostics,
-			timestamp: new Date().toISOString(),
-			precision: location.precision,
-			...(location.diagnostics.textRepair?.used === true ? { repair: "text_context" } : {}),
-			page: message.page,
-			x: message.x,
-			y: message.y,
-			...(message.selectedText === undefined ? {} : { selected_text: message.selectedText }),
-			...(repairedSelection.selectionStart !== undefined ? { selection_start: this.withEndpointDiagnostics(repairedSelection.selectionStart, selectionStart) } : selectionStart === undefined ? {} : { selection_start: this.sourceLocationEventFromReverse(selectionStart, message.page, message.selectionStartX as number, message.selectionStartY as number) }),
-			...(repairedSelection.selectionEnd !== undefined ? { selection_end: this.withEndpointDiagnostics(repairedSelection.selectionEnd, selectionEnd) } : selectionEnd === undefined ? {} : { selection_end: this.sourceLocationEventFromReverse(selectionEnd, message.page, message.selectionEndX as number, message.selectionEndY as number) }),
-			...(selectionStartError === undefined ? {} : { selection_start_error: selectionStartError }),
-			...(selectionEndError === undefined ? {} : { selection_end_error: selectionEndError }),
-			...(location.rawMappedLine === undefined ? {} : {
-				raw_mapped_source_file: location.rawMappedSourceFile,
-				raw_mapped_line: location.rawMappedLine,
-				raw_mapped_column: location.rawMappedColumn,
-				...(location.rawMappedSourceLine === undefined ? {} : { raw_mapped_source_line: location.rawMappedSourceLine }),
-			}),
-			...(location.normalizedFormulaSpan === undefined ? {} : {
-				normalized_formula_span: {
-					source_file: location.normalizedFormulaSpan.sourceFile,
-					start_line: location.normalizedFormulaSpan.startLine,
-					end_line: location.normalizedFormulaSpan.endLine,
-				},
-				normalized_formula_excerpt: location.normalizedFormulaExcerpt,
-			}),
-		});
+		this.eventStore.appendReverseSynctexEvent(reverseSynctexPdfEventFromViewerMessage({
+			message,
+			pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd },
+			reverseSynctexMapper: this.reverseSynctexMapper,
+		}));
 	}
 
 	private resolvePdfPath(pdfPath: string, workspaceContext: HostServiceWorkspaceContext): string {

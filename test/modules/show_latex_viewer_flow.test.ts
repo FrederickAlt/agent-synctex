@@ -4,8 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest, MCP_ERROR_INVALID_PARAMS } from "../../src/modules/host_service_mcp.ts";
-import { PdfJsViewerMcpService, type BrowserLaunchResult, type BrowserLauncher } from "../../src/modules/pdfjs_viewer_mcp_service.ts";
-import { PdfJsViewerRegistry } from "../../src/modules/pdfjs_viewer_registry.ts";
+import { FakeViewerHostClient, ViewerHostMcpService } from "../../src/modules/viewer_host_client.ts";
 
 function writeFakeLatexmk(binDir: string, recordFile: string): void {
 	mkdirSync(binDir, { recursive: true, mode: 0o700 });
@@ -41,15 +40,7 @@ async function withPath(pathPrefix: string, run: () => Promise<void>): Promise<v
 	}
 }
 
-class RecordingBrowserLauncher implements BrowserLauncher {
-	readonly openedUrls: string[] = [];
-	async open(url: string): Promise<BrowserLaunchResult> {
-		this.openedUrls.push(url);
-		return { ok: true, command: "fake-browser", pid: 1234 };
-	}
-}
-
-async function callShowLatex(args: Record<string, unknown>, service: PdfJsViewerMcpService): Promise<Record<string, unknown>> {
+async function callShowLatex(args: Record<string, unknown>, service: ViewerHostMcpService): Promise<Record<string, unknown>> {
 	const response = await handleMcpRequest(JSON.stringify({
 		jsonrpc: "2.0",
 		id: 1,
@@ -73,8 +64,8 @@ test("show_latex schema exposes source and optional compiler but no inline or ra
 });
 
 test("show_latex rejects empty source and legacy inline arguments before compiling or opening a viewer", async () => {
-	const launcher = new RecordingBrowserLauncher();
-	const service = new PdfJsViewerMcpService({ browserLauncher: launcher });
+	const client = new FakeViewerHostClient();
+	const service = new ViewerHostMcpService({ client });
 	try {
 		let response = await callShowLatex({ source: "   " }, service);
 		assert.equal((response.error as { code?: number }).code, MCP_ERROR_INVALID_PARAMS);
@@ -82,19 +73,18 @@ test("show_latex rejects empty source and legacy inline arguments before compili
 		response = await callShowLatex({ source: "x", inline: false }, service);
 		assert.equal((response.error as { code?: number }).code, MCP_ERROR_INVALID_PARAMS);
 		assert.match((response.error as { message?: string }).message ?? "", /show_latex unknown argument: inline/);
-		assert.deepEqual(launcher.openedUrls, []);
+		assert.deepEqual(client.messages, []);
 	} finally {
 		await service.stop();
 	}
 });
 
-test("show_latex writes runtime preamble, compiles once with SyncTeX, registers PDF.js viewer, and returns viewer metadata", async () => {
+test("show_latex writes runtime preamble, compiles once with SyncTeX, registers Viewer Host PDF, and returns viewer metadata", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "show-latex-viewer-flow-"));
 	const binDir = join(dir, "bin");
 	const recordFile = join(dir, "latexmk-records.jsonl");
-	const launcher = new RecordingBrowserLauncher();
-	const registry = new PdfJsViewerRegistry({ makePdfId: () => 4242 });
-	const service = new PdfJsViewerMcpService({ registry, browserLauncher: launcher });
+	const client = new FakeViewerHostClient({ origin: "http://127.0.0.1:43125" });
+	const service = new ViewerHostMcpService({ client, makePdfId: () => 4242 });
 	writeFakeLatexmk(binDir, recordFile);
 	writeFileSync(join(dir, "preamble.tex"), "\\usepackage{physics}\n\\newcommand{\\runtimeMacro}{R}\n");
 	try {
@@ -112,8 +102,8 @@ test("show_latex writes runtime preamble, compiles once with SyncTeX, registers 
 			assert.equal(typeof result.details.source, "string");
 			assert.equal(typeof result.details.log, "string");
 			assert.equal(typeof result.details.viewer_url, "string");
-			assert.match(result.content[0].text, /viewer_url=http:\/\/127\.0\.0\.1:/);
-			assert.deepEqual(launcher.openedUrls, [result.details.viewer_url]);
+			assert.match(result.content[0].text, /viewer_url=http:\/\/127\.0\.0\.1:43125\/viewer-lw\/4242/);
+			assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf"]);
 			assert.equal(result.details.inline, undefined);
 			assert.equal(result.details.inline_preview, undefined);
 			assert.equal(result.details.inline_previews, undefined);

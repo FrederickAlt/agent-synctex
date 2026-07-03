@@ -4,16 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
-import { PdfJsViewerMcpService, type BrowserLauncher } from "../../src/modules/pdfjs_viewer_mcp_service.ts";
-import { PdfJsViewerRegistry } from "../../src/modules/pdfjs_viewer_registry.ts";
-
-class FakeBrowserLauncher implements BrowserLauncher {
-	readonly urls: string[] = [];
-	async open(url: string): ReturnType<BrowserLauncher["open"]> {
-		this.urls.push(url);
-		return { ok: true, command: "fake-browser" };
-	}
-}
+import { FakeViewerHostClient, ViewerHostMcpService } from "../../src/modules/viewer_host_client.ts";
 
 function writeFakeLatexmk(binDir: string, stateDir: string): void {
 	mkdirSync(binDir, { recursive: true, mode: 0o700 });
@@ -61,7 +52,7 @@ async function withPath<T>(pathValue: string, run: () => Promise<T>): Promise<T>
 	}
 }
 
-function callCompile(args: Record<string, unknown>, service: PdfJsViewerMcpService): Promise<unknown> {
+function callCompile(args: Record<string, unknown>, service: ViewerHostMcpService): Promise<unknown> {
 	return handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "compile_latex_file", arguments: args } }), service.pdfOperations);
 }
 
@@ -70,7 +61,7 @@ test("compile_latex_file performs one fake one-shot compile and returns source/p
 	const stateDir = join(baseDir, "state");
 	writeFakeLatexmk(join(baseDir, "bin"), stateDir);
 	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}Hi\\end{document}\n");
-	const service = new PdfJsViewerMcpService({ browserLauncher: new FakeBrowserLauncher(), pdfRefresh: { autoStart: false } });
+	const service = new ViewerHostMcpService({ client: new FakeViewerHostClient() });
 	try {
 		await withPath(`${join(baseDir, "bin")}:${process.env.PATH ?? ""}`, async () => {
 			const response = await callCompile({ latex_file_path: "paper.tex", compiler: "lualatex", hide_warnings: false, workspace_context: { cwd: baseDir } }, service) as { result?: { isError?: boolean; details?: Record<string, unknown> } };
@@ -97,7 +88,7 @@ test("compile_latex_file compile-only calls invoke the compiler every time inste
 	const sourcePath = join(baseDir, "paper.tex");
 	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}Hi\\end{document}\n");
 	utimesSync(sourcePath, 1, 1);
-	const service = new PdfJsViewerMcpService({ browserLauncher: new FakeBrowserLauncher(), pdfRefresh: { autoStart: false } });
+	const service = new ViewerHostMcpService({ client: new FakeViewerHostClient() });
 	try {
 		await withPath(`${join(baseDir, "bin")}:${process.env.PATH ?? ""}`, async () => {
 			await callCompile({ latex_file_path: "paper.tex", workspace_context: { cwd: baseDir } }, service);
@@ -118,7 +109,7 @@ test("compile_latex_file clean=true removes same-basename artifacts before compi
 	for (const extension of [".aux", ".log", ".pdf", ".toc"]) {
 		writeFileSync(join(baseDir, `paper${extension}`), `stale ${extension}\n`);
 	}
-	const service = new PdfJsViewerMcpService({ browserLauncher: new FakeBrowserLauncher(), pdfRefresh: { autoStart: false } });
+	const service = new ViewerHostMcpService({ client: new FakeViewerHostClient() });
 	try {
 		await withPath(`${join(baseDir, "bin")}:${process.env.PATH ?? ""}`, async () => {
 			const response = await callCompile({ latex_file_path: "paper.tex", clean: true, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: { cleaned_artifacts?: string[] } } };
@@ -135,33 +126,22 @@ test("compile_latex_file clean=true removes same-basename artifacts before compi
 	}
 });
 
-test("compile_latex_file open_pdf uses PDF.js viewer and refreshes an already tracked PDF", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "compile-file-mcp-open-refresh-"));
+test("compile_latex_file open_pdf uses Viewer Host and reuses an already tracked PDF", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "compile-file-mcp-open-reuse-"));
 	const stateDir = join(baseDir, "state");
 	writeFakeLatexmk(join(baseDir, "bin"), stateDir);
 	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}Hi\\end{document}\n");
-	const launcher = new FakeBrowserLauncher();
-	const registry = new PdfJsViewerRegistry({ makePdfId: () => 42 });
-	const service = new PdfJsViewerMcpService({ browserLauncher: launcher, registry, pdfRefresh: { autoStart: false } });
+	const client = new FakeViewerHostClient({ origin: "http://127.0.0.1:43125" });
+	const service = new ViewerHostMcpService({ client, makePdfId: () => 42 });
 	try {
 		await withPath(`${join(baseDir, "bin")}:${process.env.PATH ?? ""}`, async () => {
 			const first = await callCompile({ latex_file_path: "paper.tex", open_pdf: true, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 			assert.equal(first.result?.details?.pdf_id, 42);
-			assert.match(String(first.result?.details?.viewer_url), /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/42$/);
-			const notifications: string[] = [];
-			registry.addClient(42, { send: (message) => notifications.push(message) });
+			assert.equal(first.result?.details?.viewer_url, "http://127.0.0.1:43125/viewer-lw/42");
 
 			const second = await callCompile({ latex_file_path: "paper.tex", open_pdf: true, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 			assert.equal(second.result?.details?.pdf_id, 42);
-			assert.equal(registry.activeCount, 1);
-			assert.equal(launcher.urls.length, 2);
-			assert.equal(notifications.length, 1);
-			assert.deepEqual(JSON.parse(notifications[0]), {
-				type: "pdf_refresh",
-				pdf_id: 42,
-				revision: 2,
-				pdf_url: String(first.result?.details?.viewer_url).replace(/\/viewer-lw\/42$/, "/pdf/42?revision=2"),
-			});
+			assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "focus_pdf"]);
 			assert.equal(readFileSync(join(stateDir, "count.txt"), "utf8"), "2");
 		});
 	} finally {
@@ -176,7 +156,7 @@ test("compile_latex_file surfaces fake compiler failures with log and diagnostic
 	writeFakeLatexmk(join(baseDir, "bin"), stateDir);
 	writeFileSync(join(baseDir, "paper.tex"), "\\documentclass{article}\n\\begin{document}\\bad\\end{document}\n");
 	writeFileSync(join(stateDir, "fail"), "1");
-	const service = new PdfJsViewerMcpService({ browserLauncher: new FakeBrowserLauncher(), pdfRefresh: { autoStart: false } });
+	const service = new ViewerHostMcpService({ client: new FakeViewerHostClient() });
 	try {
 		await withPath(`${join(baseDir, "bin")}:${process.env.PATH ?? ""}`, async () => {
 			const response = await callCompile({ latex_file_path: "paper.tex", workspace_context: { cwd: baseDir } }, service) as { result?: { isError?: boolean; details?: Record<string, unknown> } };
@@ -194,7 +174,7 @@ test("compile_latex_file surfaces fake compiler failures with log and diagnostic
 });
 
 test("compile_latex_file rejects removed continuous input", async () => {
-	const service = new PdfJsViewerMcpService({ browserLauncher: new FakeBrowserLauncher(), pdfRefresh: { autoStart: false } });
+	const service = new ViewerHostMcpService({ client: new FakeViewerHostClient() });
 	try {
 		const response = await callCompile({ latex_file_path: "paper.tex", continuous: true, workspace_context: { cwd: tmpdir() } }, service) as { error?: { code: number; message: string } };
 		assert.equal(response.error?.code, -32602);

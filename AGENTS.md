@@ -1,5 +1,9 @@
 # AGENTS
 
+## Architecture overview
+
+`CONTEXT.md` outlines the current repository architecture, active viewer/server split, important module ownership, and high-signal tests. Read it before making architectural, viewer, SyncTeX, MCP runtime, or compile-flow changes.
+
 ## Implementation lineage
 
 This implementation is based on/derived from the sibling LaTeX Workshop repo (`../latex-workshop`; this workspace may have it as `../LaTeX-Workshop`). When changing LaTeX build, SyncTeX, or PDF viewer behavior, compare the relevant behavior and design against that repo before diverging.
@@ -25,7 +29,7 @@ Before changing viewer architecture, refresh policy, SyncTeX behavior, or PDF.js
 For extension composition and transport, keep `index.ts` as the composition root:
 - `src/modules/pi_adapter/pi_adapter.ts` should remain the thin Pi dispatch adapter.
 - MCP tool protocol and tool schemas are implemented in `src/modules/host_service_mcp.ts`.
-- Keep runtime and artifact-facing operations in `src/modules/stdio_mcp_runtime.ts` and `src/modules/pdfjs_viewer_mcp_service.ts`.
+- Keep runtime and artifact-facing operations in `src/modules/stdio_mcp_runtime.ts` and `src/modules/viewer_host_client.ts`; do not reintroduce the removed legacy `pdfjs_viewer_*` stack.
 - `scripts/tex-actionsctl.ts`, `scripts/agent-synctex-host-service.ts`, and `scripts/pi_synctex_callback.mjs` are removed in this branch; do not reintroduce these entrypoints.
 
 Avoid reintroducing direct viewer-command spawning in production TypeScript. `test/viewer_guardrails.test.ts` is the production regression guard for this boundary.

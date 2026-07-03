@@ -24,7 +24,7 @@ export async function startDesktopViewerHostForDesktopWrapper(options: DesktopVi
 		registry,
 		server,
 		origin,
-		appUrl: `${origin}/app`,
+		appUrl: server.appUrl,
 		address: server.address,
 		shutdown: () => server.stop(),
 	};

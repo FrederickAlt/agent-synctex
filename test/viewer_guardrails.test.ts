@@ -771,7 +771,7 @@ test("Active MCP runtime import graph excludes legacy host-service/runtime proto
 });
 
 
-test("Legacy daemon entrypoints are removed", () => {
+test("Legacy viewer and daemon entrypoints are removed", () => {
 	const hostServicePath = join(REPO_ROOT, "systemd", "show-latex.service");
 	const legacyHostServicePath = join(REPO_ROOT, "systemd", "codex-show-latex-viewer.service");
 	const texActionsCtlPath = join(REPO_ROOT, "scripts", "tex-actionsctl.ts");
@@ -779,6 +779,11 @@ test("Legacy daemon entrypoints are removed", () => {
 	const callbackScriptPath = join(REPO_ROOT, "scripts", "pi_synctex_callback.mjs");
 	const pdfjsViewerBrokerScriptPath = join(REPO_ROOT, "scripts", "pdfjs-viewer-broker.ts");
 	const pdfjsViewerBrokerModulePath = join(REPO_ROOT, "src", "modules", "pdfjs_viewer_broker.ts");
+	const legacyPdfjsViewerModules = [
+		"pdfjs_viewer_mcp_service.ts",
+		"pdfjs_viewer_registry.ts",
+		"pdfjs_viewer_server.ts",
+	].map((file) => join(REPO_ROOT, "src", "modules", file));
 
 	assert.equal(existsSync(hostServicePath), false, "systemd unit should be absent for stdio-hosted runtime");
 	assert.equal(existsSync(legacyHostServicePath), false, "legacy daemon unit filename should be removed");
@@ -787,6 +792,9 @@ test("Legacy daemon entrypoints are removed", () => {
 	assert.equal(existsSync(callbackScriptPath), false, "legacy callback script should be removed");
 	assert.equal(existsSync(pdfjsViewerBrokerScriptPath), false, "detached PDF.js viewer broker entrypoint should be removed");
 	assert.equal(existsSync(pdfjsViewerBrokerModulePath), false, "detached PDF.js viewer broker module should be removed");
+	for (const legacyPdfjsViewerModule of legacyPdfjsViewerModules) {
+		assert.equal(existsSync(legacyPdfjsViewerModule), false, "legacy PdfJsViewer module should be removed in favor of Viewer Host");
+	}
 });
 
 

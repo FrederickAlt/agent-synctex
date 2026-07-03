@@ -60,6 +60,13 @@ let latestHoverRequestId = 0;
 let probeRequestId = 0;
 let latestProbeRequestId = 0;
 
+const synctexOverlayState = {
+  forwardMessage: undefined,
+  hoverResult: undefined,
+  probeResult: undefined,
+  redrawTimer: undefined,
+};
+
 const navigationHistory = {
   back: [],
   forward: [],
@@ -647,7 +654,11 @@ function scrollOverlayIntoView(markers) {
   if (pdfViewer()?.scrollMode === 1) container.scrollLeft += markerRect.left - containerRect.left - container.clientWidth * 0.2;
 }
 
-function renderSynctexOverlay(message, { selector, datasetName, label } = {}) {
+function usesForwardSynctexBoxStyle(datasetName) {
+  return datasetName === "synctexMarker" || datasetName === "reverseSynctexForwardProbe";
+}
+
+function renderSynctexOverlay(message, { selector, datasetName, label, scroll = true } = {}) {
   const pageNumber = Number(message.page);
   const page = pageElement(pageNumber);
   const viewport = pageViewport(pageNumber);
@@ -679,19 +690,39 @@ function renderSynctexOverlay(message, { selector, datasetName, label } = {}) {
     } else {
       marker.style.width = `${position.width}px`;
       marker.style.height = `${position.height}px`;
-      marker.style.background = datasetName === "reverseSynctexForwardProbe" ? "rgba(239,68,68,.18)" : "rgba(0,0,255,.35)";
-      marker.style.outline = datasetName === "reverseSynctexForwardProbe" ? "2px solid rgba(239,68,68,.9)" : "1px solid rgba(37,99,235,.85)";
+      marker.style.background = usesForwardSynctexBoxStyle(datasetName) ? "rgba(239,68,68,.18)" : "rgba(0,0,255,.35)";
+      marker.style.outline = usesForwardSynctexBoxStyle(datasetName) ? "2px solid rgba(239,68,68,.9)" : "1px solid rgba(37,99,235,.85)";
     }
     overlayParent.appendChild(marker);
     return marker;
   });
   if (label) overlayParent.appendChild(label);
-  scrollOverlayIntoView(markers);
+  if (scroll) scrollOverlayIntoView(markers);
   return true;
 }
 
-function showSynctexMarker(message) {
-  return renderSynctexOverlay(message, { selector: "[data-synctex-marker]", datasetName: "synctexMarker" });
+function redrawSynctexOverlays() {
+  synctexOverlayState.redrawTimer = undefined;
+  if (synctexOverlayState.forwardMessage) renderSynctexOverlay(synctexOverlayState.forwardMessage, { selector: "[data-synctex-marker]", datasetName: "synctexMarker", scroll: false });
+  if (synctexOverlayState.hoverResult) showHoverResult(synctexOverlayState.hoverResult, { scroll: false, remember: false });
+  if (synctexOverlayState.probeResult) showProbeResult(synctexOverlayState.probeResult, { scroll: false, remember: false });
+}
+
+function scheduleSynctexOverlayRedraw() {
+  if (synctexOverlayState.redrawTimer !== undefined) return;
+  synctexOverlayState.redrawTimer = setTimeout(() => requestAnimationFrame(redrawSynctexOverlays), 50);
+}
+
+function installSynctexOverlayRedrawHandlers() {
+  window.addEventListener("resize", scheduleSynctexOverlayRedraw, { passive: true });
+  app()?.eventBus?.on?.("scalechanging", scheduleSynctexOverlayRedraw);
+  app()?.eventBus?.on?.("pagerendered", scheduleSynctexOverlayRedraw);
+  app()?.eventBus?.on?.("pagesloaded", scheduleSynctexOverlayRedraw);
+}
+
+function showSynctexMarker(message, options = {}) {
+  if (options.remember !== false) synctexOverlayState.forwardMessage = message;
+  return renderSynctexOverlay(message, { selector: "[data-synctex-marker]", datasetName: "synctexMarker", scroll: options.scroll !== false });
 }
 
 function clientPointToPdfPoint(event, pageNumber) {
@@ -1092,8 +1123,9 @@ function hoverRectPosition(rect, page, viewport) {
   };
 }
 
-function showHoverResult(message) {
+function showHoverResult(message, options = {}) {
   if (!hostState.hoverEnabled || Number(message.request_id) !== latestHoverRequestId) return;
+  if (options.remember !== false) synctexOverlayState.hoverResult = message;
   removeOverlays("[data-reverse-synctex-hover]");
   if (message.error || !message.rect) return;
   const pageNumber = Number(message.page);
@@ -1122,15 +1154,16 @@ function showHoverResult(message) {
   overlayParent.append(marker, label);
 }
 
-function showProbeResult(message) {
+function showProbeResult(message, options = {}) {
   if (Number(message.request_id) !== latestProbeRequestId) return;
+  if (options.remember !== false) synctexOverlayState.probeResult = message;
   const label = document.createElement("div");
   label.dataset.reverseSynctexForwardProbe = "label";
   label.className = "hostSynctexOverlayLabel";
   label.textContent = message.error ? String(message.error) : `reverse line ${String(message.reverse_line || message.line || "?")} -> forward boxes`;
   label.style.left = "0px";
   label.style.top = "0px";
-  renderSynctexOverlay(message, { selector: "[data-reverse-synctex-forward-probe]", datasetName: "reverseSynctexForwardProbe", label });
+  renderSynctexOverlay(message, { selector: "[data-reverse-synctex-forward-probe]", datasetName: "reverseSynctexForwardProbe", label, scroll: options.scroll !== false });
 }
 
 function installPageEventHandlers() {
@@ -1254,6 +1287,7 @@ installWebViewerLoadedConfigListener();
 await import("/viewer-lw/viewer.mjs");
 forceShowLaTeXWorkshopChrome();
 installNavigationHistoryControls();
+installSynctexOverlayRedrawHandlers();
 installHoverToolbarButton();
 installToolsHitboxFallback();
 installPageEventHandlers();
