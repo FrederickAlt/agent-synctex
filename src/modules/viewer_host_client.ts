@@ -730,7 +730,7 @@ export class ViewerHostMcpService {
 	private updateViewerUrlsForSession(session: ActiveViewerHostSession): void {
 		const origin = session.client.origin.replace(/\/$/, "");
 		for (const record of this.recordsById.values()) {
-			record.viewerUrl = `${origin}/viewer/${record.pdfId}`;
+			record.viewerUrl = `${origin}/viewer-lw/${record.pdfId}`;
 		}
 	}
 
@@ -959,7 +959,7 @@ export class ViewerHostMcpService {
 
 	private setRecordViewerUrl(record: TrackedViewerHostPdf, session: Pick<ActiveViewerHostSession, "client">): void {
 		const origin = session.client.origin.replace(/\/$/, "");
-		record.viewerUrl = `${origin}/viewer/${record.pdfId}`;
+		record.viewerUrl = `${origin}/viewer-lw/${record.pdfId}`;
 	}
 
 	private allocatePdfId(): number {

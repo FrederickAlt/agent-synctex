@@ -147,7 +147,7 @@ test("compile_latex_file open_pdf uses PDF.js viewer and refreshes an already tr
 		await withPath(`${join(baseDir, "bin")}:${process.env.PATH ?? ""}`, async () => {
 			const first = await callCompile({ latex_file_path: "paper.tex", open_pdf: true, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 			assert.equal(first.result?.details?.pdf_id, 42);
-			assert.match(String(first.result?.details?.viewer_url), /^http:\/\/127\.0\.0\.1:\d+\/viewer\/42$/);
+			assert.match(String(first.result?.details?.viewer_url), /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/42$/);
 			const notifications: string[] = [];
 			registry.addClient(42, { send: (message) => notifications.push(message) });
 
@@ -160,7 +160,7 @@ test("compile_latex_file open_pdf uses PDF.js viewer and refreshes an already tr
 				type: "pdf_refresh",
 				pdf_id: 42,
 				revision: 2,
-				pdf_url: String(first.result?.details?.viewer_url).replace(/\/viewer\/42$/, "/pdf/42?revision=2"),
+				pdf_url: String(first.result?.details?.viewer_url).replace(/\/viewer-lw\/42$/, "/pdf/42?revision=2"),
 			});
 			assert.equal(readFileSync(join(stateDir, "count.txt"), "utf8"), "2");
 		});

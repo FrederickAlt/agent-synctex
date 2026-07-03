@@ -14,3 +14,7 @@ tmux-out-*.log
 __pycache__/
 *.pyc
 .skylos
+
+node_modules
+
+.repowise

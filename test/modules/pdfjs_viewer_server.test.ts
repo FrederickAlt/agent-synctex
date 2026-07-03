@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -10,8 +9,6 @@ import { Readable } from "node:stream";
 import { test } from "node:test";
 import { PdfJsViewerRegistry } from "../../src/modules/pdfjs_viewer_registry.ts";
 import { PdfJsViewerServer } from "../../src/modules/pdfjs_viewer_server.ts";
-
-const require = createRequire(import.meta.url);
 
 function writeFakePdf(path: string, suffix = "body"): Buffer {
 	const bytes = Buffer.from(`%PDF-1.4\n${suffix}\n%%EOF\n`, "utf8");
@@ -116,7 +113,7 @@ function encodeClientWebSocketTextFrame(message: string): Buffer {
 	return Buffer.concat([header, mask, maskedPayload]);
 }
 
-test("PDF.js viewer server serves shell/config/assets and registered PDF bytes only", async () => {
+test("PDF.js viewer server redirects legacy viewer route to LaTeX Workshop viewer and serves registered PDF bytes only", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "pdfjs-server-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	const pdfBytes = writeFakePdf(pdfPath);
@@ -125,39 +122,43 @@ test("PDF.js viewer server serves shell/config/assets and registered PDF bytes o
 	try {
 		await server.start();
 		const record = registry.registerPdf({ pdfPath, viewerUrl: server.viewerUrl(5) });
+		assert.equal(record.viewerUrl, `${server.origin}/viewer-lw/${record.pdfId}`);
+
+		const legacyViewer = await readHttp(`${server.origin}/viewer/${record.pdfId}`, { redirect: "manual" });
+		assert.equal(legacyViewer.status, 302);
+		assert.equal(legacyViewer.headers.get("location"), `/viewer-lw/${record.pdfId}`);
 
 		const shell = await readHttp(record.viewerUrl);
 		assert.equal(shell.status, 200);
 		assert.match(shell.contentType, /text\/html/);
 		const shellHtml = shell.body.toString("utf8");
-		assert.match(shellHtml, /PDF\.js/);
-		assert.match(shellHtml, /viewer script failed to load/i);
-		assertNoExternalUrls("viewer shell", shellHtml);
+		assert.match(shellHtml, /viewer-lw\/build\/pdf\.mjs/);
+		assert.match(shellHtml, /viewer-lw\/host_lw_adapter\.mjs/);
+		assert.doesNotMatch(shellHtml, /<h1>PDF\.js viewer<\/h1>|id="status"|id="pages"|fallback-link|\/assets\/viewer\.js/);
+		assert.doesNotMatch(shellHtml, /Open registered PDF bytes directly|Use the direct PDF link|direct PDF link|Direct PDF fallback/i);
 
 		const config = await readHttp(`${server.origin}/config/${record.pdfId}.json`);
 		assert.equal(config.status, 200);
 		assert.match(config.contentType, /application\/json/);
-		assert.equal(JSON.parse(config.body.toString("utf8")).pdf_id, record.pdfId);
+		const parsedConfig = JSON.parse(config.body.toString("utf8"));
+		assert.equal(parsedConfig.pdf_id, record.pdfId);
+		assert.equal(parsedConfig.viewer_socket_url, `${server.origin.replace(/^http:/, "ws:")}/ws?pdf_id=${record.pdfId}`);
 
-		const asset = await readHttp(`${server.origin}/assets/viewer.js`);
-		assert.equal(asset.status, 200);
-		assert.match(asset.contentType, /javascript/);
-		const viewerScript = asset.body.toString("utf8");
-		assertNoExternalUrls("viewer script", viewerScript);
-		assert.match(viewerScript, /pdf_refresh/);
-		assert.match(viewerScript, /synctex/);
-		assert.match(viewerScript, /canvas\.offsetHeight - \(event\.clientY - rect\.top\)/);
-		assert.match(viewerScript, /window\.scrollTo/);
-		assert.doesNotMatch(viewerScript, /location\.reload|viewer_reload/);
+		const removedOldAsset = await readHttp(`${server.origin}/assets/viewer.js`);
+		assert.equal(removedOldAsset.status, 404);
 
-		const pdfJs = await readHttp(`${server.origin}/assets/pdf.mjs`);
+		const lwAdapter = await readHttp(`${server.origin}/viewer-lw/host_lw_adapter.mjs`);
+		assert.equal(lwAdapter.status, 200);
+		assert.match(lwAdapter.contentType, /javascript/);
+		assert.match(lwAdapter.body.toString("utf8"), /viewer_socket_url/);
+		const pdfJs = await readHttp(`${server.origin}/viewer-lw/build/pdf.mjs`);
 		assert.equal(pdfJs.status, 200);
 		assert.match(pdfJs.contentType, /javascript/);
-		assert.equal(pdfJs.body.toString("utf8"), readFileSync(require.resolve("pdfjs-dist/legacy/build/pdf.mjs"), "utf8"));
-		const pdfWorker = await readHttp(`${server.origin}/assets/pdf.worker.mjs`);
+		assert.deepEqual(pdfJs.body, readFileSync("src/viewer_lw/build/pdf.mjs"));
+		const pdfWorker = await readHttp(`${server.origin}/viewer-lw/build/pdf.worker.mjs`);
 		assert.equal(pdfWorker.status, 200);
 		assert.match(pdfWorker.contentType, /javascript/);
-		assert.equal(pdfWorker.body.toString("utf8"), readFileSync(require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs"), "utf8"));
+		assert.deepEqual(pdfWorker.body, readFileSync("src/viewer_lw/build/pdf.worker.mjs"));
 
 		const pdf = await readHttp(`${server.origin}/pdf/${record.pdfId}`);
 		assert.equal(pdf.status, 200);
@@ -276,7 +277,7 @@ test("PDF.js viewer server delivers synctex notifications to connected WebSocket
 		const message = JSON.parse(await readWebSocketTextFrame(socket));
 
 		assert.equal(notified, 1);
-		assert.deepEqual(message, { type: "synctex", pdf_id: record.pdfId, page: 2, x: 12.5, y: 34.75, source_file: "/tmp/main.tex", line: 9 });
+		assert.deepEqual(message, { type: "synctex_forward", pdf_id: record.pdfId, page: 2, x: 12.5, y: 34.75, source_file: "/tmp/main.tex", line: 9 });
 		socket.end();
 	} finally {
 		await server.stop();

@@ -1,0 +1,1284 @@
+/*
+ * Host adapter for the vendored LaTeX Workshop/PDF.js viewer route.
+ * This file is original glue for agent-synctex. The surrounding viewer UI files
+ * retain their upstream Apache-2.0 (PDF.js) and MIT (LaTeX Workshop) notices.
+ */
+
+const configUrl = document.body.dataset.configUrl;
+if (!configUrl) {
+  throw new Error("missing Host viewer config URL");
+}
+
+const failedAssetRequests = [];
+const MAX_FAILED_ASSET_REQUESTS = 20;
+
+function rememberFailedAssetRequest(value) {
+  if (!value || failedAssetRequests.length >= MAX_FAILED_ASSET_REQUESTS) return;
+  failedAssetRequests.push(String(value));
+}
+
+window.addEventListener("error", (event) => {
+  const target = event.target;
+  if (target instanceof HTMLScriptElement || target instanceof HTMLLinkElement || target instanceof HTMLImageElement) {
+    rememberFailedAssetRequest(target.src || target.href || target.currentSrc);
+  }
+}, true);
+
+globalThis.viewerTrim = 0;
+
+const response = await fetch(configUrl, { cache: "no-store" });
+if (!response.ok) {
+  throw new Error(`Host viewer config request failed: ${response.status}`);
+}
+const initialConfig = await response.json();
+
+const HOVER_THROTTLE_MS = 60;
+const NAVIGATION_SETTLE_MS = 200;
+const MIN_HISTORY_SCROLL_DELTA = 24;
+
+const hostState = {
+  config: initialConfig,
+  visibleRevision: Number(initialConfig.revision),
+  latestRevision: Number(initialConfig.revision),
+  refreshSerial: 0,
+  socketStatus: "disconnected",
+  lastError: undefined,
+  hoverEnabled: false,
+};
+let activeRefreshLoadingTask;
+let activeSocket;
+let reconnectTimer;
+let selectionGeneration = 0;
+let lastSelectionSignature;
+let lastSentSelectionSignature;
+let lastSentSelectionGeneration = -1;
+let pendingSelectionSend;
+let hoverTimer;
+let pendingHover;
+let hoverRequestId = 0;
+let latestHoverRequestId = 0;
+let probeRequestId = 0;
+let latestProbeRequestId = 0;
+
+const navigationHistory = {
+  back: [],
+  forward: [],
+  restoring: false,
+  lastSideButton: undefined,
+  lastSettledState: undefined,
+  pendingSettledTimer: undefined,
+  pendingStartState: undefined,
+};
+const recentRawMouseEvents = [];
+const MAX_RAW_MOUSE_EVENTS = 20;
+const MAX_NAVIGATION_HISTORY = 50;
+
+function forceShowLaTeXWorkshopChrome() {
+  document.querySelector(".toolbar")?.classList.remove("hide");
+  document.body.classList.add("host-lw-toolbar-visible");
+}
+
+function app() {
+  return globalThis.PDFViewerApplication;
+}
+
+function pdfViewer() {
+  return app()?.pdfViewer;
+}
+
+function viewerContainer() {
+  return document.getElementById("viewerContainer");
+}
+
+function viewerSocketOpen() {
+  return activeSocket && activeSocket.readyState === WebSocket.OPEN;
+}
+
+function sendViewerSocketPayload(payload) {
+  if (!viewerSocketOpen()) return false;
+  activeSocket.send(JSON.stringify(payload));
+  return true;
+}
+
+function viewerLoadedState(extra = {}) {
+  const application = app();
+  const viewer = application?.pdfViewer;
+  const pageInput = document.getElementById("pageNumber");
+  const numPages = application?.pdfDocument?.numPages;
+  const pagesCount = viewer?.pagesCount;
+  const renderedPages = Array.from(document.querySelectorAll("#viewer .page[data-page-number]"));
+  const loadedPages = renderedPages.filter((page) => page.getAttribute("data-loaded") === "true").length;
+  const canvases = Array.from(document.querySelectorAll("#viewer .page[data-page-number] canvas"));
+  const renderedCanvases = canvases.filter((canvas) => canvas.width > 0 && canvas.height > 0).length;
+  return {
+    initialized: application?.initialized === true,
+    pdfDocumentLoaded: !!application?.pdfDocument,
+    numPages: typeof numPages === "number" ? numPages : undefined,
+    pagesCount: typeof pagesCount === "number" ? pagesCount : undefined,
+    renderedPageCount: loadedPages,
+    pageElementCount: renderedPages.length,
+    canvasCount: canvases.length,
+    renderedCanvasCount: renderedCanvases,
+    currentPage: application?.page ?? viewer?.currentPageNumber,
+    currentPageInput: pageInput?.value,
+    currentPageLabel: document.getElementById("numPages")?.textContent ?? document.getElementById("pageNumber")?.getAttribute("max"),
+    socketStatus: hostState.socketStatus,
+    visibleRevision: hostState.visibleRevision,
+    latestRevision: hostState.latestRevision,
+    lastError: hostState.lastError,
+    failedAssetRequests: failedAssetRequests.slice(),
+    toolsHitTarget: typeof collectToolsHitTargetDiagnostics === "function" ? collectToolsHitTargetDiagnostics() : undefined,
+    ...extra,
+  };
+}
+
+function sendLoadedStateDiagnostic(phase, extra = {}) {
+  sendViewerSocketPayload({
+    type: "selection_debug",
+    phase,
+    text: "",
+    details: viewerLoadedState(extra),
+  });
+}
+
+function roundedRect(rect) {
+  if (!rect) return undefined;
+  return {
+    left: rect.left,
+    top: rect.top,
+    right: rect.right,
+    bottom: rect.bottom,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function describeElementForDiagnostics(element) {
+  if (!(element instanceof Element)) return undefined;
+  const style = getComputedStyle(element);
+  const htmlElement = element instanceof HTMLElement ? element : undefined;
+  return {
+    tag: element.tagName,
+    id: element.id || undefined,
+    className: typeof element.className === "string" ? element.className : undefined,
+    role: element.getAttribute("role") ?? undefined,
+    ariaLabel: element.getAttribute("aria-label") ?? undefined,
+    zIndex: style.zIndex,
+    pointerEvents: style.pointerEvents,
+    position: style.position,
+    display: style.display,
+    visibility: style.visibility,
+    opacity: style.opacity,
+    overflow: style.overflow,
+    overflowX: style.overflowX,
+    overflowY: style.overflowY,
+    rect: roundedRect(element.getBoundingClientRect()),
+    tabIndex: htmlElement?.tabIndex,
+    clientWidth: htmlElement?.clientWidth,
+    clientHeight: htmlElement?.clientHeight,
+    scrollWidth: htmlElement?.scrollWidth,
+    scrollHeight: htmlElement?.scrollHeight,
+    scrollLeft: htmlElement?.scrollLeft,
+    scrollTop: htmlElement?.scrollTop,
+  };
+}
+
+function scrollabilityDiagnostics(element) {
+  const style = element ? getComputedStyle(element) : undefined;
+  return {
+    overflow: style?.overflow,
+    overflowX: style?.overflowX,
+    overflowY: style?.overflowY,
+    clientWidth: element?.clientWidth,
+    clientHeight: element?.clientHeight,
+    scrollWidth: element?.scrollWidth,
+    scrollHeight: element?.scrollHeight,
+    scrollLeft: element?.scrollLeft,
+    scrollTop: element?.scrollTop,
+    scrollableX: !!element && element.scrollWidth > element.clientWidth,
+    scrollableY: !!element && element.scrollHeight > element.clientHeight,
+  };
+}
+
+function describeMouseEventForDiagnostics(event, handledDirection) {
+  const target = event.target instanceof Element ? event.target : undefined;
+  return {
+    type: event.type,
+    button: event.button,
+    buttons: event.buttons,
+    which: event.which,
+    detail: event.detail,
+    target: describeElementForDiagnostics(target),
+    defaultPrevented: event.defaultPrevented,
+    altKey: event.altKey,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    shiftKey: event.shiftKey,
+    handledDirection,
+  };
+}
+
+function rememberRawMouseEvent(event, handledDirection) {
+  const diagnostic = describeMouseEventForDiagnostics(event, handledDirection);
+  recentRawMouseEvents.push(diagnostic);
+  while (recentRawMouseEvents.length > MAX_RAW_MOUSE_EVENTS) recentRawMouseEvents.shift();
+  return diagnostic;
+}
+
+function collectToolsHitTargetDiagnostics() {
+  const container = document.getElementById("secondaryToolbarToggle");
+  const button = document.getElementById("secondaryToolbarToggleButton");
+  const targetElement = button ?? container;
+  const rect = targetElement?.getBoundingClientRect();
+  const points = rect ? [
+    { name: "left", x: rect.left + rect.width * 0.15, y: rect.top + rect.height / 2 },
+    { name: "center", x: rect.left + rect.width * 0.5, y: rect.top + rect.height / 2 },
+    { name: "right", x: rect.left + rect.width * 0.9, y: rect.top + rect.height / 2 },
+  ] : [];
+  let parentInfo;
+  try {
+    const sameOrigin = !!parent.document;
+    const frameRect = frameElement instanceof Element ? frameElement.getBoundingClientRect() : undefined;
+    parentInfo = parent && parent !== window ? {
+      sameOrigin,
+      frameElement: describeElementForDiagnostics(frameElement),
+      viewport: { width: parent.innerWidth, height: parent.innerHeight, devicePixelRatio: parent.devicePixelRatio },
+      windowScroll: { scrollX: parent.scrollX, scrollY: parent.scrollY, scrollableX: parent.document.documentElement.scrollWidth > parent.innerWidth, scrollableY: parent.document.documentElement.scrollHeight > parent.innerHeight },
+      documentElement: scrollabilityDiagnostics(parent.document.documentElement),
+      body: scrollabilityDiagnostics(parent.document.body),
+      recentRawMouseEvents: typeof parent.__hostAppShellRawMouseDebug === "function" ? parent.__hostAppShellRawMouseDebug() : undefined,
+      points: frameRect ? points.map((point) => {
+        const parentX = frameRect.left + point.x;
+        const parentY = frameRect.top + point.y;
+        const hit = parent.document.elementFromPoint(parentX, parentY);
+        return { name: point.name, x: parentX, y: parentY, hit: describeElementForDiagnostics(hit) };
+      }) : [],
+    } : { sameOrigin: false };
+  } catch {
+    parentInfo = { sameOrigin: false };
+  }
+  const toolbarRight = document.getElementById("toolbarViewerRight");
+  const viewer = viewerContainer();
+  const viewerRect = viewer?.getBoundingClientRect();
+  const toolsRect = targetElement?.getBoundingClientRect();
+  const verticalScrollbarGutter = viewer ? Math.max(0, viewer.offsetWidth - viewer.clientWidth) : 0;
+  const viewerScrollbarLeft = viewerRect ? viewerRect.right - verticalScrollbarGutter : undefined;
+  return {
+    route: location.pathname,
+    viewport: { width: innerWidth, height: innerHeight, devicePixelRatio },
+    windowScroll: { scrollX, scrollY, scrollableX: document.documentElement.scrollWidth > innerWidth, scrollableY: document.documentElement.scrollHeight > innerHeight },
+    documentElement: scrollabilityDiagnostics(document.documentElement),
+    body: scrollabilityDiagnostics(document.body),
+    activeElement: describeElementForDiagnostics(document.activeElement),
+    focusedElement: describeElementForDiagnostics(document.hasFocus() ? document.activeElement : undefined),
+    appShell: parentInfo,
+    scrollbarGutter: {
+      viewerVerticalWidth: verticalScrollbarGutter,
+      viewerScrollbarLeft,
+      overlapsToolsRect: !!(toolsRect && viewerRect && verticalScrollbarGutter > 0 && toolsRect.right > (viewerScrollbarLeft ?? viewerRect.right) && toolsRect.left < viewerRect.right && toolsRect.bottom > viewerRect.top && toolsRect.top < viewerRect.bottom),
+      toolbarRightGapToViewport: toolbarRight ? innerWidth - toolbarRight.getBoundingClientRect().right : undefined,
+      toolsGapToViewport: toolsRect ? innerWidth - toolsRect.right : undefined,
+    },
+    elements: {
+      outerContainer: describeElementForDiagnostics(document.getElementById("outerContainer")),
+      mainContainer: describeElementForDiagnostics(document.getElementById("mainContainer")),
+      viewerContainer: describeElementForDiagnostics(viewer),
+      secondaryToolbarToggle: describeElementForDiagnostics(container),
+      secondaryToolbarToggleButton: describeElementForDiagnostics(button),
+      secondaryToolbar: describeElementForDiagnostics(document.getElementById("secondaryToolbar")),
+      toolbarViewerRight: describeElementForDiagnostics(toolbarRight),
+      toolbarContainer: describeElementForDiagnostics(document.getElementById("toolbarContainer")),
+      hostSynctexHoverButton: describeElementForDiagnostics(document.getElementById("hostSynctexHoverButton")),
+      historyBack: describeElementForDiagnostics(document.getElementById("historyBack")),
+      historyForward: describeElementForDiagnostics(document.getElementById("historyForward")),
+    },
+    recentRawMouseEvents: recentRawMouseEvents.slice(),
+    points: points.map((point) => {
+      const hit = document.elementFromPoint(point.x, point.y);
+      const closestToolsButton = hit instanceof Element ? hit.closest("#secondaryToolbarToggleButton")?.id : undefined;
+      const closestToolsContainer = hit instanceof Element ? hit.closest("#secondaryToolbarToggle")?.id : undefined;
+      const expectedHit = closestToolsButton === "secondaryToolbarToggleButton" || closestToolsContainer === "secondaryToolbarToggle";
+      return {
+        ...point,
+        hit: describeElementForDiagnostics(hit),
+        closestToolsButton,
+        closestToolsContainer,
+        expectedHit,
+        interceptingElement: expectedHit ? undefined : describeElementForDiagnostics(hit),
+      };
+    }),
+  };
+}
+
+function sendToolsHitTargetDiagnostic(trigger) {
+  sendViewerSocketPayload({
+    type: "selection_debug",
+    phase: "lw_tools_hit_target",
+    text: "",
+    details: { trigger, ...collectToolsHitTargetDiagnostics() },
+  });
+}
+
+globalThis.__hostLwLoadedState = viewerLoadedState;
+
+function conciseRawMouseDiagnosticText(phase, details) {
+  if (phase !== "lw_app_shell_raw_mouse_event" && phase !== "lw_raw_mouse_event") return undefined;
+  const parts = [];
+  if (details.type !== undefined) parts.push(`type=${String(details.type)}`);
+  if (details.button !== undefined) parts.push(`button=${String(details.button)}`);
+  if (details.buttons !== undefined) parts.push(`buttons=${String(details.buttons)}`);
+  if (details.which !== undefined) parts.push(`which=${String(details.which)}`);
+  if (details.handledDirection !== undefined) parts.push(`handled=${String(details.handledDirection)}`);
+  else parts.push("handled=false");
+  return parts.join(" ");
+}
+
+function sendSelectionDebug(phase, page, details = {}) {
+  const selectedText = window.getSelection()?.toString() ?? "";
+  const text = conciseRawMouseDiagnosticText(phase, details) ?? selectedText;
+  sendViewerSocketPayload({
+    type: "selection_debug",
+    phase,
+    ...(page === undefined ? {} : { page }),
+    text,
+    details,
+  });
+}
+
+function pageView(pageNumber) {
+  return pdfViewer()?._pages?.[pageNumber - 1];
+}
+
+function pageElement(pageNumber) {
+  return pageView(pageNumber)?.div ?? document.querySelector(`.page[data-page-number='${String(pageNumber)}']`);
+}
+
+function pageNumberFromElement(element) {
+  const target = element?.nodeType === Node.ELEMENT_NODE ? element : element?.parentElement;
+  const page = target?.closest?.(".page[data-page-number]");
+  const pageNumber = Number(page?.dataset.pageNumber);
+  return Number.isInteger(pageNumber) && pageNumber > 0 ? pageNumber : undefined;
+}
+
+function pageCanvasElement(page) {
+  return page.querySelector("canvas");
+}
+
+function pageOverlayParent(page) {
+  return page.querySelector(".canvasWrapper") ?? page;
+}
+
+function pageViewport(pageNumber) {
+  return pageView(pageNumber)?.viewport;
+}
+
+function pageViewportHeight(page, viewport) {
+  return pageOverlayParent(page).getBoundingClientRect().height || pageCanvasElement(page)?.offsetHeight || viewport?.height || 1;
+}
+
+function updateHostDataset() {
+  document.body.dataset.hostLwSocket = hostState.socketStatus;
+  document.body.dataset.hostLwVisibleRevision = String(hostState.visibleRevision ?? "");
+  document.body.dataset.hostLwLatestRevision = String(hostState.latestRevision ?? "");
+  document.body.dataset.hostLwLastError = hostState.lastError ?? "";
+  document.body.dataset.hostLwHoverEnabled = hostState.hoverEnabled ? "true" : "false";
+}
+
+function captureRefreshState() {
+  const application = app();
+  const viewer = application?.pdfViewer;
+  const container = viewerContainer();
+  return {
+    page: viewer?.currentPageNumber,
+    scale: viewer?.currentScaleValue,
+    scrollTop: container?.scrollTop,
+    scrollLeft: container?.scrollLeft,
+  };
+}
+
+async function waitForPagesReady(application) {
+  await application.pdfViewer?.pagesPromise?.catch(() => undefined);
+  await application.pdfViewer?.onePageRendered?.catch(() => undefined);
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function restoreRefreshState(state) {
+  restoreNavigationState(state);
+}
+
+function captureNavigationState() {
+  const viewer = pdfViewer();
+  const container = viewerContainer();
+  return {
+    page: viewer?.currentPageNumber,
+    scale: viewer?.currentScaleValue,
+    scrollTop: container?.scrollTop ?? 0,
+    scrollLeft: container?.scrollLeft ?? 0,
+  };
+}
+
+function sameNavigationState(left, right) {
+  if (!left || !right) return false;
+  return left.page === right.page
+    && left.scale === right.scale
+    && Math.abs(Number(left.scrollTop ?? 0) - Number(right.scrollTop ?? 0)) < 1
+    && Math.abs(Number(left.scrollLeft ?? 0) - Number(right.scrollLeft ?? 0)) < 1;
+}
+
+function meaningfulNavigationChange(left, right) {
+  if (!left || !right) return false;
+  return left.page !== right.page
+    || left.scale !== right.scale
+    || Math.abs(Number(left.scrollTop ?? 0) - Number(right.scrollTop ?? 0)) >= MIN_HISTORY_SCROLL_DELTA
+    || Math.abs(Number(left.scrollLeft ?? 0) - Number(right.scrollLeft ?? 0)) >= MIN_HISTORY_SCROLL_DELTA;
+}
+
+function restoreNavigationState(state) {
+  if (!state) return;
+  const viewer = pdfViewer();
+  const container = viewerContainer();
+  navigationHistory.restoring = true;
+  if (state.scale !== undefined && viewer) viewer.currentScaleValue = state.scale;
+  if (typeof state.page === "number" && viewer) viewer.currentPageNumber = Math.max(1, Math.min(state.page, viewer.pagesCount || state.page));
+  requestAnimationFrame(() => {
+    if (container) {
+      if (typeof state.scrollTop === "number") container.scrollTop = state.scrollTop;
+      if (typeof state.scrollLeft === "number") container.scrollLeft = state.scrollLeft;
+    }
+    requestAnimationFrame(() => {
+      navigationHistory.restoring = false;
+      navigationHistory.lastSettledState = captureNavigationState();
+      updateNavigationButtons();
+    });
+  });
+}
+
+function pushNavigationHistory(state = captureNavigationState()) {
+  if (navigationHistory.restoring || !state) return;
+  const last = navigationHistory.back.at(-1);
+  if (sameNavigationState(last, state)) return;
+  navigationHistory.back.push(state);
+  if (navigationHistory.back.length > MAX_NAVIGATION_HISTORY) navigationHistory.back.splice(0, navigationHistory.back.length - MAX_NAVIGATION_HISTORY);
+  navigationHistory.forward.splice(0);
+  updateNavigationButtons();
+}
+
+function recordSettledNavigationChange() {
+  if (navigationHistory.restoring) return;
+  const current = captureNavigationState();
+  const start = navigationHistory.pendingStartState ?? navigationHistory.lastSettledState;
+  navigationHistory.pendingStartState = undefined;
+  if (meaningfulNavigationChange(start, current)) pushNavigationHistory(start);
+  navigationHistory.lastSettledState = current;
+}
+
+function scheduleSettledNavigationCapture() {
+  if (navigationHistory.restoring) return;
+  if (!navigationHistory.pendingStartState) navigationHistory.pendingStartState = navigationHistory.lastSettledState ?? captureNavigationState();
+  if (navigationHistory.pendingSettledTimer !== undefined) clearTimeout(navigationHistory.pendingSettledTimer);
+  navigationHistory.pendingSettledTimer = setTimeout(() => {
+    navigationHistory.pendingSettledTimer = undefined;
+    recordSettledNavigationChange();
+  }, NAVIGATION_SETTLE_MS);
+}
+
+function navigateHistory(direction) {
+  const source = direction === "back" ? navigationHistory.back : navigationHistory.forward;
+  const target = source.pop();
+  if (!target) {
+    updateNavigationButtons();
+    return false;
+  }
+  const destination = direction === "back" ? navigationHistory.forward : navigationHistory.back;
+  destination.push(captureNavigationState());
+  if (destination.length > MAX_NAVIGATION_HISTORY) destination.splice(0, destination.length - MAX_NAVIGATION_HISTORY);
+  restoreNavigationState(target);
+  updateNavigationButtons();
+  return true;
+}
+
+function updateNavigationButtons() {
+  const backButton = document.getElementById("historyBack");
+  const forwardButton = document.getElementById("historyForward");
+  if (backButton instanceof HTMLButtonElement) {
+    backButton.disabled = navigationHistory.back.length === 0;
+    backButton.setAttribute("aria-disabled", String(backButton.disabled));
+  }
+  if (forwardButton instanceof HTMLButtonElement) {
+    forwardButton.disabled = navigationHistory.forward.length === 0;
+    forwardButton.setAttribute("aria-disabled", String(forwardButton.disabled));
+  }
+}
+
+function destroyLoadingTask(task) {
+  try {
+    const destroyed = task?.destroy?.();
+    if (destroyed && typeof destroyed.catch === "function") destroyed.catch(() => undefined);
+  } catch {
+    // A stale loading task may already be torn down by PDF.js; ignore it.
+  }
+}
+
+function configurePdfViewerApplicationOptions() {
+  globalThis.PDFViewerApplicationOptions.setAll({
+    defaultUrl: initialConfig.pdf_url,
+    annotationEditorMode: -1,
+    disablePreferences: true,
+    enableScripting: false,
+    cMapUrl: "/viewer-lw/cmaps/",
+    standardFontDataUrl: "/viewer-lw/standard_fonts/",
+    wasmUrl: "/viewer-lw/wasm/",
+    sidebarViewOnLoad: 0,
+    workerSrc: "/viewer-lw/build/pdf.worker.mjs",
+    forcePageColors: true,
+    maxCanvasPixels: -1,
+    maxCanvasDim: -1,
+    enableDetailCanvas: false,
+    showPreviousViewOnLoad: false,
+  });
+}
+
+function installWebViewerLoadedConfigListener() {
+  const listener = (event) => {
+    if (event?.detail?.source && event.detail.source !== window) return;
+    forceShowLaTeXWorkshopChrome();
+    configurePdfViewerApplicationOptions();
+  };
+  document.addEventListener("webviewerloaded", listener);
+  try {
+    if (parent?.document && parent.document !== document) {
+      parent.document.addEventListener("webviewerloaded", listener);
+    }
+  } catch {
+    // Cross-origin parents are not expected in the Host app, but direct route loading must still work.
+  }
+}
+
+async function refreshToConfig(config) {
+  const revision = Number(config.revision);
+  const serial = ++hostState.refreshSerial;
+  const snapshot = captureRefreshState();
+  hostState.lastError = undefined;
+  updateHostDataset();
+
+  destroyLoadingTask(activeRefreshLoadingTask);
+  const pdfjsLib = await import("/viewer-lw/build/pdf.mjs");
+  if (serial !== hostState.refreshSerial) return;
+  const loadingTask = pdfjsLib.getDocument({
+    url: config.pdf_url,
+    cMapUrl: "/viewer-lw/cmaps/",
+    standardFontDataUrl: "/viewer-lw/standard_fonts/",
+    wasmUrl: "/viewer-lw/wasm/",
+  });
+  activeRefreshLoadingTask = loadingTask;
+
+  try {
+    const pdfDocument = await loadingTask.promise;
+    if (serial !== hostState.refreshSerial) {
+      pdfDocument.destroy?.();
+      return;
+    }
+    app().setTitleUsingUrl?.(config.pdf_url, config.pdf_url);
+    app().load(pdfDocument);
+    await waitForPagesReady(app());
+    if (serial !== hostState.refreshSerial) return;
+    restoreRefreshState(snapshot);
+    hostState.config = config;
+    hostState.visibleRevision = revision;
+    sendLoadedStateDiagnostic("lw_refresh_loaded", { revision });
+  } catch (error) {
+    if (serial === hostState.refreshSerial) hostState.lastError = `refresh failed: ${error?.message ?? String(error)}`;
+  } finally {
+    if (serial === hostState.refreshSerial && activeRefreshLoadingTask === loadingTask) activeRefreshLoadingTask = undefined;
+    updateHostDataset();
+  }
+}
+
+function viewportScale(viewport) {
+  const origin = viewport.convertToViewportPoint(0, 0);
+  const xUnit = viewport.convertToViewportPoint(1, 0);
+  const yUnit = viewport.convertToViewportPoint(0, 1);
+  return { x: Math.abs(xUnit[0] - origin[0]) || 1, y: Math.abs(yUnit[1] - origin[1]) || 1 };
+}
+
+function viewportPageBox(viewport) {
+  const box = Array.isArray(viewport.viewBox) ? viewport.viewBox.map(Number) : [0, 0, Number(viewport.width) || 0, Number(viewport.height) || 0];
+  const left = Math.min(box[0], box[2]);
+  const top = Math.max(box[1], box[3]);
+  const height = Math.abs(box[3] - box[1]) || 1;
+  return { left, top, height };
+}
+
+function topOriginPdfPointToViewport(viewport, x, y) {
+  const box = viewportPageBox(viewport);
+  return viewport.convertToViewportPoint(box.left + Number(x), box.top - Number(y));
+}
+
+function forwardMarkerFromPdfPoint({ viewport, pdfX, pdfY, width, height }) {
+  const point = topOriginPdfPointToViewport(viewport, pdfX, pdfY);
+  const scale = viewportScale(viewport);
+  const position = { left: point[0], top: point[1] };
+  if (width === undefined || height === undefined) return position;
+  return { ...position, width: Number(width) * scale.x, height: Number(height) * scale.y };
+}
+
+function forwardMarkerFromPdfRange({ viewport, h, v, W, H }) {
+  const topLeft = topOriginPdfPointToViewport(viewport, Number(h), Number(v) - Number(H));
+  const bottomRight = topOriginPdfPointToViewport(viewport, Number(h) + Number(W), Number(v));
+  return {
+    left: Math.min(topLeft[0], bottomRight[0]),
+    top: Math.min(topLeft[1], bottomRight[1]),
+    width: Math.max(1, Math.abs(bottomRight[0] - topLeft[0])),
+    height: Math.max(1, Math.abs(bottomRight[1] - topLeft[1])),
+  };
+}
+
+function removeOverlays(selector) {
+  for (const marker of document.querySelectorAll(selector)) marker.remove();
+}
+
+function scrollOverlayIntoView(markers) {
+  const first = markers.find(Boolean);
+  const container = viewerContainer();
+  if (!first || !container) return;
+  const markerRect = first.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  container.scrollTop += markerRect.top - containerRect.top - container.clientHeight * 0.4;
+  if (pdfViewer()?.scrollMode === 1) container.scrollLeft += markerRect.left - containerRect.left - container.clientWidth * 0.2;
+}
+
+function renderSynctexOverlay(message, { selector, datasetName, label } = {}) {
+  const pageNumber = Number(message.page);
+  const page = pageElement(pageNumber);
+  const viewport = pageViewport(pageNumber);
+  if (!page || !viewport) return false;
+  if (selector) removeOverlays(selector);
+  const overlayParent = pageOverlayParent(page);
+  const ranges = Array.isArray(message.ranges) ? message.ranges.filter((range) => Number(range.page) === pageNumber) : [];
+  const scalarPosition = ranges.length === 0 && message.width !== undefined && message.height !== undefined
+    ? forwardMarkerFromPdfPoint({ viewport, pdfX: message.x, pdfY: message.y, width: message.width, height: message.height })
+    : undefined;
+  const positions = scalarPosition ? [scalarPosition] : ranges.map((range) => forwardMarkerFromPdfRange({ viewport, ...range }));
+  if (positions.length === 0) positions.push(forwardMarkerFromPdfPoint({ viewport, pdfX: message.x, pdfY: message.y }));
+  const markers = positions.map((position) => {
+    const marker = document.createElement("div");
+    if (datasetName) marker.dataset[datasetName] = position.width === undefined ? "circle" : "rect";
+    marker.style.position = "absolute";
+    marker.style.pointerEvents = "none";
+    marker.style.zIndex = "100000";
+    marker.style.left = `${position.left}px`;
+    marker.style.top = `${position.top}px`;
+    if (position.width === undefined || position.height === undefined) {
+      marker.style.width = "0.5em";
+      marker.style.height = "0.5em";
+      marker.style.border = "0.2em solid red";
+      marker.style.borderRadius = "50%";
+      marker.style.opacity = "0.8";
+      marker.style.transform = "translate(-50%, -50%)";
+      marker.className = "show";
+    } else {
+      marker.style.width = `${position.width}px`;
+      marker.style.height = `${position.height}px`;
+      marker.style.background = datasetName === "reverseSynctexForwardProbe" ? "rgba(239,68,68,.18)" : "rgba(0,0,255,.35)";
+      marker.style.outline = datasetName === "reverseSynctexForwardProbe" ? "2px solid rgba(239,68,68,.9)" : "1px solid rgba(37,99,235,.85)";
+    }
+    overlayParent.appendChild(marker);
+    return marker;
+  });
+  if (label) overlayParent.appendChild(label);
+  scrollOverlayIntoView(markers);
+  return true;
+}
+
+function showSynctexMarker(message) {
+  return renderSynctexOverlay(message, { selector: "[data-synctex-marker]", datasetName: "synctexMarker" });
+}
+
+function clientPointToPdfPoint(event, pageNumber) {
+  const page = pageElement(pageNumber);
+  const viewport = pageViewport(pageNumber);
+  const canvas = page ? pageCanvasElement(page) : undefined;
+  if (!page || !viewport || !canvas) return undefined;
+  const rect = (page.querySelector(".canvasWrapper") ?? canvas).getBoundingClientRect();
+  return viewport.convertToPdfPoint(event.clientX - rect.left, rect.height - (event.clientY - rect.top));
+}
+
+function textNodeAtBoundary(root, node, offset, preferPrevious) {
+  if (node.nodeType === Node.TEXT_NODE) return { node, offset };
+  const children = Array.from(node.childNodes ?? []);
+  const start = preferPrevious ? Math.min(children.length - 1, offset - 1) : Math.min(children.length - 1, offset);
+  const step = preferPrevious ? -1 : 1;
+  for (let index = start; index >= 0 && index < children.length; index += step) {
+    const walker = document.createTreeWalker(children[index], NodeFilter.SHOW_TEXT);
+    let candidate = preferPrevious ? undefined : walker.nextNode();
+    if (preferPrevious) {
+      let current = walker.nextNode();
+      while (current) {
+        candidate = current;
+        current = walker.nextNode();
+      }
+    }
+    if (candidate?.textContent) return { node: candidate, offset: preferPrevious ? candidate.textContent.length : 0 };
+  }
+  return undefined;
+}
+
+function boundaryClientRect(root, boundary) {
+  const text = textNodeAtBoundary(root, boundary.node, boundary.offset, boundary.preferPrevious);
+  if (!text?.node?.textContent) return undefined;
+  const length = text.node.textContent.length;
+  const start = boundary.preferPrevious ? text.offset - 1 : text.offset;
+  const end = boundary.preferPrevious ? text.offset : text.offset + 1;
+  if (start < 0 || end > length || start >= end) return undefined;
+  const range = document.createRange();
+  range.setStart(text.node, start);
+  range.setEnd(text.node, end);
+  const rect = range.getBoundingClientRect();
+  range.detach?.();
+  return rect.width || rect.height ? rect : undefined;
+}
+
+function pdfPointFromRect(rect, page, viewport) {
+  const canvas = pageCanvasElement(page);
+  if (!canvas) return undefined;
+  const canvasRect = (page.querySelector(".canvasWrapper") ?? canvas).getBoundingClientRect();
+  return viewport.convertToPdfPoint(rect.left + rect.width / 2 - canvasRect.left, canvasRect.height - (rect.top + rect.height / 2 - canvasRect.top));
+}
+
+function reverseSynctexContextForPage(pageNumber) {
+  const page = pageElement(pageNumber);
+  const viewport = pageViewport(pageNumber);
+  const selection = window.getSelection();
+  if (!page || !viewport || !selection || selection.rangeCount === 0) return {};
+  const textLayer = page.querySelector(".textLayer");
+  if (!textLayer) return {};
+  const range = selection.getRangeAt(0);
+  if (!textLayer.contains(range.commonAncestorContainer)) return {};
+  if (selection.isCollapsed) {
+    const anchorNode = selection.anchorNode;
+    if (!anchorNode || anchorNode.nodeType !== Node.TEXT_NODE || !anchorNode.textContent || !textLayer.contains(anchorNode)) return {};
+    return {
+      textBeforeSelection: anchorNode.textContent.substring(0, selection.anchorOffset),
+      textAfterSelection: anchorNode.textContent.substring(selection.anchorOffset),
+    };
+  }
+  const selectedText = selection.toString();
+  if (!selectedText) return {};
+  const context = { selectedText };
+  if (range.startContainer.nodeType === Node.TEXT_NODE && typeof range.startContainer.textContent === "string") {
+    context.textBeforeSelection = range.startContainer.textContent.substring(0, range.startOffset);
+  }
+  if (range.endContainer.nodeType === Node.TEXT_NODE && typeof range.endContainer.textContent === "string") {
+    context.textAfterSelection = range.endContainer.textContent.substring(range.endOffset);
+  }
+  const startRect = boundaryClientRect(textLayer, { node: range.startContainer, offset: range.startOffset, preferPrevious: false });
+  const endRect = boundaryClientRect(textLayer, { node: range.endContainer, offset: range.endOffset, preferPrevious: true });
+  if (!startRect || !endRect) return context;
+  const start = pdfPointFromRect(startRect, page, viewport);
+  const end = pdfPointFromRect(endRect, page, viewport);
+  if (!start || !end) return context;
+  return { ...context, selectionStartX: start[0], selectionStartY: start[1], selectionEndX: end[0], selectionEndY: end[1] };
+}
+
+function selectionSignature(pageNumber, context) {
+  if (context.selectedText === undefined) return undefined;
+  return [pageNumber, context.selectedText, context.selectionStartX, context.selectionStartY, context.selectionEndX, context.selectionEndY].join("|");
+}
+
+function currentSelectionSignature() {
+  for (const page of document.querySelectorAll(".page[data-page-number]")) {
+    const pageNumber = Number(page.dataset.pageNumber);
+    if (!Number.isInteger(pageNumber) || pageNumber <= 0) continue;
+    const signature = selectionSignature(pageNumber, reverseSynctexContextForPage(pageNumber));
+    if (signature !== undefined) return signature;
+  }
+  return undefined;
+}
+
+function selectionPayload(pageNumber, context) {
+  return {
+    type: "reverse_synctex",
+    page: pageNumber,
+    x: context.selectionStartX,
+    y: context.selectionStartY,
+    selectedText: context.selectedText,
+    selectionStartX: context.selectionStartX,
+    selectionStartY: context.selectionStartY,
+    selectionEndX: context.selectionEndX,
+    selectionEndY: context.selectionEndY,
+    ...(context.textBeforeSelection === undefined ? {} : { textBeforeSelection: context.textBeforeSelection }),
+    ...(context.textAfterSelection === undefined ? {} : { textAfterSelection: context.textAfterSelection }),
+  };
+}
+
+function sendSelectionPayload(pageNumber) {
+  const context = reverseSynctexContextForPage(pageNumber);
+  if (context.selectedText === undefined || context.selectionStartX === undefined || context.selectionStartY === undefined || context.selectionEndX === undefined || context.selectionEndY === undefined) {
+    sendSelectionDebug("send_skip", pageNumber, { reason: "incomplete_selection", hasSelectedText: context.selectedText !== undefined, hasStart: context.selectionStartX !== undefined && context.selectionStartY !== undefined, hasEnd: context.selectionEndX !== undefined && context.selectionEndY !== undefined });
+    return false;
+  }
+  const signature = selectionSignature(pageNumber, context);
+  if (signature !== undefined && signature === lastSentSelectionSignature && selectionGeneration === lastSentSelectionGeneration) {
+    sendSelectionDebug("suppress", pageNumber, { reason: "already_sent", signature, generation: selectionGeneration });
+    return true;
+  }
+  lastSentSelectionSignature = signature;
+  lastSentSelectionGeneration = selectionGeneration;
+  const payload = selectionPayload(pageNumber, context);
+  sendSelectionDebug("send", pageNumber, { signature, generation: selectionGeneration, selectedPayloadText: payload.selectedText, selectedPayloadTextLength: payload.selectedText.length, selectionStartX: payload.selectionStartX, selectionStartY: payload.selectionStartY, selectionEndX: payload.selectionEndX, selectionEndY: payload.selectionEndY });
+  const sent = sendViewerSocketPayload(payload);
+  setTimeout(() => {
+    const currentText = window.getSelection()?.toString() ?? "";
+    sendSelectionDebug("post_send_audit", pageNumber, { sentText: payload.selectedText, sentTextLength: payload.selectedText.length, currentText, currentTextLength: currentText.length, changed: currentText !== payload.selectedText });
+  }, 300);
+  return sent;
+}
+
+function scheduleSelectionPayload(pageNumber) {
+  const request = { pageNumber };
+  pendingSelectionSend = request;
+  let observedGeneration = selectionGeneration;
+  let observedSignature = currentSelectionSignature();
+  let stableSamples = 0;
+  const scheduleTick = (delay) => setTimeout(() => requestAnimationFrame(tick), delay);
+  function tick() {
+    if (pendingSelectionSend !== request) return;
+    const signature = currentSelectionSignature();
+    if (selectionGeneration !== observedGeneration || signature !== observedSignature) {
+      observedGeneration = selectionGeneration;
+      observedSignature = signature;
+      stableSamples = 0;
+      scheduleTick(100);
+      return;
+    }
+    stableSamples += 1;
+    if (stableSamples < 2) {
+      scheduleTick(25);
+      return;
+    }
+    pendingSelectionSend = undefined;
+    sendSelectionPayload(pageNumber);
+  }
+  scheduleTick(100);
+}
+
+document.addEventListener("selectionchange", () => {
+  const signature = currentSelectionSignature();
+  if (signature !== lastSelectionSignature) selectionGeneration += 1;
+  lastSelectionSignature = signature;
+  sendSelectionDebug("selectionchange", undefined, { observedSignature: signature, generation: selectionGeneration });
+});
+
+function sendReverseSynctexClick(event, pageNumber) {
+  if (!(event.ctrlKey || event.metaKey)) return false;
+  const point = clientPointToPdfPoint(event, pageNumber);
+  if (!point) return false;
+  if (sendSelectionPayload(pageNumber)) return true;
+  return sendViewerSocketPayload({ type: "reverse_synctex", page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageNumber) });
+}
+
+function setHoverEnabled(enabled) {
+  hostState.hoverEnabled = enabled;
+  const button = document.getElementById("hostSynctexHoverButton");
+  if (button) {
+    button.setAttribute("aria-pressed", enabled ? "true" : "false");
+    button.title = enabled ? "Disable SyncTeX highlight/hover mode" : "Enable SyncTeX highlight/hover mode";
+    button.setAttribute("aria-label", button.title);
+  }
+  if (!enabled) {
+    latestHoverRequestId += 1;
+    latestProbeRequestId += 1;
+    pendingHover = undefined;
+    if (hoverTimer !== undefined) clearTimeout(hoverTimer);
+    hoverTimer = undefined;
+    removeOverlays("[data-reverse-synctex-hover]");
+    removeOverlays("[data-reverse-synctex-forward-probe]");
+  }
+  updateHostDataset();
+}
+
+function isEditableTarget(target) {
+  const element = target instanceof Element ? target : undefined;
+  if (!element) return false;
+  return !!element.closest("input, textarea, select, button, a[href], [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only'], [role='button'], [role='textbox'], [role='combobox'], [role='listbox'], [role='slider'], [role='spinbutton']");
+}
+
+function hasEditableFocus() {
+  return isEditableTarget(document.activeElement);
+}
+
+function invokeHistoryShortcut(direction, originalTarget) {
+  if (isEditableTarget(originalTarget) || hasEditableFocus()) return false;
+  return navigateHistory(direction);
+}
+
+function handleHistoryKeydown(event) {
+  if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+  const key = event.key.toLowerCase();
+  if (key !== "o" && key !== "i") return;
+  event.preventDefault();
+  event.stopPropagation();
+  invokeHistoryShortcut(key === "o" ? "back" : "forward", event.target);
+}
+
+function historyDirectionFromMouseEvent(event) {
+  if (event.button === 3) return "back";
+  if (event.button === 4) return "forward";
+  if (event.button === 8) return "back";
+  if (event.button === 16) return "forward";
+  if (event.button === 1 || event.button === 2 || event.which === 2 || event.which === 3) return undefined;
+  if ((event.buttons & 8) === 8) return "back";
+  if ((event.buttons & 16) === 16) return "forward";
+  if (event.button === 0 && event.buttons === 0 && event.which === 4) return "back";
+  if (event.button === 0 && event.buttons === 0 && event.which === 5) return "forward";
+  return undefined;
+}
+
+function sideButtonDedupeKey(event, direction) {
+  return `${direction}:${event.button}:${event.buttons}:${event.which}`;
+}
+
+function handleHistoryMouseButton(event) {
+  const direction = historyDirectionFromMouseEvent(event);
+  const rawDiagnostic = rememberRawMouseEvent(event, direction);
+  sendSelectionDebug("lw_raw_mouse_event", undefined, rawDiagnostic);
+  if (!direction) return;
+  event.preventDefault();
+  event.stopPropagation();
+  rawDiagnostic.defaultPrevented = event.defaultPrevented;
+  const key = sideButtonDedupeKey(event, direction);
+  const now = performance.now();
+  const recent = navigationHistory.lastSideButton;
+  const alreadyHandled = recent?.key === key && now - recent.time < 250;
+  if (!alreadyHandled && (event.type === "mousedown" || event.type === "auxclick")) {
+    sendSelectionDebug("lw_raw_mouse_navigation", undefined, rawDiagnostic);
+    invokeHistoryShortcut(direction, event.target);
+    navigationHistory.lastSideButton = { key, time: now };
+  }
+}
+
+function handleParentNavigationMessage(event) {
+  if (event.source !== parent || !event.data) return;
+  if (event.data.type === "host_lw_app_shell_mouse_diagnostic") {
+    sendSelectionDebug("lw_app_shell_raw_mouse_event", undefined, event.data.diagnostic ?? {});
+    return;
+  }
+  if (event.data.type !== "host_lw_navigation") return;
+  const direction = event.data.direction === "forward" ? "forward" : event.data.direction === "back" ? "back" : undefined;
+  if (!direction) return;
+  invokeHistoryShortcut(direction, document.activeElement);
+}
+
+function pointInsideElement(element, x, y) {
+  if (!element) return false;
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
+function handleToolsHitboxClick(event) {
+  if (!(event instanceof MouseEvent) || event.defaultPrevented || event.button !== 0) return;
+  const container = document.getElementById("secondaryToolbarToggle");
+  const button = document.getElementById("secondaryToolbarToggleButton");
+  if (!(button instanceof HTMLButtonElement)) return;
+  const target = event.target instanceof Element ? event.target : undefined;
+  if (target?.closest("#secondaryToolbarToggleButton")) return;
+  if (!pointInsideElement(button, event.clientX, event.clientY) && !pointInsideElement(container, event.clientX, event.clientY)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  button.click();
+}
+
+function installToolsHitboxFallback() {
+  for (const target of [window, document]) {
+    target.addEventListener("click", handleToolsHitboxClick, true);
+  }
+}
+
+function installNavigationHistoryControls() {
+  const backButton = document.getElementById("historyBack");
+  const forwardButton = document.getElementById("historyForward");
+  const container = viewerContainer();
+  backButton?.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    navigateHistory("back");
+  });
+  forwardButton?.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    navigateHistory("forward");
+  });
+  for (const target of [window, document]) {
+    target.addEventListener("keydown", handleHistoryKeydown, true);
+  }
+  for (const eventName of ["mousedown", "mouseup", "auxclick"]) {
+    for (const target of [window, document]) target.addEventListener(eventName, handleHistoryMouseButton, true);
+  }
+  window.addEventListener("message", handleParentNavigationMessage, true);
+  container?.addEventListener("scroll", scheduleSettledNavigationCapture, { passive: true });
+  app()?.eventBus?.on?.("pagechanging", scheduleSettledNavigationCapture);
+  app()?.eventBus?.on?.("scalechanging", scheduleSettledNavigationCapture);
+  navigationHistory.lastSettledState = captureNavigationState();
+  updateNavigationButtons();
+}
+
+function installHoverToolbarButton() {
+  if (document.getElementById("hostSynctexHoverButton")) return;
+  const button = document.createElement("button");
+  button.id = "hostSynctexHoverButton";
+  button.className = "toolbarButton";
+  button.type = "button";
+  button.tabIndex = 0;
+  const label = document.createElement("span");
+  label.textContent = "SyncTeX highlight";
+  button.appendChild(label);
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setHoverEnabled(!hostState.hoverEnabled);
+  });
+  const separator = document.createElement("div");
+  separator.className = "verticalToolbarSeparator hostSynctexSeparator";
+  const anchor = document.getElementById("toolbarViewerRight")?.firstElementChild ?? document.getElementById("toolbarViewerRight");
+  anchor?.parentNode?.insertBefore(separator, anchor);
+  anchor?.parentNode?.insertBefore(button, anchor);
+  setHoverEnabled(false);
+}
+
+function scheduleHover(event, pageNumber) {
+  if (!hostState.hoverEnabled || !viewerSocketOpen()) return;
+  const point = clientPointToPdfPoint(event, pageNumber);
+  if (!point) return;
+  const requestId = hoverRequestId + 1;
+  hoverRequestId = requestId;
+  latestHoverRequestId = requestId;
+  pendingHover = { type: "reverse_synctex_hover", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageNumber) };
+  if (hoverTimer !== undefined) return;
+  hoverTimer = setTimeout(() => {
+    hoverTimer = undefined;
+    const payload = pendingHover;
+    pendingHover = undefined;
+    if (!hostState.hoverEnabled || !payload) return;
+    sendViewerSocketPayload(payload);
+  }, HOVER_THROTTLE_MS);
+}
+
+function sendProbe(event, pageNumber) {
+  if (!hostState.hoverEnabled || event.ctrlKey || event.metaKey || !viewerSocketOpen()) return;
+  if ((window.getSelection()?.toString() ?? "").length > 0) return;
+  const point = clientPointToPdfPoint(event, pageNumber);
+  if (!point) return;
+  const requestId = probeRequestId + 1;
+  probeRequestId = requestId;
+  latestProbeRequestId = requestId;
+  removeOverlays("[data-reverse-synctex-forward-probe]");
+  sendViewerSocketPayload({ type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageNumber) });
+}
+
+function hoverDiagnosticsLabel(message) {
+  const file = String(message.source_file || "").split(/[\\/]/).pop() || "source";
+  return `${file}:${message.line ?? "?"}${message.source_line ? ` ${String(message.source_line).slice(0, 100)}` : ""}`;
+}
+
+function hoverRectPosition(rect, page, viewport) {
+  const leftTop = viewport.convertToViewportPoint(Number(rect.left), Number(rect.top));
+  const rightBottom = viewport.convertToViewportPoint(Number(rect.right), Number(rect.bottom));
+  const pageHeight = pageViewportHeight(page, viewport);
+  return {
+    left: Math.min(leftTop[0], rightBottom[0]),
+    top: pageHeight - Math.max(leftTop[1], rightBottom[1]),
+    width: Math.max(2, Math.abs(rightBottom[0] - leftTop[0])),
+    height: Math.max(2, Math.abs(leftTop[1] - rightBottom[1])),
+  };
+}
+
+function showHoverResult(message) {
+  if (!hostState.hoverEnabled || Number(message.request_id) !== latestHoverRequestId) return;
+  removeOverlays("[data-reverse-synctex-hover]");
+  if (message.error || !message.rect) return;
+  const pageNumber = Number(message.page);
+  const page = pageElement(pageNumber);
+  const viewport = pageViewport(pageNumber);
+  if (!page || !viewport) return;
+  const position = hoverRectPosition(message.rect, page, viewport);
+  const overlayParent = pageOverlayParent(page);
+  const marker = document.createElement("div");
+  marker.dataset.reverseSynctexHover = "rect";
+  marker.style.position = "absolute";
+  marker.style.pointerEvents = "none";
+  marker.style.zIndex = "100001";
+  marker.style.left = `${position.left}px`;
+  marker.style.top = `${position.top}px`;
+  marker.style.width = `${position.width}px`;
+  marker.style.height = `${position.height}px`;
+  marker.style.outline = "2px solid rgba(14,165,233,.9)";
+  marker.style.background = "rgba(14,165,233,.18)";
+  const label = document.createElement("div");
+  label.dataset.reverseSynctexHover = "label";
+  label.className = "hostSynctexOverlayLabel";
+  label.style.left = `${Math.max(0, position.left)}px`;
+  label.style.top = `${Math.max(0, position.top - 28)}px`;
+  label.textContent = hoverDiagnosticsLabel(message);
+  overlayParent.append(marker, label);
+}
+
+function showProbeResult(message) {
+  if (Number(message.request_id) !== latestProbeRequestId) return;
+  const label = document.createElement("div");
+  label.dataset.reverseSynctexForwardProbe = "label";
+  label.className = "hostSynctexOverlayLabel";
+  label.textContent = message.error ? String(message.error) : `reverse line ${String(message.reverse_line || message.line || "?")} -> forward boxes`;
+  label.style.left = "0px";
+  label.style.top = "0px";
+  renderSynctexOverlay(message, { selector: "[data-reverse-synctex-forward-probe]", datasetName: "reverseSynctexForwardProbe", label });
+}
+
+function installPageEventHandlers() {
+  const viewer = document.getElementById("viewer");
+  if (!viewer || viewer.dataset.hostSynctexHandlers === "true") return;
+  viewer.dataset.hostSynctexHandlers = "true";
+  viewer.addEventListener("click", (event) => {
+    const pageNumber = pageNumberFromElement(event.target);
+    if (!pageNumber) return;
+    if (sendReverseSynctexClick(event, pageNumber)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    sendProbe(event, pageNumber);
+  }, true);
+  viewer.addEventListener("mousedown", (event) => {
+    const pageNumber = pageNumberFromElement(event.target);
+    if (!pageNumber || event.button !== 0) return;
+    sendSelectionDebug("mousedown", pageNumber, { clientX: event.clientX, clientY: event.clientY, generation: selectionGeneration });
+  }, true);
+  viewer.addEventListener("mouseup", (event) => {
+    const pageNumber = pageNumberFromElement(event.target);
+    if (!pageNumber || event.button !== 0) return;
+    const selectedText = window.getSelection()?.toString() ?? "";
+    sendSelectionDebug("mouseup", pageNumber, { clientX: event.clientX, clientY: event.clientY, selectedTextLength: selectedText.length, generation: selectionGeneration });
+    if (selectedText.length > 0) scheduleSelectionPayload(pageNumber);
+  }, true);
+  viewer.addEventListener("mousemove", (event) => {
+    const pageNumber = pageNumberFromElement(event.target);
+    if (!pageNumber) return;
+    scheduleHover(event, pageNumber);
+  }, true);
+}
+
+function handleHostMessage(message) {
+  if (!message || Number(message.pdf_id) !== Number(initialConfig.pdf_id)) return;
+  if (message.type === "pdf_refresh") {
+    const nextRevision = Number(message.revision);
+    if (!Number.isFinite(nextRevision) || nextRevision < hostState.latestRevision) return;
+    const nextConfig = { ...hostState.config, revision: nextRevision, pdf_url: message.pdf_url };
+    hostState.latestRevision = nextRevision;
+    updateHostDataset();
+    void refreshToConfig(nextConfig);
+  } else if (message.type === "synctex_forward") {
+    pushNavigationHistory();
+    showSynctexMarker(message);
+  } else if (message.type === "reverse_synctex_hover_result") {
+    showHoverResult(message);
+  } else if (message.type === "reverse_synctex_forward_probe_result") {
+    showProbeResult(message);
+  }
+}
+
+function scheduleViewerSocketReconnect() {
+  if (reconnectTimer !== undefined) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = undefined;
+    connectViewerSocket();
+  }, 300);
+}
+
+async function reportInitialLoadedState() {
+  const deadline = Date.now() + 10_000;
+  try {
+    while (Date.now() < deadline) {
+      const state = viewerLoadedState({ trigger: "pages_ready" });
+      if (state.pdfDocumentLoaded && state.pagesCount > 0 && state.renderedPageCount > 0 && state.canvasCount > 0) {
+        sendLoadedStateDiagnostic("lw_loaded_state", { trigger: "pages_ready" });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    sendLoadedStateDiagnostic("lw_loaded_state", { trigger: "pages_ready_timeout" });
+  } catch (error) {
+    hostState.lastError = `initial load diagnostic failed: ${error?.message ?? String(error)}`;
+    updateHostDataset();
+    sendLoadedStateDiagnostic("lw_loaded_state", { trigger: "pages_ready_error" });
+  }
+}
+
+function connectViewerSocket() {
+  if (!initialConfig.viewer_socket_url) return;
+  const socket = new WebSocket(initialConfig.viewer_socket_url);
+  activeSocket = socket;
+  hostState.socketStatus = "connecting";
+  updateHostDataset();
+  socket.addEventListener("open", () => {
+    if (activeSocket !== socket) return;
+    hostState.socketStatus = "connected";
+    updateHostDataset();
+    sendLoadedStateDiagnostic("lw_loaded_state", { trigger: "socket_open" });
+    sendToolsHitTargetDiagnostic("socket_open");
+  });
+  socket.addEventListener("message", (event) => {
+    if (activeSocket !== socket) return;
+    try {
+      handleHostMessage(JSON.parse(event.data));
+    } catch (error) {
+      hostState.lastError = `socket message failed: ${error?.message ?? String(error)}`;
+      updateHostDataset();
+    }
+  });
+  socket.addEventListener("close", () => {
+    if (activeSocket !== socket) return;
+    hostState.socketStatus = "disconnected";
+    updateHostDataset();
+    scheduleViewerSocketReconnect();
+  });
+  socket.addEventListener("error", () => {
+    if (activeSocket !== socket) return;
+    hostState.socketStatus = "error";
+    updateHostDataset();
+  });
+}
+
+forceShowLaTeXWorkshopChrome();
+
+installWebViewerLoadedConfigListener();
+
+await import("/viewer-lw/viewer.mjs");
+forceShowLaTeXWorkshopChrome();
+installNavigationHistoryControls();
+installHoverToolbarButton();
+installToolsHitboxFallback();
+installPageEventHandlers();
+connectViewerSocket();
+updateHostDataset();
+void reportInitialLoadedState();
+
+globalThis.__hostLwRefreshDebug = {
+  state: () => ({ ...hostState }),
+  capture: captureRefreshState,
+  loadedState: viewerLoadedState,
+};
+
+globalThis.__hostLwSynctexDebug = {
+  showSynctexMarker,
+  setHoverEnabled,
+  pointFromClient: clientPointToPdfPoint,
+};
+
+globalThis.__hostLwNavigationHistoryDebug = {
+  capture: captureNavigationState,
+  state: () => ({ back: navigationHistory.back.slice(), forward: navigationHistory.forward.slice() }),
+  navigate: navigateHistory,
+  invoke: invokeHistoryShortcut,
+};
+
+globalThis.__hostLwToolsHitTargetDebug = collectToolsHitTargetDiagnostics;
+globalThis.__hostLwRawMouseDebug = () => recentRawMouseEvents.slice();

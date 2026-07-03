@@ -2,15 +2,12 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Socket } from "node:net";
 import { test } from "node:test";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
-
-const require = createRequire(import.meta.url);
 
 function writeFakePdf(path: string, suffix = "body"): Buffer {
 	const bytes = Buffer.from(`%PDF-1.4\n${suffix}\n%%EOF\n`, "utf8");
@@ -122,23 +119,30 @@ test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer 
 		assert.match(tabShellScript.contentType, /javascript/);
 		const tabShellScriptBody = tabShellScript.body.toString("utf8");
 		assert.match(tabShellScriptBody, /EventSource\("\/app-events"\)/);
+		assert.match(tabShellScriptBody, /\/viewer-lw\//);
 		assert.match(tabShellScriptBody, /data-close-pdf-id/);
 		assertHostLoadedWebCode("tab shell script", tabShellScriptBody);
 
-		const viewer = await readHttp(`${server.origin}/viewer/109`);
+		const legacyViewer = await readHttp(`${server.origin}/viewer/109?revision=2`, { redirect: "manual" });
+		assert.equal(legacyViewer.status, 302);
+		assert.equal(legacyViewer.headers.get("location"), "/viewer-lw/109?revision=2");
+
+		const viewer = await readHttp(`${server.origin}/viewer-lw/109`);
 		assert.equal(viewer.status, 200);
 		assert.match(viewer.contentType, /text\/html/);
 		const viewerHtml = viewer.body.toString("utf8");
-		assert.match(viewerHtml, /PDF\.js viewer/i);
+		assert.match(viewerHtml, /<title>PDF\.js viewer<\/title>/i);
+		assert.match(viewerHtml, /id="toolbarViewer"/);
 		assert.match(viewerHtml, /\/config\/109\.json/);
-		assert.match(viewerHtml, /href="\/pdf\/109\?revision=2"/);
-		assertHostLoadedWebCode("per-PDF viewer page", viewerHtml);
+		assert.match(viewerHtml, /\/viewer-lw\/host_lw_adapter\.mjs/);
+		assert.doesNotMatch(viewerHtml, /Direct PDF fallback|Open registered PDF bytes directly|Use the direct PDF link/i);
 
 		const configResponse = await readHttp(`${server.origin}/config/109.json`);
 		assert.equal(configResponse.status, 200);
 		assert.match(configResponse.contentType, /application\/json/);
 		const config = JSON.parse(configResponse.body.toString("utf8")) as Record<string, unknown>;
 		assert.equal(config.pdf_id, 109);
+		assert.equal(config.title, "paper.pdf");
 		assert.equal(config.revision, 2);
 		assert.equal(config.pdf_url, `${server.origin}/pdf/109?revision=2`);
 		assert.equal(typeof config.viewer_socket_token, "string");
@@ -146,28 +150,11 @@ test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer 
 		assert.equal(config.viewer_socket_url, viewerSocketUrl);
 		assert.equal(config.ws_url, viewerSocketUrl);
 
-		const viewerScript = await readHttp(`${server.origin}/assets/viewer.js`);
-		assert.equal(viewerScript.status, 200);
-		assert.match(viewerScript.contentType, /javascript/);
-		const viewerScriptBody = viewerScript.body.toString("utf8");
-		assert.match(viewerScriptBody, /getDocument/);
-		assert.match(viewerScriptBody, /convertToPdfPoint/);
-		assert.match(viewerScriptBody, /viewportHeight: canvas\.offsetHeight/);
-		assert.match(viewerScriptBody, /input\.viewportHeight - input\.viewportY/);
-		assert.match(viewerScriptBody, /convertToViewportPoint/);
-		assertHostLoadedWebCode("viewer script", viewerScriptBody);
+		assert.equal((await readHttp(`${server.origin}/assets/viewer.js`)).status, 404);
+		assert.equal((await readHttp(`${server.origin}/assets/pdf.mjs`)).status, 404);
+		assert.equal((await readHttp(`${server.origin}/assets/pdf.worker.mjs`)).status, 404);
 
-		const pdfJs = await readHttp(`${server.origin}/assets/pdf.mjs`);
-		assert.equal(pdfJs.status, 200);
-		assert.match(pdfJs.contentType, /javascript/);
-		assert.equal(pdfJs.body.toString("utf8"), readFileSync(require.resolve("pdfjs-dist/legacy/build/pdf.mjs"), "utf8"));
-
-		const worker = await readHttp(`${server.origin}/assets/pdf.worker.mjs`);
-		assert.equal(worker.status, 200);
-		assert.match(worker.contentType, /javascript/);
-		assert.equal(worker.body.toString("utf8"), readFileSync(require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs"), "utf8"));
-
-		assert.equal((await readHttp(`${server.origin}/viewer/999`)).status, 404);
+		assert.equal((await readHttp(`${server.origin}/viewer/999`, { redirect: "manual" })).status, 404);
 		assert.equal((await readHttp(`${server.origin}/config/999.json`)).status, 404);
 	} finally {
 		await server.stop();
@@ -355,5 +342,88 @@ test("Viewer Host Server shutdown closes sockets and releases the port", async (
 	} finally {
 		socket.destroy();
 		await server.stop();
+	}
+});
+
+test("Viewer Host Server serves side-by-side LaTeX Workshop viewer route and assets", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-routes-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	try {
+		registry.registerPdf({ pdfId: 141, pdfPath, title: "paper.pdf", revision: 5, fileSnapshot: snapshotPdf(pdfPath) });
+		await server.start();
+
+		const viewer = await readHttp(`${server.origin}/viewer-lw/141`);
+		assert.equal(viewer.status, 200);
+		assert.match(viewer.contentType, /text\/html/);
+		const html = viewer.body.toString("utf8");
+		assert.match(html, /Copyright 2012 Mozilla Foundation/);
+		assert.match(html, /Licensed under the Apache License, Version 2\.0/);
+		assert.match(html, /data-config-url="\/config\/141\.json"/);
+		assert.match(html, /\/viewer-lw\/host_lw_adapter\.mjs/);
+		assert.match(html, /worker-src 'self' blob:/);
+		assert.match(html, /script-src 'self' 'wasm-unsafe-eval'/);
+		assert.doesNotMatch(html, /id="status"|synctex-hover-toggle|Open registered PDF bytes directly/);
+
+		const viewerScript = await readHttp(`${server.origin}/viewer-lw/viewer.mjs`);
+		assert.equal(viewerScript.status, 200);
+		assert.match(viewerScript.contentType, /javascript/);
+		assert.match(viewerScript.body.toString("utf8"), /Copyright 2024 Mozilla Foundation/);
+		assert.match(viewerScript.body.toString("utf8"), /Licensed under the Apache License, Version 2\.0/);
+
+		const css = await readHttp(`${server.origin}/viewer-lw/latexworkshop.css`);
+		assert.equal(css.status, 200);
+		assert.match(css.contentType, /text\/css/);
+		assert.match(css.body.toString("utf8"), /LaTeX Workshop|MIT|Copyright/i);
+
+		const image = await readHttp(`${server.origin}/viewer-lw/images/toolbarButton-search.svg`);
+		assert.equal(image.status, 200);
+		assert.match(image.contentType, /image\/svg\+xml/);
+
+		const pdfJsModule = await readHttp(`${server.origin}/viewer-lw/build/pdf.mjs`);
+		assert.equal(pdfJsModule.status, 200);
+		assert.match(pdfJsModule.contentType, /javascript/);
+		assert.match(pdfJsModule.body.toString("utf8"), /^\/\/ PDF\.js compatibility polyfills for older WebKit\/Tauri webviews\./);
+		assert.match(pdfJsModule.body.toString("utf8"), /Promise\.withResolvers/);
+		assert.match(pdfJsModule.body.toString("utf8"), /Promise\.try/);
+		assert.match(pdfJsModule.body.toString("utf8"), /pdfjsVersion = 5\.7\.284/);
+
+		const worker = await readHttp(`${server.origin}/viewer-lw/build/pdf.worker.mjs`);
+		assert.equal(worker.status, 200);
+		assert.match(worker.contentType, /javascript/);
+		assert.match(worker.body.toString("utf8"), /^\/\/ PDF\.js compatibility polyfills for older WebKit\/Tauri webviews\./);
+		assert.match(worker.body.toString("utf8"), /Promise\.withResolvers/);
+		assert.match(worker.body.toString("utf8"), /Promise\.try/);
+		assert.match(worker.body.toString("utf8"), /pdfjsVersion = 5\.7\.284/);
+
+		const cmap = await readHttp(`${server.origin}/viewer-lw/cmaps/Adobe-Japan1-UCS2.bcmap`);
+		assert.equal(cmap.status, 200);
+		assert.match(cmap.contentType, /application\/octet-stream/);
+
+		const font = await readHttp(`${server.origin}/viewer-lw/standard_fonts/LiberationSans-Regular.ttf`);
+		assert.equal(font.status, 200);
+		assert.match(font.contentType, /font\/ttf/);
+
+		const wasm = await readHttp(`${server.origin}/viewer-lw/wasm/qcms_bg.wasm`);
+		assert.equal(wasm.status, 200);
+		assert.match(wasm.contentType, /application\/wasm/);
+
+		const provenance = await readHttp(`${server.origin}/viewer-lw/README.md`);
+		assert.equal(provenance.status, 200);
+		assert.match(provenance.contentType, /text\/markdown|application\/octet-stream/);
+		assert.match(provenance.body.toString("utf8"), /pdfjsVersion = 5\.7\.284|Version consistency/);
+
+		const license = await readHttp(`${server.origin}/viewer-lw/LICENSE-PDF.js.txt`);
+		assert.equal(license.status, 200);
+		assert.match(license.contentType, /text\/plain/);
+		assert.match(license.body.toString("utf8"), /Apache License/);
+
+		const missing = await readHttp(`${server.origin}/viewer-lw/999`);
+		assert.equal(missing.status, 404);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
 	}
 });

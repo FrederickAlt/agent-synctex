@@ -181,7 +181,7 @@ test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host bound
 		const pdfId = openResponse.result?.details?.pdf_id;
 		assert.equal(typeof viewerUrl, "string");
 		assert.equal(typeof pdfId, "number");
-		assert.match(viewerUrl as string, /^http:\/\/127\.0\.0\.1:\d+\/viewer\/\d+$/);
+		assert.match(viewerUrl as string, /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/\d+$/);
 		assert.equal((viewerUrl as string).includes(pdfPath), false, "viewer URL must not expose raw PDF paths");
 		const origin = new URL(viewerUrl as string).origin;
 		const viewer = await fetch(viewerUrl as string);

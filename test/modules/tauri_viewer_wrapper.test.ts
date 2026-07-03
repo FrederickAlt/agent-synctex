@@ -51,9 +51,10 @@ test("desktop wrapper launcher starts the Viewer Host Server without Tauri APIs 
 		assert.equal(app.status, 200);
 		assert.match(app.body, /Viewer Client/i);
 
-		const viewer = await readHttp(`${launched.origin}/viewer/114`);
+		const viewer = await readHttp(`${launched.origin}/viewer-lw/114`);
 		assert.equal(viewer.status, 200);
-		assert.match(viewer.body, /PDF\.js viewer/i);
+		assert.match(viewer.body, /id="toolbarViewer"/);
+		assert.match(viewer.body, /\/viewer-lw\/host_lw_adapter\.mjs/);
 	} finally {
 		await launched.shutdown();
 		rmSync(baseDir, { recursive: true, force: true });

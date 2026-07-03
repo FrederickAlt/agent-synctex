@@ -604,7 +604,7 @@ test("new open racing with reconnect joins the same Host generation and register
 
 		assert.equal(first.result?.details?.pdf_id, 70);
 		assert.equal(second.result?.details?.pdf_id, 71);
-		assert.equal(second.result?.details?.viewer_url, "http://127.0.0.1:42602/viewer/71");
+		assert.equal(second.result?.details?.viewer_url, "http://127.0.0.1:42602/viewer-lw/71");
 		assert.equal(launches, 2, "new open must not launch a second Host while reconnect is in progress");
 		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "focus_pdf", "open_pdf"]);
 		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 70, pdf_path: firstPdfPath, title: basename(firstPdfPath), workspace_cwd: baseDir });

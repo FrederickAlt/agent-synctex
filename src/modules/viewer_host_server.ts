@@ -2,11 +2,10 @@ import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, readFileSync } from "node:fs";
 import { stat as statFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { createRequire } from "node:module";
 import type { AddressInfo, Socket } from "node:net";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
-import { URL } from "node:url";
+import { fileURLToPath, URL } from "node:url";
 import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
 import { inspectReverseSynctexHover, mapReverseForwardSynctexProbe } from "./synctex/forward_synctex.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
@@ -14,11 +13,29 @@ import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry
 const LOCAL_HOST = "127.0.0.1";
 const DEFAULT_PORT = 0;
 const MAX_VIEWER_SOCKET_MESSAGE_BYTES = 64 * 1024;
-const require = createRequire(import.meta.url);
-const LOCAL_PDFJS_ASSETS = new Map<string, string>([
-	["/assets/pdf.mjs", require.resolve("pdfjs-dist/legacy/build/pdf.mjs")],
-	["/assets/pdf.worker.mjs", require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs")],
+const LW_VIEWER_ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "viewer_lw");
+const LW_PDFJS_BUILD_ASSETS = new Map<string, { path: string; polyfillModernPromiseHelpers?: boolean }>([
+	["/viewer-lw/build/pdf.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.mjs"), polyfillModernPromiseHelpers: true }],
+	["/viewer-lw/build/pdf.worker.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.worker.mjs"), polyfillModernPromiseHelpers: true }],
+	["/viewer-lw/build/pdf.sandbox.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.sandbox.mjs") }],
 ]);
+const PDFJS_MODERN_PROMISE_HELPERS_POLYFILL = `// PDF.js compatibility polyfills for older WebKit/Tauri webviews.
+if (typeof Promise.withResolvers !== "function") {
+	Promise.withResolvers = function withResolvers() {
+		let resolve, reject;
+		const promise = new Promise((promiseResolve, promiseReject) => {
+			resolve = promiseResolve;
+			reject = promiseReject;
+		});
+		return { promise, resolve, reject };
+	};
+}
+if (typeof Promise.try !== "function") {
+	Promise.try = function promiseTry(callback, ...args) {
+		return new Promise(resolve => resolve(callback(...args)));
+	};
+}
+`;
 
 const VIEWER_CLIENT_TABS_SCRIPT = `
 const state = {
@@ -40,7 +57,122 @@ function titleFor(message) {
 }
 
 function viewerUrlFor(message) {
-	return message.viewer_url || "/viewer/" + encodeURIComponent(String(message.pdf_id));
+	return message.viewer_url || "/viewer-lw/" + encodeURIComponent(String(message.pdf_id));
+}
+
+function isEditableAppShellTarget(target) {
+	if (!(target instanceof Element)) return false;
+	if (target.isContentEditable) return true;
+	return Boolean(target.closest("input, textarea, select, button, a[href], [contenteditable], [role='button'], [role='textbox'], [role='combobox'], [role='listbox'], [role='slider'], [role='spinbutton']"));
+}
+
+function activeViewerIframe() {
+	if (state.activePdfId === undefined) return undefined;
+	return document.querySelector("iframe[data-pdf-id='" + pdfIdKey(state.activePdfId) + "']");
+}
+
+function postNavigationToActiveViewer(direction) {
+	const iframe = activeViewerIframe();
+	if (!iframe || !iframe.contentWindow) return false;
+	iframe.contentWindow.postMessage({ type: "host_lw_navigation", direction }, location.origin);
+	return true;
+}
+
+const recentAppShellRawMouseEvents = [];
+const MAX_APP_SHELL_RAW_MOUSE_EVENTS = 20;
+
+function describeAppShellEventTarget(target) {
+	if (target instanceof Element) return { tag: target.tagName, id: target.id || undefined, className: typeof target.className === "string" ? target.className : undefined };
+	if (target === document) return { tag: "#document" };
+	if (target === window) return { tag: "#window" };
+	return undefined;
+}
+
+function appShellHistoryDirectionFromMouseEvent(event) {
+	if (event.button === 3) return "back";
+	if (event.button === 4) return "forward";
+	if (event.button === 8) return "back";
+	if (event.button === 16) return "forward";
+	if (event.button === 1 || event.button === 2 || event.which === 2 || event.which === 3) return undefined;
+	if ((event.buttons & 8) === 8) return "back";
+	if ((event.buttons & 16) === 16) return "forward";
+	if (event.button === 0 && event.buttons === 0 && event.which === 4) return "back";
+	if (event.button === 0 && event.buttons === 0 && event.which === 5) return "forward";
+	return undefined;
+}
+
+function rememberAppShellRawMouseEvent(event, handledDirection) {
+	const diagnostic = {
+		type: event.type,
+		button: event.button,
+		buttons: event.buttons,
+		which: event.which,
+		detail: event.detail,
+		pointerType: event.pointerType,
+		target: describeAppShellEventTarget(event.target),
+		defaultPrevented: event.defaultPrevented,
+		altKey: event.altKey,
+		ctrlKey: event.ctrlKey,
+		metaKey: event.metaKey,
+		shiftKey: event.shiftKey,
+		handledDirection,
+	};
+	recentAppShellRawMouseEvents.push(diagnostic);
+	while (recentAppShellRawMouseEvents.length > MAX_APP_SHELL_RAW_MOUSE_EVENTS) recentAppShellRawMouseEvents.shift();
+	return diagnostic;
+}
+
+function appShellSideButtonDedupeKey(event, direction) {
+	return direction + ":" + event.button + ":" + event.buttons + ":" + event.which;
+}
+
+function postNavigationDiagnosticToActiveViewer(diagnostic) {
+	const iframe = activeViewerIframe();
+	if (!iframe || !iframe.contentWindow) return false;
+	iframe.contentWindow.postMessage({ type: "host_lw_app_shell_mouse_diagnostic", diagnostic }, location.origin);
+	return true;
+}
+
+function handleAppShellHistoryKeydown(event) {
+	if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+	const key = event.key.toLowerCase();
+	if (key !== "o" && key !== "i") return;
+	if (isEditableAppShellTarget(event.target) || isEditableAppShellTarget(document.activeElement)) return;
+	event.preventDefault();
+	event.stopImmediatePropagation?.();
+	event.stopPropagation();
+	postNavigationToActiveViewer(key === "o" ? "back" : "forward");
+}
+
+let lastAppShellSideButtonNavigation;
+function handleAppShellHistoryMouseButton(event) {
+	const direction = appShellHistoryDirectionFromMouseEvent(event);
+	const rawDiagnostic = rememberAppShellRawMouseEvent(event, direction);
+	if (!direction) {
+		postNavigationDiagnosticToActiveViewer(rawDiagnostic);
+		return;
+	}
+	if (isEditableAppShellTarget(event.target) || isEditableAppShellTarget(document.activeElement)) return;
+	event.preventDefault();
+	event.stopImmediatePropagation?.();
+	event.stopPropagation();
+	rawDiagnostic.defaultPrevented = event.defaultPrevented;
+	postNavigationDiagnosticToActiveViewer(rawDiagnostic);
+	const now = performance.now();
+	const recent = lastAppShellSideButtonNavigation;
+	const key = appShellSideButtonDedupeKey(event, direction);
+	if (recent && recent.key === key && recent.type !== event.type && now - recent.time < 250) return;
+	lastAppShellSideButtonNavigation = { key, type: event.type, time: now };
+	postNavigationToActiveViewer(direction);
+}
+
+function bindAppShellViewerShortcuts() {
+	for (const target of [window, document]) {
+		target.addEventListener("keydown", handleAppShellHistoryKeydown, true);
+	}
+	for (const eventName of ["pointerdown", "pointerup", "mousedown", "mouseup", "auxclick"]) {
+		for (const target of [window, document]) target.addEventListener(eventName, handleAppShellHistoryMouseButton, true);
+	}
 }
 
 function openOrFocusTab(message) {
@@ -141,844 +273,10 @@ function connectAppEvents() {
 	});
 }
 
+window.__hostAppShellRawMouseDebug = () => recentAppShellRawMouseEvents.slice();
+bindAppShellViewerShortcuts();
 renderTabs();
 connectAppEvents();
-`;
-
-const VIEWER_SCRIPT = `
-const status = document.getElementById("status");
-const pages = document.getElementById("pages");
-const fallback = document.getElementById("fallback-link");
-const configUrl = document.body.dataset.configUrl;
-
-function setStatus(message) {
-	if (status) status.textContent = message;
-}
-
-function reportViewerError(error) {
-	const message = error && error.message ? error.message : String(error || "unknown viewer error");
-	setStatus("Unable to render via PDF.js: " + message + ". Use the direct PDF link below.");
-}
-
-window.addEventListener("error", (event) => {
-	reportViewerError(event.error || event.message || "viewer script failed to load");
-});
-window.addEventListener("unhandledrejection", (event) => {
-	reportViewerError(event.reason || "unhandled viewer promise rejection");
-});
-
-let activeConfig;
-let viewerSocket;
-const pageViewports = new Map();
-const pendingReverseSynctexContexts = new WeakMap();
-let lastObservedSelectionSignature;
-let selectionGeneration = 0;
-let lastSentSelectionSignature;
-let lastSentSelectionGeneration;
-let pendingReverseSynctexSelectionSend;
-let pendingSelectionMouseDownDebug;
-let selectionDebugCount = 0;
-let reverseSynctexHoverEnabled = false;
-let reverseSynctexHoverRequestId = 0;
-let reverseSynctexHoverLatestRequestId = 0;
-let reverseSynctexHoverTimer;
-let reverseSynctexHoverPending;
-let reverseSynctexForwardProbeRequestId = 0;
-let reverseSynctexForwardProbeLatestRequestId = 0;
-const REVERSE_SYNCTEX_HOVER_THROTTLE_MS = 150;
-const MAX_SELECTION_DEBUG_EVENTS = 200;
-const MAX_SELECTION_DEBUG_TEXT = 500;
-
-function boundedSelectionDebugText(value) {
-	const text = typeof value === "string" ? value : "";
-	return text.length > MAX_SELECTION_DEBUG_TEXT ? text.slice(0, MAX_SELECTION_DEBUG_TEXT) : text;
-}
-
-function describeSelectionDebugNode(node) {
-	if (!node) return undefined;
-	if (node.nodeType === Node.TEXT_NODE) {
-		const text = node.textContent ?? "";
-		return { type: "text", length: text.length, text: boundedSelectionDebugText(text) };
-	}
-	if (node instanceof Element) {
-		return { type: "element", tag: node.tagName.toLowerCase(), id: node.id || undefined, className: typeof node.className === "string" ? node.className.slice(0, 80) : undefined, childNodes: node.childNodes.length };
-	}
-	return { type: String(node.nodeType) };
-}
-
-function selectionDebugSnapshot(phase, pageNumber, extra = {}) {
-	const selection = window.getSelection();
-	const text = selection ? selection.toString() : "";
-	const snapshot = {
-		phase,
-		time: Date.now(),
-		performanceNow: typeof performance !== "undefined" && performance.now ? performance.now() : undefined,
-		page: pageNumber,
-		selectionGeneration,
-		currentSignature: currentReverseSynctexSelectionSignature(),
-		selectionText: boundedSelectionDebugText(text),
-		selectionTextLength: text.length,
-		isCollapsed: selection?.isCollapsed,
-		rangeCount: selection?.rangeCount ?? 0,
-		anchorOffset: selection?.anchorOffset,
-		focusOffset: selection?.focusOffset,
-		anchorNode: describeSelectionDebugNode(selection?.anchorNode),
-		focusNode: describeSelectionDebugNode(selection?.focusNode),
-		...extra,
-	};
-	if (selection && selection.rangeCount > 0) {
-		const range = selection.getRangeAt(0);
-		snapshot.rangeStartOffset = range.startOffset;
-		snapshot.rangeEndOffset = range.endOffset;
-		snapshot.rangeStartNode = describeSelectionDebugNode(range.startContainer);
-		snapshot.rangeEndNode = describeSelectionDebugNode(range.endContainer);
-	}
-	return snapshot;
-}
-
-function sendSelectionDebugDetails(phase, pageNumber, details) {
-	if (selectionDebugCount >= MAX_SELECTION_DEBUG_EVENTS) return;
-	if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
-	selectionDebugCount += 1;
-	viewerSocket.send(JSON.stringify({
-		type: "selection_debug",
-		phase,
-		...(pageNumber === undefined ? {} : { page: pageNumber }),
-		text: details.selectionText,
-		details,
-	}));
-}
-
-function sendSelectionDebug(phase, pageNumber, extra = {}) {
-	const details = selectionDebugSnapshot(phase, pageNumber, extra);
-	if (details.selectionTextLength === 0 && extra.selectedPayloadText === undefined && extra.suppressionReason === undefined && extra.sentText === undefined) return;
-	sendSelectionDebugDetails(phase, pageNumber, details);
-}
-
-function reverseSynctexPayloadFromViewportPoint(input) {
-	const point = input.viewport.convertToPdfPoint(input.viewportX, input.viewportHeight - input.viewportY);
-	return {
-		type: "reverse_synctex",
-		page: input.page,
-		x: point[0],
-		y: point[1],
-		...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }),
-		...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }),
-		...(input.selectedText === undefined ? {} : { selectedText: input.selectedText }),
-		...(input.selectionStartX === undefined ? {} : { selectionStartX: input.selectionStartX }),
-		...(input.selectionStartY === undefined ? {} : { selectionStartY: input.selectionStartY }),
-		...(input.selectionEndX === undefined ? {} : { selectionEndX: input.selectionEndX }),
-		...(input.selectionEndY === undefined ? {} : { selectionEndY: input.selectionEndY }),
-	};
-}
-
-function firstTextNode(node) {
-	if (node.nodeType === Node.TEXT_NODE && (node.textContent ?? "").length > 0) return node;
-	const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
-	let current = walker.nextNode();
-	while (current) {
-		if ((current.textContent ?? "").length > 0) return current;
-		current = walker.nextNode();
-	}
-	return undefined;
-}
-
-function lastTextNode(node) {
-	if (node.nodeType === Node.TEXT_NODE && (node.textContent ?? "").length > 0) return node;
-	const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
-	let last;
-	let current = walker.nextNode();
-	while (current) {
-		if ((current.textContent ?? "").length > 0) last = current;
-		current = walker.nextNode();
-	}
-	return last;
-}
-
-function adjacentTextNodeAtBoundary(root, node, offset, preferPrevious) {
-	const boundary = document.createRange();
-	boundary.setStart(node, offset);
-	boundary.collapse(true);
-	const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-	let previous;
-	let current = walker.nextNode();
-	while (current) {
-		const length = (current.textContent ?? "").length;
-		if (length > 0) {
-			const probe = document.createRange();
-			probe.setStart(current, preferPrevious ? length : 0);
-			probe.collapse(true);
-			const comparison = probe.compareBoundaryPoints(Range.START_TO_START, boundary);
-			probe.detach?.();
-			if (preferPrevious) {
-				if (comparison <= 0) previous = current;
-				else break;
-			} else if (comparison >= 0) {
-				boundary.detach?.();
-				return current;
-			}
-		}
-		current = walker.nextNode();
-	}
-	boundary.detach?.();
-	return preferPrevious ? previous : undefined;
-}
-
-function textNodeAtBoundary(root, node, offset, preferPrevious) {
-	if (node.nodeType === Node.TEXT_NODE) {
-		const length = (node.textContent ?? "").length;
-		if (length === 0) {
-			const adjacent = adjacentTextNodeAtBoundary(root, node, offset, preferPrevious);
-			return adjacent ? { node: adjacent, offset: preferPrevious ? (adjacent.textContent ?? "").length : 0 } : undefined;
-		}
-		if (preferPrevious) {
-			if (offset > 0) return { node, offset };
-			const previous = adjacentTextNodeAtBoundary(root, node, offset, true);
-			return previous ? { node: previous, offset: (previous.textContent ?? "").length } : undefined;
-		}
-		if (offset < length) return { node, offset };
-		const next = adjacentTextNodeAtBoundary(root, node, offset, false);
-		return next ? { node: next, offset: 0 } : undefined;
-	}
-	const children = Array.from(node.childNodes ?? []);
-	if (preferPrevious) {
-		for (let index = Math.min(offset, children.length) - 1; index >= 0; index -= 1) {
-			const candidate = lastTextNode(children[index]);
-			if (candidate) return { node: candidate, offset: (candidate.textContent ?? "").length };
-		}
-		const previous = adjacentTextNodeAtBoundary(root, node, offset, true);
-		return previous ? { node: previous, offset: (previous.textContent ?? "").length } : undefined;
-	}
-	for (let index = Math.max(0, offset); index < children.length; index += 1) {
-		const candidate = firstTextNode(children[index]);
-		if (candidate) return { node: candidate, offset: 0 };
-	}
-	const next = adjacentTextNodeAtBoundary(root, node, offset, false);
-	return next ? { node: next, offset: 0 } : undefined;
-}
-
-function boundaryClientRect(root, boundary) {
-	const text = textNodeAtBoundary(root, boundary.node, boundary.offset, boundary.preferPrevious);
-	if (!text || !text.node || !text.node.textContent) return undefined;
-	const length = text.node.textContent.length;
-	const start = boundary.preferPrevious ? text.offset - 1 : text.offset;
-	const end = boundary.preferPrevious ? text.offset : text.offset + 1;
-	if (start < 0 || end > length || start >= end) return undefined;
-	const probe = document.createRange();
-	probe.setStart(text.node, start);
-	probe.setEnd(text.node, end);
-	const rect = probe.getBoundingClientRect();
-	probe.detach?.();
-	return rect.width || rect.height ? rect : undefined;
-}
-
-function pdfPointFromClientRect(rect, canvas, viewport) {
-	const canvasRect = canvas.getBoundingClientRect();
-	return viewport.convertToPdfPoint(rect.left + rect.width / 2 - canvasRect.left, canvas.offsetHeight - (rect.top + rect.height / 2 - canvasRect.top));
-}
-
-function reverseSynctexContextForPage(pageElement, canvas, viewport) {
-	const selection = window.getSelection();
-	if (!selection || selection.rangeCount === 0) return {};
-	const textLayer = pageElement.querySelector(".textLayer");
-	if (!textLayer) return {};
-	const range = selection.getRangeAt(0);
-	if (!textLayer.contains(range.commonAncestorContainer)) return {};
-	if (selection.isCollapsed) {
-		const anchorNode = selection.anchorNode;
-		if (!anchorNode || anchorNode.nodeType !== Node.TEXT_NODE || !anchorNode.textContent || !textLayer.contains(anchorNode)) return {};
-		return {
-			textBeforeSelection: anchorNode.textContent.substring(0, selection.anchorOffset),
-			textAfterSelection: anchorNode.textContent.substring(selection.anchorOffset),
-		};
-	}
-	const selectedText = selection.toString();
-	if (!selectedText) return {};
-	const startRect = boundaryClientRect(textLayer, { node: range.startContainer, offset: range.startOffset, preferPrevious: false });
-	const endRect = boundaryClientRect(textLayer, { node: range.endContainer, offset: range.endOffset, preferPrevious: true });
-	if (!startRect || !endRect) return {};
-	const start = pdfPointFromClientRect(startRect, canvas, viewport);
-	const end = pdfPointFromClientRect(endRect, canvas, viewport);
-	return { selectedText, selectionStartX: start[0], selectionStartY: start[1], selectionEndX: end[0], selectionEndY: end[1] };
-}
-
-async function renderTextLayer(pdfjsLib, page, viewport, pageContainer) {
-	const textLayer = document.createElement("div");
-	textLayer.className = "textLayer";
-	textLayer.style.position = "absolute";
-	textLayer.style.inset = "0";
-	textLayer.style.overflow = "hidden";
-	textLayer.style.lineHeight = "1";
-	textLayer.style.textAlign = "initial";
-	textLayer.style.transformOrigin = "0 0";
-	pageContainer.appendChild(textLayer);
-	try {
-		if (typeof pdfjsLib.TextLayer === "function") {
-			const textContentSource = typeof page.streamTextContent === "function"
-				? page.streamTextContent({ includeMarkedContent: true })
-				: await page.getTextContent({ includeMarkedContent: true });
-			const layer = new pdfjsLib.TextLayer({ textContentSource, container: textLayer, viewport });
-			await layer.render();
-			textLayer.dataset.rendered = "true";
-		}
-	} catch (error) {
-		textLayer.remove();
-		console.warn("Unable to render PDF.js text layer", error);
-	}
-}
-
-function hasReverseSynctexContext(context) {
-	return context.textBeforeSelection !== undefined || context.textAfterSelection !== undefined || context.selectedText !== undefined;
-}
-
-function reverseSynctexSelectionSignature(pageNumber, selection) {
-	if (selection.selectedText === undefined) return undefined;
-	return [pageNumber, selection.selectedText, selection.selectionStartX, selection.selectionStartY, selection.selectionEndX, selection.selectionEndY].join("|");
-}
-
-function reverseSynctexSelectionPayload(pageNumber, selection) {
-	return {
-		type: "reverse_synctex",
-		page: pageNumber,
-		x: selection.selectionStartX,
-		y: selection.selectionStartY,
-		selectedText: selection.selectedText,
-		selectionStartX: selection.selectionStartX,
-		selectionStartY: selection.selectionStartY,
-		selectionEndX: selection.selectionEndX,
-		selectionEndY: selection.selectionEndY,
-	};
-}
-
-function wasSelectionAlreadySent(signature, generation) {
-	return signature !== undefined && signature === lastSentSelectionSignature && generation === lastSentSelectionGeneration;
-}
-
-function rememberSentSelection(signature, generation) {
-	lastSentSelectionSignature = signature;
-	lastSentSelectionGeneration = generation;
-}
-
-function currentReverseSynctexSelectionSignature() {
-	if (!pages) return undefined;
-	for (const pageElement of pages.querySelectorAll("div[data-page-number]")) {
-		const pageNumber = Number(pageElement.dataset.pageNumber);
-		const viewport = pageViewports.get(pageNumber);
-		const canvas = pageElement.querySelector("canvas[data-page-number]");
-		if (!viewport || !canvas) continue;
-		const selection = reverseSynctexContextForPage(pageElement, canvas, viewport);
-		const signature = reverseSynctexSelectionSignature(pageNumber, selection);
-		if (signature !== undefined) return signature;
-	}
-	return undefined;
-}
-
-document.addEventListener("selectionchange", () => {
-	const signature = currentReverseSynctexSelectionSignature();
-	if (signature !== lastObservedSelectionSignature) selectionGeneration += 1;
-	lastObservedSelectionSignature = signature;
-	sendSelectionDebug("selectionchange", undefined, { observedSignature: signature });
-});
-
-function sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport) {
-	if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return false;
-	const selection = reverseSynctexContextForPage(pageElement, canvas, viewport);
-	if (selection.selectedText === undefined || selection.selectionStartX === undefined || selection.selectionStartY === undefined || selection.selectionEndX === undefined || selection.selectionEndY === undefined) return false;
-	const signature = reverseSynctexSelectionSignature(pageNumber, selection);
-	if (wasSelectionAlreadySent(signature, selectionGeneration)) {
-		sendSelectionDebug("suppress", pageNumber, { suppressionReason: "already_sent", signature, generation: selectionGeneration, selectedPayloadText: boundedSelectionDebugText(selection.selectedText), selectedPayloadTextLength: selection.selectedText.length });
-		return true;
-	}
-	rememberSentSelection(signature, selectionGeneration);
-	const payload = reverseSynctexSelectionPayload(pageNumber, selection);
-	sendSelectionDebug("send", pageNumber, { signature, generation: selectionGeneration, selectedPayloadText: boundedSelectionDebugText(payload.selectedText), selectedPayloadTextLength: payload.selectedText.length, selectionStartX: payload.selectionStartX, selectionStartY: payload.selectionStartY, selectionEndX: payload.selectionEndX, selectionEndY: payload.selectionEndY });
-	viewerSocket.send(JSON.stringify(payload));
-	setTimeout(() => {
-		const currentText = window.getSelection()?.toString() ?? "";
-		sendSelectionDebug("post_send_audit", pageNumber, { sentText: boundedSelectionDebugText(payload.selectedText), sentTextLength: payload.selectedText.length, currentText: boundedSelectionDebugText(currentText), currentTextLength: currentText.length, changed: currentText !== payload.selectedText });
-	}, 300);
-	return true;
-}
-
-function scheduleReverseSynctexSelectionSend(pageNumber, pageElement, canvas, viewport) {
-	const request = { pageNumber, pageElement, canvas, viewport };
-	pendingReverseSynctexSelectionSend = request;
-	let observedGeneration = selectionGeneration;
-	let observedSignature = currentReverseSynctexSelectionSignature();
-	let stableSamples = 0;
-	const scheduleTick = (delay) => {
-		setTimeout(() => requestAnimationFrame(tick), delay);
-	};
-	function tick() {
-		if (pendingReverseSynctexSelectionSend !== request) return;
-		const signature = currentReverseSynctexSelectionSignature();
-		sendSelectionDebug("scheduler_tick", pageNumber, { observedGeneration, observedSignature, signature, stableSamples });
-		if (selectionGeneration !== observedGeneration || signature !== observedSignature) {
-			observedGeneration = selectionGeneration;
-			observedSignature = signature;
-			stableSamples = 0;
-			scheduleTick(100);
-			return;
-		}
-		stableSamples += 1;
-		if (stableSamples < 2) {
-			scheduleTick(25);
-			return;
-		}
-		pendingReverseSynctexSelectionSend = undefined;
-		sendReverseSynctexSelection(pageNumber, pageElement, canvas, viewport);
-	}
-	scheduleTick(100);
-}
-
-function viewportScale(input) {
-	const origin = input.viewport.convertToViewportPoint(0, 0);
-	const xUnit = input.viewport.convertToViewportPoint(1, 0);
-	const yUnit = input.viewport.convertToViewportPoint(0, 1);
-	return { x: Math.abs(xUnit[0] - origin[0]) || 1, y: Math.abs(yUnit[1] - origin[1]) || 1 };
-}
-
-function forwardSynctexMarkerFromPdfPoint(input) {
-	const scale = viewportScale(input);
-	const point = input.viewport.convertToViewportPoint(input.pdfX, input.pdfY);
-	const pageHeight = input.pageHeight ?? input.viewport.convertToViewportPoint(0, 0)[1];
-	const position = { left: point[0], top: pageHeight - point[1] };
-	if (input.width === undefined || input.height === undefined) return position;
-	return { ...position, width: input.width * scale.x, height: input.height * scale.y };
-}
-
-function removeReverseSynctexHoverOverlay() {
-	for (const marker of document.querySelectorAll("[data-reverse-synctex-hover]")) marker.remove();
-}
-
-function removeReverseSynctexForwardProbeOverlay() {
-	for (const marker of document.querySelectorAll("[data-reverse-synctex-forward-probe]")) marker.remove();
-}
-
-function setReverseSynctexHoverEnabled(enabled) {
-	reverseSynctexHoverEnabled = enabled;
-	const button = document.getElementById("synctex-hover-toggle");
-	if (button) {
-		button.setAttribute("aria-pressed", enabled ? "true" : "false");
-		button.textContent = enabled ? "SyncTeX hover: on" : "SyncTeX hover: off";
-	}
-	if (!enabled) {
-		reverseSynctexHoverLatestRequestId += 1;
-		reverseSynctexHoverPending = undefined;
-		if (reverseSynctexHoverTimer !== undefined) clearTimeout(reverseSynctexHoverTimer);
-		reverseSynctexHoverTimer = undefined;
-		reverseSynctexForwardProbeLatestRequestId += 1;
-		removeReverseSynctexHoverOverlay();
-		removeReverseSynctexForwardProbeOverlay();
-	}
-}
-
-function reverseSynctexHoverRectPosition(rect, page, viewport) {
-	const leftTop = viewport.convertToViewportPoint(Number(rect.left), Number(rect.top));
-	const rightBottom = viewport.convertToViewportPoint(Number(rect.right), Number(rect.bottom));
-	const pageHeight = page.getBoundingClientRect().height;
-	return {
-		left: Math.min(leftTop[0], rightBottom[0]),
-		top: pageHeight - Math.max(leftTop[1], rightBottom[1]),
-		width: visibleSynctexRectDimension(Math.abs(rightBottom[0] - leftTop[0])),
-		height: visibleSynctexRectDimension(Math.abs(leftTop[1] - rightBottom[1])),
-	};
-}
-
-function truncateHoverLabel(value) {
-	const text = String(value ?? "").trim();
-	return text.length > 100 ? text.slice(0, 97) + "…" : text;
-}
-
-function hoverCandidateLine(prefix, candidate) {
-	if (!candidate) return "";
-	const source = candidate.source_line ? " " + truncateHoverLabel(String(candidate.source_line)) : "";
-	const precision = candidate.precision ? " [" + String(candidate.precision) + "]" : "";
-	const score = candidate.score === undefined ? "" : " score " + String(candidate.score);
-	const distance = candidate.score === undefined && candidate.distance !== undefined ? " distance " + String(candidate.distance) : "";
-	return prefix + ": line " + String(candidate.line || "?") + score + distance + source + precision;
-}
-
-function hoverDiagnosticsLabel(message) {
-	const file = String(message.source_file || "").split(/[\\/]/).pop() || "source";
-	const simple = file + ":" + message.line + " " + truncateHoverLabel(message.source_line);
-	const nearestCandidate = message.nearest_candidate || message.raw;
-	if (nearestCandidate || message.repaired || message.precision || Array.isArray(message.candidates) || message.forward) {
-		const parts = [simple];
-		if (nearestCandidate) parts.push(hoverCandidateLine("nearest candidate", nearestCandidate));
-		if (message.repaired) parts.push(hoverCandidateLine("repair", message.repaired));
-		else parts.push(hoverCandidateLine("result", { line: message.line, source_line: message.source_line, precision: message.precision, score: message.selected_score }));
-		if (message.forward && message.forward.contains_click) parts.push("forward: verified");
-		if (Array.isArray(message.candidates) && message.candidates.length > 0) parts.push("top: " + message.candidates.slice(0, 3).map((candidate) => "line " + String(candidate.line || "?") + (candidate.score === undefined ? "" : " score " + String(candidate.score))).join("; "));
-		return parts.filter(Boolean).join("\\n");
-	}
-	return simple;
-}
-
-function showReverseSynctexHoverResult(message) {
-	if (!reverseSynctexHoverEnabled || Number(message.request_id) !== reverseSynctexHoverLatestRequestId) return;
-	if (message.error || !message.rect) {
-		removeReverseSynctexHoverOverlay();
-		return;
-	}
-	const pageNumber = Number(message.page);
-	const page = pages.querySelector("[data-page-number='" + String(pageNumber) + "']");
-	const viewport = pageViewports.get(pageNumber);
-	if (!page || !viewport) return;
-	removeReverseSynctexHoverOverlay();
-	const position = reverseSynctexHoverRectPosition(message.rect, page, viewport);
-	const marker = document.createElement("div");
-	marker.dataset.reverseSynctexHover = "rect";
-	marker.style.position = "absolute";
-	marker.style.pointerEvents = "none";
-	marker.style.zIndex = "100001";
-	marker.style.left = String(position.left) + "px";
-	marker.style.top = String(position.top) + "px";
-	marker.style.width = String(position.width) + "px";
-	marker.style.height = String(position.height) + "px";
-	marker.style.outline = "2px solid rgba(14,165,233,.9)";
-	marker.style.background = "rgba(14,165,233,.18)";
-	const label = document.createElement("div");
-	label.dataset.reverseSynctexHover = "label";
-	label.style.position = "absolute";
-	label.style.pointerEvents = "none";
-	label.style.zIndex = "100002";
-	label.style.left = String(Math.max(0, position.left)) + "px";
-	label.style.top = String(Math.max(0, position.top - 28)) + "px";
-	label.style.maxWidth = "min(60ch, 80vw)";
-	label.style.padding = "3px 6px";
-	label.style.borderRadius = "4px";
-	label.style.background = "rgba(15,23,42,.9)";
-	label.style.color = "white";
-	label.style.font = "12px/1.3 sans-serif";
-	label.style.whiteSpace = "pre-line";
-	label.textContent = hoverDiagnosticsLabel(message);
-	page.append(marker, label);
-}
-
-function sendReverseSynctexForwardProbe(event, pageNumber, pageElement, canvas, viewport) {
-	if (!reverseSynctexHoverEnabled || !viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
-	if ((window.getSelection()?.toString() ?? "").length > 0) return;
-	const rect = canvas.getBoundingClientRect();
-	const point = viewport.convertToPdfPoint(event.clientX - rect.left, canvas.offsetHeight - (event.clientY - rect.top));
-	const requestId = reverseSynctexForwardProbeRequestId + 1;
-	reverseSynctexForwardProbeRequestId = requestId;
-	reverseSynctexForwardProbeLatestRequestId = requestId;
-	removeReverseSynctexForwardProbeOverlay();
-	viewerSocket.send(JSON.stringify({ type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageElement, canvas, viewport) }));
-}
-
-function scheduleReverseSynctexHover(event, pageNumber, pageElement, canvas, viewport) {
-	if (!reverseSynctexHoverEnabled || !viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
-	const rect = canvas.getBoundingClientRect();
-	const point = viewport.convertToPdfPoint(event.clientX - rect.left, canvas.offsetHeight - (event.clientY - rect.top));
-	const requestId = reverseSynctexHoverRequestId + 1;
-	reverseSynctexHoverRequestId = requestId;
-	reverseSynctexHoverLatestRequestId = requestId;
-	reverseSynctexHoverPending = { request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageElement, canvas, viewport) };
-	if (reverseSynctexHoverTimer !== undefined) return;
-	reverseSynctexHoverTimer = setTimeout(() => {
-		reverseSynctexHoverTimer = undefined;
-		const pending = reverseSynctexHoverPending;
-		reverseSynctexHoverPending = undefined;
-		if (!reverseSynctexHoverEnabled || !pending || !viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
-		viewerSocket.send(JSON.stringify({ type: "reverse_synctex_hover", request_id: pending.request_id, page: pending.page, x: pending.x, y: pending.y, ...(pending.textBeforeSelection ? { textBeforeSelection: pending.textBeforeSelection } : {}), ...(pending.textAfterSelection ? { textAfterSelection: pending.textAfterSelection } : {}) }));
-	}, REVERSE_SYNCTEX_HOVER_THROTTLE_MS);
-}
-
-async function renderPdf(config) {
-	activeConfig = config;
-	if (fallback) fallback.href = config.pdf_url;
-	pageViewports.clear();
-	pages.replaceChildren();
-	setStatus("Loading PDF " + config.pdf_id + " revision " + config.revision + " through PDF.js…");
-	const pdfjsLib = await import("/assets/pdf.mjs");
-	pdfjsLib.GlobalWorkerOptions.workerSrc = "/assets/pdf.worker.mjs";
-	const pdf = await pdfjsLib.getDocument({ url: config.pdf_url }).promise;
-	for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-		const page = await pdf.getPage(pageNumber);
-		const viewport = page.getViewport({ scale: 1.25 });
-		pageViewports.set(pageNumber, viewport);
-		const canvas = document.createElement("canvas");
-		canvas.width = viewport.width;
-		canvas.height = viewport.height;
-		canvas.dataset.pageNumber = String(pageNumber);
-		const pageContainer = document.createElement("div");
-		pageContainer.style.position = "relative";
-		pageContainer.style.width = String(viewport.width) + "px";
-		pageContainer.style.margin = "1rem auto";
-		pageContainer.dataset.pageNumber = String(pageNumber);
-		pageContainer.appendChild(canvas);
-		await renderTextLayer(pdfjsLib, page, viewport, pageContainer);
-		pageContainer.addEventListener("mousedown", () => {
-			pendingSelectionMouseDownDebug = selectionDebugSnapshot("mousedown", pageNumber);
-			pendingReverseSynctexContexts.set(pageContainer, { ...reverseSynctexContextForPage(pageContainer, canvas, viewport), selectionGeneration });
-		}, true);
-		pageContainer.addEventListener("mouseup", () => {
-			if ((window.getSelection()?.toString() ?? "").length > 0 && pendingSelectionMouseDownDebug !== undefined) {
-				sendSelectionDebugDetails("mousedown", pageNumber, pendingSelectionMouseDownDebug);
-			}
-			pendingSelectionMouseDownDebug = undefined;
-			sendSelectionDebug("mouseup", pageNumber);
-			scheduleReverseSynctexSelectionSend(pageNumber, pageContainer, canvas, viewport);
-		}, true);
-		pageContainer.addEventListener("mousemove", (event) => scheduleReverseSynctexHover(event, pageNumber, pageContainer, canvas, viewport));
-		pageContainer.addEventListener("mouseleave", () => {
-			reverseSynctexHoverLatestRequestId += 1;
-			reverseSynctexHoverPending = undefined;
-			removeReverseSynctexHoverOverlay();
-		});
-		pageContainer.addEventListener("click", (event) => {
-			if (!event.ctrlKey) {
-				sendReverseSynctexForwardProbe(event, pageNumber, pageContainer, canvas, viewport);
-				return;
-			}
-			removeReverseSynctexHoverOverlay();
-			removeReverseSynctexForwardProbeOverlay();
-			if (!viewerSocket || viewerSocket.readyState !== WebSocket.OPEN) return;
-			const rect = canvas.getBoundingClientRect();
-			const pendingTextSelection = pendingReverseSynctexContexts.get(pageContainer) || {};
-			pendingReverseSynctexContexts.delete(pageContainer);
-			const currentTextSelection = { ...reverseSynctexContextForPage(pageContainer, canvas, viewport), selectionGeneration };
-			const textSelection = hasReverseSynctexContext(pendingTextSelection) ? pendingTextSelection : currentTextSelection;
-			const selectionSignature = reverseSynctexSelectionSignature(pageNumber, textSelection);
-			if (wasSelectionAlreadySent(selectionSignature, textSelection.selectionGeneration)) {
-				sendSelectionDebug("suppress", pageNumber, { suppressionReason: "already_sent_click", signature: selectionSignature, generation: textSelection.selectionGeneration, selectedPayloadText: boundedSelectionDebugText(textSelection.selectedText), selectedPayloadTextLength: textSelection.selectedText?.length });
-				return;
-			}
-			if (textSelection.selectedText !== undefined && textSelection.selectionStartX !== undefined && textSelection.selectionStartY !== undefined && textSelection.selectionEndX !== undefined && textSelection.selectionEndY !== undefined) {
-				rememberSentSelection(selectionSignature, textSelection.selectionGeneration);
-				const payload = reverseSynctexSelectionPayload(pageNumber, textSelection);
-				sendSelectionDebug("send", pageNumber, { signature: selectionSignature, generation: textSelection.selectionGeneration, selectedPayloadText: boundedSelectionDebugText(payload.selectedText), selectedPayloadTextLength: payload.selectedText.length, selectionStartX: payload.selectionStartX, selectionStartY: payload.selectionStartY, selectionEndX: payload.selectionEndX, selectionEndY: payload.selectionEndY });
-				viewerSocket.send(JSON.stringify(payload));
-				setTimeout(() => {
-					const currentText = window.getSelection()?.toString() ?? "";
-					sendSelectionDebug("post_send_audit", pageNumber, { sentText: boundedSelectionDebugText(payload.selectedText), sentTextLength: payload.selectedText.length, currentText: boundedSelectionDebugText(currentText), currentTextLength: currentText.length, changed: currentText !== payload.selectedText });
-				}, 300);
-				return;
-			}
-			const payload = reverseSynctexPayloadFromViewportPoint({
-				page: pageNumber,
-				viewportX: event.clientX - rect.left,
-				viewportY: event.clientY - rect.top,
-				viewportHeight: canvas.offsetHeight,
-				viewport,
-				...textSelection,
-			});
-			viewerSocket.send(JSON.stringify(payload));
-		});
-		pages.appendChild(pageContainer);
-		await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-		canvas.dataset.rendered = "true";
-	}
-	setStatus("Loaded PDF " + config.pdf_id + " revision " + config.revision + ": " + pdf.numPages + " page(s)");
-}
-
-function visibleSynctexRectDimension(value) {
-	return Math.max(value, 2);
-}
-
-function forwardSynctexMarkerFromPdfRange(input) {
-	const leftTop = input.viewport.convertToViewportPoint(input.h, input.v - input.H);
-	const rightBottom = input.viewport.convertToViewportPoint(input.h + input.W, input.v);
-	return {
-		left: leftTop[0],
-		top: input.pageHeight - leftTop[1],
-		width: visibleSynctexRectDimension(rightBottom[0] - leftTop[0]),
-		height: visibleSynctexRectDimension(leftTop[1] - rightBottom[1]),
-	};
-}
-
-function scrollToUnionInViewport(markers) {
-	const page = markers[0]?.parentNode;
-	if (!page || !(page instanceof HTMLElement)) return;
-	let left = Infinity;
-	let right = -Infinity;
-	let top = Infinity;
-	let bottom = -Infinity;
-	for (const marker of markers) {
-		const bounds = marker.getBoundingClientRect();
-		left = Math.min(left, bounds.left);
-		right = Math.max(right, bounds.right);
-		top = Math.min(top, bounds.top);
-		bottom = Math.max(bottom, bounds.bottom);
-	}
-	if (!Number.isFinite(left) || !Number.isFinite(right) || !Number.isFinite(top) || !Number.isFinite(bottom)) return;
-	window.scrollTo({
-		left: window.scrollX + (left + right) / 2 - window.innerWidth / 2,
-		top: window.scrollY + (top + bottom) / 2 - window.innerHeight * 0.4,
-	});
-}
-
-function showReverseSynctexForwardProbeResult(message) {
-	if (!reverseSynctexHoverEnabled || Number(message.request_id) !== reverseSynctexForwardProbeLatestRequestId) return;
-	removeReverseSynctexForwardProbeOverlay();
-	if (message.error || message.page === undefined || message.x === undefined || message.y === undefined) return;
-	const pageNumber = Number(message.page);
-	const page = pages.querySelector("[data-page-number='" + String(pageNumber) + "']");
-	const viewport = pageViewports.get(pageNumber);
-	if (!page || !viewport) return;
-	const ranges = Array.isArray(message.ranges) ? message.ranges : [];
-	const rectRanges = ranges.filter((entry) => Number(entry.page) === pageNumber);
-	const scalarRectPosition = rectRanges.length === 0 && message.width !== undefined && message.height !== undefined
-		? forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, width: message.width, height: message.height, pageHeight: page.getBoundingClientRect().height, viewport })
-		: undefined;
-	const positions = scalarRectPosition === undefined ? rectRanges.map((range) => forwardSynctexMarkerFromPdfRange({
-		h: Number(range.h),
-		v: Number(range.v),
-		W: Number(range.W),
-		H: Number(range.H),
-		pageHeight: page.getBoundingClientRect().height,
-		viewport,
-	})) : [scalarRectPosition];
-	if (positions.length === 0) positions.push(forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, pageHeight: page.getBoundingClientRect().height, viewport }));
-	const markers = [];
-	for (const position of positions) {
-		const marker = document.createElement("div");
-		marker.dataset.reverseSynctexForwardProbe = "marker";
-		marker.style.position = "absolute";
-		marker.style.pointerEvents = "none";
-		marker.style.zIndex = "100003";
-		marker.style.left = String(position.left) + "px";
-		marker.style.top = String(position.top) + "px";
-		if (position.width === undefined || position.height === undefined) {
-			marker.dataset.synctexMarkerKind = "circle";
-			marker.style.border = "0.2em solid red";
-			marker.style.borderRadius = "50%";
-			marker.style.background = "rgba(255,0,0,0.4)";
-			marker.style.transform = "translate(-50%, -50%)";
-			marker.style.width = "0.5em";
-			marker.style.height = "0.5em";
-		} else {
-			marker.dataset.synctexMarkerKind = "rect";
-			marker.style.width = String(position.width) + "px";
-			marker.style.height = String(position.height) + "px";
-			marker.style.background = "rgba(239,68,68,.18)";
-		}
-		markers.push(marker);
-		page.appendChild(marker);
-	}
-	const label = document.createElement("div");
-	label.dataset.reverseSynctexForwardProbe = "label";
-	label.style.position = "absolute";
-	label.style.pointerEvents = "none";
-	label.style.zIndex = "100004";
-	label.style.left = String(Math.max(0, positions[0].left)) + "px";
-	label.style.top = String(Math.max(0, positions[0].top - 28)) + "px";
-	label.style.padding = "3px 6px";
-	label.style.borderRadius = "4px";
-	label.style.background = "rgba(127,29,29,.92)";
-	label.style.color = "white";
-	label.style.font = "12px/1.3 sans-serif";
-	label.textContent = "reverse line " + String(message.reverse_line || message.line || "?") + " -> forward boxes";
-	page.appendChild(label);
-	scrollToUnionInViewport(markers);
-}
-
-function showSynctexMarker(message) {
-	const pageNumber = Number(message.page);
-	const page = pages.querySelector("[data-page-number='" + String(pageNumber) + "']");
-	const viewport = pageViewports.get(pageNumber);
-	if (!page || !viewport) return;
-	const existing = document.querySelectorAll("[data-synctex-marker]");
-	for (const marker of existing) marker.remove();
-
-	const ranges = Array.isArray(message.ranges) ? message.ranges : [];
-	const rectRanges = ranges.filter((entry) => Number(entry.page) === pageNumber);
-	const scalarRectPosition = rectRanges.length === 0 && message.width !== undefined && message.height !== undefined
-		? forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, width: message.width, height: message.height, pageHeight: page.getBoundingClientRect().height, viewport })
-		: undefined;
-	const isCircle = rectRanges.length === 0 && scalarRectPosition === undefined;
-	if (isCircle) {
-		const marker = document.createElement("div");
-		marker.dataset.synctexMarker = "true";
-		marker.tabIndex = -1;
-		marker.style.position = "absolute";
-		marker.style.pointerEvents = "none";
-		marker.style.zIndex = "100000";
-		const position = forwardSynctexMarkerFromPdfPoint({ pdfX: message.x, pdfY: message.y, pageHeight: page.getBoundingClientRect().height, viewport });
-		marker.dataset.synctexMarkerKind = "circle";
-		marker.style.left = String(position.left) + "px";
-		marker.style.top = String(position.top) + "px";
-		marker.style.border = "0.2em solid red";
-		marker.style.borderRadius = "50%";
-		marker.style.background = "rgba(255,0,0,0.4)";
-		marker.style.transform = "translate(-50%, -50%)";
-		marker.style.opacity = "0.8";
-		marker.style.width = "0.5em";
-		marker.style.height = "0.5em";
-		page.appendChild(marker);
-		scrollToUnionInViewport([marker]);
-		marker.focus({ preventScroll: true });
-		return;
-	}
-
-	const markers = [];
-	const positions = scalarRectPosition === undefined ? rectRanges.map((range) => forwardSynctexMarkerFromPdfRange({
-		h: Number(range.h),
-		v: Number(range.v),
-		W: Number(range.W),
-		H: Number(range.H),
-		pageHeight: page.getBoundingClientRect().height,
-		viewport,
-	})) : [scalarRectPosition];
-	for (const position of positions) {
-		const marker = document.createElement("div");
-		marker.dataset.synctexMarker = "true";
-		marker.tabIndex = -1;
-		marker.style.position = "absolute";
-		marker.style.pointerEvents = "none";
-		marker.style.zIndex = "100000";
-		marker.dataset.synctexMarkerKind = "rect";
-		marker.style.left = String(position.left) + "px";
-		marker.style.top = String(position.top) + "px";
-		marker.style.width = String(position.width) + "px";
-		marker.style.height = String(position.height) + "px";
-		marker.style.border = "0";
-		marker.style.borderRadius = "0";
-		marker.style.background = "rgba(239,68,68,.18)";
-		markers.push(marker);
-		page.appendChild(marker);
-	}
-	if (markers.length === 0) return;
-	scrollToUnionInViewport(markers);
-	markers[0].focus({ preventScroll: true });
-}
-
-function connectViewerSocket(config) {
-	if (!config.viewer_socket_url || !("WebSocket" in window)) return;
-	viewerSocket = new WebSocket(config.viewer_socket_url);
-	viewerSocket.addEventListener("message", (event) => {
-		const message = JSON.parse(event.data);
-		if (message.type === "pdf_refresh") {
-			const nextConfig = { ...activeConfig, revision: message.revision, pdf_url: message.pdf_url };
-			void renderPdf(nextConfig).catch(reportViewerError);
-		} else if (message.type === "synctex_forward") {
-			showSynctexMarker(message);
-		} else if (message.type === "reverse_synctex_hover_result") {
-			showReverseSynctexHoverResult(message);
-		} else if (message.type === "reverse_synctex_forward_probe_result") {
-			showReverseSynctexForwardProbeResult(message);
-		}
-	});
-}
-
-const hoverToggle = document.getElementById("synctex-hover-toggle");
-if (hoverToggle) hoverToggle.addEventListener("click", () => setReverseSynctexHoverEnabled(!reverseSynctexHoverEnabled));
-setReverseSynctexHoverEnabled(false);
-
-fetch(configUrl)
-	.then((response) => {
-		if (!response.ok) throw new Error("config request failed: " + response.status);
-		return response.json();
-	})
-	.then((config) => {
-		connectViewerSocket(config);
-		return renderPdf(config);
-	})
-	.catch((error) => {
-		reportViewerError(error);
-	});
 `;
 
 export interface ViewerHostFileSystem {
@@ -1225,6 +523,17 @@ export class ViewerHostServer {
 			return;
 		}
 
+		const lwViewerMatch = /^\/viewer-lw\/(\d+)$/.exec(requestUrl.pathname);
+		if (lwViewerMatch) {
+			const pdfId = parsePositiveInteger(lwViewerMatch[1]);
+			if (pdfId === undefined || !this.hasRegisteredPdf(pdfId)) {
+				textResponse(response, 404, "text/plain; charset=utf-8", "unknown pdf_id", request.method === "HEAD");
+				return;
+			}
+			this.serveLaTeXWorkshopViewerShell(response, pdfId, request.method === "HEAD");
+			return;
+		}
+
 		const viewerMatch = /^\/viewer\/(\d+)$/.exec(requestUrl.pathname);
 		if (viewerMatch) {
 			const pdfId = parsePositiveInteger(viewerMatch[1]);
@@ -1232,7 +541,9 @@ export class ViewerHostServer {
 				textResponse(response, 404, "text/plain; charset=utf-8", "unknown pdf_id", request.method === "HEAD");
 				return;
 			}
-			this.serveViewerShell(response, pdfId, request.method === "HEAD");
+			const location = `/viewer-lw/${pdfId}${requestUrl.search}`;
+			response.writeHead(302, { location, "cache-control": "no-store" });
+			response.end();
 			return;
 		}
 
@@ -1252,14 +563,13 @@ export class ViewerHostServer {
 			return;
 		}
 
-		if (requestUrl.pathname === "/assets/viewer.js") {
-			textResponse(response, 200, "text/javascript; charset=utf-8", VIEWER_SCRIPT, request.method === "HEAD");
+
+		if (requestUrl.pathname.startsWith("/viewer-lw/")) {
+			this.serveLaTeXWorkshopViewerAsset(response, requestUrl.pathname, request.method === "HEAD");
 			return;
 		}
-
-		const pdfJsAssetPath = LOCAL_PDFJS_ASSETS.get(requestUrl.pathname);
-		if (pdfJsAssetPath !== undefined) {
-			this.serveLocalPdfJsAsset(response, pdfJsAssetPath, request.method === "HEAD");
+		if (requestUrl.pathname.startsWith("/cmaps/") || requestUrl.pathname.startsWith("/standard_fonts/") || requestUrl.pathname.startsWith("/wasm/")) {
+			this.servePdfJsDistAsset(response, requestUrl.pathname, request.method === "HEAD");
 			return;
 		}
 
@@ -1336,20 +646,24 @@ export class ViewerHostServer {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Viewer Client</title>
 <style>
-body{font-family:sans-serif;margin:0;background:#f7f7f7;color:#222}
-#viewer-client-app{display:flex;flex-direction:column;height:100vh}
-header{display:flex;align-items:center;gap:1rem;padding:.5rem .75rem;background:#1f2937;color:white}
+*{box-sizing:border-box}
+html,body{width:100%;height:100%;min-width:0;min-height:0;margin:0;overflow:hidden}
+body{font-family:sans-serif;background:#f7f7f7;color:#222;position:fixed;inset:0}
+#viewer-client-app{display:flex;flex-direction:column;width:100%;height:100vh;min-width:0;min-height:0;overflow:hidden}
+header{flex:0 0 auto;display:flex;align-items:center;gap:1rem;min-width:0;padding:.5rem .75rem;background:#1f2937;color:white}
 h1{font-size:1rem;margin:0;white-space:nowrap}
-[role=tablist]{display:flex;gap:.25rem;overflow:auto}
+[role=tablist]{display:flex;gap:.25rem;min-width:0;overflow:auto}
 .tab-item{display:flex;background:#374151;border-radius:.25rem;overflow:hidden}
 button{font:inherit}
 [role=tab],button[data-close-pdf-id]{border:0;color:white;background:transparent;padding:.35rem .55rem;cursor:pointer}
 [role=tab][aria-selected=true]{background:#f7f7f7;color:#111827}
 button[data-close-pdf-id]{border-left:1px solid #4b5563}
-#empty-state{margin:2rem;text-align:center;color:#555}
-#viewer-panels{flex:1;min-height:0}
-[role=tabpanel]{height:100%}
-iframe{width:100%;height:100%;border:0;background:white}
+#empty-state{flex:0 0 auto;margin:2rem;text-align:center;color:#555}
+#empty-state[hidden]{display:none!important}
+#viewer-panels{flex:1 1 auto;display:block;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
+[role=tabpanel]{display:block;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
+[role=tabpanel][hidden]{display:none!important}
+iframe{display:block;width:100%;height:100%;min-width:0;min-height:0;border:0;background:white;vertical-align:top}
 </style>
 </head>
 <body>
@@ -1367,44 +681,47 @@ iframe{width:100%;height:100%;border:0;background:white}
 		textResponse(response, 200, "text/html; charset=utf-8", body, headOnly);
 	}
 
-	private serveViewerShell(response: ServerResponse, pdfId: number, headOnly: boolean): void {
-		const record = this.registry.getPdf(pdfId);
-		const fallbackUrl = `/pdf/${record.pdfId}?revision=${record.revision}`;
-		const body = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PDF.js viewer ${pdfId}</title>
-<style>body{font-family:sans-serif;margin:1rem;background:#f7f7f7}canvas{display:block;background:white;box-shadow:0 1px 8px #999}#status{margin-bottom:1rem}.textLayer{position:absolute;inset:0;overflow:hidden;line-height:1;text-align:initial;transform-origin:0 0}.textLayer span,.textLayer br{color:transparent;position:absolute;white-space:pre;cursor:text;transform-origin:0 0}.textLayer ::selection{background:rgba(0,0,255,.25)}</style>
-</head>
-<body data-config-url="/config/${pdfId}.json">
-<h1>PDF.js viewer</h1>
-<p id="status">Loading PDF.js viewer for pdf_id=${pdfId}…</p>
-<p><button id="synctex-hover-toggle" type="button" aria-pressed="false">SyncTeX hover: off</button> <a id="fallback-link" href="${fallbackUrl}">Open registered PDF bytes directly</a></p>
-<div id="pages"></div>
-<script>
-(function () {
-	function setFailure(message) {
-		var status = document.getElementById("status");
-		if (status) status.textContent = message + " Use the direct PDF link below.";
-	}
-	window.addEventListener("error", function (event) {
-		if (event.target && event.target.tagName === "SCRIPT") {
-			setFailure("Unable to load PDF.js viewer script: viewer script failed to load.");
+	private serveLaTeXWorkshopViewerShell(response: ServerResponse, pdfId: number, headOnly: boolean): void {
+		try {
+			const html = readFileSync(resolve(LW_VIEWER_ASSET_ROOT, "viewer.html"), "utf8")
+				.replace("<body tabindex=\"0\">", `<body tabindex="0" data-config-url="/config/${pdfId}.json">`);
+			textResponse(response, 200, "text/html; charset=utf-8", html, headOnly);
+		} catch {
+			textResponse(response, 404, "text/plain; charset=utf-8", "LaTeX Workshop viewer shell is not readable", headOnly);
 		}
-	});
-	window.addEventListener("unhandledrejection", function (event) {
-		var reason = event.reason && event.reason.message ? event.reason.message : String(event.reason || "unhandled viewer promise rejection");
-		setFailure("Unable to load PDF.js viewer script: " + reason + ".");
-	});
-}());
-</script>
-<script type="module" src="/assets/viewer.js" onerror="document.getElementById('status').textContent='Unable to load PDF.js viewer script: viewer script failed to load. Use the direct PDF link below.'"></script>
-<script nomodule>document.getElementById("status").textContent = "Unable to load PDF.js viewer script: this browser does not support JavaScript modules. Use the direct PDF link below.";</script>
-</body>
-</html>`;
-		textResponse(response, 200, "text/html; charset=utf-8", body, headOnly);
+	}
+
+	private serveLaTeXWorkshopViewerAsset(response: ServerResponse, requestPath: string, headOnly: boolean): void {
+		const buildAsset = LW_PDFJS_BUILD_ASSETS.get(requestPath);
+		if (buildAsset !== undefined) {
+			this.serveLocalPdfJsAsset(response, buildAsset.path, headOnly, buildAsset.polyfillModernPromiseHelpers === true);
+			return;
+		}
+		const relativeAssetPath = requestPath.replace(/^\/viewer-lw\//, "");
+		if (relativeAssetPath === "" || relativeAssetPath === "viewer.html" || relativeAssetPath.includes("\0")) {
+			textResponse(response, 404, "text/plain; charset=utf-8", "not found", headOnly);
+			return;
+		}
+		this.serveStaticFile(response, LW_VIEWER_ASSET_ROOT, relativeAssetPath, headOnly);
+	}
+
+	private servePdfJsDistAsset(response: ServerResponse, requestPath: string, headOnly: boolean): void {
+		const relativeAssetPath = requestPath.replace(/^\//, "");
+		this.serveStaticFile(response, LW_VIEWER_ASSET_ROOT, relativeAssetPath, headOnly);
+	}
+
+	private serveStaticFile(response: ServerResponse, root: string, relativeAssetPath: string, headOnly: boolean): void {
+		const assetPath = resolve(root, relativeAssetPath);
+		const relativeToRoot = relative(root, assetPath);
+		if (relativeToRoot.startsWith("..") || relativeToRoot === "" || relativeToRoot.split(sep).includes("..")) {
+			textResponse(response, 404, "text/plain; charset=utf-8", "not found", headOnly);
+			return;
+		}
+		try {
+			binaryResponse(response, 200, contentTypeForPath(assetPath), readFileSync(assetPath), headOnly);
+		} catch {
+			textResponse(response, 404, "text/plain; charset=utf-8", "asset is not readable", headOnly);
+		}
 	}
 
 	private serveViewerConfig(response: ServerResponse, pdfId: number, headOnly: boolean): void {
@@ -1419,6 +736,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 		const viewerSocketUrl = `${this.origin.replace(/^http:/, "ws:")}/viewer-socket?pdf_id=${record.pdfId}&token=${encodeURIComponent(token)}`;
 		const body = JSON.stringify({
 			pdf_id: record.pdfId,
+			title: record.title,
 			revision: record.revision,
 			pdf_url: this.pdfUrl(record.pdfId, record.revision),
 			viewer_socket_url: viewerSocketUrl,
@@ -1428,9 +746,14 @@ iframe{width:100%;height:100%;border:0;background:white}
 		textResponse(response, 200, "application/json; charset=utf-8", body, headOnly);
 	}
 
-	private serveLocalPdfJsAsset(response: ServerResponse, path: string, headOnly: boolean): void {
+	private serveLocalPdfJsAsset(response: ServerResponse, path: string, headOnly: boolean, prependModernPromiseHelpersPolyfill = false): void {
 		try {
-			binaryResponse(response, 200, "text/javascript; charset=utf-8", readFileSync(path), headOnly);
+			const body = readFileSync(path);
+			if (prependModernPromiseHelpersPolyfill) {
+				textResponse(response, 200, contentTypeForPath(path), `${PDFJS_MODERN_PROMISE_HELPERS_POLYFILL}${body.toString("utf8")}`, headOnly);
+				return;
+			}
+			binaryResponse(response, 200, contentTypeForPath(path), body, headOnly);
 		} catch {
 			textResponse(response, 404, "text/plain; charset=utf-8", "PDF.js asset is not readable", headOnly);
 		}
@@ -1778,7 +1101,7 @@ iframe{width:100%;height:100%;border:0;background:white}
 			pdf_id: record.pdfId,
 			title: record.title,
 			revision: record.revision,
-			viewer_url: `/viewer/${record.pdfId}?revision=${record.revision}`,
+			viewer_url: `/viewer-lw/${record.pdfId}?revision=${record.revision}`,
 			visible_tab_token: this.createVisibleTabToken(),
 		};
 		this.visibleViewerClientTabs.delete(record.pdfId);
@@ -2142,6 +1465,27 @@ function parsePositiveInteger(value: string | undefined): number | undefined {
 	if (value === undefined || !/^\d+$/.test(value)) return undefined;
 	const parsed = Number(value);
 	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function contentTypeForPath(path: string): string {
+	switch (extname(path).toLowerCase()) {
+		case ".html": return "text/html; charset=utf-8";
+		case ".css": return "text/css; charset=utf-8";
+		case ".js":
+		case ".mjs": return "text/javascript; charset=utf-8";
+		case ".json": return "application/json; charset=utf-8";
+		case ".svg": return "image/svg+xml";
+		case ".gif": return "image/gif";
+		case ".ico": return "image/x-icon";
+		case ".bcmap": return "application/octet-stream";
+		case ".wasm": return "application/wasm";
+		case ".ttf": return "font/ttf";
+		case ".pfb": return "application/octet-stream";
+		case ".md": return "text/markdown; charset=utf-8";
+		case ".ftl":
+		case ".txt": return "text/plain; charset=utf-8";
+		default: return "application/octet-stream";
+	}
 }
 
 function textResponse(response: ServerResponse, status: number, contentType: string, body: string, headOnly: boolean, headers: Record<string, string> = {}): void {

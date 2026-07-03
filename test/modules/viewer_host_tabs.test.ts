@@ -108,7 +108,7 @@ test("Viewer Client opens a tab for a PDF that was opened before the app event s
 
 		await waitForActivePdf(page, 7);
 		assert.deepEqual(await tabState(page), { tabs: ["7"], iframes: ["7"], active: "7", emptyVisible: false });
-		assert.equal(await iframeSrc(page, 7), "/viewer/7?revision=1");
+		assert.equal(await iframeSrc(page, 7), "/viewer-lw/7?revision=1");
 	} finally {
 		await browser?.close();
 		await server.stop();
@@ -133,7 +133,7 @@ test("Viewer Client reloads an existing tab when re-opening the same visible pdf
 
 		assert.equal((await client.send({ type: "open_pdf", pdf_id: 9, pdf_path: pdfPath, title: "First" })).ok, true);
 		await waitForActivePdf(page, 9);
-		assert.equal(await iframeSrc(page, 9), "/viewer/9?revision=1");
+		assert.equal(await iframeSrc(page, 9), "/viewer-lw/9?revision=1");
 		const firstIframeToken = await page.evaluate(() => {
 			const iframe = document.querySelector("iframe[data-pdf-id='9']") as HTMLIFrameElement & { testToken?: string };
 			iframe.testToken = "same-visible-iframe";
@@ -142,7 +142,7 @@ test("Viewer Client reloads an existing tab when re-opening the same visible pdf
 
 		writeFakePdf(pdfPath, "changed body with different size");
 		assert.equal((await client.send({ type: "open_pdf", pdf_id: 9, pdf_path: pdfPath, title: "First v2" })).ok, true);
-		await page.waitForFunction(() => (document.querySelector("iframe[data-pdf-id='9']") as HTMLIFrameElement | null)?.getAttribute("src") === "/viewer/9?revision=2");
+		await page.waitForFunction(() => (document.querySelector("iframe[data-pdf-id='9']") as HTMLIFrameElement | null)?.getAttribute("src") === "/viewer-lw/9?revision=2");
 
 		assert.deepEqual(await tabState(page), { tabs: ["9"], iframes: ["9"], active: "9", emptyVisible: false });
 		assert.equal(await page.evaluate(() => (document.querySelector("iframe[data-pdf-id='9']") as HTMLIFrameElement & { testToken?: string })?.testToken), firstIframeToken);
@@ -172,7 +172,7 @@ test("Viewer Host ignores stale tab-close notifications from an older revision",
 		const staleClose = await fetch(`${server.origin}/app-tab-closed`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ pdf_id: 11, revision: 1, viewer_url: "/viewer/11?revision=1", visible_tab_token: "old-revision-token" }),
+			body: JSON.stringify({ pdf_id: 11, revision: 1, viewer_url: "/viewer-lw/11?revision=1", visible_tab_token: "old-revision-token" }),
 		});
 		assert.equal(staleClose.status, 200);
 		assert.deepEqual(await staleClose.json(), { ok: true });
@@ -183,7 +183,7 @@ test("Viewer Host ignores stale tab-close notifications from an older revision",
 
 		await waitForActivePdf(page, 11);
 		assert.deepEqual(await tabState(page), { tabs: ["11"], iframes: ["11"], active: "11", emptyVisible: false });
-		assert.equal(await iframeSrc(page, 11), "/viewer/11?revision=2");
+		assert.equal(await iframeSrc(page, 11), "/viewer-lw/11?revision=2");
 		assert.equal(registry.getPdf(11).revision, 2);
 	} finally {
 		await browser?.close();
@@ -218,7 +218,7 @@ test("Viewer Host ignores stale same-revision tab-close notifications from an ol
 		const staleClose = await fetch(`${server.origin}/app-tab-closed`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ pdf_id: 1, revision: 1, viewer_url: "/viewer/1?revision=1", visible_tab_token: staleToken }),
+			body: JSON.stringify({ pdf_id: 1, revision: 1, viewer_url: "/viewer-lw/1?revision=1", visible_tab_token: staleToken }),
 		});
 		assert.equal(staleClose.status, 200);
 		assert.deepEqual(await staleClose.json(), { ok: true });
@@ -229,7 +229,7 @@ test("Viewer Host ignores stale same-revision tab-close notifications from an ol
 
 		await waitForActivePdf(page, 1);
 		assert.deepEqual(await tabState(page), { tabs: ["1"], iframes: ["1"], active: "1", emptyVisible: false });
-		assert.equal(await iframeSrc(page, 1), "/viewer/1?revision=1");
+		assert.equal(await iframeSrc(page, 1), "/viewer-lw/1?revision=1");
 		assert.equal(registry.getPdf(1).revision, 1);
 	} finally {
 		await browser?.close();
@@ -257,7 +257,7 @@ test("Viewer Client tab shell opens, focuses, closes, and reopens Host-registere
 			assert.doesNotMatch(request.url(), /close_pdf|unregister/i, `tab UI must not call close/unregister routes: ${request.method()} ${request.url()}`);
 		});
 		page.on("response", (response: Response) => {
-			if (response.status() >= 400 && !/\/assets\/viewer\.js|\/config\/|\/pdf\//.test(response.url())) failedRequests.push(`${response.status()} ${response.url()}`);
+			if (response.status() >= 400 && !/\/assets\/viewer\.js|\/viewer-lw\/|\/config\/|\/pdf\//.test(response.url())) failedRequests.push(`${response.status()} ${response.url()}`);
 		});
 		await page.goto(`${server.origin}/app`, { waitUntil: "domcontentloaded" });
 		await waitForAppEvents(page);

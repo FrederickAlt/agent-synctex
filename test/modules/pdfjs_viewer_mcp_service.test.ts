@@ -137,7 +137,7 @@ test("PDF.js MCP service open_pdf validates local PDFs, returns viewer_url, and 
 		assert.equal(response.status_details.pdf_id, 1);
 		assert.equal(response.status_details.revision, 1);
 		assert.equal(response.status_details.managed_record?.metadata?.revision, 1);
-		assert.match(response.status_details.viewer_url ?? "", /^http:\/\/127\.0\.0\.1:\d+\/viewer\/1$/);
+		assert.match(response.status_details.viewer_url ?? "", /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/1$/);
 		assert.deepEqual(launcher.urls, [response.status_details.viewer_url]);
 		assert.deepEqual(response.status_details.browser_launch, { ok: true, command: "fake-browser" });
 	} finally {
@@ -167,7 +167,7 @@ test("PDF.js MCP service open_pdf reports browser launch failure as diagnostics 
 		assert.equal(response.status, "ok");
 		assert.equal(response.status_details.pdf, pdfPath);
 		assert.equal(response.status_details.pdf_id, 1);
-		assert.match(response.status_details.viewer_url ?? "", /^http:\/\/127\.0\.0\.1:\d+\/viewer\/1$/);
+		assert.match(response.status_details.viewer_url ?? "", /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/1$/);
 		assert.deepEqual(response.status_details.browser_launch, { ok: false, command: "fake-browser", error: "spawn failed" });
 	} finally {
 		await service.stop();
@@ -268,7 +268,7 @@ test("PDF.js MCP service debounces changed file snapshots before sending pdf_ref
 			type: "pdf_refresh",
 			pdf_id: pdfId,
 			revision: 2,
-			pdf_url: `${record.viewerUrl.replace(/\/viewer\/\d+$/, "")}/pdf/${pdfId}?revision=2`,
+			pdf_url: `${record.viewerUrl.replace(/\/viewer-lw\/\d+$/, "")}/pdf/${pdfId}?revision=2`,
 		});
 	} finally {
 		await service.stop();
@@ -520,7 +520,7 @@ test("PDF.js MCP service jump_pdf maps SyncTeX, notifies viewers, and returns so
 		assert.equal(jump.status_details.reason, "notified_viewers=1");
 
 		const notification = JSON.parse(notifications[0] ?? "{}") as Record<string, unknown>;
-		assert.equal(notification.type, "synctex");
+		assert.equal(notification.type, "synctex_forward");
 		assert.equal(notification.pdf_id, pdfId);
 		assert.equal(notification.page, 6);
 		assert.equal(notification.x, jump.status_details.x);
@@ -1098,7 +1098,7 @@ test("MCP open_pdf tool returns pdf_id, pdf, and viewer_url from the PDF.js serv
 		const result = response.result as { details: { pdf_id: number; pdf: string; viewer_url: string }; content: Array<{ text: string }> };
 		assert.equal(result.details.pdf, pdfPath);
 		assert.equal(result.details.pdf_id, 1);
-		assert.match(result.details.viewer_url, /^http:\/\/127\.0\.0\.1:\d+\/viewer\/1$/);
+		assert.match(result.details.viewer_url, /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/1$/);
 		assert.match(result.content[0].text, /viewer_url=http:\/\/127\.0\.0\.1:/);
 	} finally {
 		await service.stop();
