@@ -6,123 +6,52 @@ import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { PdfEventStore, type PdfEvent, type ReverseSynctexPdfEventInput } from "../../src/modules/pdf_events.ts";
 import { ViewerHostMcpService, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import { collectPostUserPdfContextFromEvents } from "../../src/modules/post_user_pdf_context.ts";
 import type { ReverseSynctexLocation } from "../../src/modules/synctex/forward_synctex.ts";
 import type { McpToViewerHostMessage, ViewerHostControlResponse } from "../../src/modules/viewer_host_protocol.ts";
 
-test("get_pdf_events text exposes reverse SyncTeX event details", async () => {
-	const event: PdfEvent = {
-		type: "reverse_synctex",
-		sequence: 7,
-		pdf_id: 34942382,
-		source_file: "/tmp/paper/main.tex",
-		line: 42,
-		column: 1,
-		source_line: "\\section{Visible target}",
-		timestamp: "2026-06-29T12:00:00.000Z",
-		page: 3,
-		x: 110,
-		y: 220,
-		selected_text: "chosen formula",
-		precision: "verified",
-		repair: "text_context",
-		selection_start: { source_file: "/tmp/paper/main.tex", line: 40, column: 2, source_line: "\\begin{align}", page: 3, x: 100, y: 210, precision: "verified", repair: "text_context", raw_mapped_source_file: "/tmp/paper/raw.tex", raw_mapped_line: 43, raw_mapped_source_line: "\\end{align}", synctex_diagnostics: { topCandidates: [{ line: 43 }, { line: 40 }] } },
-		selection_end: { source_file: "/tmp/paper/main.tex", line: 42, column: 12, source_line: "  a &= b + c\\\\", page: 3, x: 130, y: 220, precision: "text", raw_mapped_line: 43, raw_mapped_source_line: "\\end{align}" },
-		raw_mapped_line: 43,
-		raw_mapped_column: 9,
-		raw_mapped_source_line: "\\end{align}",
-		normalized_formula_span: {
+test("fetch_pdf_context formats PDF annotation comments as concise source-cited marks", async () => {
+	const events: PdfEvent[] = [
+		{
+			type: "selection_debug",
+			sequence: 7,
+			pdf_id: 34942382,
+			timestamp: "2026-06-29T12:00:00.000Z",
+			phase: "send",
+			text: "debug text",
+			details: {},
+		},
+		{
+			type: "pdf_annotation",
+			sequence: 8,
+			pdf_id: 34942382,
+			annotation_id: "annotation-1",
+			timestamp: "2026-06-29T12:00:00.000Z",
 			source_file: "/tmp/paper/main.tex",
-			start_line: 40,
-			end_line: 43,
+			line: 42,
+			source_line: "E = mc^2",
+			page: 3,
+			x: 110,
+			y: 220,
+			comment: "Please justify this step.",
 		},
-		normalized_formula_excerpt: "\\begin{align}\n  a &= b + c\\\\\n\\end{align}",
-		synctex_diagnostics: {
-			branch: "js_fallback",
-			precision: "verified",
-			textRepair: { used: true },
-			selected: { sourceFile: "/tmp/paper/main.tex", line: 42, column: 1, sourceLine: "\\section{Visible target}" },
-			context: { hasSelectionContext: true, textBeforeSelection: "formula body", textAfterSelection: "closing delimiter" },
-			candidates: [
-				{ kind: "initial_candidate", sourceFile: "/tmp/paper/main.tex", line: 43, column: 9 },
-				{ kind: "formula_normalized", sourceFile: "/tmp/paper/main.tex", line: 42, column: 1 },
-			],
-		},
-	};
+	];
 
 	const response = await handleMcpRequest(JSON.stringify({
 		jsonrpc: "2.0",
-		id: 1,
+		id: 12,
 		method: "tools/call",
-		params: { name: "get_pdf_events", arguments: { pdf_id: event.pdf_id, max_events: 5 } },
+		params: { name: "fetch_pdf_context", arguments: { pdf_id: 34942382, max_events: 5 } },
 	}), {
-		getPdfEvents: () => [event],
+		fetchPdfContext: (request) => collectPostUserPdfContextFromEvents(events, { pdfId: request.pdf_id, maxEvents: request.max_events, clearViewer: true }),
 	});
 
 	assert.ok(response && "result" in response);
-	assert.deepEqual((response.result as { details?: { events?: PdfEvent[] } }).details, { events: [event] });
-
-	const text = (response.result as { content?: Array<{ type: string; text: string }> }).content?.[0]?.text ?? "";
-	assert.match(text, /Returned 1 PDF event\(s\) for pdf_id=34942382\./);
-	assert.match(text, /reverse_synctex/);
-	assert.match(text, /pdf_id=34942382/);
-	assert.match(text, /source_file=\/tmp\/paper\/main\.tex/);
-	assert.match(text, /line=42/);
-	assert.match(text, /source_line=\\section\{Visible target\}/);
-	assert.match(text, /page=3/);
-	assert.match(text, /precision=verified/);
-	assert.match(text, /repair=text_context/);
-	assert.doesNotMatch(text, /\bx=110\b/);
-	assert.doesNotMatch(text, /\by=220\b/);
-	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.x, 110);
-	assert.equal((response.result as { details?: { events?: PdfEvent[] } }).details?.events?.[0]?.y, 220);
-	assert.match(text, /selected_text=chosen formula/);
-	assert.match(text, /selection_start=\/tmp\/paper\/main\.tex:line=40:column=2:precision=verified:repair=text_context:initial_candidate_source_file=\/tmp\/paper\/raw\.tex:initial_candidate_line=43/);
-	assert.match(text, /selection_end=\/tmp\/paper\/main\.tex:line=42:column=12:precision=text:initial_candidate_line=43/);
-	assert.doesNotMatch(text, /topCandidates/);
-	assert.doesNotMatch(text, /raw_mapped_/);
-	assert.match(text, /initial_candidate_line=43/);
-	assert.match(text, /initial_candidate_column=9/);
-	assert.match(text, /initial_candidate_source_line=\\end\{align\}/);
-	assert.match(text, /normalized_formula_span=40-43/);
-	assert.match(text, /normalized_formula_excerpt=\\begin\{align\} a &= b \+ c\\\\ \\end\{align\}/);
-	assert.match(text, /synctex_diagnostics=branch=js_fallback/);
-	assert.match(text, /selected=\/tmp\/paper\/main\.tex:line=42:column=1/);
-	assert.match(text, /context=selection=true;before=formula body;after=closing delimiter/);
-	assert.match(text, /candidates=2/);
-});
-
-test("get_pdf_events text exposes PDF annotation comments", async () => {
-	const event: PdfEvent = {
-		type: "pdf_annotation",
-		sequence: 8,
-		pdf_id: 34942382,
-		annotation_id: "annotation-1",
-		timestamp: "2026-06-29T12:00:00.000Z",
-		source_file: "/tmp/paper/main.tex",
-		line: 42,
-		source_line: "E = mc^2",
-		page: 3,
-		x: 110,
-		y: 220,
-		comment: "Please justify this step.",
-	};
-
-	const response = await handleMcpRequest(JSON.stringify({
-		jsonrpc: "2.0",
-		id: 2,
-		method: "tools/call",
-		params: { name: "get_pdf_events", arguments: { pdf_id: event.pdf_id, max_events: 5 } },
-	}), {
-		getPdfEvents: () => [event],
-	});
-
-	assert.ok(response && "result" in response);
-	assert.deepEqual((response.result as { details?: { events?: PdfEvent[] } }).details, { events: [event] });
-	const text = (response.result as { content?: Array<{ type: string; text: string }> }).content?.[0]?.text ?? "";
-	assert.match(text, /pdf_annotation/);
-	assert.match(text, /annotation_id=annotation-1/);
-	assert.match(text, /source_line=E = mc\^2/);
-	assert.match(text, /comment=Please justify this step\./);
+	const result = response.result as { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> };
+	const text = result.content?.[0]?.text ?? "";
+	assert.equal(text, "## PDF marks from Agent SyncTeX\n\n- `/tmp/paper/main.tex:42` — `E = mc^2`\n  User comment: Please justify this step.");
+	assert.deepEqual(result.details, { pdf_ids: [34942382], event_count: 1, cleared: true });
+	assert.doesNotMatch(text, /selection_debug|page=3/);
 });
 
 function eventInput(pdfId: number, line: number): ReverseSynctexPdfEventInput {
@@ -136,51 +65,45 @@ function eventInput(pdfId: number, line: number): ReverseSynctexPdfEventInput {
 	};
 }
 
-test("get_pdf_events text formats selection debug compactly while retaining full details", async () => {
-	const event: PdfEvent = {
-		type: "selection_debug",
-		sequence: 3,
-		pdf_id: 88,
-		timestamp: "2026-07-01T00:00:00.000Z",
-		phase: "post_send_audit",
-		page: 1,
-		text: "selected text",
-		details: {
-			phase: "post_send_audit",
-			selectionTextLength: 13,
-			sentText: "selected text",
-			currentText: "changed text",
-			changed: true,
-			rangeStartNode: { type: "text", text: "full node text retained" },
-		},
-	};
-
-	const response = await handleMcpRequest(JSON.stringify({
-		jsonrpc: "2.0",
-		id: 2,
-		method: "tools/call",
-		params: { name: "get_pdf_events", arguments: { pdf_id: event.pdf_id, max_events: 5, debug: true } },
-	}), {
-		getPdfEvents: () => [event],
-	});
-
-	assert.ok(response && "result" in response);
-	assert.deepEqual((response.result as { details?: { events?: PdfEvent[] } }).details, { events: [event] });
-	const text = (response.result as { content?: Array<{ type: string; text: string }> }).content?.[0]?.text ?? "";
-	assert.match(text, /selection_debug/);
-	assert.match(text, /phase=post_send_audit/);
-	assert.match(text, /page=1/);
-	assert.match(text, /selection_text_len=13/);
-	assert.match(text, /selection_text=selected text/);
-	assert.doesNotMatch(text, /full node text retained/);
-});
-
 class SelectionDebugTestClient implements ViewerHostClient {
 	readonly origin = "http://127.0.0.1:1";
-	async send(_message: McpToViewerHostMessage): Promise<void | ViewerHostControlResponse> {
+	readonly messages: McpToViewerHostMessage[] = [];
+	async send(message: McpToViewerHostMessage): Promise<void | ViewerHostControlResponse> {
+		this.messages.push(message);
 		return undefined;
 	}
 }
+
+test("Viewer Host MCP service fetches context and clears consumed viewer annotations", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "viewer-host-fetch-context-clear-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		const client = new SelectionDebugTestClient();
+		const service = new ViewerHostMcpService({ client, makePdfId: () => 513 });
+		await service.openPdf({ protocol_version: 1, request_id: "open", operation: "open_pdf", created_at_ns: 1, workspace_context: { cwd: dir }, details: { pdf_path: pdfPath } });
+		service.handleHostMessage({
+			type: "pdf_annotation",
+			pdf_id: 513,
+			annotation_id: "a1",
+			page: 1,
+			x: 10,
+			y: 20,
+			source_file: join(dir, "main.tex"),
+			line: 7,
+			source_line: "marked source",
+			comment: "user note",
+		});
+
+		const result = await service.fetchPdfContext({ pdf_id: 513, max_events: 5 });
+
+		assert.equal(result.text, `## PDF marks from Agent SyncTeX\n\n- \`${join(dir, "main.tex")}:7\` — \`marked source\`\n  User comment: user note`);
+		assert.deepEqual(client.messages.at(-1), { type: "clear_pdf_annotations", pdf_id: 513 });
+		assert.deepEqual(await service.getPdfEvents({ pdf_id: 513, max_events: 5 }), []);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
 
 test("Viewer Host MCP service accepts and stores selection debug messages", async () => {
 	const service = new ViewerHostMcpService({ client: new SelectionDebugTestClient() });
@@ -310,37 +233,29 @@ test("PdfEventStore max_events returns oldest unread page and leaves overflow un
 	assert.deepEqual(store.getEvents({ max_events: 2 }), [third]);
 });
 
-test("get_pdf_events schema accepts stale and debug booleans and rejects invalid values", async () => {
+test("fetch_pdf_context schema is advertised while raw get_pdf_events remains hidden", async () => {
 	const listResponse = await handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
 	assert.ok(listResponse && "result" in listResponse);
 	const tools = (listResponse.result as { tools?: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown> } }> }).tools ?? [];
-	const tool = tools.find((candidate) => candidate.name === "get_pdf_events");
-	assert.deepEqual(tool?.inputSchema?.properties?.stale, { type: "boolean" });
-	assert.deepEqual(tool?.inputSchema?.properties?.debug, { type: "boolean" });
+	assert.equal(tools.find((candidate) => candidate.name === "get_pdf_events"), undefined);
+	const tool = tools.find((candidate) => candidate.name === "fetch_pdf_context");
+	assert.equal(tool?.inputSchema?.properties?.clear, undefined);
+	assert.deepEqual(tool?.inputSchema?.properties?.max_events, { type: "integer", minimum: 1 });
 
 	const accepted = await handleMcpRequest(JSON.stringify({
 		jsonrpc: "2.0",
 		id: 2,
 		method: "tools/call",
-		params: { name: "get_pdf_events", arguments: { max_events: 1, stale: true, debug: true } },
+		params: { name: "fetch_pdf_context", arguments: { max_events: 1 } },
 	}), { getPdfEvents: () => [] });
 	assert.ok(accepted && "result" in accepted);
 
-	const rejectedStale = await handleMcpRequest(JSON.stringify({
+	const rejectedUnknown = await handleMcpRequest(JSON.stringify({
 		jsonrpc: "2.0",
 		id: 3,
 		method: "tools/call",
-		params: { name: "get_pdf_events", arguments: { max_events: 1, stale: "yes" } },
-	}), { getPdfEvents: () => [] });
-	assert.ok(rejectedStale && "error" in rejectedStale);
-	assert.match(rejectedStale.error.message, /stale must be a boolean/);
-
-	const rejectedDebug = await handleMcpRequest(JSON.stringify({
-		jsonrpc: "2.0",
-		id: 4,
-		method: "tools/call",
-		params: { name: "get_pdf_events", arguments: { max_events: 1, debug: "yes" } },
-	}), { getPdfEvents: () => [] });
-	assert.ok(rejectedDebug && "error" in rejectedDebug);
-	assert.match(rejectedDebug.error.message, /debug must be a boolean/);
+		params: { name: "fetch_pdf_context", arguments: { clear: true } },
+	}), { fetchPdfContext: () => ({ text: "", pdfIds: [], eventCount: 0, cleared: false, events: [] }) });
+	assert.ok(rejectedUnknown && "error" in rejectedUnknown);
+	assert.match(rejectedUnknown.error.message, /unknown argument: clear/);
 });

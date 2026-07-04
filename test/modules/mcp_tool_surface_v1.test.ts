@@ -6,7 +6,7 @@ function request(id: number, method: string, params: Record<string, unknown> = {
 	return JSON.stringify({ jsonrpc: "2.0", id, method, params });
 }
 
-test("v1 tools/list exposes Viewer Host tools and omits public close_pdf", async () => {
+test("v1 tools/list exposes Viewer Host tools and omits raw event and close tools", async () => {
 	const response = await handleMcpRequest(request(1, "tools/list")) as unknown as { result: { tools: Array<{ name: string }> } };
 	const names = response.result.tools.map((tool) => tool.name);
 
@@ -16,9 +16,32 @@ test("v1 tools/list exposes Viewer Host tools and omits public close_pdf", async
 		"open_pdf",
 		"jump_pdf",
 		"set_latex_preamble",
-		"get_pdf_events",
+		"fetch_pdf_context",
 	]);
+	assert.equal(names.includes("get_pdf_events"), false);
 	assert.equal(names.includes("close_pdf"), false);
+});
+
+test("hook-aware tools/list hides manual PDF context tool", async () => {
+	const response = await handleMcpRequest(request(3, "tools/list"), {}, { hooksEnabled: true }) as unknown as { result: { tools: Array<{ name: string }> } };
+	const names = response.result.tools.map((tool) => tool.name);
+
+	assert.deepEqual(names, [
+		"show_latex",
+		"compile_latex_file",
+		"open_pdf",
+		"jump_pdf",
+		"set_latex_preamble",
+	]);
+	assert.equal(names.includes("fetch_pdf_context"), false);
+	assert.equal(names.includes("get_pdf_events"), false);
+
+	const callResponse = await handleMcpRequest(request(4, "tools/call", {
+		name: "fetch_pdf_context",
+		arguments: {},
+	}), { fetchPdfContext: () => ({ text: "should not be called", pdfIds: [], eventCount: 0, cleared: false, events: [] }) }, { hooksEnabled: true }) as unknown as { result: { isError?: boolean; content: Array<{ text: string }> } };
+	assert.equal(callResponse.result.isError, true);
+	assert.match(callResponse.result.content[0].text, /Tool not implemented by runtime: fetch_pdf_context/);
 });
 
 test("removed close_pdf tool behaves like an unsupported MCP tool", async () => {

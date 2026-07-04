@@ -42,7 +42,7 @@ The exported MCP tools are:
 - `open_pdf`
 - `jump_pdf`
 - `set_latex_preamble`
-- `get_pdf_events`
+- `fetch_pdf_context` (pure MCP mode only; hidden when launched with `--with-hooks`)
 
 Tool handlers delegate PDF operations through the `HostServiceMcpPdfOperations` interface in `src/modules/host_service_mcp.ts`. In normal stdio runtime, those operations come from `ViewerHostMcpService.pdfOperations` in `src/modules/viewer_host_client.ts`.
 
@@ -51,7 +51,7 @@ Important MCP invariants:
 - `workspace_context` is injected by `src/modules/stdio_mcp_runtime.ts` for stdio callers.
 - `open_pdf` and compile-open flows return a process-local `pdf_id`.
 - `jump_pdf` requires a known active `pdf_id` and a readable source file, or enough information to infer the default `.tex` source from the PDF path.
-- `get_pdf_events` drains Viewer Host events before reading the process-local event store.
+- `fetch_pdf_context` drains Viewer Host events, formats user-marked PDF comments as source-cited context, and consumes/clears pending viewer marks.
 
 ## LaTeX PDF production
 
@@ -85,7 +85,7 @@ Responsibilities:
 - launch/connect to a Viewer Host Server via `createDefaultViewerHostClientFactory`;
 - send typed Viewer Host protocol messages over a `ViewerHostClient` adapter;
 - recover from Viewer Host reconnects by re-registering known PDFs;
-- implement `openPdf`, `jumpPdf`, `getPdfEvents`, and `markTrackedPdfUpdated` for MCP handlers;
+- implement `openPdf`, `jumpPdf`, `getPdfEvents`/`fetchPdfContext` internals, and `markTrackedPdfUpdated` for MCP handlers;
 - store agent-readable PDF events in `PdfEventStore` from `src/modules/pdf_events.ts`.
 
 Important concrete adapters/classes in `src/modules/viewer_host_client.ts`:
@@ -281,11 +281,11 @@ PDF event types and storage live in:
 
 Agent flow:
 
-1. Viewer sends reverse/selection messages over viewer socket.
+1. Viewer sends reverse/selection/annotation messages over viewer socket.
 2. Host queues/drains messages or sends them to MCP event sink.
-3. `ViewerHostMcpService.getPdfEvents` drains Host events.
+3. `ViewerHostMcpService.getPdfEvents` drains Host events for internal consumers.
 4. Reverse SyncTeX messages are resolved through SyncTeX resolution.
-5. Agent receives formatted events through `get_pdf_events`.
+5. In pure MCP mode, agents receive concise marked-comment context through `fetch_pdf_context`; in hook-aware mode (`--with-hooks`), harness hooks inject that context before the model turn.
 
 ## Desktop Viewer / Tauri wrapper
 

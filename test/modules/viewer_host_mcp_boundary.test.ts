@@ -213,8 +213,8 @@ test("reverse-forward probe is handled by ViewerHostServer without mcpEventSink 
 		assert.equal(result.page, 1);
 		assert.equal(sinkMessages.length, 0, "debug probe must not be routed through mcpEventSink");
 
-		const eventsResponse = await callTool(2, "get_pdf_events", { pdf_id: 812, max_events: 10, stale: true, debug: true }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-		assert.equal(eventsResponse.result?.details?.events?.length ?? 0, 0, "debug probe must not be appended to get_pdf_events");
+		const events = await service.getPdfEvents({ pdf_id: 812, max_events: 10, stale: true, debug: true });
+		assert.equal(events.length, 0, "debug probe must not be appended to the MCP event store");
 	} finally {
 		socket?.close();
 		await service?.stop();

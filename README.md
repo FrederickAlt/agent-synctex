@@ -2,7 +2,7 @@
 
 TeX Actions is a local stdio MCP server for LaTeX snippet rendering, file compilation, and PDF navigation through the Desktop Viewer Host boundary.
 
-The active runtime launches a local loopback Viewer Host Server process on demand, registers PDFs with MCP-owned `pdf_id`s, serves the Host-loaded Viewer Client/PDF.js pages, forwards SyncTeX display requests, drains reverse SyncTeX events back into `get_pdf_events`, and re-registers known PDFs after Host restart. Fake Viewer Host clients are used only by tests or explicit injection.
+The active runtime launches a local loopback Viewer Host Server process on demand, registers PDFs with MCP-owned `pdf_id`s, serves the Host-loaded Viewer Client/PDF.js pages, forwards SyncTeX display requests, fetches user-marked PDF comments as source-cited context through `fetch_pdf_context` in pure MCP mode, and re-registers known PDFs after Host restart. Fake Viewer Host clients are used only by tests or explicit injection.
 
 ## Exposed MCP tools
 
@@ -18,8 +18,8 @@ The active runtime launches a local loopback Viewer Host Server process on deman
   - Forward-search a tracked PDF by `pdf_id` and source line; MCP computes SyncTeX coordinates and sends `synctex_forward` to the Viewer Host Client boundary.
 - `set_latex_preamble`
   - Set the runtime preamble used by snippet compilation.
-- `get_pdf_events`
-  - Fetch recent process-local viewer events.
+- `fetch_pdf_context`
+  - Fetch unread PDF viewer marks/comments as concise source-cited context and consume the pending marks. Hidden when the MCP is launched with `--with-hooks` because harness hooks inject this context automatically.
 
 `close_pdf` is intentionally not a public MCP tool in this boundary slice. Viewer/tab close is a Viewer Client concern and does not delete MCP-owned `pdf_id` state.
 
@@ -50,6 +50,12 @@ For MCP client configuration after installation, use the package bin:
 
 ```bash
 tex-actions-mcp
+```
+
+When harness post-user-message hooks are installed, launch the MCP with hook-aware mode so the manual context tool is hidden:
+
+```bash
+tex-actions-mcp --with-hooks
 ```
 
 Pi's local MCP config supports `lifecycle` values `"lazy"`, `"eager"`, and `"keep-alive"`. Use `"keep-alive"` for `tex-actions` so process-local MCP state survives between calls while the MCP stdio process remains alive. Do not configure MCP clients with `npm run tex-actions:mcp`; npm output can corrupt stdio framing. Use the installed `tex-actions-mcp` bin or the direct `node scripts/tex-actions-mcp.ts` command for local development only.

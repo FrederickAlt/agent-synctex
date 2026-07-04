@@ -46,6 +46,11 @@ export interface ViewerHostPdfMaybeUpdatedMessage {
 	pdf_id: number;
 }
 
+export interface ViewerHostClearPdfAnnotationsMessage {
+	type: "clear_pdf_annotations";
+	pdf_id: number;
+}
+
 export type ViewerHostSynctexPrecision = "verified" | "text" | "line" | "raw";
 
 export interface ViewerHostReverseSynctexCandidateSummary {
@@ -121,6 +126,7 @@ export type McpToViewerHostMessage =
 	| ViewerHostFocusPdfMessage
 	| ViewerHostSynctexForwardMessage
 	| ViewerHostPdfMaybeUpdatedMessage
+	| ViewerHostClearPdfAnnotationsMessage
 	| ViewerHostReverseSynctexHoverResultMessage
 	| ViewerHostReverseSynctexForwardProbeResultMessage;
 
@@ -460,6 +466,8 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			};
 		}
 		case "pdf_maybe_updated":
+			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
+		case "clear_pdf_annotations":
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
 		case "reverse_synctex_hover_result": {
 			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");

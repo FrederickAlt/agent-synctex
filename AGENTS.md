@@ -34,3 +34,7 @@ For extension composition and transport, keep `index.ts` as the composition root
 - `scripts/tex-actionsctl.ts`, `scripts/agent-synctex-host-service.ts`, and `scripts/pi_synctex_callback.mjs` are removed in this branch; do not reintroduce these entrypoints.
 
 Avoid reintroducing direct viewer-command spawning in production TypeScript. `test/viewer_guardrails.test.ts` is the production regression guard for this boundary.
+
+## Test guardrails
+
+Do not add tests that assert documentation files exist. Documentation may be absent, moved, or pruned in worktrees; tests should verify executable behavior, APIs, protocols, and production guardrails instead of using doc-file existence as a pass/fail condition.

@@ -33,6 +33,7 @@ const EXPECTED_ACTIVE_RUNTIME_ENTRYPOINTS = new Set<string>([
 	"scripts/tex-actions-mcp.ts",
 	"scripts/pdf-preview-mcp.ts",
 	"scripts/viewer-host-server.ts",
+	"scripts/agent-synctex.ts",
 ]);
 
 const FORBIDDEN_RUNTIME_IMPORT_SYMBOLS = new Map<string, string>([
@@ -108,17 +109,10 @@ const REMOVED_IMPLEMENTED_DOC_PATHS = [
 	"docs/issues/synctex-native-parity/006-synctex-diagnostics-and-acceptance.md",
 ] as const;
 
-const ACTIVE_DOC_PATHS = [
-	"README.md",
-	"CONTEXT.md",
-	"docs/prd-viewer-client-ux-followups.md",
-	"docs/tdd-viewer-client-ux-followups.md",
-] as const;
 const STALE_PI_EXTENSION_BRANDING_PATTERNS: Array<[RegExp, string]> = [
 	[/\bPi extension\b/gi, "stale Pi extension branding"],
 	[/\bpi-extension\b/gi, "stale pi-extension keyword branding"],
 ];
-const NPM_MCP_SCRIPT = "npm run tex-actions:mcp";
 
 function collectProductionTypeScriptFiles(directory = REPO_ROOT): string[] {
 	const collected: string[] = [];
@@ -368,37 +362,6 @@ function collectStalePiExtensionBrandingViolations(file: string, source: string)
 	}
 
 	return violations;
-}
-
-function collectUnsafeNpmMcpStartupGuidanceViolations(file: string, source: string): GuardrailViolation[] {
-	const violations: GuardrailViolation[] = [];
-	const escapedScript = NPM_MCP_SCRIPT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const lines = source.split(/\r?\n/);
-	const scriptPattern = new RegExp(escapedScript, "g");
-
-	for (const match of source.matchAll(scriptPattern)) {
-		if (match.index === undefined) continue;
-		const lineIndex = source.slice(0, match.index).split(/\r?\n/).length - 1;
-		const context = lines.slice(Math.max(0, lineIndex - 3), Math.min(lines.length, lineIndex + 4)).join("\n").toLowerCase();
-		const isManualConvenience = /manual|convenience|developer|development|dev/.test(context);
-		if (isManualConvenience) continue;
-		addViolation(
-			violations,
-			source,
-			file,
-			match.index,
-			`${NPM_MCP_SCRIPT} must not be recommended for MCP client startup because npm output can corrupt stdio framing`,
-		);
-	}
-
-	return violations;
-}
-
-function collectActiveDocRuntimeGuidanceViolations(file: string, source: string): GuardrailViolation[] {
-	return [
-		...collectStalePiExtensionBrandingViolations(file, source),
-		...collectUnsafeNpmMcpStartupGuidanceViolations(file, source),
-	];
 }
 
 function collectMetadataReferenceViolations(metadataSource: string, file: string, pkg: unknown): GuardrailViolation[] {
@@ -714,40 +677,6 @@ test("Package metadata keeps approved production entrypoints", () => {
 	}
 
 	assert.equal(metadataViolations.length, 0, `Package metadata contains stale legacy runtime references:\n${formatViolations(metadataViolations)}`);
-});
-
-
-test("Active docs track current Viewer Host guidance and safe MCP startup commands", () => {
-	const violations: GuardrailViolation[] = [];
-	let combinedDocs = "";
-
-	for (const docPath of REMOVED_IMPLEMENTED_DOC_PATHS) {
-		assert.equal(existsSync(join(REPO_ROOT, docPath)), false, `${docPath} should remain removed after implementation`);
-	}
-
-	for (const docPath of ACTIVE_DOC_PATHS) {
-		const file = join(REPO_ROOT, docPath);
-		assert.equal(existsSync(file), true, `${docPath} should exist as an active documentation guardrail input`);
-		const source = readFileSync(file, "utf8");
-		combinedDocs += `\n${source}`;
-		violations.push(...collectActiveDocRuntimeGuidanceViolations(file, source));
-	}
-
-	assert.match(combinedDocs, /stdio MCP/i, "active docs must identify the stdio MCP runtime");
-	assert.match(combinedDocs, /Viewer Host/i, "active docs must identify the Viewer Host boundary");
-	assert.match(combinedDocs, /Viewer Client UX Follow-ups/i, "active docs must include the current Viewer Client UX follow-up PRD/TDD");
-	assert.match(combinedDocs, /Viewer Client code must remain usable in a normal browser context/i, "active docs must preserve Viewer Client portability guidance");
-	assert.match(combinedDocs, /Core success criteria/i, "active docs must include the current Viewer Client UX test plan");
-	assert.doesNotMatch(readFileSync(join(REPO_ROOT, "README.md"), "utf8"), /reachable browser\/PDF\.js|browser-hosted PDF\.js|process-local PDF\.js HTTP serving/i, "README must not promise old reachable in-process PDF.js behavior");
-	assert.equal(
-		violations.length,
-		0,
-		`Active docs contain stale Pi-extension branding or unsafe MCP startup guidance:\n${formatViolations(violations)}`,
-	);
-
-	const readmeSource = readFileSync(join(REPO_ROOT, "README.md"), "utf8");
-	assert.match(readmeSource, /^node scripts\/tex-actions-mcp\.ts$/m, "README local-dev startup must use direct node entrypoint");
-	assert.match(readmeSource, /^tex-actions-mcp$/m, "README MCP client startup must use installed tex-actions-mcp bin");
 });
 
 

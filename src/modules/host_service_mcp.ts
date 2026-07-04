@@ -5,6 +5,7 @@ import { resolveTexActionsAgentRuntimeDir } from "./agent_runtime_context.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
 import { buildLatexPreambleIndex } from "./latex/latex_preamble_index.ts";
 import type { GetPdfEventsRequest, PdfEvent } from "./pdf_events.ts";
+import { normalizeFetchPdfContextRequest, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
 import type {
 	HostServiceCloseRequest,
 	HostServiceCloseResponseEnvelope,
@@ -39,6 +40,7 @@ export interface HostServiceMcpPdfOperations {
 	jumpPdf?: (request: HostServiceJumpRequest) => Promise<HostServiceJumpResponseEnvelope>;
 	closePdf?: (request: HostServiceCloseRequest) => Promise<HostServiceCloseResponseEnvelope>;
 	getPdfEvents?: (request: GetPdfEventsRequest) => PdfEvent[] | Promise<PdfEvent[]>;
+	fetchPdfContext?: (request: FetchPdfContextRequest) => PostUserPdfContextResult | Promise<PostUserPdfContextResult>;
 	markTrackedPdfUpdated?: (pdfPath: string) => Promise<unknown>;
 	compileService?: HostServiceCompileService;
 }
@@ -94,6 +96,10 @@ export interface McpToolDefinition {
 }
 
 type McpResponsePayload = McpSuccessResponse | McpErrorResponse;
+
+export interface HostServiceMcpOptions {
+	hooksEnabled?: boolean;
+}
 
 type ParsedMcpRequestId = McpRequestId | undefined;
 
@@ -576,8 +582,8 @@ function workspaceContextSchema(): { type: "object"; properties: Record<string, 
 	};
 }
 
-function mcpToolDescriptions(): readonly McpToolDefinition[] {
-	return [
+function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpToolDefinition[] {
+	const tools: McpToolDefinition[] = [
 		{
 			name: "show_latex",
 			description: "Render a LaTeX snippet as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Raw string/FREEFORM tool arguments are accepted as LaTeX source; callers may pass a full document, a \\begin{document}...\\end{document} body, or just document body content.",
@@ -655,34 +661,43 @@ function mcpToolDescriptions(): readonly McpToolDefinition[] {
 				additionalProperties: false,
 			},
 		},
-		{
-			name: "get_pdf_events",
-			description: "Return unread process-local viewer events by default, or inspect old events with stale=true. Selection diagnostics are hidden unless debug=true. Optionally filter by pdf_id.",
+	];
+	if (options.hooksEnabled !== true) {
+		tools.push({
+			name: "fetch_pdf_context",
+			description: "Fetch unread PDF viewer marks/comments as concise source-cited context. Returns user comments attached to LaTeX source lines and consumes pending viewer marks.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					pdf_id: { type: "integer", minimum: 1 },
 					max_events: { type: "integer", minimum: 1 },
-					stale: { type: "boolean" },
-					debug: { type: "boolean" },
 				},
-				required: ["max_events"],
+				required: [],
 				additionalProperties: false,
 			},
-		},
-	];
+		});
+	}
+	return tools;
 }
 
-export const HOST_SERVICE_TOOL_NAMES = [
+const HOST_SERVICE_BASE_TOOL_NAMES = [
 	"show_latex",
 	"compile_latex_file",
 	"open_pdf",
 	"jump_pdf",
 	"set_latex_preamble",
-	"get_pdf_events",
+] as const;
+
+export const HOST_SERVICE_TOOL_NAMES = [
+	...HOST_SERVICE_BASE_TOOL_NAMES,
+	"fetch_pdf_context",
 ] as const;
 
 type HostServiceToolName = (typeof HOST_SERVICE_TOOL_NAMES)[number];
+
+function hostServiceToolNames(options: HostServiceMcpOptions = {}): readonly HostServiceToolName[] {
+	return options.hooksEnabled === true ? HOST_SERVICE_BASE_TOOL_NAMES : HOST_SERVICE_TOOL_NAMES;
+}
 
 type HostServiceMcpToolHandler = (
 	requestId: ParsedMcpRequestId,
@@ -891,171 +906,37 @@ async function handleSetLatexPreambleTool(
 	}
 }
 
-function parseGetPdfEventsRequest(args: Record<string, unknown>): GetPdfEventsRequest {
-	for (const key of Object.keys(args)) {
-		if (key !== "pdf_id" && key !== "max_events" && key !== "stale" && key !== "debug") {
-			throw new Error(`get_pdf_events unknown argument: ${key}`);
-		}
-	}
-	const maxEvents = args.max_events;
-	if (typeof maxEvents !== "number" || !Number.isInteger(maxEvents) || maxEvents < 1) {
-		throw new Error("get_pdf_events max_events must be a positive integer");
-	}
-	if (args.pdf_id !== undefined && (typeof args.pdf_id !== "number" || !Number.isInteger(args.pdf_id) || args.pdf_id < 1)) {
-		throw new Error("get_pdf_events pdf_id must be a positive integer");
-	}
-	if (args.stale !== undefined && typeof args.stale !== "boolean") {
-		throw new Error("get_pdf_events stale must be a boolean");
-	}
-	if (args.debug !== undefined && typeof args.debug !== "boolean") {
-		throw new Error("get_pdf_events debug must be a boolean");
-	}
-	return {
-		max_events: maxEvents,
-		...(args.pdf_id === undefined ? {} : { pdf_id: args.pdf_id }),
-		...(args.stale === undefined ? {} : { stale: args.stale }),
-		...(args.debug === undefined ? {} : { debug: args.debug }),
-	};
-}
-
-function compactToolText(value: string, maxLength = 180): string {
-	const compacted = value.replace(/\s+/g, " ").trim();
-	return compacted.length > maxLength ? `${compacted.slice(0, maxLength - 1)}…` : compacted;
-}
-
-function formatMaybeTextField(name: string, value: unknown, maxLength?: number): string | undefined {
-	return typeof value === "string" ? `${name}=${compactToolText(value, maxLength)}` : undefined;
-}
-
-function formatReverseSynctexDiagnosticsSummary(diagnostics: unknown): string | undefined {
-	if (!isRecord(diagnostics)) return undefined;
-	const parts: string[] = [];
-	if (typeof diagnostics.branch === "string") {
-		parts.push(`branch=${diagnostics.branch}`);
-	}
-	const selected = diagnostics.selected;
-	if (isRecord(selected)) {
-		const selectedParts: string[] = [];
-		if (typeof selected.sourceFile === "string") selectedParts.push(selected.sourceFile);
-		if (typeof selected.line === "number") selectedParts.push(`line=${selected.line}`);
-		if (typeof selected.column === "number") selectedParts.push(`column=${selected.column}`);
-		if (selectedParts.length > 0) parts.push(`selected=${selectedParts.join(":")}`);
-	}
-	const context = diagnostics.context;
-	if (isRecord(context)) {
-		const contextParts: string[] = [];
-		if (typeof context.hasSelectionContext === "boolean") contextParts.push(`selection=${context.hasSelectionContext}`);
-		if (typeof context.textBeforeSelection === "string") contextParts.push(`before=${compactToolText(context.textBeforeSelection, 48)}`);
-		if (typeof context.textAfterSelection === "string") contextParts.push(`after=${compactToolText(context.textAfterSelection, 48)}`);
-		if (contextParts.length > 0) parts.push(`context=${contextParts.join(";")}`);
-	}
-	if (typeof diagnostics.precision === "string") {
-		parts.push(`precision=${diagnostics.precision}`);
-	}
-	const textRepair = diagnostics.textRepair;
-	if (isRecord(textRepair) && textRepair.used === true) {
-		parts.push("repair=text_context");
-	}
-	if (Array.isArray(diagnostics.candidates)) {
-		parts.push(`candidates=${diagnostics.candidates.length}`);
-	}
-	return parts.length > 0 ? `synctex_diagnostics=${parts.join(" ")}` : undefined;
-}
-
-function formatSelectionEndpointForTool(name: string, endpoint: { source_file: string; line: number; column: number; precision?: string; repair?: string; raw_mapped_source_file?: string; raw_mapped_line?: number; raw_mapped_column?: number; raw_mapped_source_line?: string }): string {
-	const parts = [`${name}=${endpoint.source_file}:line=${endpoint.line}:column=${endpoint.column}`];
-	if (endpoint.precision !== undefined) parts.push(`precision=${endpoint.precision}`);
-	if (endpoint.repair !== undefined) parts.push(`repair=${endpoint.repair}`);
-	if (endpoint.raw_mapped_source_file !== undefined && endpoint.raw_mapped_source_file !== endpoint.source_file) parts.push(`initial_candidate_source_file=${endpoint.raw_mapped_source_file}`);
-	if (endpoint.raw_mapped_line !== undefined) parts.push(`initial_candidate_line=${endpoint.raw_mapped_line}`);
-	if (endpoint.raw_mapped_column !== undefined) parts.push(`initial_candidate_column=${endpoint.raw_mapped_column}`);
-	if (endpoint.raw_mapped_source_line !== undefined) parts.push(`initial_candidate_source_line=${compactToolText(endpoint.raw_mapped_source_line)}`);
-	return parts.join(":");
-}
-
-function formatPdfEventForTool(event: PdfEvent): string {
-	if (event.type === "pdf_annotation") {
-		const fields = [
-			`type=${event.type}`,
-			`pdf_id=${event.pdf_id}`,
-			`annotation_id=${event.annotation_id}`,
-			`source_file=${event.source_file}`,
-			`line=${event.line}`,
-		];
-		if (event.source_line !== undefined) fields.push(`source_line=${compactToolText(event.source_line)}`);
-		fields.push(`page=${event.page}`);
-		const comment = formatMaybeTextField("comment", event.comment, 500);
-		if (comment !== undefined) fields.push(comment);
-		return fields.join(", ");
-	}
-	if (event.type === "selection_debug") {
-		const fields = [
-			`type=${event.type}`,
-			`pdf_id=${event.pdf_id}`,
-			`phase=${event.phase}`,
-		];
-		if (event.page !== undefined) fields.push(`page=${event.page}`);
-		fields.push(`selection_text_len=${event.text.length}`);
-		fields.push(`selection_text=${compactToolText(event.text, 160)}`);
-		return fields.join(", ");
-	}
-	const fields = [
-		`type=${event.type}`,
-		`pdf_id=${event.pdf_id}`,
-		`source_file=${event.source_file}`,
-		`line=${event.line}`,
-	];
-	if (event.source_line !== undefined) {
-		fields.push(`source_line=${compactToolText(event.source_line)}`);
-	}
-	if (event.page !== undefined) fields.push(`page=${event.page}`);
-	if (event.precision !== undefined) fields.push(`precision=${event.precision}`);
-	if (event.repair !== undefined) fields.push(`repair=${event.repair}`);
-	const selectedText = formatMaybeTextField("selected_text", event.selected_text, 240);
-	if (selectedText !== undefined) fields.push(selectedText);
-	if (event.selection_start !== undefined) fields.push(formatSelectionEndpointForTool("selection_start", event.selection_start));
-	if (event.selection_end !== undefined) fields.push(formatSelectionEndpointForTool("selection_end", event.selection_end));
-	const selectionStartError = formatMaybeTextField("selection_start_error", event.selection_start_error, 180);
-	if (selectionStartError !== undefined) fields.push(selectionStartError);
-	const selectionEndError = formatMaybeTextField("selection_end_error", event.selection_end_error, 180);
-	if (selectionEndError !== undefined) fields.push(selectionEndError);
-	if (event.raw_mapped_source_file !== undefined && event.raw_mapped_source_file !== event.source_file) {
-		fields.push(`initial_candidate_source_file=${event.raw_mapped_source_file}`);
-	}
-	if (event.raw_mapped_line !== undefined) fields.push(`initial_candidate_line=${event.raw_mapped_line}`);
-	if (event.raw_mapped_column !== undefined) fields.push(`initial_candidate_column=${event.raw_mapped_column}`);
-	const initialCandidateSourceLine = formatMaybeTextField("initial_candidate_source_line", event.raw_mapped_source_line);
-	if (initialCandidateSourceLine !== undefined) fields.push(initialCandidateSourceLine);
-	if (event.normalized_formula_span !== undefined) {
-		fields.push(`normalized_formula_span=${event.normalized_formula_span.start_line}-${event.normalized_formula_span.end_line}`);
-	}
-	const normalizedFormulaExcerpt = formatMaybeTextField("normalized_formula_excerpt", event.normalized_formula_excerpt, 240);
-	if (normalizedFormulaExcerpt !== undefined) fields.push(normalizedFormulaExcerpt);
-	const diagnosticsSummary = formatReverseSynctexDiagnosticsSummary(event.synctex_diagnostics);
-	if (diagnosticsSummary !== undefined) fields.push(diagnosticsSummary);
-	return fields.join(", ");
-}
-
-async function handleGetPdfEventsTool(
+async function handleFetchPdfContextTool(
 	requestId: ParsedMcpRequestId,
 	args: Record<string, unknown>,
 	pdfOperations: HostServiceMcpPdfOperations,
 	_mcpCompileService: HostServiceCompileService,
 ): Promise<McpResponsePayload> {
-	let request: GetPdfEventsRequest;
+	let request: FetchPdfContextRequest;
 	try {
-		request = parseGetPdfEventsRequest(args);
+		request = normalizeFetchPdfContextRequest(args);
 	} catch (error) {
 		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, error instanceof Error ? error.message : String(error));
 	}
-	const events = await pdfOperations.getPdfEvents?.(request) ?? [];
-	const filterText = request.pdf_id === undefined ? "" : ` for pdf_id=${request.pdf_id}`;
-	const summary = events.length === 0 ? `No PDF events found${filterText}.` : `Returned ${events.length} PDF event(s)${filterText}.`;
-	const eventDetails = events.map(formatPdfEventForTool);
+	const result = await collectPdfContext(pdfOperations, request);
 	return buildSuccess(requestId, {
-		content: [{ type: "text", text: [summary, ...eventDetails].join("\n") }],
-		details: { events },
+		content: [{ type: "text", text: result.text || "No PDF marks from Agent SyncTeX are pending." }],
+		details: {
+			pdf_ids: result.pdfIds,
+			event_count: result.eventCount,
+			cleared: result.cleared,
+		},
 	});
+}
+
+async function collectPdfContext(pdfOperations: HostServiceMcpPdfOperations, request: FetchPdfContextRequest): Promise<PostUserPdfContextResult> {
+	return await pdfOperations.fetchPdfContext?.(request) ?? {
+		text: "",
+		pdfIds: [],
+		eventCount: 0,
+		cleared: false,
+		events: [],
+	};
 }
 
 export function mcpFramedResponse(payload: McpResponsePayload): string {
@@ -1065,6 +946,7 @@ export function mcpFramedResponse(payload: McpResponsePayload): string {
 export async function handleMcpRequest(
 	rawPayload: string,
 	pdfOperations: HostServiceMcpPdfOperations = {},
+	options: HostServiceMcpOptions = {},
 ): Promise<McpResponsePayload | null> {
 	let request: McpParsedRequest;
 	try {
@@ -1102,7 +984,7 @@ export async function handleMcpRequest(
 			return buildSuccess(request.id, {});
 		case "tools/list":
 			return buildSuccess(request.id, {
-				tools: mcpToolDescriptions(),
+				tools: mcpToolDescriptions(options),
 			});
 		case "tools/call": {
 			let call: { name: string; args: Record<string, unknown> };
@@ -1115,7 +997,7 @@ export async function handleMcpRequest(
 				return buildMcpErrorResponse(request.id, MCP_ERROR_INTERNAL, error instanceof Error ? error.message : String(error));
 			}
 
-			if (!HOST_SERVICE_TOOL_NAMES.includes(call.name as typeof HOST_SERVICE_TOOL_NAMES[number])) {
+			if (!hostServiceToolNames(options).includes(call.name as HostServiceToolName)) {
 				return buildSuccess(request.id, {
 					isError: true,
 					content: [{ type: "text", text: `Tool not implemented by runtime: ${call.name}` }],
@@ -1129,7 +1011,7 @@ export async function handleMcpRequest(
 				open_pdf: handleOpenPdfTool,
 				jump_pdf: handleJumpPdfTool,
 				set_latex_preamble: handleSetLatexPreambleTool,
-				get_pdf_events: handleGetPdfEventsTool,
+				fetch_pdf_context: handleFetchPdfContextTool,
 			};
 			const handler = toolHandlers[call.name as HostServiceToolName] ?? null;
 			if (handler === null) {
@@ -1149,8 +1031,9 @@ export async function handleMcpRequest(
 export async function handleFramedMcpRequest(
 	rawPayload: string,
 	pdfOperations?: HostServiceMcpPdfOperations,
+	options?: HostServiceMcpOptions,
 ): Promise<string | null> {
-	const response = await handleMcpRequest(rawPayload, pdfOperations);
+	const response = await handleMcpRequest(rawPayload, pdfOperations, options);
 	if (response === null) {
 		return null;
 	}

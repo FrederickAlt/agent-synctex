@@ -296,7 +296,7 @@ const HOST_TOOL_NAMES = [
 	"open_pdf",
 	"jump_pdf",
 	"set_latex_preamble",
-	"get_pdf_events",
+	"fetch_pdf_context",
 ];
 
 

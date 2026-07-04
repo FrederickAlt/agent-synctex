@@ -128,7 +128,7 @@ test("actual tex-actions-mcp entrypoint answers initialize and tools/list over s
 		assert.equal(initialize.result.capabilities.tools.listChanged, false);
 		assert.equal(toolsList.id, 2);
 		const names = toolsList.result.tools.map((tool) => tool.name);
-		assert.deepEqual(names, ["show_latex", "compile_latex_file", "open_pdf", "jump_pdf", "set_latex_preamble", "get_pdf_events"]);
+		assert.deepEqual(names, ["show_latex", "compile_latex_file", "open_pdf", "jump_pdf", "set_latex_preamble", "fetch_pdf_context"]);
 		const showLatexProperties = toolsList.result.tools.find((tool) => tool.name === "show_latex")?.inputSchema.properties ?? {};
 		assert.deepEqual(Object.keys(showLatexProperties).sort(), ["compiler", "source"]);
 		assert.equal(toolsList.result.tools.find((tool) => tool.name === "compile_latex_file")?.inputSchema.properties?.continuous, undefined);
@@ -245,26 +245,24 @@ test("actual tex-actions-mcp entrypoint bridges reverse SyncTeX events from the 
 		assert.equal(typeof config.viewer_socket_url, "string");
 
 		socket = await openViewerSocket(config.viewer_socket_url as string);
-		socket.send(JSON.stringify({ type: "reverse_synctex", page: 1, x: 110, y: 220 }));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 110, y: 220, source_file: sourcePath, line: 3, source_line: "Reverse target text.", comment: "Please check this." }));
 
-		let event: Record<string, unknown> | undefined;
+		let text = "";
+		let details: Record<string, unknown> | undefined;
 		for (let attempt = 0; attempt < 20; attempt += 1) {
 			const output = collectMcpFrames(child.stdout as PassThrough, 1, 2_000);
-			child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 10 + attempt, method: "tools/call", params: { name: "get_pdf_events", arguments: { pdf_id: pdfId, max_events: 5 } } }));
-			const [eventsFrame] = await output as Array<{ result?: { details?: { events?: Array<Record<string, unknown>> } } }>;
-			event = eventsFrame.result?.details?.events?.[0];
-			if (event) break;
+			child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 10 + attempt, method: "tools/call", params: { name: "fetch_pdf_context", arguments: { pdf_id: pdfId, max_events: 5 } } }));
+			const [contextFrame] = await output as Array<{ result?: { content?: Array<{ text?: string }>; details?: Record<string, unknown> } }>;
+			text = contextFrame.result?.content?.[0]?.text ?? "";
+			details = contextFrame.result?.details;
+			if (/User comment: Please check this\./.test(text)) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 
-		assert.ok(event, "reverse SyncTeX event should be visible through get_pdf_events in the split-process default runtime");
-		assert.equal(event.pdf_id, pdfId);
-		assert.equal(event.source_file, sourcePath);
-		assert.equal(event.line, 3);
-		assert.equal(event.source_line, "Reverse target text.");
-		assert.equal(event.page, 1);
-		assert.equal(event.x, 110);
-		assert.equal(event.y, 220);
+		assert.equal(text.includes(`${sourcePath}:3`), true);
+		assert.match(text, /`Reverse target text\.`/);
+		assert.match(text, /User comment: Please check this\./);
+		assert.deepEqual(details, { pdf_ids: [pdfId], event_count: 1, cleared: true });
 	} finally {
 		socket?.close();
 		child.kill("SIGTERM");
@@ -274,8 +272,8 @@ test("actual tex-actions-mcp entrypoint bridges reverse SyncTeX events from the 
 	}
 });
 
-test("stdio runtime rejects invalid get_pdf_events calls with normal JSON-RPC validation", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-invalid-get-events-"));
+test("stdio runtime rejects invalid fetch_pdf_context calls with normal JSON-RPC validation", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-invalid-fetch-context-"));
 	const launchCwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
 	mkdirSync(launchCwd, { recursive: true });
@@ -286,7 +284,7 @@ test("stdio runtime rejects invalid get_pdf_events calls with normal JSON-RPC va
 		try {
 			runtime.start();
 			const output = collectMcpFrames(stdout, 1);
-			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", method: "tools/call", params: { name: "get_pdf_events", arguments: {} } }));
+			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", method: "tools/call", params: { name: "fetch_pdf_context", arguments: {} } }));
 			const [response] = await output as Array<{ id: null; error?: { code: number; message: string }; result?: unknown }>;
 			assert.equal(response.id, null);
 			assert.equal(response.result, undefined);
@@ -299,8 +297,8 @@ test("stdio runtime rejects invalid get_pdf_events calls with normal JSON-RPC va
 	rmSync(baseDir, { recursive: true, force: true });
 });
 
-test("stdio runtime rejects get_pdf_events arguments that violate its schema", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-invalid-get-events-args-"));
+test("stdio runtime rejects fetch_pdf_context arguments that violate its schema", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-invalid-fetch-context-args-"));
 	const launchCwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
 	mkdirSync(launchCwd, { recursive: true });
@@ -312,18 +310,17 @@ test("stdio runtime rejects get_pdf_events arguments that violate its schema", a
 			runtime.start();
 			const invalidArguments = [
 				"bad",
-				{},
 				{ max_events: 0 },
 				{ max_events: 1.5 },
 				{ max_events: "1" },
 				{ pdf_id: 0, max_events: 1 },
 				{ pdf_id: "1", max_events: 1 },
-				{ since_event_id: "cursor-1", max_events: 1 },
+				{ clear: true },
 				{ unknown: true, max_events: 1 },
 			];
 			const output = collectMcpFrames(stdout, invalidArguments.length);
 			for (const [index, args] of invalidArguments.entries()) {
-				stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 20 + index, method: "tools/call", params: { name: "get_pdf_events", arguments: args } }));
+				stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 20 + index, method: "tools/call", params: { name: "fetch_pdf_context", arguments: args } }));
 			}
 			const responses = await output as Array<{ id: number; error?: { code: number; message: string }; result?: unknown }>;
 			assert.equal(responses.length, invalidArguments.length);
@@ -339,8 +336,8 @@ test("stdio runtime rejects get_pdf_events arguments that violate its schema", a
 	rmSync(baseDir, { recursive: true, force: true });
 });
 
-test("stdio runtime accepts valid get_pdf_events arguments", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-valid-get-events-"));
+test("stdio runtime accepts valid fetch_pdf_context arguments", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-valid-fetch-context-"));
 	const launchCwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
 	mkdirSync(launchCwd, { recursive: true });
@@ -351,20 +348,21 @@ test("stdio runtime accepts valid get_pdf_events arguments", async () => {
 		try {
 			runtime.start();
 			const validArguments = [
+				{},
 				{ max_events: 1 },
 				{ pdf_id: 1, max_events: 1 },
 				{ pdf_id: 2, max_events: 5 },
 			];
 			const output = collectMcpFrames(stdout, validArguments.length);
 			for (const [index, args] of validArguments.entries()) {
-				stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 30 + index, method: "tools/call", params: { name: "get_pdf_events", arguments: args } }));
+				stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 30 + index, method: "tools/call", params: { name: "fetch_pdf_context", arguments: args } }));
 			}
-			const responses = await output as Array<{ id: number; result?: { details?: { events?: unknown[] } }; error?: unknown }>;
+			const responses = await output as Array<{ id: number; result?: { details?: Record<string, unknown> }; error?: unknown }>;
 			assert.equal(responses.length, validArguments.length);
 			for (const [index, response] of responses.entries()) {
 				assert.equal(response.id, 30 + index);
 				assert.equal(response.error, undefined);
-				assert.deepEqual(response.result?.details, { events: [] });
+				assert.deepEqual(response.result?.details, { pdf_ids: [], event_count: 0, cleared: false });
 			}
 		} finally {
 			runtime.close();

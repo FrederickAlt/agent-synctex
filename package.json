@@ -19,7 +19,8 @@
     "pdf-preview-mcp": "node scripts/pdf-preview-mcp.ts"
   },
   "bin": {
-    "tex-actions-mcp": "scripts/tex-actions-mcp.ts"
+    "tex-actions-mcp": "scripts/tex-actions-mcp.ts",
+    "agent-synctex": "scripts/agent-synctex.ts"
   },
   "keywords": [
     "mcp",

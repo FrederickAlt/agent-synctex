@@ -7,6 +7,7 @@ import { assertReadablePdfFile, assertReadableSourceFile, inferDefaultSourceFile
 import { mapReverseSynctex } from "./synctex/forward_synctex.ts";
 import { resolveForwardSynctexJump, reverseSynctexHoverResult, reverseSynctexPdfEventFromViewerMessage, type ReverseSynctexMapper } from "./synctex/synctex_resolution.ts";
 import { PdfEventStore, type GetPdfEventsRequest, type PdfEvent } from "./pdf_events.ts";
+import { collectPostUserPdfContextFromEvents, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
 import type {
 	HostServiceJumpRequest,
 	HostServiceJumpResponseEnvelope,
@@ -466,6 +467,7 @@ export class ViewerHostMcpService {
 			openPdf: (request) => this.openPdf(request),
 			jumpPdf: (request) => this.jumpPdf(request),
 			getPdfEvents: (request) => this.getPdfEvents(request),
+			fetchPdfContext: (request) => this.fetchPdfContext(request),
 			markTrackedPdfUpdated: (pdfPath) => this.markTrackedPdfUpdated(pdfPath),
 		};
 	}
@@ -600,6 +602,24 @@ export class ViewerHostMcpService {
 	async getPdfEvents(request: GetPdfEventsRequest): Promise<PdfEvent[]> {
 		await this.drainHostEvents();
 		return this.eventStore.getEvents(request);
+	}
+
+	async fetchPdfContext(request: FetchPdfContextRequest): Promise<PostUserPdfContextResult> {
+		const events = await this.getPdfEvents({
+			...(request.pdf_id === undefined ? {} : { pdf_id: request.pdf_id }),
+			max_events: request.max_events ?? 20,
+		});
+		const result = collectPostUserPdfContextFromEvents(events, {
+			...(request.pdf_id === undefined ? {} : { pdfId: request.pdf_id }),
+			maxEvents: request.max_events,
+			clearViewer: true,
+		});
+		if (result.cleared) {
+			for (const pdfId of result.pdfIds) {
+				await this.sendWithReconnect({ type: "clear_pdf_annotations", pdf_id: pdfId }, { reregisterBeforeSend: true });
+			}
+		}
+		return result;
 	}
 
 	async markTrackedPdfUpdated(pdfPath: string): Promise<{ tracked: boolean; pdfId?: number }> {

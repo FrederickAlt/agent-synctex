@@ -4,6 +4,7 @@ import { MCP_ERROR_PARSE_ERROR, buildMcpErrorResponse, handleMcpRequest } from "
 import { resolveAgentWorkspaceContext } from "./agent_runtime_context.ts";
 import { initializeLatexPreambleFile } from "./pi_extension/latex_preamble_manager.ts";
 import { ViewerHostMcpService } from "./viewer_host_client.ts";
+import { startHookContextBridge, type HookContextBridgeHandle } from "./hook_context_bridge.ts";
 import {
 	frameClientPayload,
 	isRecord,
@@ -22,6 +23,7 @@ export interface TexActionsStdioMcpRuntimeOptions {
 	launchCwd?: string;
 	maxPayloadBytes?: number;
 	pdfOperations?: StdioMcpPdfOperations;
+	hooksEnabled?: boolean;
 }
 
 const STDIO_WORKSPACE_CONTEXT_TOOL_NAMES = new Set([
@@ -54,7 +56,9 @@ export class TexActionsStdioMcpRuntime {
 	private readonly launchCwd: string;
 	private readonly frameLoop: McpStdioFrameLoop;
 	private readonly pdfOperations: StdioMcpPdfOperations;
+	private readonly hooksEnabled: boolean;
 	private readonly defaultPdfService?: ViewerHostMcpService;
+	private hookContextBridge?: HookContextBridgeHandle;
 	private closed = false;
 
 	constructor(options: TexActionsStdioMcpRuntimeOptions = {}) {
@@ -63,6 +67,7 @@ export class TexActionsStdioMcpRuntime {
 		this.launchCwd = options.launchCwd ?? process.cwd();
 		this.defaultPdfService = options.pdfOperations === undefined ? new ViewerHostMcpService() : undefined;
 		this.pdfOperations = options.pdfOperations ?? this.defaultPdfService?.pdfOperations ?? {};
+		this.hooksEnabled = options.hooksEnabled === true;
 		this.frameLoop = new McpStdioFrameLoop({
 			stdin: options.stdin ?? processStdin,
 			stderr,
@@ -74,7 +79,17 @@ export class TexActionsStdioMcpRuntime {
 
 	start(): void {
 		if (this.closed) return;
-		this.seedRuntimePreamble();
+		const workspaceContext = this.seedRuntimePreamble();
+		if (this.hooksEnabled) {
+			this.hookContextBridge = startHookContextBridge({
+				runtimeDir: workspaceContext.workspace_root!,
+				fetchContext: async (request) => {
+					if (!this.pdfOperations.fetchPdfContext) return { text: "", pdfIds: [], eventCount: 0, cleared: false, events: [] };
+					return this.pdfOperations.fetchPdfContext(request);
+				},
+			});
+			void this.hookContextBridge.ready.catch(() => undefined);
+		}
 		this.frameLoop.start();
 	}
 
@@ -82,6 +97,7 @@ export class TexActionsStdioMcpRuntime {
 		if (this.closed) return;
 		this.closed = true;
 		this.frameLoop.close();
+		void this.hookContextBridge?.close();
 		void this.defaultPdfService?.stop();
 	};
 
@@ -89,18 +105,19 @@ export class TexActionsStdioMcpRuntime {
 		return resolveAgentWorkspaceContext({ cwd: this.launchCwd });
 	}
 
-	private seedRuntimePreamble(): void {
+	private seedRuntimePreamble() {
 		const workspaceContext = this.workspaceContext();
 		initializeLatexPreambleFile({
 			cwd: workspaceContext.cwd,
 			runtimeDirectory: workspaceContext.workspace_root,
 			overwrite: false,
 		});
+		return workspaceContext;
 	}
 
 	private async handleFrame(payload: string, protocol: McpClientFrameProtocol): Promise<void> {
 		const rewrittenPayload = this.rewriteRequestPayload(payload);
-		const response = await handleMcpRequest(rewrittenPayload, this.pdfOperations);
+		const response = await handleMcpRequest(rewrittenPayload, this.pdfOperations, { hooksEnabled: this.hooksEnabled });
 		if (response === null) return;
 		const rewrittenResponse = rewriteToolsListForV1(response);
 		await this.writePayload(JSON.stringify(rewrittenResponse), protocol);

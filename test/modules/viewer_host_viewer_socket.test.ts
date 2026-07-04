@@ -268,7 +268,7 @@ test("PDF annotation socket payloads are coalesced for MCP drain and clear viewe
 	}
 });
 
-test("reverse SyncTeX viewer socket payloads flow through Host to MCP event store and get_pdf_events details", async () => {
+test("reverse SyncTeX viewer socket payloads flow through Host to MCP event store", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-reverse-"));
 	const { pdfPath, sourcePath } = writeSynctexFixture(baseDir);
 	const registry = new ViewerHostPdfRegistry();
@@ -299,16 +299,15 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 			selectionEndY: 155.27,
 		}));
 
-		let details: { events?: Array<Record<string, unknown>> } | undefined;
+		let events: Array<Record<string, unknown>> = [];
 		for (let attempt = 0; attempt < 20; attempt += 1) {
-			const response = await callTool(2, "get_pdf_events", { pdf_id: 112, max_events: 5 }, service) as { result?: { details?: { events?: Array<Record<string, unknown>> } } };
-			details = response.result?.details;
-			if ((details?.events?.length ?? 0) > 0) break;
+			events = await service.getPdfEvents({ pdf_id: 112, max_events: 5 }) as unknown as Array<Record<string, unknown>>;
+			if (events.length > 0) break;
 			await new Promise((resolve) => setTimeout(resolve, 25));
 		}
 
-		assert.equal(details?.events?.length, 1);
-		const event = details?.events?.[0];
+		assert.equal(events.length, 1);
+		const event = events[0];
 		assert.deepEqual({ ...event, synctex_diagnostics: undefined, selection_start: undefined, selection_end: undefined, precision: undefined, repair: undefined, raw_mapped_source_file: undefined, raw_mapped_line: undefined, raw_mapped_column: undefined, raw_mapped_source_line: undefined }, {
 			type: "reverse_synctex",
 			sequence: 1,
@@ -345,7 +344,7 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 		assert.equal(diagnostics.selected.sourceFile, sourcePath);
 		assert.equal(diagnostics.selected.line, 3);
 		assert.equal(diagnostics.selected.column, 6);
-		assert.match(String(details?.events?.[0]?.timestamp), /^\d{4}-\d{2}-\d{2}T/);
+		assert.match(String(event?.timestamp), /^\d{4}-\d{2}-\d{2}T/);
 	} finally {
 		socket?.close();
 		await server.stop();

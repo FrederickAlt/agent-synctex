@@ -572,6 +572,11 @@ export class ViewerHostServer {
 				await this.verifyPdfMaybeUpdated(record);
 				return { ok: true, result: { type: "pdf_maybe_updated", pdf_id: record.pdfId } };
 			}
+			case "clear_pdf_annotations": {
+				const record = this.registry.getPdf(message.pdf_id);
+				this.broadcastViewerSocketMessage(record.pdfId, { type: "annotations_cleared", pdf_id: record.pdfId });
+				return { ok: true, result: { type: "clear_pdf_annotations", pdf_id: record.pdfId } };
+			}
 			case "reverse_synctex_hover_result": {
 				const record = this.registry.getPdf(message.pdf_id);
 				this.broadcastViewerSocketMessage(record.pdfId, message);
