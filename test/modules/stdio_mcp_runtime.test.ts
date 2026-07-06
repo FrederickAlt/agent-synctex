@@ -128,7 +128,7 @@ test("stdio runtime closes hook bridge when stdio closes", async () => {
 			const stdin = new PassThrough();
 			const runtime = new TexActionsStdioMcpRuntime({ stdin, stdout: new PassThrough(), stderr: new PassThrough(), launchCwd, hookMode: { kind: "hook-capable", harness: "codex" }, pdfOperations: {} });
 			runtime.start();
-			const discoveryPath = join(runtimeRoot, "agents", "agent-synctex-codex", "hook-context-bridge.json");
+			const discoveryPath = join(runtimeRoot, "agents", "stdio-test-agent", "hook-context-bridge.json");
 			try {
 				await waitForFile(discoveryPath);
 				stdin.end();

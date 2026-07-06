@@ -6,7 +6,7 @@ import { getMcpTmpDir } from "./runtime_paths.ts";
 import { sanitizeTexActionsAgentId } from "./agent_runtime_context.ts";
 import { collectPostUserPdfContextFromEvents, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
 import type { PdfAnnotationEvent, PdfEvent } from "./pdf_events.ts";
-import { validateViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
+import { VIEWER_HOST_CONTROL_TOKEN_HEADER, validateViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
 
 export const HOOK_CONTEXT_BRIDGE_FILE_NAME = "hook-context-bridge.json";
 const HOOK_CONTEXT_BRIDGE_VERSION = 1;
@@ -202,7 +202,7 @@ async function fetchPersistentViewerHostContext(options: FetchHookContextOptions
 	if (!state) return "";
 	const fetchImpl = options.fetchImpl ?? fetch;
 	try {
-		const response = await fetchImpl(`${state.origin}/mcp-events/drain`, { method: "POST" });
+		const response = await fetchImpl(`${state.origin}/mcp-events/drain`, { method: "POST", headers: { [VIEWER_HOST_CONTROL_TOKEN_HEADER]: state.controlToken } });
 		const payload = await response.json() as { ok?: unknown; events?: unknown[] };
 		if (!response.ok || payload.ok !== true || !Array.isArray(payload.events)) return "";
 		const events = hostMessagesToPdfEvents(payload.events);
@@ -210,7 +210,7 @@ async function fetchPersistentViewerHostContext(options: FetchHookContextOptions
 		if (result.cleared) {
 			await Promise.allSettled(result.pdfIds.map((pdfId) => fetchImpl(`${state.origin}/control`, {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", [VIEWER_HOST_CONTROL_TOKEN_HEADER]: state.controlToken },
 				body: JSON.stringify({ type: "clear_pdf_annotations", pdf_id: pdfId }),
 			})));
 		}
@@ -250,11 +250,12 @@ function hostMessagesToPdfEvents(messages: unknown[]): PdfEvent[] {
 	return events;
 }
 
-function readPersistentViewerHostState(runtimeDir: string): { origin: string } | undefined {
+function readPersistentViewerHostState(runtimeDir: string): { origin: string; controlToken: string } | undefined {
 	try {
-		const raw = JSON.parse(readFileSync(join(runtimeDir, "viewer-host.json"), "utf8")) as { origin?: unknown };
+		const raw = JSON.parse(readFileSync(join(runtimeDir, "viewer-host.json"), "utf8")) as { origin?: unknown; control_token?: unknown };
 		if (typeof raw.origin !== "string" || !raw.origin.startsWith("http://127.0.0.1:")) return undefined;
-		return { origin: raw.origin.replace(/\/$/, "") };
+		if (typeof raw.control_token !== "string" || raw.control_token.length < 16) return undefined;
+		return { origin: raw.origin.replace(/\/$/, ""), controlToken: raw.control_token };
 	} catch {
 		return undefined;
 	}

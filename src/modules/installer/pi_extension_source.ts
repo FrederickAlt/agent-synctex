@@ -15,8 +15,14 @@ function cwdFromEvent(event: any): string | undefined {
 	return undefined;
 }
 
-function fetchPdfContext(prompt: string, cwd: string | undefined): { text: string; error?: string } {
+function agentIdFromContext(ctx: any): string | undefined {
+	const sessionId = ctx?.sessionManager?.getSessionId?.();
+	return typeof sessionId === "string" && sessionId ? "agent-synctex-pi-" + sessionId : undefined;
+}
+
+function fetchPdfContext(prompt: string, cwd: string | undefined, agentId: string | undefined): { text: string; error?: string } {
 	const args = ["fetch-info", "--harness", "pi"];
+	if (agentId) args.push("--agent-id", agentId);
 	if (cwd) args.push("--cwd", cwd);
 	const options = {
 		input: prompt,
@@ -41,8 +47,8 @@ function resultError(result: ReturnType<typeof spawnSync>): string {
 
 export default function(pi: any): void {
 	pi.on("before_agent_start", async (event: any, ctx: any) => {
-		const cwd = cwdFromEvent(event);
-		const context = fetchPdfContext(textFromPromptEvent(event), cwd);
+		const cwd = cwdFromEvent(event) ?? ctx?.cwd;
+		const context = fetchPdfContext(textFromPromptEvent(event), cwd, agentIdFromContext(ctx));
 		if (!context.text) {
 			if (context.error) ctx?.ui?.notify?.("Agent SyncTeX hook failed: " + context.error, "warning");
 			return;

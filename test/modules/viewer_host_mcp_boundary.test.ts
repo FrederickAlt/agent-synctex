@@ -252,11 +252,12 @@ test("reverse-forward probe is handled by ViewerHostServer without mcpEventSink 
 test("default Viewer Host client factory reuses agent runtime server origin", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-reuse-"));
 	const registry = new ViewerHostPdfRegistry();
-	const server = new ViewerHostServer({ registry });
+	const controlToken = "reuse-control-token";
+	const server = new ViewerHostServer({ registry, controlToken });
 	const launches: BrowserViewerLaunchTarget[] = [];
 	try {
 		await server.start();
-		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, updated_at: new Date().toISOString() }) + "\n");
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, updated_at: new Date().toISOString() }) + "\n");
 		const factory = createDefaultViewerHostClientFactory({
 			agentRuntimeDir: baseDir,
 			command: join(baseDir, "must-not-launch"),
@@ -302,10 +303,11 @@ test("ViewerHostMcpService.stop shuts down a persistent Viewer Host server", asy
 	try {
 		const opened = await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 		assert.equal(opened.result?.details?.pdf_id, 347);
-		const state = JSON.parse(readFileSync(statePath, "utf8")) as { origin?: unknown; pid?: unknown; shutdown_token?: unknown };
+		const state = JSON.parse(readFileSync(statePath, "utf8")) as { origin?: unknown; pid?: unknown; shutdown_token?: unknown; control_token?: unknown };
 		assert.equal(typeof state.origin, "string");
 		assert.equal(typeof state.pid, "number");
 		assert.equal(typeof state.shutdown_token, "string");
+		assert.equal(typeof state.control_token, "string");
 		pid = state.pid as number;
 		assert.equal(isPidRunning(pid), true);
 
@@ -334,11 +336,12 @@ test("ViewerHostMcpService.stop shuts down a persistent Viewer Host server", asy
 test("default Viewer Host client factory reopens an already-opened reused host when no active viewer is connected", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-reuse-opened-"));
 	const registry = new ViewerHostPdfRegistry();
-	const server = new ViewerHostServer({ registry });
+	const controlToken = "reuse-opened-control-token";
+	const server = new ViewerHostServer({ registry, controlToken });
 	const launches: BrowserViewerLaunchTarget[] = [];
 	try {
 		await server.start();
-		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, updated_at: new Date().toISOString(), browser_opened_at: new Date().toISOString() }) + "\n");
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, updated_at: new Date().toISOString(), browser_opened_at: new Date().toISOString() }) + "\n");
 		const factory = createDefaultViewerHostClientFactory({
 			agentRuntimeDir: baseDir,
 			command: join(baseDir, "must-not-launch"),

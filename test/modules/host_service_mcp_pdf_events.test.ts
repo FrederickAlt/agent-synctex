@@ -124,21 +124,29 @@ test("Viewer Host MCP service fetches context and clears consumed viewer annotat
 });
 
 test("Viewer Host MCP service accepts and stores selection debug messages", async () => {
-	const service = new ViewerHostMcpService({ client: new SelectionDebugTestClient() });
-	service.handleHostMessage({
-		type: "selection_debug",
-		pdf_id: 77,
-		phase: "send",
-		page: 2,
-		text: "browser selection",
-		details: { selectionTextLength: 17, selectedPayloadTextLength: 17 },
-	});
+	const dir = mkdtempSync(join(tmpdir(), "viewer-host-selection-debug-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		const service = new ViewerHostMcpService({ client: new SelectionDebugTestClient(), makePdfId: () => 77 });
+		await service.openPdf({ protocol_version: 1, request_id: "open", operation: "open_pdf", created_at_ns: 1, workspace_context: { cwd: dir }, details: { pdf_path: pdfPath } });
+		service.handleHostMessage({
+			type: "selection_debug",
+			pdf_id: 77,
+			phase: "send",
+			page: 2,
+			text: "browser selection",
+			details: { selectionTextLength: 17, selectedPayloadTextLength: 17 },
+		});
 
-	const events = await service.getPdfEvents({ pdf_id: 77, max_events: 5, debug: true });
-	assert.equal(events.length, 1);
-	assert.equal(events[0]?.type, "selection_debug");
-	assert.equal(events[0]?.phase, "send");
-	assert.deepEqual(events[0]?.details, { selectionTextLength: 17, selectedPayloadTextLength: 17 });
+		const events = await service.getPdfEvents({ pdf_id: 77, max_events: 5, debug: true });
+		assert.equal(events.length, 1);
+		assert.equal(events[0]?.type, "selection_debug");
+		assert.equal(events[0]?.phase, "send");
+		assert.deepEqual(events[0]?.details, { selectionTextLength: 17, selectedPayloadTextLength: 17 });
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 function fakeReverseLocation(input: { pdfPath: string; page: number; x: number; y: number; textBeforeSelection?: string; textAfterSelection?: string }, sourcePath: string, line: number, rawLine?: number): ReverseSynctexLocation {

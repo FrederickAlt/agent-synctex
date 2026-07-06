@@ -6,7 +6,7 @@ import type { AddressInfo, Socket } from "node:net";
 import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath, URL } from "node:url";
-import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
+import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_CONTROL_TOKEN_HEADER, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
 import { reverseSynctexForwardProbeResult, reverseSynctexHoverResult } from "./synctex/synctex_resolution.ts";
 import { DEFAULT_VIEWER_HOST_ACCESS_POLICY, type ViewerHostAccessPolicy, type ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
@@ -112,6 +112,7 @@ export interface ViewerHostServerOptions {
 	pdfChangeDetection?: ViewerHostPdfChangeDetectionOptions;
 	accessPolicy?: ViewerHostAccessPolicy;
 	shutdownRequest?: ViewerHostShutdownRequestHandler;
+	controlToken?: string;
 }
 
 export class ViewerHostServer {
@@ -126,6 +127,7 @@ export class ViewerHostServer {
 	private readonly nowMs: () => number;
 	private readonly accessPolicy: ViewerHostAccessPolicy;
 	private readonly shutdownRequest: ViewerHostShutdownRequestHandler | undefined;
+	private readonly controlToken: string | undefined;
 	private controlReady = false;
 	private controlProtocolVersion: number | undefined;
 	private server: Server | undefined;
@@ -157,6 +159,7 @@ export class ViewerHostServer {
 		this.nowMs = options.pdfChangeDetection?.nowMs ?? (() => Date.now());
 		this.accessPolicy = options.accessPolicy ?? DEFAULT_VIEWER_HOST_ACCESS_POLICY;
 		this.shutdownRequest = options.shutdownRequest;
+		this.controlToken = options.controlToken;
 	}
 
 	get origin(): string {
@@ -313,7 +316,7 @@ export class ViewerHostServer {
 			return;
 		}
 		if (requestUrl.pathname === "/mcp-events/drain") {
-			this.handleMcpEventsDrainRequest(request, response);
+			await this.handleMcpEventsDrainRequest(request, response);
 			return;
 		}
 
@@ -471,16 +474,59 @@ export class ViewerHostServer {
 		return payload;
 	}
 
-	private handleMcpEventsDrainRequest(request: IncomingMessage, response: ServerResponse): void {
+	private async handleMcpEventsDrainRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		if (!this.isAuthorizedControlRequest(request)) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid Viewer Host control token" } });
+			return;
+		}
 		if (request.method !== "POST") {
 			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "MCP event drain requires POST" } });
 			return;
 		}
-		const events = this.mcpEventBacklog.splice(0);
+		const pdfIds = await this.readMcpEventsDrainPdfIds(request, response);
+		if (response.headersSent) return;
+		const events = this.drainMcpEventBacklog(pdfIds);
 		this.broadcastAnnotationsCleared(new Set(events
 			.filter((event) => event.type === "pdf_annotation" || event.type === "pdf_annotation_deleted")
 			.map((event) => event.pdf_id)));
 		jsonResponse(response, 200, { ok: true, events });
+	}
+
+	private async readMcpEventsDrainPdfIds(request: IncomingMessage, response: ServerResponse): Promise<Set<number> | undefined> {
+		if (request.headers["content-type"] === undefined) return undefined;
+		let body = "";
+		try {
+			body = await readRequestBody(request);
+		} catch {
+			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "MCP event drain body must be valid JSON" } });
+			return undefined;
+		}
+		if (!body.trim()) return undefined;
+		let payload: unknown;
+		try {
+			payload = JSON.parse(body);
+		} catch {
+			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "MCP event drain body must be valid JSON" } });
+			return undefined;
+		}
+		if (!isRecord(payload) || payload.pdf_ids === undefined) return undefined;
+		if (!Array.isArray(payload.pdf_ids) || !payload.pdf_ids.every((value) => Number.isInteger(value) && value > 0)) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_pdf_ids", message: "MCP event drain pdf_ids must be positive integers" } });
+			return undefined;
+		}
+		return new Set(payload.pdf_ids);
+	}
+
+	private drainMcpEventBacklog(pdfIds: Set<number> | undefined): ViewerHostToMcpMessage[] {
+		if (pdfIds === undefined) return this.mcpEventBacklog.splice(0);
+		const drained: ViewerHostToMcpMessage[] = [];
+		const kept: ViewerHostToMcpMessage[] = [];
+		for (const event of this.mcpEventBacklog) {
+			if ("pdf_id" in event && pdfIds.has(event.pdf_id)) drained.push(event);
+			else kept.push(event);
+		}
+		this.mcpEventBacklog.splice(0, this.mcpEventBacklog.length, ...kept);
+		return drained;
 	}
 
 	private serveAppShell(response: ServerResponse, headOnly: boolean): void {
@@ -610,7 +656,15 @@ export class ViewerHostServer {
 		jsonResponse(response, 200, { ok: true });
 	}
 
+	private isAuthorizedControlRequest(request: IncomingMessage): boolean {
+		return this.controlToken === undefined || request.headers[VIEWER_HOST_CONTROL_TOKEN_HEADER] === this.controlToken;
+	}
+
 	private async handleControlRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		if (!this.isAuthorizedControlRequest(request)) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid Viewer Host control token" } });
+			return;
+		}
 		if (request.method !== "POST") {
 			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "control channel requires POST" } });
 			return;

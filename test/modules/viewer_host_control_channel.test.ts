@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
 import { ViewerHostPdfRegistry, type ViewerHostPdfRecord } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer, type ViewerHostViewerDispatch } from "../../src/modules/viewer_host_server.ts";
-import type { ViewerHostSynctexForwardMessage } from "../../src/modules/viewer_host_protocol.ts";
+import { VIEWER_HOST_CONTROL_TOKEN_HEADER, type ViewerHostSynctexForwardMessage } from "../../src/modules/viewer_host_protocol.ts";
 
 function writeFakePdf(path: string, body = "body"): void {
 	writeFileSync(path, `%PDF-1.4\n${body}\n%%EOF\n`);
@@ -53,6 +53,26 @@ test("Viewer Host control channel accepts hello and records protocol readiness",
 		await server.stop();
 	}
 });
+
+test("Viewer Host MCP endpoints require the configured owner token", async () => {
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry, controlToken: "owner-token" });
+	try {
+		await server.start();
+		const unauthorized = await fetch(`${server.origin}/control`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "hello", protocol_version: 1 }) });
+		assert.equal(unauthorized.status, 403);
+		const unauthorizedDrain = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
+		assert.equal(unauthorizedDrain.status, 403);
+
+		const client = new ViewerHostControlClient({ origin: server.origin, controlToken: "owner-token" });
+		assert.equal((await client.send({ type: "hello", protocol_version: 1 })).ok, true);
+		const authorizedDrain = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST", headers: { [VIEWER_HOST_CONTROL_TOKEN_HEADER]: "owner-token" } });
+		assert.equal(authorizedDrain.status, 200);
+	} finally {
+		await server.stop();
+	}
+});
+
 
 test("Viewer Host control channel registers and re-registers open_pdf with MCP-provided ids", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-control-open-"));

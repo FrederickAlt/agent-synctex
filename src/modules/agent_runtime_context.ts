@@ -20,9 +20,16 @@ interface AgentWorkspaceContextSource {
 
 function rawPiSessionId(ctx?: AgentWorkspaceContextSource): string | undefined {
 	const rawSessionId = ctx?.session_id;
-	return typeof rawSessionId === "string" && rawSessionId.trim().length > 0
-		? rawSessionId
-		: undefined;
+	if (typeof rawSessionId === "string" && rawSessionId.trim().length > 0) return rawSessionId;
+	const sessionManager = (ctx as { sessionManager?: { getSessionId?: unknown } } | undefined)?.sessionManager;
+	const getSessionId = sessionManager?.getSessionId;
+	if (typeof getSessionId !== "function") return undefined;
+	try {
+		const sessionId = getSessionId.call(sessionManager);
+		return typeof sessionId === "string" && sessionId.trim().length > 0 ? sessionId : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 export function sanitizeTexActionsAgentId(agentId: string): string {

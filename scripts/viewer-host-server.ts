@@ -25,12 +25,14 @@ function parseIdleTimeoutMs(value: string | undefined): number {
 const persistent = process.env.AGENT_SYNCTEX_PERSISTENT_VIEWER_HOST === "1";
 const idleTimeoutMs = parseIdleTimeoutMs(process.env.AGENT_SYNCTEX_VIEWER_HOST_IDLE_MS);
 const shutdownToken = process.env.AGENT_SYNCTEX_VIEWER_HOST_SHUTDOWN_TOKEN;
+const controlToken = process.env.AGENT_SYNCTEX_VIEWER_HOST_CONTROL_TOKEN;
 const registry = new ViewerHostPdfRegistry();
 let stopping = false;
 const server = new ViewerHostServer({
 	registry,
 	port: parsePort(process.env.PDF_PREVIEW_VIEWER_HOST_PORT),
 	...(shutdownToken === undefined ? {} : { shutdownRequest: { token: shutdownToken, shutdown: (reason: string) => shutdown(reason) } }),
+	...(controlToken === undefined ? {} : { controlToken }),
 });
 await server.start();
 

@@ -268,6 +268,46 @@ test("PDF annotation socket payloads are coalesced for MCP drain and clear viewe
 	}
 });
 
+test("MCP event drain can be scoped to owned pdf_ids without consuming other events", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-drain-owned-"));
+	const firstPdf = join(baseDir, "first.pdf");
+	const secondPdf = join(baseDir, "second.pdf");
+	writeFakePdf(firstPdf, "first");
+	writeFakePdf(secondPdf, "second");
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let firstSocket: TestWebSocket | undefined;
+	let secondSocket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 41, pdfPath: firstPdf, title: basename(firstPdf), revision: 1, fileSnapshot: snapshotPdf(firstPdf) });
+		registry.registerPdf({ pdfId: 42, pdfPath: secondPdf, title: basename(secondPdf), revision: 1, fileSnapshot: snapshotPdf(secondPdf) });
+		await server.start();
+		firstSocket = await openViewerSocket(server.origin, 41, await getViewerSocketToken(server.origin, 41));
+		secondSocket = await openViewerSocket(server.origin, 42, await getViewerSocketToken(server.origin, 42));
+		firstSocket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "first.tex"), line: 1 }));
+		secondSocket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a2", page: 1, x: 30, y: 40, source_file: join(baseDir, "second.tex"), line: 2 }));
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		const firstClearMessage = nextJsonMessage(firstSocket);
+		const scopedResponse = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pdf_ids: [41] }) });
+		assert.equal(scopedResponse.status, 200);
+		const scopedPayload = await scopedResponse.json() as { events?: Array<{ pdf_id?: number }> };
+		assert.deepEqual(scopedPayload.events?.map((event) => event.pdf_id), [41]);
+		assert.deepEqual(await firstClearMessage, { type: "annotations_cleared", pdf_id: 41, pdf_ids: [41] });
+
+		const secondClearMessage = nextJsonMessage(secondSocket);
+		const remainingPayload = await (await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" })).json() as { events?: Array<{ pdf_id?: number }> };
+		assert.deepEqual(remainingPayload.events?.map((event) => event.pdf_id), [42]);
+		assert.deepEqual(await secondClearMessage, { type: "annotations_cleared", pdf_id: 42, pdf_ids: [42] });
+	} finally {
+		firstSocket?.close();
+		secondSocket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
 test("clear_pdf_annotations reaches active viewer sockets for inactive PDFs", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-clear-inactive-"));
 	const activePdfPath = join(baseDir, "active.pdf");

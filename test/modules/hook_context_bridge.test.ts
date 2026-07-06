@@ -147,7 +147,7 @@ test("actual agent-synctex mcp --harness writes bridge discovery file", async ()
 		child.once("error", () => resolveExit());
 	});
 	try {
-		await waitForFile(hookContextBridgeDiscoveryPath(join(runtimeRoot, "agents", "agent-synctex-claude")));
+		await waitForFile(hookContextBridgeDiscoveryPath(join(runtimeRoot, "agents", "entrypoint-hooks-agent")));
 	} finally {
 		child.kill("SIGTERM");
 		await Promise.race([exitPromise, new Promise((resolveWait) => setTimeout(resolveWait, 300))]);
@@ -166,12 +166,13 @@ test("fetchHookContext falls back to persistent Viewer Host when MCP bridge is g
 	writeFileSync(pdfPath, "%PDF-1.4\n% fallback\n%%EOF\n");
 	writeFileSync(sourcePath, "Marked source line.\n");
 	const registry = new ViewerHostPdfRegistry();
-	const server = new ViewerHostServer({ registry });
+	const controlToken = "persistent-fallback-control-token";
+	const server = new ViewerHostServer({ registry, controlToken });
 	let socket: TestWebSocket | undefined;
 	try {
 		registry.registerPdf({ pdfId: 12, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath) });
 		await server.start();
-		writeFileSync(join(runtimeDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, updated_at: new Date().toISOString() }) + "\n");
+		writeFileSync(join(runtimeDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, control_token: controlToken, updated_at: new Date().toISOString() }) + "\n");
 		const config = await (await fetch(`${server.origin}/config/12.json`)).json() as { viewer_socket_url: string };
 		socket = await openViewerSocket(config.viewer_socket_url);
 		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: sourcePath, line: 1, source_line: "Marked source line.", comment: "fallback note" }));
@@ -206,7 +207,7 @@ test("agent-synctex fetch-info prints bridge context", async () => {
 	const scriptPath = resolve(process.cwd(), "scripts", "agent-synctex.ts");
 	try {
 		await bridge.ready;
-		const child = spawn(process.execPath, [scriptPath, "fetch-info", "--harness", "codex"], {
+		const child = spawn(process.execPath, [scriptPath, "fetch-info", "--harness", "codex", "--agent-id", "agent-synctex-codex"], {
 			env: { ...process.env, MCP_TMPDIR: runtimeRoot, TEX_ACTIONS_AGENT_ID: "unused-legacy-agent" },
 			stdio: ["pipe", "pipe", "pipe"],
 		});

@@ -15,6 +15,7 @@ interface ParsedCli {
 	dryRun: boolean;
 	yes: boolean;
 	noHooks: boolean;
+	agentId?: string;
 	cwd: string;
 	help: boolean;
 }
@@ -36,6 +37,7 @@ Options:
   --local                 Write project-local config/hooks instead of user/global config.
   --scope <scope>         project|user (default: user; --local is shorthand for --scope project)
   --no-hooks              For mcp/install mcp/install: manual-only mode; do not install/use hooks.
+  --agent-id <id>         Explicit agent/session id for mcp and fetch-info ownership.
   --cwd <path>            Project directory (default: current working directory)
   --dry-run               Print planned changes without writing files.
   --yes                   Accept non-interactive defaults.
@@ -63,7 +65,7 @@ export async function runAgentSynctexCli(argv: string[], io: { stdin?: NodeJS.Re
 	if (parsed.command === "fetch-info") {
 		const prompt = await readStdin(io.stdin ?? processStdin).catch(() => "");
 		if (!isHarnessId(parsed.harness)) return 0;
-		const context = await fetchHookContext({ prompt, agentId: agentIdForHarness(parsed.harness), cwd: parsed.cwd }).catch(() => "");
+		const context = await fetchHookContext({ prompt, agentId: parsed.agentId ?? process.env.TEX_ACTIONS_AGENT_ID ?? agentIdForHarness(parsed.harness), cwd: parsed.cwd }).catch(() => "");
 		if (context) stdout.write(context);
 		return 0;
 	}
@@ -125,6 +127,7 @@ function runMcp(parsed: ParsedCli, stderr: Pick<NodeJS.WritableStream, "write">)
 	if (parsed.harness !== "auto" && parsed.harness !== "all" && isHarnessId(parsed.harness)) {
 		const runtime = startTexActionsStdioMcpRuntime({
 			launchCwd: parsed.cwd,
+			agentId: parsed.agentId,
 			hookMode: parsed.noHooks ? { kind: "no-hooks", harness: parsed.harness } : { kind: "hook-capable", harness: parsed.harness },
 		});
 		process.once("SIGINT", () => runtime.close());
@@ -180,6 +183,12 @@ function parseCli(argv: string[]): ParsedCli {
 			const value = arg.slice("--scope=".length);
 			if (value !== "project" && value !== "user") throw new Error("--scope must be project or user");
 			parsed.scope = value;
+		} else if (arg === "--agent-id") {
+			const value = argv[++index];
+			if (!value) throw new Error("Missing value for --agent-id");
+			parsed.agentId = value;
+		} else if (arg.startsWith("--agent-id=")) {
+			parsed.agentId = arg.slice("--agent-id=".length);
 		} else if (arg === "--cwd") {
 			const value = argv[++index];
 			if (!value) throw new Error("Missing value for --cwd");

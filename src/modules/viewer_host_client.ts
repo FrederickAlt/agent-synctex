@@ -17,6 +17,7 @@ import type {
 } from "./host_service_protocol.ts";
 import type { HostServiceMcpPdfOperations } from "./host_service_mcp.ts";
 import {
+	VIEWER_HOST_CONTROL_TOKEN_HEADER,
 	VIEWER_HOST_PROTOCOL_VERSION,
 	validateMcpToViewerHostMessage,
 	validateViewerHostToMcpMessage,
@@ -57,7 +58,7 @@ interface TrackedViewerHostPdf {
 export interface ViewerHostClient {
 	readonly origin: string;
 	send(message: McpToViewerHostMessage): Promise<void | ViewerHostControlResponse>;
-	drainEvents?(): Promise<ViewerHostToMcpMessage[]>;
+	drainEvents?(pdfIds?: readonly number[]): Promise<ViewerHostToMcpMessage[]>;
 	close?(): Promise<void> | void;
 	shutdownHost?(): Promise<void> | void;
 }
@@ -156,6 +157,7 @@ interface PersistentViewerHostState {
 	app_url: string;
 	pid?: number;
 	shutdown_token?: string;
+	control_token?: string;
 	updated_at: string;
 	browser_opened_at?: string;
 }
@@ -166,6 +168,7 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 	private readonly browserLauncher: BrowserViewerLauncher;
 	private readonly browserOpenAckTimeoutMs: number;
 	private readonly controlClient: ViewerHostControlClient;
+	private readonly controlToken: string | undefined;
 	private readonly closeHost: (() => Promise<void>) | undefined;
 	private readonly shutdownHostHandler: (() => Promise<void>) | undefined;
 	private readonly afterBrowserLaunch: (() => void) | undefined;
@@ -173,12 +176,13 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 	private closed = false;
 	private hostShutdownStarted = false;
 
-	constructor(options: { origin: string; appUrl: string; browserLauncher: BrowserViewerLauncher; closeHost?: () => Promise<void>; shutdownHost?: () => Promise<void>; launchBrowserOnNextOpen?: boolean; afterBrowserLaunch?: () => void; browserOpenAckTimeoutMs?: number }) {
+	constructor(options: { origin: string; appUrl: string; browserLauncher: BrowserViewerLauncher; controlToken?: string; closeHost?: () => Promise<void>; shutdownHost?: () => Promise<void>; launchBrowserOnNextOpen?: boolean; afterBrowserLaunch?: () => void; browserOpenAckTimeoutMs?: number }) {
 		this.origin = options.origin.replace(/\/$/, "");
 		this.appUrl = options.appUrl;
 		this.browserLauncher = options.browserLauncher;
 		this.browserOpenAckTimeoutMs = options.browserOpenAckTimeoutMs ?? DEFAULT_BROWSER_OPEN_ACK_TIMEOUT_MS;
-		this.controlClient = new ViewerHostControlClient({ origin: this.origin });
+		this.controlToken = options.controlToken;
+		this.controlClient = new ViewerHostControlClient({ origin: this.origin, controlToken: this.controlToken });
 		this.closeHost = options.closeHost;
 		this.shutdownHostHandler = options.shutdownHost;
 		this.launchBrowserOnNextOpen = options.launchBrowserOnNextOpen ?? true;
@@ -248,14 +252,22 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 		return 0;
 	}
 
-	async drainEvents(): Promise<ViewerHostToMcpMessage[]> {
+	async drainEvents(pdfIds?: readonly number[]): Promise<ViewerHostToMcpMessage[]> {
 		if (this.closed) return [];
-		const response = await fetch(`${this.origin}/mcp-events/drain`, { method: "POST" });
+		const response = await fetch(`${this.origin}/mcp-events/drain`, {
+			method: "POST",
+			headers: { ...this.controlHeaders(), ...(pdfIds === undefined ? {} : { "content-type": "application/json" }) },
+			...(pdfIds === undefined ? {} : { body: JSON.stringify({ pdf_ids: pdfIds }) }),
+		});
 		const payload = await response.json() as { ok?: unknown; events?: unknown; error?: { message?: unknown } };
 		if (!response.ok || payload.ok !== true || !Array.isArray(payload.events)) {
 			throw new Error(typeof payload.error?.message === "string" ? payload.error.message : "failed to drain Viewer Host MCP events");
 		}
 		return payload.events.map((event) => validateViewerHostToMcpMessage(event));
+	}
+
+	private controlHeaders(): Record<string, string> {
+		return this.controlToken === undefined ? {} : { [VIEWER_HOST_CONTROL_TOKEN_HEADER]: this.controlToken };
 	}
 
 	async close(): Promise<void> {
@@ -280,12 +292,13 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 }
 
 class LocalViewerHostProcessClient extends HttpViewerHostProcessClient {
-	constructor(child: ChildProcessWithoutNullStreams, ready: ViewerHostReadyLine, shutdownTimeoutMs: number, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number) {
+	constructor(child: ChildProcessWithoutNullStreams, ready: ViewerHostReadyLine, shutdownTimeoutMs: number, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number, controlToken: string) {
 		super({
 			origin: ready.origin,
 			appUrl: ready.app_url,
 			browserLauncher,
 			browserOpenAckTimeoutMs,
+			controlToken,
 			closeHost: async () => {
 				await browserLauncher.close?.();
 				child.stdin.write("shutdown\n");
@@ -314,6 +327,7 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 	if (reusableClient) return reusableClient;
 	const persistent = options.agentRuntimeDir !== undefined;
 	const shutdownToken = persistent ? randomBytes(32).toString("base64url") : undefined;
+	const controlToken = randomBytes(32).toString("base64url");
 	const child = spawn(command, args, {
 		stdio: ["pipe", "pipe", "pipe"],
 		detached: persistent,
@@ -321,6 +335,7 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 			...process.env,
 			...(persistent ? { AGENT_SYNCTEX_PERSISTENT_VIEWER_HOST: "1" } : {}),
 			...(shutdownToken === undefined ? {} : { AGENT_SYNCTEX_VIEWER_HOST_SHUTDOWN_TOKEN: shutdownToken }),
+			AGENT_SYNCTEX_VIEWER_HOST_CONTROL_TOKEN: controlToken,
 		},
 	});
 	let stderr = "";
@@ -331,9 +346,9 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 	try {
 		const ready = await readViewerHostReadyLine(child, readyTimeoutMs, () => stderr);
 		if (!persistent || options.agentRuntimeDir === undefined) {
-			return new LocalViewerHostProcessClient(child, ready, shutdownTimeoutMs, browserLauncher, browserOpenAckTimeoutMs);
+			return new LocalViewerHostProcessClient(child, ready, shutdownTimeoutMs, browserLauncher, browserOpenAckTimeoutMs, controlToken);
 		}
-		const state: PersistentViewerHostState = { origin: ready.origin, app_url: ready.app_url, pid: child.pid, ...(shutdownToken === undefined ? {} : { shutdown_token: shutdownToken }), updated_at: new Date().toISOString() };
+		const state: PersistentViewerHostState = { origin: ready.origin, app_url: ready.app_url, pid: child.pid, ...(shutdownToken === undefined ? {} : { shutdown_token: shutdownToken }), control_token: controlToken, updated_at: new Date().toISOString() };
 		writePersistentViewerHostState(options.agentRuntimeDir, state);
 		child.stdin.end();
 		child.stdout.destroy();
@@ -344,6 +359,7 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 			appUrl: ready.app_url,
 			browserLauncher,
 			browserOpenAckTimeoutMs,
+			controlToken,
 			shutdownHost: () => shutdownPersistentViewerHost({ agentRuntimeDir: options.agentRuntimeDir!, state, shutdownTimeoutMs, browserLauncher }),
 			afterBrowserLaunch: () => writePersistentViewerHostState(options.agentRuntimeDir!, { ...state, browser_opened_at: new Date().toISOString(), updated_at: new Date().toISOString() }),
 		});
@@ -366,6 +382,7 @@ function readPersistentViewerHostState(agentRuntimeDir: string): PersistentViewe
 			app_url: parsed.app_url,
 			...(typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0 ? { pid: parsed.pid } : {}),
 			...(typeof parsed.shutdown_token === "string" && parsed.shutdown_token.length > 0 ? { shutdown_token: parsed.shutdown_token } : {}),
+			...(typeof parsed.control_token === "string" && parsed.control_token.length > 0 ? { control_token: parsed.control_token } : {}),
 			updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : "",
 			...(typeof parsed.browser_opened_at === "string" ? { browser_opened_at: parsed.browser_opened_at } : {}),
 		};
@@ -382,9 +399,9 @@ function writePersistentViewerHostState(agentRuntimeDir: string, state: Persiste
 
 async function reusableViewerHostClient(agentRuntimeDir: string, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number, shutdownTimeoutMs: number): Promise<ViewerHostClient | undefined> {
 	const state = readPersistentViewerHostState(agentRuntimeDir);
-	if (!state) return undefined;
+	if (!state?.control_token) return undefined;
 	try {
-		const response = await new ViewerHostControlClient({ origin: state.origin }).send({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION });
+		const response = await new ViewerHostControlClient({ origin: state.origin, controlToken: state.control_token }).send({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION });
 		if (response.ok === true) {
 			const activeViewerClients = "message" in response && typeof response.message.active_viewer_clients === "number" ? response.message.active_viewer_clients : 0;
 			return new HttpViewerHostProcessClient({
@@ -392,6 +409,7 @@ async function reusableViewerHostClient(agentRuntimeDir: string, browserLauncher
 				appUrl: state.app_url,
 				browserLauncher,
 				browserOpenAckTimeoutMs,
+				controlToken: state.control_token,
 				launchBrowserOnNextOpen: activeViewerClients <= 0,
 				shutdownHost: () => shutdownPersistentViewerHost({ agentRuntimeDir, state, shutdownTimeoutMs, browserLauncher }),
 				afterBrowserLaunch: () => writePersistentViewerHostState(agentRuntimeDir, { ...state, browser_opened_at: new Date().toISOString(), updated_at: new Date().toISOString() }),
@@ -418,11 +436,11 @@ async function shutdownPersistentViewerHost(options: PersistentViewerHostShutdow
 	}
 	const endpointStopped = options.state.shutdown_token === undefined
 		? false
-		: await requestPersistentViewerHostShutdown(options.state.origin, options.state.shutdown_token, options.shutdownTimeoutMs);
+		: await requestPersistentViewerHostShutdown(options.state.origin, options.state.shutdown_token, options.shutdownTimeoutMs, options.state.control_token);
 	if (endpointStopped) removePersistentViewerHostState(options.agentRuntimeDir, options.state);
 }
 
-async function requestPersistentViewerHostShutdown(origin: string, token: string, timeoutMs: number): Promise<boolean> {
+async function requestPersistentViewerHostShutdown(origin: string, token: string, timeoutMs: number, controlToken: string | undefined): Promise<boolean> {
 	try {
 		const response = await fetch(`${origin}/shutdown`, {
 			method: "POST",
@@ -433,24 +451,24 @@ async function requestPersistentViewerHostShutdown(origin: string, token: string
 	} catch {
 		return false;
 	}
-	return await waitForViewerHostUnavailable(origin, timeoutMs);
+	return await waitForViewerHostUnavailable(origin, timeoutMs, controlToken);
 }
 
-async function waitForViewerHostUnavailable(origin: string, timeoutMs: number): Promise<boolean> {
+async function waitForViewerHostUnavailable(origin: string, timeoutMs: number, controlToken: string | undefined): Promise<boolean> {
 	const deadline = Date.now() + Math.max(0, timeoutMs);
 	while (true) {
 		const remainingMs = deadline - Date.now();
-		if (!await viewerHostHelloSucceeds(origin, Math.min(100, Math.max(1, remainingMs)))) return true;
+		if (!await viewerHostHelloSucceeds(origin, Math.min(100, Math.max(1, remainingMs)), controlToken)) return true;
 		if (remainingMs <= 0) return false;
 		await sleep(Math.min(50, Math.max(1, remainingMs)));
 	}
 }
 
-async function viewerHostHelloSucceeds(origin: string, timeoutMs: number): Promise<boolean> {
+async function viewerHostHelloSucceeds(origin: string, timeoutMs: number, controlToken: string | undefined): Promise<boolean> {
 	try {
 		const response = await fetch(`${origin}/control`, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: { "content-type": "application/json", ...(controlToken === undefined ? {} : { [VIEWER_HOST_CONTROL_TOKEN_HEADER]: controlToken }) },
 			body: JSON.stringify({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION }),
 			signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
 		});
@@ -778,6 +796,7 @@ export class ViewerHostMcpService {
 
 	handleHostMessage(message: ViewerHostToMcpMessage): void {
 		const parsed = validateViewerHostToMcpMessage(message);
+		if ("pdf_id" in parsed && !this.recordsById.has(parsed.pdf_id)) return;
 		if (parsed.type === "reverse_synctex") {
 			this.appendReverseSynctexEvent(parsed);
 		} else if (parsed.type === "pdf_annotation") {
@@ -810,7 +829,9 @@ export class ViewerHostMcpService {
 	}
 
 	private async drainHostEvents(): Promise<void> {
-		const events = await this.activeSession?.client.drainEvents?.() ?? [];
+		const pdfIds = [...this.recordsById.keys()];
+		if (pdfIds.length === 0) return;
+		const events = await this.activeSession?.client.drainEvents?.(pdfIds) ?? [];
 		for (const event of events) {
 			this.handleHostMessage(event);
 		}

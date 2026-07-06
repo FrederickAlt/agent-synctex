@@ -1,4 +1,5 @@
 export const VIEWER_HOST_PROTOCOL_VERSION = 1 as const;
+export const VIEWER_HOST_CONTROL_TOKEN_HEADER = "x-agent-synctex-viewer-host-token" as const;
 
 export interface ViewerHostHelloMessage {
 	type: "hello";
