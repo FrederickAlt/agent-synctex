@@ -5,7 +5,7 @@ import { basename, join, resolve } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
-import { createDefaultViewerHostClientFactory, FakeViewerHostClient, ViewerHostMcpService, type BrowserViewerLaunchTarget, type BrowserViewerLauncher, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import { BrowserViewerAppLauncher, createDefaultViewerHostClientFactory, FakeViewerHostClient, ViewerHostMcpService, type BrowserViewerLaunchTarget, type BrowserViewerLauncher, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
 import type { McpToViewerHostMessage, ViewerHostControlResponse, ViewerHostToMcpMessage } from "../../src/modules/viewer_host_protocol.ts";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
@@ -170,6 +170,22 @@ class ViewerSocketBrowserLauncher extends RecordingBrowserViewerLauncher {
 		this.socket?.close();
 	}
 }
+
+test("Browser viewer launcher reports immediate opener failures", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-opener-failure-"));
+	try {
+		const opener = join(baseDir, "fail-open");
+		writeFileSync(opener, `#!/bin/sh\necho opener failed >&2\nexit 7\n`);
+		chmodSync(opener, 0o700);
+		const launcher = new BrowserViewerAppLauncher({ command: opener });
+		await assert.rejects(
+			() => launcher.launchOrFocus({ origin: "http://127.0.0.1:1", appUrl: "http://127.0.0.1:1/viewer-lw" }),
+			/opener .*exited with code 7: opener failed/,
+		);
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
 
 test("reverse-forward probe is handled by ViewerHostServer without mcpEventSink or PDF events", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-probe-boundary-"));

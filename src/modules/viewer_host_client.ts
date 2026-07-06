@@ -87,8 +87,18 @@ export class BrowserViewerAppLauncher implements BrowserViewerLauncher {
 
 	async launchOrFocus(target: BrowserViewerLaunchTarget): Promise<void> {
 		const config = this.resolveConfig(target.appUrl);
-		const child = spawn(config.command, config.args, { stdio: "ignore", detached: true });
+		const child = spawn(config.command, config.args, { stdio: ["ignore", "ignore", "pipe"], detached: true });
+		let stderr = "";
+		child.stderr?.on("data", (chunk: Buffer) => {
+			stderr += String(chunk);
+			if (stderr.length > 2_048) stderr = stderr.slice(-2_048);
+		});
 		await waitForSpawn(child, `failed to open browser viewer ${target.appUrl}`);
+		const earlyExit = await waitForEarlyProcessExit(child, 750);
+		if (earlyExit && earlyExit.code !== 0) {
+			throw new Error(`browser opener ${config.command} exited ${earlyExit.signal ? `with signal ${earlyExit.signal}` : `with code ${earlyExit.code}`}${stderr.trim() ? `: ${stderr.trim()}` : ""}`);
+		}
+		if (!earlyExit) child.stderr?.destroy();
 		child.unref();
 	}
 
@@ -426,6 +436,21 @@ async function waitForSpawn(child: ChildProcess, errorPrefix: string): Promise<v
 		const onError = (error: Error) => settle(() => rejectSpawn(new Error(`${errorPrefix}: ${error.message}`)));
 		child.once("spawn", onSpawn);
 		child.once("error", onError);
+	});
+}
+
+async function waitForEarlyProcessExit(child: ChildProcess, timeoutMs: number): Promise<{ code: number | null; signal: NodeJS.Signals | null } | undefined> {
+	if (child.exitCode !== null || child.signalCode !== null) return { code: child.exitCode, signal: child.signalCode };
+	return await new Promise((resolveWait) => {
+		const timer = setTimeout(() => {
+			child.off("exit", onExit);
+			resolveWait(undefined);
+		}, timeoutMs);
+		const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+			clearTimeout(timer);
+			resolveWait({ code, signal });
+		};
+		child.once("exit", onExit);
 	});
 }
 

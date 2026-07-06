@@ -69,6 +69,8 @@ test("default installer writes user/global MCP config and hooks for all harnesse
 			assert.equal(piMcp.mcpServers["agent-synctex"].lifecycle, "keep-alive");
 			const piExtension = readFileSync(join(home, ".pi", "agent", "extensions", "agent-synctex-post-user.ts"), "utf8");
 			assert.match(piExtension, /spawnSync\("agent-synctex", args/);
+			assert.match(piExtension, /spawnSync\(shell, \["-lc", "exec agent-synctex/);
+			assert.match(piExtension, /Agent SyncTeX hook failed: " \+ context\.error/);
 			assert.match(piExtension, /args = \["fetch-info", "--harness", "pi"\]/);
 
 			const opencode = JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8"));
@@ -176,6 +178,8 @@ test("Pi installer combined install reports MCP config once and writes standalon
 		assert.match(extension, /fetch-info", "--harness", "pi"/);
 		assert.match(extension, /systemPromptOptions\?\.cwd/);
 		assert.match(extension, /args\.push\("--cwd", cwd\)/);
+		assert.match(extension, /process\.env\.SHELL\?\.trim\(\) \|\| "\/bin\/sh"/);
+		assert.match(extension, /Agent SyncTeX hook failed/);
 		assert.doesNotMatch(extension, /registerTool/);
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });

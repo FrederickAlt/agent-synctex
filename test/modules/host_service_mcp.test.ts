@@ -243,7 +243,7 @@ test("MCP open_pdf includes viewer URL in tool text when no live browser viewer 
 				backend_identity_ok: true,
 				pdf_id: 123,
 				viewer_url: "http://127.0.0.1:40000/viewer-lw/123",
-				browser_launch: { attempted: true, confirmed: false, active_viewer_clients: 0 },
+				browser_launch: { attempted: true, confirmed: false, active_viewer_clients: 0, error: "xdg-open exited 3\nno method available" },
 			},
 		} as never),
 	}, {
@@ -253,7 +253,7 @@ test("MCP open_pdf includes viewer URL in tool text when no live browser viewer 
 	assert.equal(response !== null && "result" in response, true);
 	const result = (response as unknown as { result: { content: Array<{ text: string }>; details: Record<string, unknown>; _meta?: Record<string, unknown> } }).result;
 	assert.deepEqual(emittedUrls, ["http://127.0.0.1:40000/viewer-lw/123"]);
-	assert.equal(result.content[0].text, "open_pdf ok: pdf_id=123\nNo browser viewer was detected after launch; pass this Viewer URL to the user: http://127.0.0.1:40000/viewer-lw/123");
+	assert.equal(result.content[0].text, "open_pdf ok: pdf_id=123\nNo browser viewer was detected after launch (browser opener failed: xdg-open exited 3 no method available); pass this Viewer URL to the user: http://127.0.0.1:40000/viewer-lw/123");
 	assert.equal(result.details.pdf_id, 123);
 	assert.equal(result.details.viewer_url, undefined);
 	assert.equal(result._meta, undefined);
