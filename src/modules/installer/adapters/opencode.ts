@@ -1,45 +1,56 @@
-import type { DoctorFinding, HarnessAdapter, HarnessDetection, InstallChange } from "../types.ts";
-import { agentIdForHarness, change, pathExists, projectPath, removeManagedFile, removeOpencodeMcp, upsertOpencodeMcp, writeText } from "../config_edit.ts";
+import type { DoctorFinding, HarnessAdapter, HarnessDetection, InstallChange, InstallerContext } from "../types.ts";
+import { change, opencodeMcpHasNoHooks, parseJsoncObject, pathExists, projectPath, removeManagedFile, removeOpencodeMcp, scopePath, upsertOpencodeMcp, writeText } from "../config_edit.ts";
 
-const PLUGIN_FILE = ".opencode/plugins/agent-synctex-post-user.ts";
+function pluginPath(ctx: InstallerContext): string {
+	return scopePath(ctx, [".opencode", "plugins", "agent-synctex-post-user.ts"], [".config", "opencode", "plugins", "agent-synctex-post-user.ts"]);
+}
+
+function mcpPath(ctx: InstallerContext): string {
+	return scopePath(ctx, ["opencode.json"], [".config", "opencode", "opencode.json"]);
+}
 
 export const opencodeAdapter: HarnessAdapter = {
 	id: "opencode",
 	detect(ctx): HarnessDetection {
 		if (pathExists(projectPath(ctx, ".opencode"))) return { id: "opencode", detected: true, reason: ".opencode/ exists" };
-		if (pathExists(projectPath(ctx, "opencode.jsonc"))) return { id: "opencode", detected: true, reason: "opencode.jsonc exists" };
+		if (pathExists(projectPath(ctx, "opencode.json")) || pathExists(projectPath(ctx, "opencode.jsonc"))) return { id: "opencode", detected: true, reason: "opencode config exists" };
 		return { id: "opencode", detected: false };
 	},
 	installMcp(ctx): InstallChange[] {
-		return upsertOpencodeMcp(ctx, projectPath(ctx, "opencode.jsonc"), false);
+		return upsertOpencodeMcp(ctx, mcpPath(ctx), "opencode", ctx.noHooks);
 	},
 	installHooks(ctx): InstallChange[] {
-		const changes = upsertOpencodeMcp(ctx, projectPath(ctx, "opencode.jsonc"), true);
-		const pluginPath = projectPath(ctx, PLUGIN_FILE);
-		writeText(ctx, pluginPath, opencodePluginSource(agentIdForHarness("opencode")));
-		changes.push(change("installed OpenCode chat.message plugin", pluginPath));
-		return changes;
+		const target = pluginPath(ctx);
+		writeText(ctx, target, opencodePluginSource());
+		return [change("installed OpenCode chat.message plugin", target), ...removeNoHooksFromManagedMcp(ctx)];
 	},
 	uninstall(ctx): InstallChange[] {
 		return [
-			...removeOpencodeMcp(ctx, projectPath(ctx, "opencode.jsonc")),
-			...removeManagedFile(ctx, projectPath(ctx, PLUGIN_FILE)),
+			...removeOpencodeMcp(ctx, mcpPath(ctx)),
+			...removeManagedFile(ctx, pluginPath(ctx)),
 		];
 	},
 	doctor(ctx): DoctorFinding[] {
-		return [{ harness: "opencode", level: pathExists(projectPath(ctx, PLUGIN_FILE)) ? "ok" : "warning", message: "OpenCode hook uses the chat.message plugin in .opencode/plugins/." }];
+		return [{ harness: "opencode", level: pathExists(pluginPath(ctx)) ? "ok" : "warning", message: "OpenCode hook uses the chat.message plugin." }];
 	},
 };
 
-function opencodePluginSource(agentId: string): string {
+function removeNoHooksFromManagedMcp(ctx: InstallerContext): InstallChange[] {
+	const path = mcpPath(ctx);
+	if (!pathExists(path)) return [];
+	const config = parseJsoncObject(path);
+	if (!opencodeMcpHasNoHooks(config)) return [];
+	return upsertOpencodeMcp(ctx, path, "opencode", false);
+}
+
+function opencodePluginSource(): string {
 	return `import { spawnSync } from "node:child_process";
 
 // Managed by agent-synctex.
 function fetchPdfContext(prompt: string): string {
-	const result = spawnSync("agent-synctex", ["fetch-info"], {
+	const result = spawnSync("agent-synctex", ["fetch-info", "--harness", "opencode"], {
 		input: prompt,
 		encoding: "utf8",
-		env: { ...process.env, TEX_ACTIONS_AGENT_ID: ${JSON.stringify(agentId)} },
 	});
 	return result.status === 0 ? (result.stdout ?? "").trim() : "";
 }

@@ -47,7 +47,7 @@ test("Viewer Host control channel accepts hello and records protocol readiness",
 
 		const response = await client.send({ type: "hello", protocol_version: 1 });
 
-		assert.deepEqual(response, { ok: true, message: { type: "ready", protocol_version: 1, origin: server.origin } });
+		assert.deepEqual(response, { ok: true, message: { type: "ready", protocol_version: 1, origin: server.origin, active_viewer_clients: 0 } });
 		assert.deepEqual(server.controlStatus, { ready: true, protocolVersion: 1 });
 	} finally {
 		await server.stop();

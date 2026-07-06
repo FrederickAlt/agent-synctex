@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import readline from "node:readline";
 import { stdin, stdout, stderr } from "node:process";
-import { startDesktopViewerHostForDesktopWrapper } from "../src/modules/tauri_viewer_wrapper.ts";
+import { ViewerHostPdfRegistry } from "../src/modules/viewer_host_registry.ts";
+import { ViewerHostServer } from "../src/modules/viewer_host_server.ts";
 
 function parsePort(value: string | undefined): number | undefined {
 	if (value === undefined || value === "") return undefined;
@@ -12,17 +13,43 @@ function parsePort(value: string | undefined): number | undefined {
 	return port;
 }
 
-const launched = await startDesktopViewerHostForDesktopWrapper({ port: parsePort(process.env.PDF_PREVIEW_VIEWER_HOST_PORT) });
+function parseIdleTimeoutMs(value: string | undefined): number {
+	if (value === undefined || value === "") return 30 * 60_000;
+	const timeout = Number(value);
+	if (!Number.isInteger(timeout) || timeout < 0) {
+		throw new Error(`AGENT_SYNCTEX_VIEWER_HOST_IDLE_MS must be a non-negative integer, got ${JSON.stringify(value)}`);
+	}
+	return timeout;
+}
+
+const persistent = process.env.AGENT_SYNCTEX_PERSISTENT_VIEWER_HOST === "1";
+const idleTimeoutMs = parseIdleTimeoutMs(process.env.AGENT_SYNCTEX_VIEWER_HOST_IDLE_MS);
+const registry = new ViewerHostPdfRegistry();
+const server = new ViewerHostServer({ registry, port: parsePort(process.env.PDF_PREVIEW_VIEWER_HOST_PORT) });
+await server.start();
 let stopping = false;
 
 async function shutdown(reason: string): Promise<void> {
 	if (stopping) return;
 	stopping = true;
-	await launched.shutdown();
-	stdout.write(JSON.stringify({ type: "stopped", reason }) + "\n");
+	await server.stop();
+	if (!persistent) stdout.write(JSON.stringify({ type: "stopped", reason }) + "\n");
 }
 
-stdout.write(JSON.stringify({ type: "ready", origin: launched.origin, app_url: launched.appUrl, address: launched.address }) + "\n");
+stdout.write(JSON.stringify({ type: "ready", origin: server.origin, app_url: server.appUrl, address: server.address }) + "\n");
+
+if (persistent && idleTimeoutMs > 0) {
+	let lastActiveAt = Date.now();
+	setInterval(() => {
+		if (server.hasActiveViewerClients()) {
+			lastActiveAt = Date.now();
+			return;
+		}
+		if (Date.now() - lastActiveAt >= idleTimeoutMs) {
+			void shutdown("idle_timeout").then(() => process.exit(0));
+		}
+	}, Math.min(30_000, Math.max(1_000, Math.floor(idleTimeoutMs / 4)))).unref();
+}
 
 const input = readline.createInterface({ input: stdin, crlfDelay: Infinity });
 input.on("line", (line) => {
@@ -31,7 +58,9 @@ input.on("line", (line) => {
 	}
 });
 input.on("close", () => {
-	void shutdown("stdin_closed").then(() => process.exit(0));
+	if (!persistent) {
+		void shutdown("stdin_closed").then(() => process.exit(0));
+	}
 });
 
 process.on("SIGINT", () => {

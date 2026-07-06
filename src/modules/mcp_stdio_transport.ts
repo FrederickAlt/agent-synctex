@@ -80,6 +80,7 @@ export interface McpStdioFrameLoopOptions {
 	onFrame: (frame: HostServiceDaemonFrame) => Promise<void>;
 	onParseError: (error: Error) => Promise<void> | void;
 	onDiagnostic?: (message: string) => void;
+	onClose?: () => void;
 }
 
 export class McpStdioFrameLoop {
@@ -89,6 +90,7 @@ export class McpStdioFrameLoop {
 	private readonly onFrame: McpStdioFrameLoopOptions["onFrame"];
 	private readonly onParseError: McpStdioFrameLoopOptions["onParseError"];
 	private readonly onDiagnostic: (message: string) => void;
+	private readonly onClose: () => void;
 	private task: Promise<void> = Promise.resolve();
 	private closed = false;
 
@@ -99,6 +101,7 @@ export class McpStdioFrameLoop {
 		this.onFrame = options.onFrame;
 		this.onParseError = options.onParseError;
 		this.onDiagnostic = options.onDiagnostic ?? ((message) => this.stderr.write(`${message}\n`));
+		this.onClose = options.onClose ?? (() => undefined);
 	}
 
 	start(): void {
@@ -107,14 +110,19 @@ export class McpStdioFrameLoop {
 			this.stdin.setEncoding("utf8");
 		}
 		this.stdin.on("data", this.handleData);
-		this.stdin.once("close", this.close);
+		this.stdin.once("close", this.handleInputClose);
 	}
 
 	readonly close = (): void => {
 		if (this.closed) return;
 		this.closed = true;
 		this.stdin.off("data", this.handleData);
-		this.stdin.off("close", this.close);
+		this.stdin.off("close", this.handleInputClose);
+	};
+
+	private readonly handleInputClose = (): void => {
+		this.close();
+		this.onClose();
 	};
 
 	private readonly handleData = (chunk: string | Buffer): void => {

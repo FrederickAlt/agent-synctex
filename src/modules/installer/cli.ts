@@ -1,9 +1,11 @@
 import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
 import { resolve } from "node:path";
 import { fetchHookContext } from "../hook_context_bridge.ts";
+import { startTexActionsStdioMcpRuntime } from "../stdio_mcp_runtime.ts";
+import { agentIdForHarness } from "./config_edit.ts";
 import { selectHarnessAdapters, isHarnessId } from "./detect_harnesses.ts";
 import { recordManifest, removeManifestHarness } from "./manifest.ts";
-import type { HarnessSelection, InstallerContext, InstallScope } from "./types.ts";
+import type { HarnessId, HarnessSelection, InstallerContext, InstallScope } from "./types.ts";
 
 interface ParsedCli {
 	command?: string;
@@ -12,6 +14,7 @@ interface ParsedCli {
 	scope: InstallScope;
 	dryRun: boolean;
 	yes: boolean;
+	noHooks: boolean;
 	cwd: string;
 	help: boolean;
 }
@@ -20,15 +23,19 @@ export function printAgentSynctexHelp(stdout: Pick<NodeJS.WritableStream, "write
 	stdout.write(`Usage: agent-synctex <command> [options]
 
 Commands:
+  mcp                     Start the stdio MCP server.
   fetch-info              Read prompt from stdin and print pending PDF mark context, or empty output.
+  install                 Install MCP config and prompt hooks/plugins/extensions.
   install mcp             Install MCP config only for a harness.
-  install hooks           Install prompt hooks/plugins/extensions and switch MCP config to --with-hooks.
+  install hooks           Install prompt hooks/plugins/extensions for a harness.
   uninstall [harness]     Remove managed MCP config and hooks for a harness.
   doctor                  Inspect managed harness integration state.
 
 Options:
-  --harness <name>        auto|all|claude|codex|cline|pi|opencode (default: auto)
-  --scope <scope>         project|user (default: project; user is reserved for future global config support)
+  --harness <name>        auto|all|claude|codex|cline|pi|opencode (default: auto; required for hook-capable mcp/fetch-info)
+  --local                 Write project-local config/hooks instead of user/global config.
+  --scope <scope>         project|user (default: user; --local is shorthand for --scope project)
+  --no-hooks              For mcp/install mcp/install: manual-only mode; do not install/use hooks.
   --cwd <path>            Project directory (default: current working directory)
   --dry-run               Print planned changes without writing files.
   --yes                   Accept non-interactive defaults.
@@ -50,9 +57,13 @@ export async function runAgentSynctexCli(argv: string[], io: { stdin?: NodeJS.Re
 		printAgentSynctexHelp(stdout);
 		return 0;
 	}
+	if (parsed.command === "mcp") {
+		return runMcp(parsed, stderr);
+	}
 	if (parsed.command === "fetch-info") {
 		const prompt = await readStdin(io.stdin ?? processStdin).catch(() => "");
-		const context = await fetchHookContext({ prompt }).catch(() => "");
+		if (!isHarnessId(parsed.harness)) return 0;
+		const context = await fetchHookContext({ prompt, agentId: agentIdForHarness(parsed.harness), cwd: parsed.cwd }).catch(() => "");
 		if (context) stdout.write(context);
 		return 0;
 	}
@@ -62,22 +73,30 @@ export async function runAgentSynctexCli(argv: string[], io: { stdin?: NodeJS.Re
 		scope: parsed.scope,
 		dryRun: parsed.dryRun,
 		yes: parsed.yes,
+		noHooks: parsed.noHooks,
 		stdout,
 		stderr,
 	};
 
 	try {
 		if (parsed.command === "install") {
-			if (parsed.subcommand !== "mcp" && parsed.subcommand !== "hooks") throw new Error("install requires subcommand: mcp or hooks");
+			if (parsed.subcommand !== undefined && parsed.subcommand !== "mcp" && parsed.subcommand !== "hooks") throw new Error("install subcommand must be mcp or hooks");
+			if (parsed.subcommand === "hooks" && parsed.noHooks) throw new Error("install hooks cannot be combined with --no-hooks");
 			const adapters = await selectHarnessAdapters(ctx, parsed.harness);
 			for (const adapter of adapters) {
-				const changes = parsed.subcommand === "mcp" ? await adapter.installMcp(ctx) : await adapter.installHooks(ctx);
-				recordManifest(ctx, adapter.id, { mcpInstalled: true, hooksInstalled: parsed.subcommand === "hooks" ? true : undefined, changes });
+				const installMcp = parsed.subcommand === undefined || parsed.subcommand === "mcp";
+				const installHooks = parsed.subcommand === "hooks" || (parsed.subcommand === undefined && !parsed.noHooks);
+				const changes = [
+					...(installMcp ? await adapter.installMcp(ctx) : []),
+					...(installHooks ? await adapter.installHooks(ctx) : []),
+				];
+				recordManifest(ctx, adapter.id, { mcpInstalled: installMcp ? true : undefined, hooksInstalled: installHooks ? true : undefined, changes });
 				printChanges(stdout, adapter.id, changes, ctx.dryRun);
 			}
 			return 0;
 		}
 		if (parsed.command === "uninstall") {
+			if (parsed.subcommand !== undefined) throw new Error(`Unknown uninstall target: ${parsed.subcommand}`);
 			const adapters = await selectHarnessAdapters(ctx, parsed.harness);
 			for (const adapter of adapters) {
 				const changes = await adapter.uninstall(ctx);
@@ -102,12 +121,35 @@ export async function runAgentSynctexCli(argv: string[], io: { stdin?: NodeJS.Re
 	}
 }
 
+function runMcp(parsed: ParsedCli, stderr: Pick<NodeJS.WritableStream, "write">): number {
+	if (parsed.harness !== "auto" && parsed.harness !== "all" && isHarnessId(parsed.harness)) {
+		const runtime = startTexActionsStdioMcpRuntime({
+			launchCwd: parsed.cwd,
+			hookMode: parsed.noHooks ? { kind: "no-hooks", harness: parsed.harness } : { kind: "hook-capable", harness: parsed.harness },
+		});
+		process.once("SIGINT", () => runtime.close());
+		process.once("SIGTERM", () => runtime.close());
+		return 0;
+	}
+	if (!parsed.noHooks) {
+		stderr.write("Agent SyncTeX: agent-synctex mcp started without --harness; falling back to --no-hooks mode.\n");
+	}
+	const runtime = startTexActionsStdioMcpRuntime({
+		launchCwd: parsed.cwd,
+		hookMode: { kind: "no-hooks", fallbackReason: parsed.noHooks ? undefined : "missing-harness" },
+	});
+	process.once("SIGINT", () => runtime.close());
+	process.once("SIGTERM", () => runtime.close());
+	return 0;
+}
+
 function parseCli(argv: string[]): ParsedCli {
 	const parsed: ParsedCli = {
 		harness: "auto",
-		scope: "project",
+		scope: "user",
 		dryRun: false,
 		yes: false,
+		noHooks: false,
 		cwd: process.cwd(),
 		help: false,
 	};
@@ -120,6 +162,10 @@ function parseCli(argv: string[]): ParsedCli {
 			parsed.dryRun = true;
 		} else if (arg === "--yes" || arg === "-y") {
 			parsed.yes = true;
+		} else if (arg === "--no-hooks") {
+			parsed.noHooks = true;
+		} else if (arg === "--local") {
+			parsed.scope = "project";
 		} else if (arg === "--harness") {
 			const value = argv[++index];
 			if (!value) throw new Error("Missing value for --harness");
@@ -157,7 +203,7 @@ function parseCli(argv: string[]): ParsedCli {
 		parsed.subcommand = undefined;
 	}
 	if (parsed.command === "install" && positional.length > 2) throw new Error("Too many positional arguments for install");
-	if (parsed.command !== "install" && parsed.command !== "uninstall" && parsed.command !== "doctor" && parsed.command !== "fetch-info" && parsed.command !== undefined) {
+	if (!["install", "uninstall", "doctor", "fetch-info", "mcp", undefined].includes(parsed.command)) {
 		throw new Error(`Unknown command: ${parsed.command}`);
 	}
 	return parsed;

@@ -4,6 +4,7 @@ import type { HostServiceOpenResponseDetails } from "../host_service_protocol.ts
 import { createHostServiceClient, extractHostServiceErrorCode, hostServiceSocketPath, hostServiceWorkspaceContextForRequest } from "./host_service_client.ts";
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
 import { errorMessage, latexToolFailure } from "./error_utils.ts";
+import { appendViewerUrlAgentNotice } from "../viewer_url_agent_notice.ts";
 
 const OpenPdfParams = Type.Object(
 	{
@@ -55,7 +56,7 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 	pi.registerTool({
 		name: "open_pdf",
 		label: "Open PDF",
-		description: "Open an existing local PDF through the host service for later SyncTeX actions. Returns a daemon-owned host-service pdf_id. Opening the same PDF path again reuses the existing daemon-managed or visible viewer where practical. The viewer is configured with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
+		description: "Open an existing local PDF through the host service for later SyncTeX actions. Returns a daemon-owned host-service pdf_id. Opening the same PDF path again reuses the existing daemon-managed or visible viewer where practical. If a browser viewer is detected after launch/focus, only pdf_id/status is returned because the user can already see the output; if no live browser viewer is detected, the result includes a Viewer URL to pass to the user. The viewer is configured with this session's inverse SyncTeX callback so PDF clicks paste source references into the interactive editor without submitting.",
 		promptSnippet: "Open a local PDF through the host service",
 		promptGuidelines: [
 			"Use open_pdf when the user asks to view an existing PDF or when you need a pdf_id for later PDF actions.",
@@ -97,8 +98,9 @@ export function registerPdfTools(pi: ExtensionAPI, callbackManager: SynctexCallb
 				}
 				pdfPath = openResponse.pdf || openResponse.managed_record?.pdfPath || requestedPath;
 				const pidText = openResponse.pid === undefined ? "" : ` pid=${openResponse.pid}`;
+				const text = appendViewerUrlAgentNotice(`ok: pdf_id=${openResponse.pdf_id}${pidText} pdf=${pdfPath}`, openResponse);
 				return {
-					content: [{ type: "text", text: `ok: pdf_id=${openResponse.pdf_id}${pidText} pdf=${pdfPath}` }],
+					content: [{ type: "text", text }],
 					details: {
 						pdf_id: openResponse.pdf_id,
 						pid: openResponse.pid,

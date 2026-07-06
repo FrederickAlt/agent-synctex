@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
 import type { PdfAnnotationEvent, PdfEvent } from "./pdf_events.ts";
 
 const DEFAULT_MAX_EVENTS = 20;
@@ -9,12 +10,14 @@ const DEFAULT_MAX_OUTPUT_LENGTH = 8_000;
 export interface FetchPdfContextRequest {
 	pdf_id?: number;
 	max_events?: number;
+	cwd?: string;
 }
 
 export interface PostUserPdfContextRequest {
 	pdfId?: number;
 	maxEvents?: number;
 	clearViewer?: boolean;
+	cwd?: string;
 }
 
 export interface PostUserPdfContextResult {
@@ -31,7 +34,7 @@ export function collectPostUserPdfContextFromEvents(events: PdfEvent[], request:
 		.filter((event): event is PdfAnnotationEvent => event.type === "pdf_annotation")
 		.filter((event) => request.pdfId === undefined || event.pdf_id === request.pdfId))
 		.slice(0, maxEvents);
-	const text = formatPdfAnnotationContext(annotations);
+	const text = formatPdfAnnotationContext(annotations, { cwd: request.cwd });
 	return {
 		text,
 		pdfIds: Array.from(new Set(annotations.map((event) => event.pdf_id))).sort((left, right) => left - right),
@@ -41,12 +44,13 @@ export function collectPostUserPdfContextFromEvents(events: PdfEvent[], request:
 	};
 }
 
-export function formatPdfAnnotationContext(events: PdfAnnotationEvent[]): string {
+export function formatPdfAnnotationContext(events: PdfAnnotationEvent[], options: { cwd?: string } = {}): string {
 	if (events.length === 0) return "";
 	const lines = ["## PDF marks from Agent SyncTeX", ""];
 	for (const event of events) {
 		const sourceLine = sourceLineForEvent(event);
-		lines.push(`- \`${event.source_file}:${event.line}\`${sourceLine ? ` — \`${escapeInlineCode(compactText(sourceLine, DEFAULT_MAX_FIELD_LENGTH))}\`` : ""}`);
+		const sourceFile = displaySourceFile(event.source_file, options.cwd);
+		lines.push(`- \`${sourceFile}:${event.line}\`${sourceLine ? ` — \`${escapeInlineCode(compactText(sourceLine, DEFAULT_MAX_FIELD_LENGTH))}\`` : ""}`);
 		if (event.comment?.trim()) {
 			lines.push(`  User comment: ${compactText(event.comment, DEFAULT_MAX_COMMENT_LENGTH)}`);
 		}
@@ -78,6 +82,19 @@ function dedupeAnnotations(events: PdfAnnotationEvent[]): PdfAnnotationEvent[] {
 		byKey.set(`${event.pdf_id}:${event.annotation_id}`, event);
 	}
 	return Array.from(byKey.values()).sort((left, right) => left.sequence - right.sequence);
+}
+
+function displaySourceFile(sourceFile: string, cwd: string | undefined): string {
+	if (!cwd) return sourceFile;
+	try {
+		const resolvedCwd = resolve(cwd);
+		const resolvedSource = isAbsolute(sourceFile) ? resolve(sourceFile) : resolve(resolvedCwd, sourceFile);
+		const relativePath = relative(resolvedCwd, resolvedSource);
+		if (relativePath && !relativePath.startsWith("..") && !isAbsolute(relativePath)) return relativePath;
+	} catch {
+		return sourceFile;
+	}
+	return sourceFile;
 }
 
 function sourceLineForEvent(event: PdfAnnotationEvent): string | undefined {

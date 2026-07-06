@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertReadablePdfFile, assertReadableSourceFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
@@ -17,6 +17,7 @@ import type {
 } from "./host_service_protocol.ts";
 import type { HostServiceMcpPdfOperations } from "./host_service_mcp.ts";
 import {
+	VIEWER_HOST_PROTOCOL_VERSION,
 	validateMcpToViewerHostMessage,
 	validateViewerHostToMcpMessage,
 	type McpToViewerHostMessage,
@@ -39,8 +40,8 @@ const MIN_PDF_ID = 1;
 const MAX_PDF_ID = 99_999_999;
 const DEFAULT_VIEWER_HOST_READY_TIMEOUT_MS = 10_000;
 const DEFAULT_VIEWER_HOST_SHUTDOWN_TIMEOUT_MS = 1_000;
-const DEFAULT_DESKTOP_APP_EARLY_EXIT_TIMEOUT_MS = 300;
-const PACKAGE_ROOT = fileURLToPath(new URL("../../", import.meta.url));
+const DEFAULT_BROWSER_OPEN_ACK_TIMEOUT_MS = 2_000;
+const BROWSER_OPEN_ACK_POLL_INTERVAL_MS = 100;
 
 interface TrackedViewerHostPdf {
 	pdfId: number;
@@ -49,6 +50,7 @@ interface TrackedViewerHostPdf {
 	createdAtNs: number;
 	revision: number;
 	viewerUrl: string;
+	debugSynctexEnabled: boolean;
 	fileSnapshot?: { size: number; mtimeMs: number };
 }
 
@@ -61,40 +63,52 @@ export interface ViewerHostClient {
 
 export type ViewerHostClientFactory = () => ViewerHostClient | Promise<ViewerHostClient>;
 
-export interface DesktopViewerAppLaunchTarget {
+export interface BrowserViewerLaunchTarget {
 	origin: string;
 	appUrl: string;
 }
 
-export interface DesktopViewerAppLaunchHandle {
-	isRunning?(): boolean;
+export interface BrowserViewerLauncher {
+	launchOrFocus(target: BrowserViewerLaunchTarget): Promise<void> | void;
 	close?(): Promise<void> | void;
 }
 
-export interface DesktopViewerAppLauncher {
-	launchOrFocus(target: DesktopViewerAppLaunchTarget): Promise<DesktopViewerAppLaunchHandle | void> | DesktopViewerAppLaunchHandle | void;
-	close?(): Promise<void> | void;
-}
-
-export interface DesktopViewerAppProcessLauncherOptions {
+export interface BrowserViewerAppLauncherOptions {
 	command?: string;
 	args?: string[];
-	cwd?: string;
-	env?: NodeJS.ProcessEnv;
-	shutdownTimeoutMs?: number;
-	earlyExitTimeoutMs?: number;
 }
 
-export interface ResolvedDesktopViewerAppLaunchConfig {
-	command: string;
-	args: string[];
-	cwd?: string;
-	env?: NodeJS.ProcessEnv;
+export class BrowserViewerAppLauncher implements BrowserViewerLauncher {
+	private readonly options: BrowserViewerAppLauncherOptions;
+
+	constructor(options: BrowserViewerAppLauncherOptions = {}) {
+		this.options = options;
+	}
+
+	async launchOrFocus(target: BrowserViewerLaunchTarget): Promise<void> {
+		const config = this.resolveConfig(target.appUrl);
+		const child = spawn(config.command, config.args, { stdio: "ignore", detached: true });
+		await waitForSpawn(child, `failed to open browser viewer ${target.appUrl}`);
+		child.unref();
+	}
+
+	private resolveConfig(appUrl: string): { command: string; args: string[] } {
+		if (this.options.command !== undefined) return { command: this.options.command, args: [...(this.options.args ?? []), appUrl] };
+		if (process.env.AGENT_SYNCTEX_BROWSER_COMMAND?.trim()) return { command: process.env.AGENT_SYNCTEX_BROWSER_COMMAND, args: [appUrl] };
+		if (process.platform === "darwin") return { command: "open", args: [appUrl] };
+		if (process.platform === "win32") return { command: "cmd", args: ["/c", "start", "", appUrl] };
+		return { command: "xdg-open", args: [appUrl] };
+	}
 }
 
 interface ActiveViewerHostSession {
 	client: ViewerHostClient;
 	generation: number;
+}
+
+interface ViewerHostSendResult {
+	session: ActiveViewerHostSession;
+	response?: ViewerHostControlResponse;
 }
 
 export class FakeViewerHostClient implements ViewerHostClient {
@@ -110,143 +124,14 @@ export class FakeViewerHostClient implements ViewerHostClient {
 	}
 }
 
-export function resolveDefaultDesktopViewerAppLaunchConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd(), packageRoot = PACKAGE_ROOT): ResolvedDesktopViewerAppLaunchConfig {
-	const configuredCommand = env.PDF_PREVIEW_VIEWER_APP_COMMAND;
-	if (configuredCommand !== undefined) {
-		if (!configuredCommand.trim()) {
-			throw new Error("PDF_PREVIEW_VIEWER_APP_COMMAND must not be empty");
-		}
-		return {
-			command: configuredCommand,
-			args: splitLaunchArgs(env.PDF_PREVIEW_VIEWER_APP_ARGS),
-			cwd: env.PDF_PREVIEW_VIEWER_APP_CWD,
-		};
-	}
-
-	for (const candidate of defaultDesktopViewerAppCommandCandidates(packageRoot)) {
-		if (existsSync(candidate)) {
-			return { command: candidate, args: [] };
-		}
-	}
-
-	if (env.PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK === "1") {
-		return { command: "npm", args: ["run", "tauri:viewer:dev"], cwd: packageRoot };
-	}
-
-	throw new Error("Desktop Viewer app command is not configured. Build the Tauri app with npm run tauri:viewer:build, or set PDF_PREVIEW_VIEWER_APP_COMMAND to the desktop app executable. Set PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK=1 only for explicit development fallback.");
-}
-
-function splitLaunchArgs(value: string | undefined): string[] {
-	return value === undefined || value === "" ? [] : value.split(/\s+/).filter(Boolean);
-}
-
-function defaultDesktopViewerAppCommandCandidates(cwd: string): string[] {
-	const executable = process.platform === "win32" ? "pdf-preview-viewer.exe" : "pdf-preview-viewer";
-	const targetDir = resolve(cwd, "apps", "viewer-desktop-tauri", "src-tauri", "target");
-	return [
-		join(targetDir, "release", executable),
-		join(targetDir, "debug", executable),
-	];
-}
-
-export class DesktopViewerAppProcessLauncher implements DesktopViewerAppLauncher {
-	private readonly options: DesktopViewerAppProcessLauncherOptions;
-	private child: ChildProcess | undefined;
-	private activeAppUrl: string | undefined;
-
-	constructor(options: DesktopViewerAppProcessLauncherOptions = {}) {
-		this.options = options;
-	}
-
-	async launchOrFocus(target: DesktopViewerAppLaunchTarget): Promise<DesktopViewerAppLaunchHandle> {
-		if (this.isRunning() && this.activeAppUrl === target.appUrl) {
-			return this.handle();
-		}
-		await this.close();
-		const config = this.resolveConfig();
-		const child = spawn(config.command, config.args, {
-			cwd: config.cwd,
-			env: {
-				...process.env,
-				...config.env,
-				PDF_PREVIEW_VIEWER_HOST_ORIGIN: target.origin,
-				PDF_PREVIEW_VIEWER_HOST_APP_URL: target.appUrl,
-			},
-			stdio: ["ignore", "ignore", "pipe"],
-		});
-		let stderr = "";
-		child.stderr?.on("data", (chunk: Buffer) => {
-			stderr += String(chunk);
-			if (stderr.length > 4_096) stderr = stderr.slice(-4_096);
-		});
-		this.child = child;
-		this.activeAppUrl = target.appUrl;
-		child.once("exit", () => {
-			if (this.child === child) {
-				this.child = undefined;
-				this.activeAppUrl = undefined;
-			}
-		});
-		try {
-			await waitForSpawn(child, `failed to launch Desktop Viewer app ${config.command}`);
-			await waitForDesktopAppStartup(child, this.options.earlyExitTimeoutMs ?? DEFAULT_DESKTOP_APP_EARLY_EXIT_TIMEOUT_MS, () => stderr);
-		} catch (error) {
-			if (this.child === child) {
-				this.child = undefined;
-				this.activeAppUrl = undefined;
-			}
-			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-			throw error;
-		}
-		return this.handle();
-	}
-
-	async close(): Promise<void> {
-		const child = this.child;
-		this.child = undefined;
-		this.activeAppUrl = undefined;
-		if (!child || child.exitCode !== null || child.signalCode !== null) return;
-		child.kill("SIGTERM");
-		await waitForProcessExitOrKill(child, this.options.shutdownTimeoutMs ?? DEFAULT_VIEWER_HOST_SHUTDOWN_TIMEOUT_MS);
-	}
-
-	private resolveConfig(): ResolvedDesktopViewerAppLaunchConfig {
-		if (this.options.command !== undefined) {
-			if (!this.options.command.trim()) throw new Error("Desktop Viewer app command must not be empty");
-			return {
-				command: this.options.command,
-				args: this.options.args ?? [],
-				cwd: this.options.cwd,
-				env: this.options.env,
-			};
-		}
-		const resolved = resolveDefaultDesktopViewerAppLaunchConfig();
-		return {
-			...resolved,
-			args: this.options.args ?? resolved.args,
-			cwd: this.options.cwd ?? resolved.cwd,
-			env: this.options.env ?? resolved.env,
-		};
-	}
-
-	private isRunning(): boolean {
-		return this.child !== undefined && this.child.exitCode === null && this.child.signalCode === null;
-	}
-
-	private handle(): DesktopViewerAppLaunchHandle {
-		return {
-			isRunning: () => this.isRunning(),
-			close: () => this.close(),
-		};
-	}
-}
-
 export interface ViewerHostProcessLauncherOptions {
 	command?: string;
 	args?: string[];
 	readyTimeoutMs?: number;
 	shutdownTimeoutMs?: number;
-	desktopAppLauncher?: DesktopViewerAppLauncher;
+	browserOpenAckTimeoutMs?: number;
+	browserLauncher?: BrowserViewerLauncher;
+	agentRuntimeDir?: string;
 }
 
 interface ViewerHostReadyLine {
@@ -255,28 +140,97 @@ interface ViewerHostReadyLine {
 	app_url: string;
 }
 
-class LocalViewerHostProcessClient implements ViewerHostClient {
+interface PersistentViewerHostState {
+	origin: string;
+	app_url: string;
+	pid?: number;
+	updated_at: string;
+	browser_opened_at?: string;
+}
+
+class HttpViewerHostProcessClient implements ViewerHostClient {
 	readonly origin: string;
-	private readonly child: ChildProcessWithoutNullStreams;
-	private readonly shutdownTimeoutMs: number;
 	private readonly appUrl: string;
-	private readonly desktopAppLauncher: DesktopViewerAppLauncher;
+	private readonly browserLauncher: BrowserViewerLauncher;
+	private readonly browserOpenAckTimeoutMs: number;
 	private readonly controlClient: ViewerHostControlClient;
+	private readonly closeHost: (() => Promise<void>) | undefined;
+	private readonly afterBrowserLaunch: (() => void) | undefined;
+	private launchBrowserOnNextOpen: boolean;
 	private closed = false;
 
-	constructor(child: ChildProcessWithoutNullStreams, ready: ViewerHostReadyLine, shutdownTimeoutMs: number, desktopAppLauncher: DesktopViewerAppLauncher) {
-		this.child = child;
-		this.shutdownTimeoutMs = shutdownTimeoutMs;
-		this.origin = ready.origin.replace(/\/$/, "");
-		this.appUrl = ready.app_url;
-		this.desktopAppLauncher = desktopAppLauncher;
+	constructor(options: { origin: string; appUrl: string; browserLauncher: BrowserViewerLauncher; closeHost?: () => Promise<void>; launchBrowserOnNextOpen?: boolean; afterBrowserLaunch?: () => void; browserOpenAckTimeoutMs?: number }) {
+		this.origin = options.origin.replace(/\/$/, "");
+		this.appUrl = options.appUrl;
+		this.browserLauncher = options.browserLauncher;
+		this.browserOpenAckTimeoutMs = options.browserOpenAckTimeoutMs ?? DEFAULT_BROWSER_OPEN_ACK_TIMEOUT_MS;
 		this.controlClient = new ViewerHostControlClient({ origin: this.origin });
+		this.closeHost = options.closeHost;
+		this.launchBrowserOnNextOpen = options.launchBrowserOnNextOpen ?? true;
+		this.afterBrowserLaunch = options.afterBrowserLaunch;
 	}
 
 	async send(message: McpToViewerHostMessage): Promise<ViewerHostControlResponse> {
 		if (this.closed) throw new Error("Viewer Host process is closed");
-		await this.desktopAppLauncher.launchOrFocus({ origin: this.origin, appUrl: this.appUrl });
-		return this.controlClient.send(message);
+		const response = await this.controlClient.send(message);
+		if (response.ok === true && (message.type === "open_pdf" || message.type === "focus_pdf")) {
+			return await this.annotateBrowserOpenStatus(response);
+		}
+		return response;
+	}
+
+	private async annotateBrowserOpenStatus(response: ViewerHostControlResponse): Promise<ViewerHostControlResponse> {
+		if (response.ok !== true || !("result" in response)) return response;
+		const alreadyActiveCount = await this.activeViewerClientCount();
+		if (alreadyActiveCount > 0) {
+			this.launchBrowserOnNextOpen = false;
+			return { ...response, result: { ...response.result, browser_open_attempted: false, browser_open_confirmed: true, active_viewer_clients: alreadyActiveCount } };
+		}
+
+		let browserOpenError: string | undefined;
+		if (this.launchBrowserOnNextOpen) {
+			try {
+				await this.browserLauncher.launchOrFocus({ origin: this.origin, appUrl: `${this.origin}/viewer-lw` });
+			} catch (error) {
+				browserOpenError = error instanceof Error ? error.message : String(error);
+			}
+		}
+		const activeCount = await this.waitForActiveViewerClient(this.browserOpenAckTimeoutMs);
+		const confirmed = activeCount > 0;
+		this.launchBrowserOnNextOpen = !confirmed;
+		if (confirmed) this.afterBrowserLaunch?.();
+		return {
+			...response,
+			result: {
+				...response.result,
+				browser_open_attempted: true,
+				browser_open_confirmed: confirmed,
+				active_viewer_clients: activeCount,
+				...(browserOpenError === undefined ? {} : { browser_open_error: browserOpenError }),
+			},
+		};
+	}
+
+	private async waitForActiveViewerClient(timeoutMs: number): Promise<number> {
+		const deadline = Date.now() + Math.max(0, timeoutMs);
+		let count = await this.activeViewerClientCount();
+		while (count <= 0 && Date.now() < deadline) {
+			await sleep(Math.min(BROWSER_OPEN_ACK_POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
+			count = await this.activeViewerClientCount();
+		}
+		return count;
+	}
+
+	private async activeViewerClientCount(): Promise<number> {
+		try {
+			const response = await this.controlClient.send({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION });
+			if (response.ok === true && "message" in response && typeof response.message.active_viewer_clients === "number") {
+				return response.message.active_viewer_clients;
+			}
+		} catch {
+			return 0;
+		}
+		return 0;
 	}
 
 	async drainEvents(): Promise<ViewerHostToMcpMessage[]> {
@@ -292,9 +246,23 @@ class LocalViewerHostProcessClient implements ViewerHostClient {
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
-		await this.desktopAppLauncher.close?.();
-		this.child.stdin.write("shutdown\n");
-		await waitForProcessExitOrKill(this.child, this.shutdownTimeoutMs);
+		await this.closeHost?.();
+	}
+}
+
+class LocalViewerHostProcessClient extends HttpViewerHostProcessClient {
+	constructor(child: ChildProcessWithoutNullStreams, ready: ViewerHostReadyLine, shutdownTimeoutMs: number, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number) {
+		super({
+			origin: ready.origin,
+			appUrl: ready.app_url,
+			browserLauncher,
+			browserOpenAckTimeoutMs,
+			closeHost: async () => {
+				await browserLauncher.close?.();
+				child.stdin.write("shutdown\n");
+				await waitForProcessExitOrKill(child, shutdownTimeoutMs);
+			},
+		});
 	}
 }
 
@@ -302,13 +270,28 @@ export function createDefaultViewerHostClientFactory(options: ViewerHostProcessL
 	return async () => launchLocalViewerHostProcess(options);
 }
 
+function defaultBrowserViewerLauncher(_shutdownTimeoutMs: number): BrowserViewerLauncher {
+	return new BrowserViewerAppLauncher();
+}
+
 async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOptions): Promise<ViewerHostClient> {
 	const command = options.command ?? process.execPath;
 	const args = options.args ?? [fileURLToPath(new URL("../../scripts/viewer-host-server.ts", import.meta.url))];
 	const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_VIEWER_HOST_READY_TIMEOUT_MS;
 	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_VIEWER_HOST_SHUTDOWN_TIMEOUT_MS;
-	const desktopAppLauncher = options.desktopAppLauncher ?? new DesktopViewerAppProcessLauncher({ shutdownTimeoutMs });
-	const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
+	const browserOpenAckTimeoutMs = options.browserOpenAckTimeoutMs ?? DEFAULT_BROWSER_OPEN_ACK_TIMEOUT_MS;
+	const browserLauncher = options.browserLauncher ?? defaultBrowserViewerLauncher(shutdownTimeoutMs);
+	const reusableClient = options.agentRuntimeDir === undefined ? undefined : await reusableViewerHostClient(options.agentRuntimeDir, browserLauncher, browserOpenAckTimeoutMs);
+	if (reusableClient) return reusableClient;
+	const persistent = options.agentRuntimeDir !== undefined;
+	const child = spawn(command, args, {
+		stdio: ["pipe", "pipe", "pipe"],
+		detached: persistent,
+		env: {
+			...process.env,
+			...(persistent ? { AGENT_SYNCTEX_PERSISTENT_VIEWER_HOST: "1" } : {}),
+		},
+	});
 	let stderr = "";
 	child.stderr.on("data", (chunk: Buffer) => {
 		stderr += String(chunk);
@@ -316,11 +299,74 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 	});
 	try {
 		const ready = await readViewerHostReadyLine(child, readyTimeoutMs, () => stderr);
-		return new LocalViewerHostProcessClient(child, ready, shutdownTimeoutMs, desktopAppLauncher);
+		if (!persistent || options.agentRuntimeDir === undefined) {
+			return new LocalViewerHostProcessClient(child, ready, shutdownTimeoutMs, browserLauncher, browserOpenAckTimeoutMs);
+		}
+		const state: PersistentViewerHostState = { origin: ready.origin, app_url: ready.app_url, pid: child.pid, updated_at: new Date().toISOString() };
+		writePersistentViewerHostState(options.agentRuntimeDir, state);
+		child.stdin.end();
+		child.stdout.destroy();
+		child.stderr.destroy();
+		child.unref();
+		return new HttpViewerHostProcessClient({
+			origin: ready.origin,
+			appUrl: ready.app_url,
+			browserLauncher,
+			browserOpenAckTimeoutMs,
+			afterBrowserLaunch: () => writePersistentViewerHostState(options.agentRuntimeDir!, { ...state, browser_opened_at: new Date().toISOString(), updated_at: new Date().toISOString() }),
+		});
 	} catch (error) {
 		child.kill("SIGKILL");
 		throw error;
 	}
+}
+
+function persistentViewerHostStatePath(agentRuntimeDir: string): string {
+	return join(agentRuntimeDir, "viewer-host.json");
+}
+
+function readPersistentViewerHostState(agentRuntimeDir: string): PersistentViewerHostState | undefined {
+	try {
+		const parsed = JSON.parse(readFileSync(persistentViewerHostStatePath(agentRuntimeDir), "utf8")) as Partial<PersistentViewerHostState>;
+		if (typeof parsed.origin !== "string" || typeof parsed.app_url !== "string") return undefined;
+		return {
+			origin: parsed.origin.replace(/\/$/, ""),
+			app_url: parsed.app_url,
+			...(typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0 ? { pid: parsed.pid } : {}),
+			updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : "",
+			...(typeof parsed.browser_opened_at === "string" ? { browser_opened_at: parsed.browser_opened_at } : {}),
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function writePersistentViewerHostState(agentRuntimeDir: string, state: PersistentViewerHostState): void {
+	mkdirSync(agentRuntimeDir, { recursive: true, mode: 0o700 });
+	chmodSync(agentRuntimeDir, 0o700);
+	writeFileSync(persistentViewerHostStatePath(agentRuntimeDir), JSON.stringify(state) + "\n", { mode: 0o600 });
+}
+
+async function reusableViewerHostClient(agentRuntimeDir: string, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number): Promise<ViewerHostClient | undefined> {
+	const state = readPersistentViewerHostState(agentRuntimeDir);
+	if (!state) return undefined;
+	try {
+		const response = await new ViewerHostControlClient({ origin: state.origin }).send({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION });
+		if (response.ok === true) {
+			const activeViewerClients = "message" in response && typeof response.message.active_viewer_clients === "number" ? response.message.active_viewer_clients : 0;
+			return new HttpViewerHostProcessClient({
+				origin: state.origin,
+				appUrl: state.app_url,
+				browserLauncher,
+				browserOpenAckTimeoutMs,
+				launchBrowserOnNextOpen: activeViewerClients <= 0,
+				afterBrowserLaunch: () => writePersistentViewerHostState(agentRuntimeDir, { ...state, browser_opened_at: new Date().toISOString(), updated_at: new Date().toISOString() }),
+			});
+		}
+	} catch {
+		return undefined;
+	}
+	return undefined;
 }
 
 async function readViewerHostReadyLine(child: ChildProcessWithoutNullStreams, timeoutMs: number, stderrText: () => string): Promise<ViewerHostReadyLine> {
@@ -362,6 +408,10 @@ async function readViewerHostReadyLine(child: ChildProcessWithoutNullStreams, ti
 	});
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
 async function waitForSpawn(child: ChildProcess, errorPrefix: string): Promise<void> {
 	await new Promise<void>((resolveSpawn, rejectSpawn) => {
 		let settled = false;
@@ -377,38 +427,6 @@ async function waitForSpawn(child: ChildProcess, errorPrefix: string): Promise<v
 		child.once("spawn", onSpawn);
 		child.once("error", onError);
 	});
-}
-
-async function waitForDesktopAppStartup(child: ChildProcess, timeoutMs: number, stderrText: () => string): Promise<void> {
-	if (child.exitCode !== null || child.signalCode !== null) {
-		throw new Error(desktopAppExitMessage(child.exitCode, child.signalCode, stderrText()));
-	}
-	await new Promise<void>((resolveStartup, rejectStartup) => {
-		let settled = false;
-		const timer = setTimeout(() => settle(resolveStartup), timeoutMs);
-		const settle = (callback: () => void) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			child.off("exit", onExit);
-			child.off("error", onError);
-			callback();
-		};
-		const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-			settle(() => rejectStartup(new Error(desktopAppExitMessage(code, signal, stderrText()))));
-		};
-		const onError = (error: Error) => {
-			settle(() => rejectStartup(new Error(`Desktop Viewer app failed during startup: ${error.message}`)));
-		};
-		child.once("exit", onExit);
-		child.once("error", onError);
-	});
-}
-
-function desktopAppExitMessage(code: number | null, signal: NodeJS.Signals | null, stderr: string): string {
-	const status = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
-	const stderrSuffix = stderr.trim() ? `: ${stderr.trim()}` : "";
-	return `Desktop Viewer app exited during startup (${status})${stderrSuffix}`;
 }
 
 async function waitForProcessExitOrKill(child: ChildProcess, timeoutMs: number): Promise<void> {
@@ -432,6 +450,7 @@ export interface ViewerHostMcpServiceOptions {
 	makePdfId?: () => number;
 	nowNs?: () => number;
 	reverseSynctexMapper?: ReverseSynctexMapper;
+	agentRuntimeDir?: string;
 }
 
 export class ViewerHostMcpService {
@@ -457,7 +476,7 @@ export class ViewerHostMcpService {
 			this.activeSession = { client: options.client, generation: this.allocateGeneration() };
 			this.clientFactory = async () => options.client!;
 		} else {
-			this.clientFactory = options.clientFactory ?? createDefaultViewerHostClientFactory();
+			this.clientFactory = options.clientFactory ?? createDefaultViewerHostClientFactory({ agentRuntimeDir: options.agentRuntimeDir });
 		}
 		this.eventStore = options.eventStore ?? new PdfEventStore();
 		this.makePdfId = options.makePdfId ?? (() => randomInt(MIN_PDF_ID, MAX_PDF_ID + 1));
@@ -483,20 +502,24 @@ export class ViewerHostMcpService {
 
 		try {
 			const opened = await this.enqueueLifecycle(async () => {
+				const debugSynctexEnabled = request.details.debug_synctex === true;
+				const hasDebugSynctexOption = request.details.debug_synctex !== undefined;
 				const existing = this.recordsByPath.get(pdfPath);
 				if (existing) {
-					await this.sendWithReconnectLocked({ type: "focus_pdf", pdf_id: existing.pdfId }, { reregisterBeforeSend: true });
-					return { record: existing, reused: true };
+					if (hasDebugSynctexOption) existing.debugSynctexEnabled = debugSynctexEnabled;
+					const focused = await this.sendWithReconnectLocked({ type: "focus_pdf", pdf_id: existing.pdfId }, { reregisterBeforeSend: true });
+					if (hasDebugSynctexOption) await this.sendWithReconnectLocked({ type: "set_debug_synctex", pdf_id: existing.pdfId, enabled: debugSynctexEnabled }, { reregisterBeforeSend: false });
+					return { record: existing, reused: true, browserLaunch: this.browserLaunchDetails(focused.response) };
 				}
 
 				const session = await this.ensureSession();
-				const record = this.createPdfRecord(pdfPath, request.workspace_context.cwd, session.client);
-				const registeredSession = await this.sendWithReconnectLocked({ type: "open_pdf", pdf_id: record.pdfId, pdf_path: record.pdfPath, title: basename(record.pdfPath), workspace_cwd: record.workspaceCwd }, { reregisterBeforeSend: false });
-				this.setRecordViewerUrl(record, registeredSession);
+				const record = this.createPdfRecord(pdfPath, request.workspace_context.cwd, session.client, debugSynctexEnabled);
+				const registered = await this.sendWithReconnectLocked({ type: "open_pdf", pdf_id: record.pdfId, pdf_path: record.pdfPath, title: basename(record.pdfPath), workspace_cwd: record.workspaceCwd, ...(record.debugSynctexEnabled ? { debug_synctex: true } : {}) }, { reregisterBeforeSend: false });
+				this.setRecordViewerUrl(record, registered.session);
 				this.commitPdfRecord(record);
-				return { record, reused: false };
+				return { record, reused: false, browserLaunch: this.browserLaunchDetails(registered.response) };
 			});
-			return this.openOk(request, opened.record, opened.reused);
+			return this.openOk(request, opened.record, opened.reused, opened.browserLaunch);
 		} catch (error) {
 			const reason = viewerHostUnavailableReason(error);
 			return this.openError(request, pdfPath, reason, "viewer_host_unavailable", this.recordsByPath.get(pdfPath));
@@ -515,6 +538,10 @@ export class ViewerHostMcpService {
 			sourceFile = isAbsolute(sourceFile) ? resolve(sourceFile) : resolve(request.workspace_context.cwd, sourceFile);
 			assertReadableSourceFile(sourceFile);
 			assertReadablePdfFile(record.pdfPath);
+			if (request.debug_synctex !== undefined) {
+				record.debugSynctexEnabled = request.debug_synctex === true;
+				await this.sendWithReconnect({ type: "set_debug_synctex", pdf_id: record.pdfId, enabled: record.debugSynctexEnabled }, { reregisterBeforeSend: true });
+			}
 			const jump = resolveForwardSynctexJump({ pdfPath: record.pdfPath, sourceFile, line: request.line, cwd: request.workspace_context.cwd });
 			await this.sendWithReconnect({
 				type: "synctex_forward",
@@ -613,6 +640,7 @@ export class ViewerHostMcpService {
 			...(request.pdf_id === undefined ? {} : { pdfId: request.pdf_id }),
 			maxEvents: request.max_events,
 			clearViewer: true,
+			cwd: request.cwd,
 		});
 		if (result.cleared) {
 			for (const pdfId of result.pdfIds) {
@@ -699,7 +727,7 @@ export class ViewerHostMcpService {
 		});
 	}
 
-	private async sendWithReconnectLocked(message: McpToViewerHostMessage, options: { reregisterBeforeSend: boolean }): Promise<ActiveViewerHostSession> {
+	private async sendWithReconnectLocked(message: McpToViewerHostMessage, options: { reregisterBeforeSend: boolean }): Promise<ViewerHostSendResult> {
 		try {
 			return await this.sendOnActiveSession(message, options.reregisterBeforeSend);
 		} catch (error) {
@@ -721,27 +749,27 @@ export class ViewerHostMcpService {
 		return result;
 	}
 
-	private async sendOnActiveSession(message: McpToViewerHostMessage, reregisterBeforeSend: boolean, forceReconnect = false): Promise<ActiveViewerHostSession> {
+	private async sendOnActiveSession(message: McpToViewerHostMessage, reregisterBeforeSend: boolean, forceReconnect = false): Promise<ViewerHostSendResult> {
 		const session = await this.ensureSession(forceReconnect);
 		if (reregisterBeforeSend) {
 			await this.reregisterKnownPdfs(session);
 		}
 		if (message.type === "open_pdf" && this.registeredGenerationByPdfId.get(message.pdf_id) === session.generation) {
-			return session;
+			return { session };
 		}
-		await this.sendToClient(session.client, message);
+		const response = await this.sendToClient(session.client, message);
 		if (message.type === "open_pdf" && this.activeSession === session) {
 			this.registeredGenerationByPdfId.set(message.pdf_id, session.generation);
 			this.updateViewerUrlsForSession(session);
 		}
-		return session;
+		return { session, response };
 	}
 
 	private async reregisterKnownPdfs(session: ActiveViewerHostSession): Promise<void> {
 		const reregistered: number[] = [];
 		for (const record of this.recordsById.values()) {
 			if (this.registeredGenerationByPdfId.get(record.pdfId) === session.generation) continue;
-			await this.sendToClient(session.client, { type: "open_pdf", pdf_id: record.pdfId, pdf_path: record.pdfPath, title: basename(record.pdfPath), workspace_cwd: record.workspaceCwd });
+			await this.sendToClient(session.client, { type: "open_pdf", pdf_id: record.pdfId, pdf_path: record.pdfPath, title: basename(record.pdfPath), workspace_cwd: record.workspaceCwd, ...(record.debugSynctexEnabled ? { debug_synctex: true } : {}) });
 			reregistered.push(record.pdfId);
 		}
 		if (this.activeSession !== session) return;
@@ -753,11 +781,12 @@ export class ViewerHostMcpService {
 		}
 	}
 
-	private async sendToClient(client: ViewerHostClient, message: McpToViewerHostMessage): Promise<void> {
+	private async sendToClient(client: ViewerHostClient, message: McpToViewerHostMessage): Promise<ViewerHostControlResponse | undefined> {
 		const response = await client.send(validateMcpToViewerHostMessage(message));
 		if (isViewerHostControlResponse(response) && !response.ok) {
 			throw new Error(response.error.message);
 		}
+		return isViewerHostControlResponse(response) ? response : undefined;
 	}
 
 	private updateViewerUrlsForSession(session: ActiveViewerHostSession): void {
@@ -797,7 +826,7 @@ export class ViewerHostMcpService {
 		return isAbsolute(pdfPath) ? resolve(pdfPath) : resolve(workspaceContext.cwd, pdfPath);
 	}
 
-	private createPdfRecord(pdfPath: string, workspaceCwd: string, client: ViewerHostClient): TrackedViewerHostPdf {
+	private createPdfRecord(pdfPath: string, workspaceCwd: string, client: ViewerHostClient, debugSynctexEnabled: boolean): TrackedViewerHostPdf {
 		const normalizedPath = resolve(pdfPath);
 		const pdfId = this.allocatePdfId();
 		const record: TrackedViewerHostPdf = {
@@ -807,6 +836,7 @@ export class ViewerHostMcpService {
 			createdAtNs: this.nowNs(),
 			revision: 1,
 			viewerUrl: "",
+			debugSynctexEnabled,
 			fileSnapshot: snapshotPdf(normalizedPath),
 		};
 		this.setRecordViewerUrl(record, { client });
@@ -840,7 +870,18 @@ export class ViewerHostMcpService {
 		return record;
 	}
 
-	private openOk(request: HostServiceOpenRequest, record: TrackedViewerHostPdf, reused: boolean): HostServiceOpenResponseEnvelope {
+	private browserLaunchDetails(response: ViewerHostControlResponse | undefined): Record<string, unknown> | undefined {
+		if (response?.ok !== true || !("result" in response)) return undefined;
+		if (response.result.browser_open_confirmed === undefined && response.result.browser_open_attempted === undefined) return undefined;
+		return {
+			...(response.result.browser_open_attempted === undefined ? {} : { attempted: response.result.browser_open_attempted }),
+			...(response.result.browser_open_confirmed === undefined ? {} : { confirmed: response.result.browser_open_confirmed }),
+			...(response.result.active_viewer_clients === undefined ? {} : { active_viewer_clients: response.result.active_viewer_clients }),
+			...(response.result.browser_open_error === undefined ? {} : { error: response.result.browser_open_error }),
+		};
+	}
+
+	private openOk(request: HostServiceOpenRequest, record: TrackedViewerHostPdf, reused: boolean, browserLaunch?: Record<string, unknown>): HostServiceOpenResponseEnvelope {
 		return {
 			protocol_version: request.protocol_version,
 			request_id: request.request_id,
@@ -857,6 +898,7 @@ export class ViewerHostMcpService {
 				pdf_id: record.pdfId,
 				revision: record.revision,
 				viewer_url: record.viewerUrl,
+				...(browserLaunch === undefined ? {} : { browser_launch: browserLaunch }),
 				managed_record: this.managedRecord(record, reused),
 			},
 		};

@@ -1,8 +1,17 @@
 import type { DoctorFinding, HarnessAdapter, HarnessDetection, InstallChange, InstallerContext } from "../types.ts";
-import { agentIdForHarness, change, isRecord, managedShellScript, pathExists, projectPath, readJsonObject, removeManagedFile, removeMcpServersJson, upsertMcpServersJson, writeJsonObject, writeText } from "../config_edit.ts";
+import { MCP_SERVER_NAME, change, isRecord, managedShellScript, mcpServerHasNoHooks, pathExists, projectPath, readJsonObject, removeManagedFile, removeMcpServersJson, scopePath, upsertMcpServersJson, writeJsonObject, writeText } from "../config_edit.ts";
 
-const HOOK_SCRIPT = ".claude/hooks/agent-synctex-fetch-info.sh";
-const HOOK_COMMAND = `./${HOOK_SCRIPT}`;
+function hookScriptPath(ctx: InstallerContext): string {
+	return scopePath(ctx, [".claude", "hooks", "agent-synctex-fetch-info.sh"], [".claude", "hooks", "agent-synctex-fetch-info.sh"]);
+}
+
+function hookSettingsPath(ctx: InstallerContext): string {
+	return scopePath(ctx, [".claude", "settings.json"], [".claude", "settings.json"]);
+}
+
+function mcpPath(ctx: InstallerContext): string {
+	return scopePath(ctx, [".mcp.json"], [".claude.json"]);
+}
 
 export const claudeAdapter: HarnessAdapter = {
 	id: "claude",
@@ -12,34 +21,35 @@ export const claudeAdapter: HarnessAdapter = {
 		return { id: "claude", detected: false };
 	},
 	installMcp(ctx): InstallChange[] {
-		return upsertMcpServersJson(ctx, projectPath(ctx, ".mcp.json"), "claude", false);
+		return upsertMcpServersJson(ctx, mcpPath(ctx), "claude", ctx.noHooks);
 	},
 	installHooks(ctx): InstallChange[] {
-		const changes = upsertMcpServersJson(ctx, projectPath(ctx, ".mcp.json"), "claude", true);
-		const scriptPath = projectPath(ctx, HOOK_SCRIPT);
-		writeText(ctx, scriptPath, managedShellScript(agentIdForHarness("claude"), "claude"), 0o755);
+		const changes: InstallChange[] = [];
+		const scriptPath = hookScriptPath(ctx);
+		writeText(ctx, scriptPath, managedShellScript("claude", "claude"), 0o755);
 		changes.push(change("installed Claude UserPromptSubmit hook script", scriptPath));
-		changes.push(...upsertClaudeHook(ctx));
+		changes.push(...upsertClaudeHook(ctx, scriptPath));
+		changes.push(...removeNoHooksFromManagedMcp(ctx));
 		return changes;
 	},
 	uninstall(ctx): InstallChange[] {
 		return [
-			...removeMcpServersJson(ctx, projectPath(ctx, ".mcp.json")),
+			...removeMcpServersJson(ctx, mcpPath(ctx)),
 			...removeClaudeHook(ctx),
-			...removeManagedFile(ctx, projectPath(ctx, HOOK_SCRIPT)),
+			...removeManagedFile(ctx, hookScriptPath(ctx)),
 		];
 	},
 	doctor(ctx): DoctorFinding[] {
-		return [{ harness: "claude", level: pathExists(projectPath(ctx, ".mcp.json")) ? "ok" : "warning", message: "Claude project MCP config is .mcp.json" }];
+		return [{ harness: "claude", level: pathExists(mcpPath(ctx)) ? "ok" : "warning", message: `Claude MCP config path is ${mcpPath(ctx)}` }];
 	},
 };
 
-function upsertClaudeHook(ctx: InstallerContext): InstallChange[] {
-	const path = projectPath(ctx, ".claude", "settings.json");
+function upsertClaudeHook(ctx: InstallerContext, scriptPath: string): InstallChange[] {
+	const path = hookSettingsPath(ctx);
 	const settings = readJsonObject(path);
 	const hooks = isRecord(settings.hooks) ? { ...settings.hooks } : {};
 	const existing = Array.isArray(hooks.UserPromptSubmit) ? hooks.UserPromptSubmit.filter((entry) => !isManagedHookEntry(entry)) : [];
-	existing.push({ matcher: "", hooks: [{ type: "command", command: HOOK_COMMAND }] });
+	existing.push({ matcher: "", hooks: [{ type: "command", command: scriptPath }] });
 	hooks.UserPromptSubmit = existing;
 	settings.hooks = hooks;
 	writeJsonObject(ctx, path, settings);
@@ -47,7 +57,7 @@ function upsertClaudeHook(ctx: InstallerContext): InstallChange[] {
 }
 
 function removeClaudeHook(ctx: InstallerContext): InstallChange[] {
-	const path = projectPath(ctx, ".claude", "settings.json");
+	const path = hookSettingsPath(ctx);
 	if (!pathExists(path)) return [];
 	const settings = readJsonObject(path);
 	if (!isRecord(settings.hooks) || !Array.isArray(settings.hooks.UserPromptSubmit)) return [];
@@ -59,6 +69,14 @@ function removeClaudeHook(ctx: InstallerContext): InstallChange[] {
 	settings.hooks = hooks;
 	writeJsonObject(ctx, path, settings);
 	return [change("removed Claude UserPromptSubmit hook entry", path)];
+}
+
+function removeNoHooksFromManagedMcp(ctx: InstallerContext): InstallChange[] {
+	const path = mcpPath(ctx);
+	if (!pathExists(path)) return [];
+	const config = readJsonObject(path);
+	if (!mcpServerHasNoHooks(config)) return [];
+	return upsertMcpServersJson(ctx, path, "claude", false);
 }
 
 function isManagedHookEntry(entry: unknown): boolean {

@@ -7,7 +7,7 @@ The important architecture goal is a clean split between:
 - the **MCP runtime** that exposes tools to agents;
 - the **Viewer Host Client** inside the MCP runtime that owns MCP-side `pdf_id` state and sends typed messages;
 - the **Viewer Host Server** that serves the app, PDF bytes, sockets, registration, refresh routing, and server-side SyncTeX hover/probe responses;
-- the **Viewer Client app** that runs in a browser/Tauri webview and owns visible tabs, PDF.js interaction, browser coordinate conversion, overlays, scrolling, and user interaction;
+- the **Viewer Client app** that runs in a browser and owns visible tabs, PDF.js interaction, browser coordinate conversion, overlays, scrolling, and user interaction;
 - the **SyncTeX resolution** module that owns parsing/scoring/source repair/result shaping on the Node side.
 
 The viewer is the Viewer Host app + `viewer_lw` route. There is one active viewer architecture: Viewer Host Client, Viewer Host Server, Viewer Client app, and `viewer_lw` PDF.js browser glue.
@@ -24,8 +24,6 @@ The viewer is the Viewer Host app + `viewer_lw` route. There is one active viewe
 - Viewer Host protocol types and validators: `src/modules/viewer_host_protocol.ts`
 - Viewer Host Server process entrypoint: `scripts/viewer-host-server.ts`
 - Viewer Host Server module: `src/modules/viewer_host_server.ts`
-- Desktop/Tauri host wrapper helper: `src/modules/tauri_viewer_wrapper.ts`
-- Tauri app shell: `apps/viewer-desktop-tauri/src-tauri/src/main.rs`
 
 `src/modules/stdio_mcp_runtime.ts` creates the default `ViewerHostMcpService` unless tests inject custom `pdfOperations`. That service is the active viewer integration path for `open_pdf`, `jump_pdf`, `show_latex`, and `compile_latex_file(open_pdf=true)`.
 
@@ -93,7 +91,7 @@ Important concrete adapters/classes in `src/modules/viewer_host_client.ts`:
 - `ViewerHostClient` — the interface used by `ViewerHostMcpService` to send Host messages.
 - `FakeViewerHostClient` — test adapter that records messages.
 - `LocalViewerHostProcessClient` — production adapter that starts/talks to `scripts/viewer-host-server.ts` and its `/control` endpoint.
-- `DesktopViewerAppProcessLauncher` — launches/focuses the Tauri desktop app when the Host needs to be visible.
+- `BrowserViewerAppLauncher` — opens/focuses the stable browser viewer entrypoint when the Host needs to be visible.
 
 Important flows:
 
@@ -127,7 +125,7 @@ Viewer-to-MCP/Host messages include:
 - `reverse_synctex_hover`
 - `reverse_synctex_forward_probe`
 
-The protocol is JSON-serializable. Keep it browser-friendly and avoid leaking Node/Tauri objects into message payloads.
+The protocol is JSON-serializable. Keep it browser-friendly and avoid leaking Node objects into message payloads.
 
 ## Viewer Host Server
 
@@ -139,7 +137,7 @@ The standalone process entrypoint is:
 
 - `scripts/viewer-host-server.ts`
 
-The server binds locally by default and announces a ready line on stdout. The MCP-side `LocalViewerHostProcessClient` reads that line and then launches/focuses the desktop app with the Host-served app URL.
+The server binds locally by default and announces a ready line on stdout. The MCP-side `LocalViewerHostProcessClient` reads that line and then opens/focuses the stable browser viewer URL.
 
 Viewer Host Server responsibilities:
 
@@ -179,7 +177,7 @@ Current adapter:
 
 - `LocalLoopbackViewerHostAccessPolicy`
 
-It is intentionally loopback-only (`127.0.0.1`). If adding LAN/mobile support, add or extend an adapter at this seam instead of scattering host/origin/auth decisions through `ViewerHostServer`, the Tauri wrapper, or the Viewer Client.
+It is intentionally loopback-only (`127.0.0.1`). If adding LAN/mobile support, add or extend an adapter at this seam instead of scattering host/origin/auth decisions through `ViewerHostServer` or the Viewer Client.
 
 Security note for future LAN/mobile mode: socket tokens already exist per PDF, but remote access would also need explicit policy for `/app`, `/config`, `/pdf`, `/control`, `/app-events`, and `/mcp-events/drain` before exposing the server beyond loopback.
 
@@ -203,7 +201,7 @@ Responsibilities:
 - listen to `/app-events` for `open_pdf` and `focus_pdf` messages;
 - route app-shell back/forward mouse/key shortcuts into the active viewer iframe.
 
-The Viewer Client app is portable browser code. It must not import Tauri APIs, Node filesystem APIs, or MCP internals.
+The Viewer Client app is portable browser code. It must not import Node filesystem APIs or MCP internals.
 
 ## PDF.js / LaTeX-Workshop viewer route
 
@@ -286,23 +284,6 @@ Agent flow:
 3. `ViewerHostMcpService.getPdfEvents` drains Host events for internal consumers.
 4. Reverse SyncTeX messages are resolved through SyncTeX resolution.
 5. In pure MCP mode, agents receive concise marked-comment context through `fetch_pdf_context`; in hook-aware mode (`--with-hooks`), harness hooks inject that context before the model turn.
-
-## Desktop Viewer / Tauri wrapper
-
-Desktop wrapper files:
-
-- `apps/viewer-desktop-tauri/src-tauri/src/main.rs`
-- `apps/viewer-desktop-tauri/README.md`
-- `src/modules/tauri_viewer_wrapper.ts`
-
-The wrapper is intentionally thin:
-
-- it loads a Host-served `/app` URL;
-- in app-owned mode it can spawn a Host process and wait for its ready line;
-- in MCP-owned mode it uses `PDF_PREVIEW_VIEWER_HOST_APP_URL` from the MCP-side app launcher;
-- it validates loopback app URLs for the current local-only mode.
-
-The wrapper must not implement PDF registration, PDF serving, SyncTeX resolution, refresh policy, tab business logic, or PDF.js UI logic.
 
 ## Important tests and verification targets
 

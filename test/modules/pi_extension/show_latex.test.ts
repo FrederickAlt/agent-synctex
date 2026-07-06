@@ -653,6 +653,7 @@ test("show_latex external flow opens through host service", async () => {
 				operation_pdf: string;
 				pdf_id: number;
 				inline: boolean;
+				log: string;
 			};
 			assert.equal(result.content.length, 1);
 			assert.equal(details.inline, false);
@@ -661,7 +662,8 @@ test("show_latex external flow opens through host service", async () => {
 			assert.equal(existsSync(MCP_FIXED_PREVIEW_PDF_PATH), true);
 			assert.equal(typeof details.pdf_id, "number");
 			assert.match(result.content[0].text, /^ok: pdf_id=\d+ pdf=/);
-			assert.match(result.content[0].text, /Log: .*\.log/);
+			assert.doesNotMatch(result.content[0].text, /Log: .*\.log/);
+			assert.match(details.log, /\.log/);
 
 			assert.equal(backend.openRequests.length, 1);
 			const request = backend.openRequests[0];

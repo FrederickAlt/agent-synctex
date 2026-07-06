@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type { InstallChange, InstallerContext } from "./types.ts";
+import type { HarnessId, InstallChange, InstallerContext } from "./types.ts";
 
 export const MCP_SERVER_NAME = "agent-synctex";
 export const MANAGED_MARKER = "Managed by agent-synctex";
@@ -10,11 +11,11 @@ export function agentIdForHarness(harness: string): string {
 	return `agent-synctex-${harness}`;
 }
 
-export function mcpServerConfig(harness: string, hooksEnabled: boolean): Record<string, unknown> {
+export function mcpServerConfig(harness: HarnessId, noHooks: boolean, extra: Record<string, unknown> = {}): Record<string, unknown> {
 	return {
-		command: "tex-actions-mcp",
-		args: hooksEnabled ? ["--with-hooks"] : [],
-		env: { TEX_ACTIONS_AGENT_ID: agentIdForHarness(harness) },
+		command: "agent-synctex",
+		args: ["mcp", "--harness", harness, ...(noHooks ? ["--no-hooks"] : [])],
+		...extra,
 	};
 }
 
@@ -66,13 +67,27 @@ export function writeJsoncObject(ctx: InstallerContext, path: string, value: Rec
 	writeText(ctx, path, `${JSON.stringify(value, null, "\t")}\n`);
 }
 
-export function upsertMcpServersJson(ctx: InstallerContext, path: string, harness: string, hooksEnabled: boolean): InstallChange[] {
+export function upsertMcpServersJson(ctx: InstallerContext, path: string, harness: HarnessId, noHooks: boolean, extra: Record<string, unknown> = {}): InstallChange[] {
 	const config = readJsonObject(path);
 	const current = isRecord(config.mcpServers) ? { ...config.mcpServers } : {};
-	current[MCP_SERVER_NAME] = mcpServerConfig(harness, hooksEnabled);
+	current[MCP_SERVER_NAME] = mcpServerConfig(harness, noHooks, extra);
 	config.mcpServers = current;
 	writeJsonObject(ctx, path, config);
-	return [change(`installed ${MCP_SERVER_NAME} MCP config${hooksEnabled ? " with --with-hooks" : ""}`, path)];
+	return [change(`installed ${MCP_SERVER_NAME} MCP config${noHooks ? " in --no-hooks mode" : ""}`, path)];
+}
+
+export function mcpServerHasNoHooks(config: Record<string, unknown>): boolean {
+	if (!isRecord(config.mcpServers)) return false;
+	const server = config.mcpServers[MCP_SERVER_NAME];
+	if (!isRecord(server) || !Array.isArray(server.args)) return false;
+	return server.args.includes("--no-hooks");
+}
+
+export function opencodeMcpHasNoHooks(config: Record<string, unknown>): boolean {
+	if (!isRecord(config.mcp)) return false;
+	const server = config.mcp[MCP_SERVER_NAME];
+	if (!isRecord(server) || !Array.isArray(server.command)) return false;
+	return server.command.includes("--no-hooks");
 }
 
 export function removeMcpServersJson(ctx: InstallerContext, path: string): InstallChange[] {
@@ -87,18 +102,17 @@ export function removeMcpServersJson(ctx: InstallerContext, path: string): Insta
 	return [change(`removed ${MCP_SERVER_NAME} MCP config`, path)];
 }
 
-export function upsertOpencodeMcp(ctx: InstallerContext, path: string, hooksEnabled: boolean): InstallChange[] {
+export function upsertOpencodeMcp(ctx: InstallerContext, path: string, harness: HarnessId, noHooks: boolean): InstallChange[] {
 	const config = parseJsoncObject(path);
 	const current = isRecord(config.mcp) ? { ...config.mcp } : {};
 	current[MCP_SERVER_NAME] = {
 		type: "local",
-		command: ["tex-actions-mcp", ...(hooksEnabled ? ["--with-hooks"] : [])],
+		command: ["agent-synctex", "mcp", "--harness", harness, ...(noHooks ? ["--no-hooks"] : [])],
 		enabled: true,
-		env: { TEX_ACTIONS_AGENT_ID: agentIdForHarness("opencode") },
 	};
 	config.mcp = current;
 	writeJsoncObject(ctx, path, config);
-	return [change(`installed ${MCP_SERVER_NAME} OpenCode MCP config${hooksEnabled ? " with --with-hooks" : ""}`, path)];
+	return [change(`installed ${MCP_SERVER_NAME} OpenCode MCP config${noHooks ? " in --no-hooks mode" : ""}`, path)];
 }
 
 export function removeOpencodeMcp(ctx: InstallerContext, path: string): InstallChange[] {
@@ -137,12 +151,15 @@ export function removeManagedTomlBlock(ctx: InstallerContext, path: string, bloc
 	return [change(`removed managed TOML block ${blockId}`, path)];
 }
 
-export function managedShellScript(commandName: string, jsonWrapper: "claude" | "cline"): string {
-	const agentId = commandName;
+export function managedShellScript(harness: HarnessId, jsonWrapper: "claude" | "codex" | "cline"): string {
+	const fetchCommand = `agent-synctex fetch-info --harness ${shellQuote(harness)}`;
 	if (jsonWrapper === "cline") {
-		return `#!/usr/bin/env bash\n# ${MANAGED_MARKER}\nset -euo pipefail\ncontext="$(TEX_ACTIONS_AGENT_ID=${shellQuote(agentId)} agent-synctex fetch-info || true)"\nif [ -z "$context" ]; then exit 0; fi\nHOOK_CONTEXT="$context" node -e 'process.stdout.write(JSON.stringify({ contextModification: process.env.HOOK_CONTEXT || "" }))'\n`;
+		return `#!/usr/bin/env bash\n# ${MANAGED_MARKER}\nset -euo pipefail\ncontext="$(${fetchCommand} || true)"\nif [ -z "$context" ]; then exit 0; fi\nHOOK_CONTEXT="$context" node -e 'process.stdout.write(JSON.stringify({ contextModification: process.env.HOOK_CONTEXT || "" }))'\n`;
 	}
-	return `#!/usr/bin/env bash\n# ${MANAGED_MARKER}\nset -euo pipefail\ncontext="$(TEX_ACTIONS_AGENT_ID=${shellQuote(agentId)} agent-synctex fetch-info || true)"\nif [ -z "$context" ]; then exit 0; fi\nHOOK_CONTEXT="$context" node -e 'process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: process.env.HOOK_CONTEXT || "" } }))'\n`;
+	if (jsonWrapper === "codex") {
+		return `#!/usr/bin/env bash\n# ${MANAGED_MARKER}\nset -euo pipefail\ncontext="$(${fetchCommand} || true)"\nif [ -z "$context" ]; then exit 0; fi\nHOOK_CONTEXT="$context" node -e 'process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: process.env.HOOK_CONTEXT || "" } }))'\n`;
+	}
+	return `#!/usr/bin/env bash\n# ${MANAGED_MARKER}\nset -euo pipefail\ncontext="$(${fetchCommand} || true)"\nif [ -z "$context" ]; then exit 0; fi\nHOOK_CONTEXT="$context" node -e 'process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: process.env.HOOK_CONTEXT || "" } }))'\n`;
 }
 
 export function removeManagedFile(ctx: InstallerContext, path: string): InstallChange[] {
@@ -158,6 +175,24 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function projectPath(ctx: InstallerContext, ...parts: string[]): string {
 	return join(ctx.cwd, ...parts);
+}
+
+export function homePath(...parts: string[]): string {
+	return join(homedir(), ...parts);
+}
+
+export function scopePath(ctx: InstallerContext, projectParts: string[], userParts: string[]): string {
+	return ctx.scope === "user" ? homePath(...userParts) : projectPath(ctx, ...projectParts);
+}
+
+export function clineMcpSettingsPath(ctx: InstallerContext): string {
+	return ctx.scope === "user" && process.env.CLINE_MCP_SETTINGS_PATH?.trim()
+		? process.env.CLINE_MCP_SETTINGS_PATH
+		: scopePath(ctx, [".cline_mcp_settings.json"], [".cline", "data", "settings", "cline_mcp_settings.json"]);
+}
+
+export function piAgentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR?.trim() || homePath(".pi", "agent");
 }
 
 function backupExistingFile(ctx: InstallerContext, path: string): void {
@@ -188,7 +223,7 @@ function stripJsonComments(raw: string): string {
 			}
 			continue;
 		}
-		if (char === '"' || char === "'") {
+		if (char === "\"" || char === "'") {
 			inString = true;
 			quote = char;
 			output += char;

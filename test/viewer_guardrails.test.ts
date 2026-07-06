@@ -30,8 +30,6 @@ const FORBIDDEN_LEGACY_IDENTIFIERS = new Map<string, string>([
 ]);
 
 const EXPECTED_ACTIVE_RUNTIME_ENTRYPOINTS = new Set<string>([
-	"scripts/tex-actions-mcp.ts",
-	"scripts/pdf-preview-mcp.ts",
 	"scripts/viewer-host-server.ts",
 	"scripts/agent-synctex.ts",
 ]);
@@ -307,12 +305,12 @@ function collectForbiddenViolations(file: string, source: string): GuardrailViol
 
 function collectProductionEntrypointPathsFromCommand(command: string): string[] {
 	const normalized = command.replace(/\n+/g, " ");
-	const matches = normalized.matchAll(/(?:^|[\s'"`(;|&])(?:\.\/)?(scripts\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\.ts)(?=\b|$)/g);
+	const matches = normalized.matchAll(/(?:^|[\s'"`(;|&])(?:\.\/)?((?:dist\/)?scripts\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\.(?:ts|js))(?=\b|$)/g);
 	const paths = new Set<string>();
 	for (const match of matches) {
 		const candidate = (match[1] ?? "").replace(/^\.\//, "");
 		if (!candidate) continue;
-		paths.add(candidate);
+		paths.add(candidate.replace(/^dist\//, "").replace(/\.js$/, ".ts"));
 	}
 	return Array.from(paths);
 }
@@ -337,7 +335,7 @@ function collectPackageMetadataEntrypoints(pkg: unknown): Set<string> {
 
 	if (typeof metadata.scripts === "object" && metadata.scripts !== null) {
 		for (const [scriptName, scriptValue] of Object.entries(metadata.scripts as Record<string, unknown>)) {
-			if (typeof scriptName === "string" && scriptName.startsWith("debug:")) {
+			if (typeof scriptName === "string" && (scriptName.startsWith("debug:") || ["build", "prepack"].includes(scriptName))) {
 				continue;
 			}
 			if (typeof scriptValue !== "string") continue;

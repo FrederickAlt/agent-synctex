@@ -54,7 +54,7 @@ test("Viewer Host protocol validates representative Host to MCP messages", () =>
 
 test("Viewer Host protocol module stays framework-neutral", () => {
 	const source = readFileSync("src/modules/viewer_host_protocol.ts", "utf8");
-	assert.doesNotMatch(source, /from ["'][^"']*(tauri|pdfjs|browser|dom)[^"']*["']/i);
+	assert.doesNotMatch(source, /from ["'][^"']*(pdfjs|browser|dom)[^"']*["']/i);
 	assert.doesNotMatch(source, /\b(window|document|HTMLElement|WebSocket)\b/);
 });
 

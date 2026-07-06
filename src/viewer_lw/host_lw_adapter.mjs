@@ -5,9 +5,6 @@
  */
 
 const configUrl = document.body.dataset.configUrl;
-if (!configUrl) {
-  throw new Error("missing Host viewer config URL");
-}
 
 const failedAssetRequests = [];
 const MAX_FAILED_ASSET_REQUESTS = 20;
@@ -26,15 +23,30 @@ window.addEventListener("error", (event) => {
 
 globalThis.viewerTrim = 0;
 
-const response = await fetch(configUrl, { cache: "no-store" });
-if (!response.ok) {
-  throw new Error(`Host viewer config request failed: ${response.status}`);
+async function loadInitialConfig() {
+  if (!configUrl) {
+    return { empty: true, revision: 0, title: "PDF Viewer", pdf_url: "", debug_synctex: false };
+  }
+  const response = await fetch(configUrl, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Host viewer config request failed: ${response.status}`);
+  }
+  return await response.json();
 }
-const initialConfig = await response.json();
+
+const initialConfig = await loadInitialConfig();
 
 const HOVER_THROTTLE_MS = 60;
 const NAVIGATION_SETTLE_MS = 200;
 const MIN_HISTORY_SCROLL_DELTA = 24;
+const THEME_STORAGE_KEY = "agent-synctex.pdfViewerTheme";
+const TAB_TITLE_STORAGE_KEY = "agent-synctex.pdfTabTitles";
+const TAB_ORDER_STORAGE_KEY = "agent-synctex.pdfTabOrder";
+const PDF_ANNOTATIONS_STORAGE_KEY = "agent-synctex.pdfAnnotations";
+const PDF_VIEWER_THEMES = {
+  light: { background: "#ffffff", foreground: "#000000", icon: "☀", label: "Light PDF theme" },
+  dark: { background: "#1f2328", foreground: "#f0f3f6", icon: "🌘", label: "Dark PDF theme" },
+};
 const ANNOTATION_BUBBLE_MAX_HEIGHT_PX = 140;
 const ANNOTATION_BUBBLE_MIN_WIDTH_PX = 220;
 const ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX = 360;
@@ -49,6 +61,7 @@ const hostState = {
   lastError: undefined,
   hoverEnabled: true,
   debugSynctexEnabled: false,
+  lastPdfLoadSource: "url",
 };
 let activeRefreshLoadingTask;
 let activeSocket;
@@ -64,6 +77,7 @@ let hoverRequestId = 0;
 let latestHoverRequestId = 0;
 let probeRequestId = 0;
 let latestProbeRequestId = 0;
+let pendingProbe;
 
 const synctexOverlayState = {
   forwardMessage: undefined,
@@ -74,6 +88,10 @@ const synctexOverlayState = {
 const annotations = new Map();
 let nextAnnotationNumber = 1;
 let selectedAnnotationId;
+const directViewerTabs = new Map();
+const pdfByteCache = new Map();
+const MAX_PDF_BYTE_CACHE_ENTRIES = 20;
+let directViewerTabsConnected = false;
 
 const navigationHistory = {
   back: [],
@@ -103,6 +121,16 @@ function pdfViewer() {
 
 function viewerContainer() {
   return document.getElementById("viewerContainer");
+}
+
+function activePdfId() {
+  const pdfId = Number(hostState.config?.pdf_id ?? initialConfig.pdf_id);
+  return Number.isInteger(pdfId) && pdfId > 0 ? pdfId : undefined;
+}
+
+function hasActiveConfig(config = hostState.config) {
+  const pdfId = Number(config?.pdf_id);
+  return Number.isInteger(pdfId) && pdfId > 0 && typeof config?.pdf_url === "string" && config.pdf_url.length > 0;
 }
 
 function viewerSocketOpen() {
@@ -141,6 +169,9 @@ function viewerLoadedState(extra = {}) {
     visibleRevision: hostState.visibleRevision,
     latestRevision: hostState.latestRevision,
     lastError: hostState.lastError,
+    activePdfId: activePdfId(),
+    lastPdfLoadSource: hostState.lastPdfLoadSource,
+    pdfByteCacheEntries: pdfByteCache.size,
     failedAssetRequests: failedAssetRequests.slice(),
     toolsHitTarget: typeof collectToolsHitTargetDiagnostics === "function" ? collectToolsHitTargetDiagnostics() : undefined,
     ...extra,
@@ -535,9 +566,86 @@ function destroyLoadingTask(task) {
   }
 }
 
+function systemPdfTheme() {
+  return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
+}
+
+function storedPdfTheme() {
+  try {
+    const value = localStorage.getItem(THEME_STORAGE_KEY);
+    return value === "dark" || value === "light" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function activePdfTheme() {
+  return storedPdfTheme() ?? systemPdfTheme();
+}
+
+function pdfThemeColors(theme = activePdfTheme()) {
+  return PDF_VIEWER_THEMES[theme] ?? PDF_VIEWER_THEMES.light;
+}
+
+function setStoredPdfTheme(theme) {
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+  } catch {
+    // Storage may be unavailable in constrained browser contexts; the in-memory theme still applies.
+  }
+}
+
+function cachedPdfBytesForConfig(config) {
+  const pdfId = Number(config?.pdf_id);
+  const revision = Number(config?.revision);
+  const cached = pdfByteCache.get(pdfId);
+  return cached && cached.revision === revision ? cached.bytes : undefined;
+}
+
+function rememberPdfBytes(config, bytes) {
+  const pdfId = Number(config?.pdf_id);
+  const revision = Number(config?.revision);
+  if (!Number.isInteger(pdfId) || pdfId <= 0 || !Number.isFinite(revision) || !(bytes instanceof ArrayBuffer)) return;
+  pdfByteCache.delete(pdfId);
+  pdfByteCache.set(pdfId, { revision, config, bytes });
+  while (pdfByteCache.size > MAX_PDF_BYTE_CACHE_ENTRIES) {
+    const oldest = pdfByteCache.keys().next().value;
+    if (oldest === undefined) break;
+    pdfByteCache.delete(oldest);
+  }
+}
+
+async function fetchConfigForPdfId(pdfId) {
+  const response = await fetch(`/config/${encodeURIComponent(String(pdfId))}.json`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`tab config request failed: ${response.status}`);
+  return await response.json();
+}
+
+async function prefetchPdfBytes(config) {
+  if (!hasActiveConfig(config)) return undefined;
+  const pdfId = Number(config?.pdf_id);
+  const revision = Number(config?.revision);
+  const existing = pdfByteCache.get(pdfId);
+  if (existing?.revision === revision && (existing.bytes || existing.inFlight)) return existing.inFlight;
+  const inFlight = (async () => {
+    const response = await fetch(config.pdf_url, { cache: "no-store" });
+    if (!response.ok) throw new Error(`PDF prefetch failed: ${response.status}`);
+    rememberPdfBytes(config, await response.arrayBuffer());
+  })().catch((error) => {
+    const current = pdfByteCache.get(pdfId);
+    if (current?.revision === revision) pdfByteCache.delete(pdfId);
+    throw error;
+  });
+  pdfByteCache.delete(pdfId);
+  pdfByteCache.set(pdfId, { revision, config, inFlight });
+  return inFlight;
+}
+
 function configurePdfViewerApplicationOptions() {
+  const theme = activePdfTheme();
+  const colors = pdfThemeColors(theme);
   globalThis.PDFViewerApplicationOptions.setAll({
-    defaultUrl: initialConfig.pdf_url,
+    defaultUrl: hasActiveConfig(initialConfig) ? initialConfig.pdf_url : "",
     annotationEditorMode: -1,
     disablePreferences: true,
     enableScripting: false,
@@ -547,6 +655,9 @@ function configurePdfViewerApplicationOptions() {
     sidebarViewOnLoad: 0,
     workerSrc: "/viewer-lw/build/pdf.worker.mjs",
     forcePageColors: true,
+    pageColorsBackground: colors.background,
+    pageColorsForeground: colors.foreground,
+    viewerCssTheme: 2,
     maxCanvasPixels: -1,
     maxCanvasDim: -1,
     enableDetailCanvas: false,
@@ -570,18 +681,20 @@ function installWebViewerLoadedConfigListener() {
   }
 }
 
-async function refreshToConfig(config) {
+async function refreshToConfig(config, options = {}) {
   const revision = Number(config.revision);
   const serial = ++hostState.refreshSerial;
-  const snapshot = captureRefreshState();
+  const snapshot = options.preserveView === false ? undefined : captureRefreshState();
   hostState.lastError = undefined;
   updateHostDataset();
 
   destroyLoadingTask(activeRefreshLoadingTask);
   const pdfjsLib = await import("/viewer-lw/build/pdf.mjs");
   if (serial !== hostState.refreshSerial) return;
+  const cachedBytes = cachedPdfBytesForConfig(config);
+  hostState.lastPdfLoadSource = cachedBytes ? "cache" : "url";
   const loadingTask = pdfjsLib.getDocument({
-    url: config.pdf_url,
+    ...(cachedBytes ? { data: cachedBytes.slice(0) } : { url: config.pdf_url }),
     cMapUrl: "/viewer-lw/cmaps/",
     standardFontDataUrl: "/viewer-lw/standard_fonts/",
     wasmUrl: "/viewer-lw/wasm/",
@@ -598,7 +711,7 @@ async function refreshToConfig(config) {
     app().load(pdfDocument);
     await waitForPagesReady(app());
     if (serial !== hostState.refreshSerial) return;
-    restoreRefreshState(snapshot);
+    if (snapshot) restoreRefreshState(snapshot);
     hostState.config = config;
     hostState.visibleRevision = revision;
     sendLoadedStateDiagnostic("lw_refresh_loaded", { revision });
@@ -768,10 +881,92 @@ function sendAnnotationUpdate(annotation) {
   if (payload) sendViewerSocketPayload(payload);
 }
 
-function clearAnnotations() {
+function annotationStorageKey(pdfId = activePdfId()) {
+  return Number.isInteger(Number(pdfId)) && Number(pdfId) > 0 ? String(Number(pdfId)) : undefined;
+}
+
+function storedPdfAnnotations() {
+  return readLocalStorageJson(PDF_ANNOTATIONS_STORAGE_KEY, {});
+}
+
+function persistAnnotations() {
+  const key = annotationStorageKey();
+  if (!key) return;
+  const all = storedPdfAnnotations();
+  all[key] = Array.from(annotations.values()).map((annotation) => ({
+    id: annotation.id,
+    message: annotation.message,
+    comment: annotation.comment || "",
+    hasBubble: annotation.hasBubble === true,
+    ...(typeof annotation.bubbleLeft === "number" ? { bubbleLeft: annotation.bubbleLeft } : {}),
+    ...(typeof annotation.bubbleTop === "number" ? { bubbleTop: annotation.bubbleTop } : {}),
+    ...(typeof annotation.bubbleWidth === "number" ? { bubbleWidth: annotation.bubbleWidth } : {}),
+  }));
+  localStorage.setItem(PDF_ANNOTATIONS_STORAGE_KEY, JSON.stringify(all));
+}
+
+function restoreAnnotationsForActivePdf() {
+  annotations.clear();
+  selectedAnnotationId = undefined;
+  const key = annotationStorageKey();
+  const stored = key ? storedPdfAnnotations()[key] : undefined;
+  if (Array.isArray(stored)) {
+    for (const annotation of stored) {
+      if (!annotation || typeof annotation.id !== "string" || !annotation.message) continue;
+      annotations.set(annotation.id, {
+        id: annotation.id,
+        message: annotation.message,
+        comment: typeof annotation.comment === "string" ? annotation.comment : "",
+        hasBubble: annotation.hasBubble === true,
+        ...(typeof annotation.bubbleLeft === "number" ? { bubbleLeft: annotation.bubbleLeft } : {}),
+        ...(typeof annotation.bubbleTop === "number" ? { bubbleTop: annotation.bubbleTop } : {}),
+        ...(typeof annotation.bubbleWidth === "number" ? { bubbleWidth: annotation.bubbleWidth } : {}),
+      });
+    }
+  }
+  renderAnnotations(false);
+}
+
+async function restoreAnnotationsForActivePdfWhenReady() {
+  if (!hasActiveConfig(hostState.config)) return;
+  const expectedPdfId = activePdfId();
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && activePdfId() === expectedPdfId) {
+    await waitForPagesReady(app()).catch(() => undefined);
+    if (document.querySelector(".page[data-page-number]")) {
+      restoreAnnotationsForActivePdf();
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (activePdfId() === expectedPdfId) restoreAnnotationsForActivePdf();
+}
+
+function clearPersistedAnnotationsForPdfIds(pdfIds) {
+  const numericPdfIds = Array.from(new Set((Array.isArray(pdfIds) ? pdfIds : [pdfIds])
+    .map((pdfId) => Number(pdfId))
+    .filter((pdfId) => Number.isInteger(pdfId) && pdfId > 0)));
+  if (numericPdfIds.length === 0) return [];
+  const all = storedPdfAnnotations();
+  for (const pdfId of numericPdfIds) delete all[String(pdfId)];
+  localStorage.setItem(PDF_ANNOTATIONS_STORAGE_KEY, JSON.stringify(all));
+  return numericPdfIds;
+}
+
+function clearAnnotations(options = {}) {
   annotations.clear();
   selectedAnnotationId = undefined;
   removeOverlays("[data-pdf-annotation]");
+  if (options.persist !== false) persistAnnotations();
+}
+
+function clearAnnotationsFromHostMessage(message) {
+  const pdfIds = Array.isArray(message.pdf_ids) ? message.pdf_ids : [message.pdf_id];
+  const clearedPdfIds = clearPersistedAnnotationsForPdfIds(pdfIds);
+  if (clearedPdfIds.includes(activePdfId())) {
+    clearForwardSynctexMarker();
+    clearAnnotations({ persist: false });
+  }
 }
 
 function selectAnnotation(annotationId, redraw = true) {
@@ -796,6 +991,7 @@ function selectAnnotationFromBubble(annotationId, preserveTextareaFocus) {
 function removeAnnotation(annotationId) {
   if (!annotations.has(annotationId)) return;
   annotations.delete(annotationId);
+  persistAnnotations();
   sendViewerSocketPayload({ type: "pdf_annotation_deleted", annotation_id: annotationId });
   if (selectedAnnotationId === annotationId) selectedAnnotationId = undefined;
   renderAnnotations(false);
@@ -864,6 +1060,7 @@ function startBubbleDrag(event, annotation, bubble) {
   };
   const onUp = () => {
     annotation.bubbleWidth = bubble.offsetWidth;
+    persistAnnotations();
     window.removeEventListener("pointermove", onMove, true);
     window.removeEventListener("pointerup", onUp, true);
   };
@@ -959,6 +1156,7 @@ function renderAnnotationBubble(annotation, root, anchor, page) {
     event.stopPropagation();
     annotation.hasBubble = false;
     annotation.comment = "";
+    persistAnnotations();
     sendAnnotationUpdate(annotation);
     renderAnnotations(false);
   });
@@ -975,6 +1173,7 @@ function renderAnnotationBubble(annotation, root, anchor, page) {
   textarea.addEventListener("keyup", (event) => event.stopPropagation());
   textarea.addEventListener("input", () => {
     annotation.comment = textarea.value;
+    persistAnnotations();
     sendAnnotationUpdate(annotation);
   });
   bubble.append(dragHandle, close, textarea);
@@ -989,7 +1188,7 @@ function renderAnnotationControls(annotation, root, anchor) {
   controls.style.display = "flex";
   controls.style.gap = "4px";
   controls.style.pointerEvents = "auto";
-  for (const [label, title, handler] of [["×", "Remove annotation", () => removeAnnotation(annotation.id)], ["💬", "Add comment", () => { annotation.hasBubble = true; renderAnnotations(false); }]]) {
+  for (const [label, title, handler] of [["×", "Remove annotation", () => removeAnnotation(annotation.id)], ["💬", "Add comment", () => { annotation.hasBubble = true; persistAnnotations(); renderAnnotations(false); }]]) {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = label;
@@ -1104,6 +1303,7 @@ function createAnnotationFromMessage(message, { select = true, bubble = false, s
   const existing = findExistingAnnotationForMessage(message);
   if (existing) {
     if (bubble) existing.hasBubble = true;
+    persistAnnotations();
     if (select) selectedAnnotationId = existing.id;
     renderAnnotations(scroll);
     return true;
@@ -1112,6 +1312,7 @@ function createAnnotationFromMessage(message, { select = true, bubble = false, s
   nextAnnotationNumber += 1;
   const annotation = { id, message, comment: "", hasBubble: bubble };
   annotations.set(id, annotation);
+  persistAnnotations();
   if (select) selectedAnnotationId = id;
   renderAnnotations(scroll);
   sendAnnotationUpdate(annotation);
@@ -1318,6 +1519,7 @@ function setHoverEnabled(enabled) {
   const button = document.getElementById("hostSynctexHoverButton");
   if (button) {
     button.setAttribute("aria-pressed", enabled ? "true" : "false");
+    button.classList.toggle("toggled", enabled);
     button.title = enabled ? "Disable annotation mode" : "Enable annotation mode";
     button.setAttribute("aria-label", button.title);
   }
@@ -1325,9 +1527,12 @@ function setHoverEnabled(enabled) {
     latestHoverRequestId += 1;
     latestProbeRequestId += 1;
     pendingHover = undefined;
+    pendingProbe = undefined;
     if (hoverTimer !== undefined) clearTimeout(hoverTimer);
     hoverTimer = undefined;
     removeOverlays("[data-reverse-synctex-hover]");
+  } else {
+    sendPendingProbe();
   }
   updateHostDataset();
 }
@@ -1481,27 +1686,452 @@ function installNavigationHistoryControls() {
   updateNavigationButtons();
 }
 
-function installDebugSynctexMenuButton() {
-  if (document.getElementById("hostSynctexDebugButton")) return;
-  const container = document.getElementById("secondaryToolbarButtonContainer");
-  if (!container) return;
-  const separator = document.createElement("div");
-  separator.className = "horizontalToolbarSeparator hostSynctexDebugSeparator";
+function updatePdfThemeButton(button, theme = activePdfTheme()) {
+  const details = PDF_VIEWER_THEMES[theme] ?? PDF_VIEWER_THEMES.light;
+  button.dataset.icon = details.icon;
+  button.title = `${details.label} — click to switch to ${theme === "dark" ? "light" : "dark"}`;
+  button.setAttribute("aria-label", button.title);
+  button.setAttribute("aria-pressed", theme === "dark" ? "true" : "false");
+}
+
+function applyPdfTheme(theme) {
+  const colors = pdfThemeColors(theme);
+  globalThis.PDFViewerApplicationOptions?.setAll?.({
+    forcePageColors: true,
+    pageColorsBackground: colors.background,
+    pageColorsForeground: colors.foreground,
+    viewerCssTheme: 2,
+  });
+  document.documentElement.style.setProperty("color-scheme", "dark");
+  const viewer = pdfViewer();
+  if (viewer) {
+    viewer.pageColors = { background: colors.background, foreground: colors.foreground };
+    for (const pageView of viewer._pages ?? []) {
+      pageView.pageColors = viewer.pageColors;
+      pageView.div?.style.setProperty("--page-bg-color", colors.background);
+    }
+    viewer.refresh?.();
+  }
+  const button = document.getElementById("hostPdfThemeButton");
+  if (button) updatePdfThemeButton(button, theme);
+}
+
+function installPdfThemeButton() {
+  if (document.getElementById("hostPdfThemeButton")) return;
   const button = document.createElement("button");
-  button.id = "hostSynctexDebugButton";
-  button.className = "toolbarButton labeled";
+  button.id = "hostPdfThemeButton";
+  button.className = "toolbarButton";
   button.type = "button";
   button.tabIndex = 0;
   const label = document.createElement("span");
-  label.textContent = "SyncTeX debug overlays";
+  label.textContent = "Toggle PDF theme";
   button.appendChild(label);
   button.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
-    setDebugSynctexEnabled(!hostState.debugSynctexEnabled);
+    const nextTheme = activePdfTheme() === "dark" ? "light" : "dark";
+    setStoredPdfTheme(nextTheme);
+    applyPdfTheme(nextTheme);
   });
-  container.append(separator, button);
-  setDebugSynctexEnabled(false);
+  const anchor = document.getElementById("toolbarViewerRight")?.firstElementChild ?? document.getElementById("toolbarViewerRight");
+  anchor?.parentNode?.insertBefore(button, anchor);
+  updatePdfThemeButton(button);
+  applyPdfTheme(activePdfTheme());
+}
+
+function installBrowserViewerToolbarLayout() {
+  const left = document.getElementById("toolbarViewerLeft");
+  const middle = document.getElementById("toolbarViewerMiddle");
+  if (!left || !middle || middle.dataset.hostLayoutMoved === "true") return;
+  middle.dataset.hostLayoutMoved = "true";
+  for (const child of Array.from(middle.children)) left.appendChild(child);
+  middle.hidden = true;
+}
+
+function installToolbarTabsContainer() {
+  if (document.getElementById("hostPdfTabsContainer")) return;
+  const toolbar = document.getElementById("toolbarViewer");
+  const right = document.getElementById("toolbarViewerRight");
+  if (!toolbar || !right) return;
+  const strip = document.createElement("div");
+  strip.id = "hostPdfTabsStrip";
+  strip.className = "toolbarHorizontalGroup";
+  strip.hidden = true;
+  const leftScroll = document.createElement("button");
+  leftScroll.id = "hostPdfTabScrollLeft";
+  leftScroll.className = "toolbarButton hostPdfTabScrollButton";
+  leftScroll.type = "button";
+  leftScroll.hidden = true;
+  leftScroll.setAttribute("aria-label", "Scroll PDF tabs left");
+  const container = document.createElement("nav");
+  container.id = "hostPdfTabsContainer";
+  container.setAttribute("aria-label", "Open PDFs");
+  const rightScroll = document.createElement("button");
+  rightScroll.id = "hostPdfTabScrollRight";
+  rightScroll.className = "toolbarButton hostPdfTabScrollButton";
+  rightScroll.type = "button";
+  rightScroll.hidden = true;
+  rightScroll.setAttribute("aria-label", "Scroll PDF tabs right");
+  leftScroll.addEventListener("click", () => scrollToolbarTabs(-1));
+  rightScroll.addEventListener("click", () => scrollToolbarTabs(1));
+  container.addEventListener("scroll", updateToolbarTabScrollButtons, { passive: true });
+  strip.append(leftScroll, container, rightScroll);
+  toolbar.insertBefore(strip, right);
+  window.addEventListener("resize", updateToolbarTabScrollButtons);
+}
+
+function readLocalStorageJson(key, fallback) {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback));
+    return parsed && typeof parsed === "object" ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function storedTabTitles() {
+  return readLocalStorageJson(TAB_TITLE_STORAGE_KEY, {});
+}
+
+function customTabTitle(pdfId) {
+  const title = storedTabTitles()[String(pdfId)];
+  return typeof title === "string" && title.trim().length > 0 ? title : undefined;
+}
+
+function setCustomTabTitle(pdfId, title) {
+  const titles = storedTabTitles();
+  const key = String(pdfId);
+  const trimmed = String(title || "").trim();
+  if (trimmed.length > 0) {
+    titles[key] = trimmed;
+  } else {
+    delete titles[key];
+  }
+  localStorage.setItem(TAB_TITLE_STORAGE_KEY, JSON.stringify(titles));
+}
+
+function tabDisplayTitle(tab, pdfId) {
+  return customTabTitle(pdfId) || tab.title || tab.originalTitle || `PDF ${pdfId}`;
+}
+
+function storedTabOrder() {
+  const value = readLocalStorageJson(TAB_ORDER_STORAGE_KEY, []);
+  return Array.isArray(value) ? value.map((pdfId) => Number(pdfId)).filter((pdfId) => Number.isInteger(pdfId) && pdfId > 0) : [];
+}
+
+function setStoredTabOrder(order) {
+  localStorage.setItem(TAB_ORDER_STORAGE_KEY, JSON.stringify(order.map((pdfId) => Number(pdfId)).filter((pdfId) => Number.isInteger(pdfId) && pdfId > 0)));
+}
+
+function orderedTabsForRender(tabs) {
+  const byId = new Map();
+  for (const tab of tabs) {
+    const pdfId = Number(tab.pdfId ?? tab.pdf_id);
+    if (Number.isInteger(pdfId) && pdfId > 0) byId.set(pdfId, { ...tab, pdfId });
+  }
+  const ordered = [];
+  const seen = new Set();
+  for (const pdfId of storedTabOrder()) {
+    const tab = byId.get(pdfId);
+    if (!tab) continue;
+    ordered.push(tab);
+    seen.add(pdfId);
+  }
+  for (const [pdfId, tab] of byId) {
+    if (seen.has(pdfId)) continue;
+    ordered.push(tab);
+  }
+  return ordered;
+}
+
+function rememberDirectViewerTabOrderFromDom() {
+  const order = Array.from(document.querySelectorAll("#hostPdfTabsContainer .hostPdfTab[data-pdf-id]"), (element) => Number(element.getAttribute("data-pdf-id"))).filter((pdfId) => Number.isInteger(pdfId) && pdfId > 0);
+  if (order.length > 0) setStoredTabOrder(order);
+}
+
+function scrollToolbarTabs(direction) {
+  const container = document.getElementById("hostPdfTabsContainer");
+  if (!container) return;
+  const delta = Math.max(160, Math.floor(container.clientWidth * 0.75));
+  container.scrollBy({ left: direction * delta, behavior: "smooth" });
+}
+
+function updateToolbarTabScrollButtons() {
+  const strip = document.getElementById("hostPdfTabsStrip");
+  const container = document.getElementById("hostPdfTabsContainer");
+  const left = document.getElementById("hostPdfTabScrollLeft");
+  const right = document.getElementById("hostPdfTabScrollRight");
+  if (!strip || !container || !left || !right) return;
+  const hasTabs = container.childElementCount > 0;
+  const maxScrollLeft = Math.max(0, container.scrollWidth - container.clientWidth);
+  const hasOverflow = hasTabs && maxScrollLeft > 1;
+  strip.hidden = !hasTabs;
+  left.hidden = !hasOverflow || container.scrollLeft <= 1;
+  right.hidden = !hasOverflow || container.scrollLeft >= maxScrollLeft - 1;
+}
+
+function tabDragAfterElement(container, x) {
+  const candidates = Array.from(container.querySelectorAll(".hostPdfTab:not(.is-dragging)"));
+  return candidates.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = x - box.left - box.width / 2;
+    return offset < 0 && offset > closest.offset ? { offset, element: child } : closest;
+  }, { offset: Number.NEGATIVE_INFINITY, element: undefined }).element;
+}
+
+function installToolbarTabDragHandlers(item) {
+  item.draggable = true;
+  item.addEventListener("dragstart", (event) => {
+    item.classList.add("is-dragging");
+    event.dataTransfer?.setData("text/plain", item.dataset.pdfId || "");
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  });
+  item.addEventListener("dragend", () => {
+    item.classList.remove("is-dragging");
+    rememberDirectViewerTabOrderFromDom();
+    renderToolbarTabs(currentDirectTabsState());
+  });
+}
+
+function installToolbarTabContainerDragHandlers(container) {
+  if (container.dataset.dragHandlersInstalled === "true") return;
+  container.dataset.dragHandlersInstalled = "true";
+  container.addEventListener("dragover", (event) => {
+    const dragging = container.querySelector(".hostPdfTab.is-dragging");
+    if (!dragging) return;
+    event.preventDefault();
+    const after = tabDragAfterElement(container, event.clientX);
+    if (after) container.insertBefore(dragging, after);
+    else container.appendChild(dragging);
+    updateToolbarTabScrollButtons();
+  });
+}
+
+function beginToolbarTabRename(button, tab, pdfId) {
+  const currentTitle = tabDisplayTitle(tab, pdfId);
+  const input = document.createElement("input");
+  input.className = "hostPdfTabRenameInput";
+  input.type = "text";
+  input.value = currentTitle;
+  input.setAttribute("aria-label", `Rename ${currentTitle}`);
+  let finished = false;
+  const finish = (commit) => {
+    if (finished) return;
+    finished = true;
+    const nextTitle = input.value.trim();
+    if (commit && nextTitle.length > 0) {
+      setCustomTabTitle(pdfId, nextTitle);
+      const current = directViewerTabs.get(pdfId);
+      if (current) {
+        current.title = nextTitle;
+        directViewerTabs.set(pdfId, current);
+      }
+      if (pdfId === activePdfId()) document.title = nextTitle;
+    }
+    renderToolbarTabs(currentDirectTabsState());
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      finish(true);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+  button.replaceWith(input);
+  input.focus();
+  input.select();
+}
+
+function renderToolbarTabs(tabState) {
+  const container = document.getElementById("hostPdfTabsContainer");
+  if (!container) return;
+  const tabs = Array.isArray(tabState?.tabs) ? tabState.tabs : [];
+  const activeTabPdfId = Number(tabState?.activePdfId ?? activePdfId());
+  const strip = document.getElementById("hostPdfTabsStrip");
+  installToolbarTabContainerDragHandlers(container);
+  container.replaceChildren();
+  container.dataset.tabCount = String(tabs.length);
+  if (strip) strip.dataset.tabCount = String(tabs.length);
+  for (const tab of orderedTabsForRender(tabs)) {
+    const pdfId = Number(tab.pdfId ?? tab.pdf_id);
+    if (!Number.isInteger(pdfId) || pdfId <= 0) continue;
+    const selected = pdfId === activeTabPdfId;
+    const item = document.createElement("div");
+    item.className = selected ? "hostPdfTab is-active" : "hostPdfTab";
+    item.dataset.pdfId = String(pdfId);
+    installToolbarTabDragHandlers(item);
+    const title = tabDisplayTitle(tab, pdfId);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "hostPdfTabButton";
+    button.dataset.pdfId = String(pdfId);
+    button.setAttribute("aria-current", selected ? "page" : "false");
+    button.title = selected ? "Rename active PDF tab" : title;
+    button.textContent = title;
+    button.addEventListener("click", (event) => {
+      const viewerUrl = tab.viewerUrl || `/viewer-lw/${encodeURIComponent(String(pdfId))}`;
+      if (selected) {
+        event.preventDefault();
+        event.stopPropagation();
+        beginToolbarTabRename(button, tab, pdfId);
+      } else if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type: "host_lw_select_tab", pdfId }, location.origin);
+      } else {
+        void switchDirectViewerTab(pdfId, viewerUrl);
+      }
+    });
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "hostPdfTabClose";
+    close.dataset.closePdfId = String(pdfId);
+    close.setAttribute("aria-label", `Close ${title}`);
+    close.textContent = "×";
+    close.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type: "host_lw_close_tab", pdfId }, location.origin);
+      } else {
+        closeDirectViewerTab(pdfId);
+      }
+    });
+    item.append(button, close);
+    container.appendChild(item);
+  }
+  requestAnimationFrame(updateToolbarTabScrollButtons);
+}
+
+function notifyDirectViewerTabSelected(tab) {
+  if (!tab) return;
+  void fetch("/app-tab-selected", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pdf_id: tab.pdfId, revision: tab.revision, viewer_url: tab.viewerUrl, visible_tab_token: tab.visibleTabToken }),
+  }).catch(() => undefined);
+}
+
+async function switchDirectViewerTab(pdfId, viewerUrl) {
+  if (pdfId === activePdfId()) {
+    notifyDirectViewerTabSelected(directViewerTabs.get(pdfId));
+    return;
+  }
+  try {
+    const tab = directViewerTabs.get(pdfId);
+    notifyDirectViewerTabSelected(tab);
+    const tabRevision = Number(tab?.revision);
+    const cached = pdfByteCache.get(pdfId);
+    const config = cached?.config && cached.revision === tabRevision ? cached.config : await fetchConfigForPdfId(pdfId);
+    if (cached?.revision === tabRevision && cached.inFlight) await cached.inFlight.catch(() => undefined);
+    persistAnnotations();
+    disconnectViewerSocket();
+    clearForwardSynctexMarker();
+    clearAnnotations({ persist: false });
+    hostState.config = config;
+    hostState.visibleRevision = Number(config.revision);
+    hostState.latestRevision = Number(config.revision);
+    document.title = tabDisplayTitle(tab || config, pdfId) || document.title;
+    await refreshToConfig(config, { preserveView: false });
+    restoreAnnotationsForActivePdf();
+    setDebugSynctexEnabled(config.debug_synctex === true);
+    connectViewerSocket();
+    history.pushState({ pdfId }, "", viewerUrl || `/viewer-lw/${encodeURIComponent(String(pdfId))}`);
+    renderToolbarTabs(currentDirectTabsState());
+  } catch (error) {
+    hostState.lastError = `tab switch failed: ${error?.message ?? String(error)}`;
+    updateHostDataset();
+  }
+}
+
+function currentDirectTabsState() {
+  return {
+    activePdfId: activePdfId(),
+    tabs: Array.from(directViewerTabs.values()),
+  };
+}
+
+function updateDirectViewerTab(message) {
+  const pdfId = Number(message.pdf_id);
+  if (!Number.isInteger(pdfId) || pdfId <= 0) return;
+  const revision = Number(message.revision);
+  const originalTitle = message.title || `PDF ${pdfId}`;
+  const tab = {
+    pdfId,
+    title: customTabTitle(pdfId) || originalTitle,
+    originalTitle,
+    revision,
+    viewerUrl: message.viewer_url || `/viewer-lw/${encodeURIComponent(String(pdfId))}`,
+    visibleTabToken: message.visible_tab_token,
+  };
+  directViewerTabs.set(pdfId, tab);
+  if (pdfId === activePdfId()) document.title = tabDisplayTitle(tab, pdfId);
+  renderToolbarTabs(currentDirectTabsState());
+  const cached = pdfByteCache.get(pdfId);
+  if (cached?.revision !== revision || (!cached.bytes && !cached.inFlight)) {
+    void fetchConfigForPdfId(pdfId).then((config) => prefetchPdfBytes(config)).catch(() => undefined);
+  }
+}
+
+function closeDirectViewerTab(pdfId) {
+  const tab = directViewerTabs.get(pdfId);
+  directViewerTabs.delete(pdfId);
+  renderToolbarTabs(currentDirectTabsState());
+  void fetch("/app-tab-closed", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pdf_id: pdfId, revision: tab?.revision, viewer_url: tab?.viewerUrl, visible_tab_token: tab?.visibleTabToken }),
+  }).catch(() => undefined);
+  if (pdfId === activePdfId()) {
+    const next = orderedTabsForRender(Array.from(directViewerTabs.values())).at(-1);
+    if (next?.viewerUrl) {
+      void switchDirectViewerTab(next.pdfId, next.viewerUrl);
+    } else {
+      persistAnnotations();
+      disconnectViewerSocket();
+      clearForwardSynctexMarker();
+      clearAnnotations({ persist: false });
+      void app()?.close?.();
+      hostState.lastError = undefined;
+      updateHostDataset();
+    }
+  }
+}
+
+function connectDirectViewerTabs() {
+  if (directViewerTabsConnected || typeof EventSource === "undefined") return;
+  directViewerTabsConnected = true;
+  if (hasActiveConfig(hostState.config)) {
+    updateDirectViewerTab({
+      type: "open_pdf",
+      pdf_id: activePdfId(),
+      title: hostState.config.title,
+      revision: hostState.config.revision,
+      viewer_url: `/viewer-lw/${encodeURIComponent(String(activePdfId()))}`,
+    });
+    void prefetchPdfBytes(hostState.config).catch(() => undefined);
+  } else {
+    renderToolbarTabs(currentDirectTabsState());
+  }
+  const events = new EventSource("/app-events");
+  events.addEventListener("message", (event) => {
+    try {
+      const message = JSON.parse(event.data);
+      if (message?.type === "open_pdf" || message?.type === "focus_pdf") updateDirectViewerTab(message);
+    } catch {}
+  });
+}
+
+function installHostTabMessageListener() {
+  window.addEventListener("message", (event) => {
+    if (event.origin !== location.origin) return;
+    const message = event.data;
+    if (!message || message.type !== "host_lw_tabs_state") return;
+    renderToolbarTabs(message);
+  });
+  window.parent?.postMessage?.({ type: "host_lw_tabs_ready", pdfId: activePdfId() }, location.origin);
+  connectDirectViewerTabs();
 }
 
 function installHoverToolbarButton() {
@@ -1546,8 +2176,15 @@ function scheduleHover(event, pageNumber) {
   }, HOVER_THROTTLE_MS);
 }
 
+function sendPendingProbe() {
+  if (!pendingProbe || !hostState.hoverEnabled || !viewerSocketOpen()) return;
+  const payload = pendingProbe;
+  pendingProbe = undefined;
+  sendViewerSocketPayload(payload);
+}
+
 function sendProbe(event, pageNumber) {
-  if (!hostState.hoverEnabled || event.ctrlKey || event.metaKey || !viewerSocketOpen()) return;
+  if (!hostState.hoverEnabled || event.ctrlKey || event.metaKey) return;
   if ((window.getSelection()?.toString() ?? "").length > 0) return;
   const point = clientPointToPdfPoint(event, pageNumber);
   if (!point) return;
@@ -1555,7 +2192,12 @@ function sendProbe(event, pageNumber) {
   probeRequestId = requestId;
   latestProbeRequestId = requestId;
   removeOverlays("[data-reverse-synctex-forward-probe]");
-  sendViewerSocketPayload({ type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageNumber) });
+  const payload = { type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexContextForPage(pageNumber) };
+  if (viewerSocketOpen()) {
+    sendViewerSocketPayload(payload);
+    return;
+  }
+  pendingProbe = payload;
 }
 
 function hoverDiagnosticsLabel(message) {
@@ -1669,20 +2311,24 @@ function installPageEventHandlers() {
 }
 
 function handleHostMessage(message) {
-  if (!message || Number(message.pdf_id) !== Number(initialConfig.pdf_id)) return;
+  if (!message) return;
+  if (message.type === "annotations_cleared") {
+    clearAnnotationsFromHostMessage(message);
+    return;
+  }
+  if (Number(message.pdf_id) !== activePdfId()) return;
   if (message.type === "pdf_refresh") {
     const nextRevision = Number(message.revision);
     if (!Number.isFinite(nextRevision) || nextRevision < hostState.latestRevision) return;
     const nextConfig = { ...hostState.config, revision: nextRevision, pdf_url: message.pdf_url };
     hostState.latestRevision = nextRevision;
     updateHostDataset();
-    void refreshToConfig(nextConfig);
+    void prefetchPdfBytes(nextConfig).catch(() => undefined).then(() => refreshToConfig(nextConfig));
   } else if (message.type === "synctex_forward") {
     pushNavigationHistory();
     showSynctexMarker(message);
-  } else if (message.type === "annotations_cleared") {
-    clearForwardSynctexMarker();
-    clearAnnotations();
+  } else if (message.type === "set_debug_synctex") {
+    setDebugSynctexEnabled(message.enabled === true);
   } else if (message.type === "reverse_synctex_hover_result") {
     showHoverResult(message);
   } else if (message.type === "reverse_synctex_forward_probe_result") {
@@ -1699,6 +2345,7 @@ function scheduleViewerSocketReconnect() {
 }
 
 async function reportInitialLoadedState() {
+  if (!hasActiveConfig(hostState.config)) return;
   const deadline = Date.now() + 10_000;
   try {
     while (Date.now() < deadline) {
@@ -1717,9 +2364,24 @@ async function reportInitialLoadedState() {
   }
 }
 
+function disconnectViewerSocket() {
+  const socket = activeSocket;
+  activeSocket = undefined;
+  if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+  pendingHover = undefined;
+  pendingProbe = undefined;
+  if (hoverTimer !== undefined) clearTimeout(hoverTimer);
+  hoverTimer = undefined;
+  socket?.close?.();
+  hostState.socketStatus = "disconnected";
+  updateHostDataset();
+}
+
 function connectViewerSocket() {
-  if (!initialConfig.viewer_socket_url) return;
-  const socket = new WebSocket(initialConfig.viewer_socket_url);
+  const socketUrl = hostState.config?.viewer_socket_url;
+  if (!socketUrl) return;
+  const socket = new WebSocket(socketUrl);
   activeSocket = socket;
   hostState.socketStatus = "connecting";
   updateHostDataset();
@@ -1729,6 +2391,7 @@ function connectViewerSocket() {
     updateHostDataset();
     sendLoadedStateDiagnostic("lw_loaded_state", { trigger: "socket_open" });
     sendToolsHitTargetDiagnostic("socket_open");
+    sendPendingProbe();
   });
   socket.addEventListener("message", (event) => {
     if (activeSocket !== socket) return;
@@ -1760,11 +2423,16 @@ await import("/viewer-lw/viewer.mjs");
 forceShowLaTeXWorkshopChrome();
 installNavigationHistoryControls();
 installSynctexOverlayRedrawHandlers();
+installBrowserViewerToolbarLayout();
+installToolbarTabsContainer();
+installHostTabMessageListener();
+installPdfThemeButton();
 installHoverToolbarButton();
-installDebugSynctexMenuButton();
+setDebugSynctexEnabled(initialConfig.debug_synctex === true);
 installToolsHitboxFallback();
 installPageEventHandlers();
-connectViewerSocket();
+void restoreAnnotationsForActivePdfWhenReady();
+if (hasActiveConfig(initialConfig)) connectViewerSocket();
 updateHostDataset();
 void reportInitialLoadedState();
 

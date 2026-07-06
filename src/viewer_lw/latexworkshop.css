@@ -203,7 +203,163 @@ body {
     z-index: 10;
 }
 
-#toolbarViewerRight {
+#toolbarContainer #toolbarViewer > #toolbarViewerLeft {
+    flex: 0 0 auto;
+    min-width: 0;
+    overflow: hidden;
+    justify-content: flex-start;
+}
+
+#toolbarViewerMiddle[hidden] {
+    display: none !important;
+}
+
+#toolbarContainer #toolbarViewer > #hostPdfTabsStrip {
+    flex: 1 1 auto !important;
+    min-width: 120px;
+    max-width: 100%;
+    justify-content: flex-start;
+    gap: 2px;
+    margin-inline: 4px 8px;
+    padding-inline: 4px;
+    border-inline: 1px solid rgb(255 255 255 / .26);
+    overflow: hidden;
+}
+
+#hostPdfTabsStrip[hidden] {
+    display: none !important;
+}
+
+#hostPdfTabsContainer {
+    display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 5px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    white-space: nowrap;
+}
+
+#hostPdfTabsContainer::-webkit-scrollbar {
+    display: none;
+}
+
+.hostPdfTabScrollButton {
+    flex: 0 0 28px;
+    width: 28px;
+    min-width: 28px;
+    height: 28px;
+    border-radius: 6px;
+}
+
+.hostPdfTabScrollButton[hidden] {
+    display: none !important;
+}
+
+#hostPdfTabScrollLeft::before {
+    -webkit-mask-image: var(--findbarButton-previous-icon);
+    mask-image: var(--findbarButton-previous-icon);
+}
+
+#hostPdfTabScrollRight::before {
+    -webkit-mask-image: var(--findbarButton-next-icon);
+    mask-image: var(--findbarButton-next-icon);
+}
+
+@media (max-width: 640px) {
+    #hostPdfTabsStrip[data-tab-count='1'] {
+        display: none !important;
+    }
+}
+
+.hostPdfTab {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 1 220px;
+    min-width: 100px;
+    max-width: 300px;
+    height: 28px;
+    border: 1px solid rgb(255 255 255 / .10);
+    border-radius: 6px;
+    background: rgb(39 44 52);
+    color: var(--main-color);
+    overflow: hidden;
+}
+
+.hostPdfTab:hover {
+    background: rgb(49 55 65);
+}
+
+.hostPdfTab[draggable='true'] {
+    cursor: grab;
+}
+
+.hostPdfTab.is-dragging {
+    opacity: .55;
+    cursor: grabbing;
+}
+
+.hostPdfTab.is-active {
+    background: rgb(82 92 108);
+    border-color: rgb(255 255 255 / .20);
+}
+
+.hostPdfTabButton,
+.hostPdfTabClose {
+    height: 100%;
+    border: 0;
+    color: inherit;
+    background: transparent;
+    font: message-box;
+    cursor: pointer;
+}
+
+.hostPdfTabButton {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding-inline: 9px 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: start;
+    white-space: nowrap;
+}
+
+.hostPdfTabButton[aria-current='page'] {
+    font-weight: 600;
+    cursor: text;
+}
+
+.hostPdfTabRenameInput {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 100%;
+    border: 0;
+    outline: 1px solid rgb(255 255 255 / .34);
+    outline-offset: -2px;
+    padding-inline: 8px 6px;
+    color: inherit;
+    background: rgb(30 34 40);
+    font: message-box;
+}
+
+.hostPdfTabClose {
+    flex: 0 0 24px;
+    width: 24px;
+    padding: 0;
+    color: rgb(218 224 232);
+    font-size: 16px;
+    line-height: 1;
+}
+
+.hostPdfTabClose:hover {
+    background: rgb(0 0 0 / .16);
+    color: white;
+}
+
+#toolbarContainer #toolbarViewer > #toolbarViewerRight {
+    flex: 0 0 auto;
+    margin-inline-start: 0;
     margin-inline-end: 0;
 }
 
@@ -249,12 +405,38 @@ body {
 }
 
 #hostSynctexHoverButton::before {
-    -webkit-mask-image: var(--editor-toolbar-highlight-image);
-    mask-image: var(--editor-toolbar-highlight-image);
+    content: "💬";
+    width: auto;
+    height: auto;
+    background: none;
+    -webkit-mask-image: none;
+    mask-image: none;
+    font-size: 15px;
+    line-height: 1;
 }
 
-#hostSynctexHoverButton[aria-pressed='true'] {
-    background-color: var(--toolbarButton-toggled-bg-color);
+#hostPdfThemeButton::before {
+    content: attr(data-icon);
+    width: auto;
+    height: auto;
+    background: none;
+    -webkit-mask-image: none;
+    mask-image: none;
+    font-size: 16px;
+    line-height: 1;
+}
+
+#hostSynctexHoverButton {
+    border-radius: 999px;
+}
+
+#hostSynctexHoverButton[aria-pressed='true'],
+#hostSynctexHoverButton[aria-pressed='true']:is(:hover,:focus-visible,:active) {
+    background-color: rgb(82 92 108) !important;
+}
+
+#hostSynctexHoverButton[aria-pressed='false']:is(:hover,:focus-visible) {
+    background-color: var(--button-hover-color);
 }
 
 .hostSynctexOverlayLabel {

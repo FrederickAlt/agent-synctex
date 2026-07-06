@@ -32,7 +32,7 @@ async function readHttp(url: string, init?: RequestInit): Promise<{ status: numb
 
 function assertHostLoadedWebCode(label: string, body: string): void {
 	assert.doesNotMatch(body, /https?:\/\//, `${label} must not reference external URLs`);
-	assert.doesNotMatch(body, /__TAURI__|@tauri-apps|window\.require|require\(|node:fs|from\s+["']fs["']|from\s+["']node:fs["']|mcp/i, `${label} must not depend on Tauri, Node filesystem APIs, or MCP internals`);
+	assert.doesNotMatch(body, /window\.require|require\(|node:fs|from\s+["']fs["']|from\s+["']node:fs["']|mcp/i, `${label} must not depend on Node filesystem APIs or MCP internals`);
 }
 
 async function assertPortCanBeRebound(port: number): Promise<void> {
@@ -386,7 +386,7 @@ test("Viewer Host Server serves side-by-side LaTeX Workshop viewer route and ass
 		const pdfJsModule = await readHttp(`${server.origin}/viewer-lw/build/pdf.mjs`);
 		assert.equal(pdfJsModule.status, 200);
 		assert.match(pdfJsModule.contentType, /javascript/);
-		assert.match(pdfJsModule.body.toString("utf8"), /^\/\/ PDF\.js compatibility polyfills for older WebKit\/Tauri webviews\./);
+		assert.match(pdfJsModule.body.toString("utf8"), /^\/\/ PDF\.js compatibility polyfills for older WebKit webviews\./);
 		assert.match(pdfJsModule.body.toString("utf8"), /Promise\.withResolvers/);
 		assert.match(pdfJsModule.body.toString("utf8"), /Promise\.try/);
 		assert.match(pdfJsModule.body.toString("utf8"), /pdfjsVersion = 5\.7\.284/);
@@ -394,7 +394,7 @@ test("Viewer Host Server serves side-by-side LaTeX Workshop viewer route and ass
 		const worker = await readHttp(`${server.origin}/viewer-lw/build/pdf.worker.mjs`);
 		assert.equal(worker.status, 200);
 		assert.match(worker.contentType, /javascript/);
-		assert.match(worker.body.toString("utf8"), /^\/\/ PDF\.js compatibility polyfills for older WebKit\/Tauri webviews\./);
+		assert.match(worker.body.toString("utf8"), /^\/\/ PDF\.js compatibility polyfills for older WebKit webviews\./);
 		assert.match(worker.body.toString("utf8"), /Promise\.withResolvers/);
 		assert.match(worker.body.toString("utf8"), /Promise\.try/);
 		assert.match(worker.body.toString("utf8"), /pdfjsVersion = 5\.7\.284/);

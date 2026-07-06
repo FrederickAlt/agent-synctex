@@ -274,7 +274,7 @@ test("LaTeX Workshop viewer Tools button is clickable across its hitbox", async 
 		assert.ok(layout.toolbarRightGap <= 8, `right toolbar group should remain flush with the stock toolbar edge: ${JSON.stringify(layout)}`);
 
 		const diagnostics = await page.evaluate(() => (window as unknown as { __hostLwToolsHitTargetDebug?: () => { scrollbarGutter?: { overlapsToolsRect?: boolean; toolsGapToViewport?: number }; points: Array<{ name: string; expectedHit?: boolean; closestToolsButton?: string; closestToolsContainer?: string; interceptingElement?: unknown }> } }).__hostLwToolsHitTargetDebug?.());
-		assert.ok(diagnostics, "Tools hit-target diagnostics should be exposed to browser/Tauri debug hooks");
+		assert.ok(diagnostics, "Tools hit-target diagnostics should be exposed to browser debug hooks");
 		assert.equal(diagnostics.scrollbarGutter?.overlapsToolsRect, false, `viewer scrollbar gutter should not overlap Tools vertically: ${JSON.stringify(diagnostics.scrollbarGutter)}`);
 		assert.ok((diagnostics.scrollbarGutter?.toolsGapToViewport ?? 999) <= 8, `Tools should remain right-aligned, not shifted left for a reserved gutter: ${JSON.stringify(diagnostics.scrollbarGutter)}`);
 		for (const hit of diagnostics.points) {
@@ -474,7 +474,7 @@ test("LaTeX Workshop viewer keeps toolbar-integrated navigation history", async 
 				return target.dispatchEvent(event);
 			});
 		});
-		assert.deepEqual(webkitWhichBackDefaults, [false, false, false], "WebKit/Tauri MSB4 which=4 sequence should suppress browser default navigation");
+		assert.deepEqual(webkitWhichBackDefaults, [false, false, false], "WebKit MSB4 which=4 sequence should suppress browser default navigation");
 		await page.waitForFunction(() => (window as unknown as { __hostLwNavigationHistoryDebug: { capture(): { scrollTop: number } } }).__hostLwNavigationHistoryDebug.capture().scrollTop < 2);
 		const webkitWhichForwardDefaults = await page.evaluate(() => {
 			const target = document.getElementById("viewerContainer") ?? document.body;
@@ -484,7 +484,7 @@ test("LaTeX Workshop viewer keeps toolbar-integrated navigation history", async 
 				return target.dispatchEvent(event);
 			});
 		});
-		assert.deepEqual(webkitWhichForwardDefaults, [false, false, false], "WebKit/Tauri MSB5 which=5 sequence should suppress browser default navigation");
+		assert.deepEqual(webkitWhichForwardDefaults, [false, false, false], "WebKit MSB5 which=5 sequence should suppress browser default navigation");
 		await page.waitForFunction((target) => Math.abs((window as unknown as { __hostLwNavigationHistoryDebug: { capture(): { scrollTop: number } } }).__hostLwNavigationHistoryDebug.capture().scrollTop - Number(target)) < 2, firstJumpScroll);
 		const rawMouseDrain = await (await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" })).json() as { events: Array<{ type: string; phase?: string; details?: { type?: string; button?: number; buttons?: number; which?: number; target?: unknown; defaultPrevented?: boolean; handledDirection?: string } }> };
 		const rawMouseEvents = rawMouseDrain.events.filter((event) => event.type === "selection_debug" && event.phase === "lw_raw_mouse_event");
@@ -647,13 +647,13 @@ test("LaTeX Workshop app shell forwards parent-level history shortcuts to the ac
 			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
 			return (debug?.capture().scrollTop ?? 0) > 50;
 		});
-		assert.deepEqual(await dispatchParentSideButton({ button: 0, buttons: 0, which: 4 }), [true, true, true, true, true], "parent WebKit/Tauri MSB4 which=4 sequence should suppress browser navigation");
+		assert.deepEqual(await dispatchParentSideButton({ button: 0, buttons: 0, which: 4 }), [true, true, true, true, true], "parent WebKit MSB4 which=4 sequence should suppress browser navigation");
 		await page.waitForFunction(() => {
 			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
 			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
 			return (debug?.capture().scrollTop ?? 999) < 2;
 		});
-		assert.deepEqual(await dispatchParentSideButton({ button: 0, buttons: 0, which: 5 }), [true, true, true, true, true], "parent WebKit/Tauri MSB5 which=5 sequence should suppress browser navigation");
+		assert.deepEqual(await dispatchParentSideButton({ button: 0, buttons: 0, which: 5 }), [true, true, true, true, true], "parent WebKit MSB5 which=5 sequence should suppress browser navigation");
 		await page.waitForFunction(() => {
 			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
 			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
@@ -811,7 +811,7 @@ test("LaTeX Workshop viewer route renders inside older WebKit-like runtimes with
 		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
 		const page = await browser.newPage();
 		await page.addInitScript(() => {
-			// Tauri on Linux uses the system WebKitGTK, which can lag Chromium's newer Promise APIs.
+			// Some WebKitGTK environments can lag Chromium's newer Promise APIs.
 			Reflect.deleteProperty(Promise, "withResolvers");
 			Reflect.deleteProperty(Promise, "try");
 		});
@@ -1177,7 +1177,7 @@ test("LaTeX Workshop viewer selection reverse SyncTeX payload preserves selected
 	}
 });
 
-test("LaTeX Workshop viewer annotation is active by default and debug menu gates hover overlay", async () => {
+test("LaTeX Workshop viewer annotation is active by default and hidden debug switch gates hover overlay", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-hover-"));
 	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
 	const registry = new ViewerHostPdfRegistry();
@@ -1192,12 +1192,24 @@ test("LaTeX Workshop viewer annotation is active by default and debug menu gates
 		await waitForLwPageReady(page);
 
 		await page.waitForFunction(() => document.body.dataset.hostLwHoverEnabled === "true" && document.body.dataset.hostLwDebugSynctexEnabled === "false", undefined, { timeout: 2_000 });
+		const activeAnnotationButton = await page.locator("#hostSynctexHoverButton").evaluate((element) => ({
+			pressed: element.getAttribute("aria-pressed"),
+			backgroundColor: getComputedStyle(element).backgroundColor,
+			borderRadius: getComputedStyle(element).borderRadius,
+		}));
+		assert.equal(activeAnnotationButton.pressed, "true", "annotation mode should be enabled by default");
+		assert.notEqual(activeAnnotationButton.backgroundColor, "rgba(0, 0, 0, 0)", "active annotation button should show a persistent background");
+		assert.notEqual(activeAnnotationButton.borderRadius, "0px", "active annotation button should be rounded");
+		await page.locator("#hostSynctexHoverButton").click();
+		await page.waitForFunction(() => document.body.dataset.hostLwHoverEnabled === "false", undefined, { timeout: 2_000 });
+		await page.locator("#hostSynctexHoverButton").click();
+		await page.waitForFunction(() => document.body.dataset.hostLwHoverEnabled === "true", undefined, { timeout: 2_000 });
 		const point = await lwCanvasPoint(page, 1, 120, 70);
 		await page.mouse.move(point.clientX, point.clientY);
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		assert.equal(await page.locator("[data-reverse-synctex-hover='rect']").count(), 0, "hover debug overlay should be hidden by default");
-		await page.locator("#secondaryToolbarToggleButton").click();
-		await page.locator("#hostSynctexDebugButton").click();
+		assert.equal(await page.locator("#hostSynctexDebugButton").count(), 0, "debug overlay control should not be visible in viewer UI");
+		await new ViewerHostControlClient({ origin: server.origin }).send({ type: "set_debug_synctex", pdf_id: 149, enabled: true });
 		await page.waitForFunction(() => document.body.dataset.hostLwDebugSynctexEnabled === "true", undefined, { timeout: 2_000 });
 		await page.mouse.move(point.clientX + 1, point.clientY + 1);
 		await page.waitForSelector("[data-reverse-synctex-hover='rect']", { state: "attached", timeout: 5_000 });
@@ -1205,10 +1217,10 @@ test("LaTeX Workshop viewer annotation is active by default and debug menu gates
 			width: Number.parseFloat((element as HTMLElement).style.width),
 			height: Number.parseFloat((element as HTMLElement).style.height),
 			pressed: document.getElementById("hostSynctexHoverButton")?.getAttribute("aria-pressed"),
-			debugPressed: document.getElementById("hostSynctexDebugButton")?.getAttribute("aria-pressed"),
+			debugEnabled: document.body.dataset.hostLwDebugSynctexEnabled,
 		}));
 		assert.equal(overlay.pressed, "true");
-		assert.equal(overlay.debugPressed, "true");
+		assert.equal(overlay.debugEnabled, "true");
 		assert.ok(overlay.width > 0 && overlay.height > 0, "hover result should render a visible overlay");
 	} finally {
 		await browser?.close();

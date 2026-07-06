@@ -52,6 +52,7 @@ export interface HostServiceCompileRequest {
 		open_pdf?: boolean;
 		reuse_existing?: boolean;
 		require_persistent_viewer?: boolean;
+		debug_synctex?: boolean;
 		callback_target_id?: string;
 		callback?: HostServiceCallbackTarget;
 	};
@@ -72,6 +73,7 @@ export interface HostServiceCompileSnippetRequest {
 		fixed_preview?: boolean;
 		reuse_existing?: boolean;
 		require_persistent_viewer?: boolean;
+		debug_synctex?: boolean;
 		callback_target_id?: string;
 		callback?: HostServiceCallbackTarget;
 	};
@@ -152,6 +154,7 @@ export interface HostServiceOpenRequest {
 		callback?: HostServiceCallbackTarget;
 		reuse_existing?: boolean;
 		require_persistent_viewer?: boolean;
+		debug_synctex?: boolean;
 	};
 }
 
@@ -173,6 +176,7 @@ export interface HostServiceJumpRequest {
 	pdf_id: number;
 	line: number;
 	source_file?: string;
+	debug_synctex?: boolean;
 }
 
 export type HostServiceRequest =
@@ -286,6 +290,7 @@ export interface HostServiceCompileResponseDetails {
 	diagnostics?: LatexDiagnosticSummary[];
 	pdf_id?: number;
 	viewer_url?: string;
+	browser_launch?: Record<string, unknown>;
 	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
 }
@@ -315,6 +320,7 @@ export interface HostServiceCompileSnippetResponseDetails {
 	operation_artifact_paths?: string[];
 	pdf_id?: number;
 	viewer_url?: string;
+	browser_launch?: Record<string, unknown>;
 	managed_record?: HostServiceManagedViewerRecord;
 	error_code?: string;
 }

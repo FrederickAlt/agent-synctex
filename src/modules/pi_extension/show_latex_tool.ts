@@ -22,6 +22,7 @@ import {
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
 import { renderShowLatexResult, rememberInlinePreviewRenderState } from "./inline_renderer.ts";
 import { errorMessage, latexToolFailure, tailText } from "./error_utils.ts";
+import { appendViewerUrlAgentNotice } from "../viewer_url_agent_notice.ts";
 
 const latexFileCompileToolSupport = createLatexFileCompileToolSupport();
 
@@ -80,8 +81,10 @@ const showLatexPreviewPipeline = createShowLatexPreviewPipeline({
 			: "";
 		const pdfId = compileResult.pdf_id === undefined ? "" : ` pdf_id=${compileResult.pdf_id}`;
 		const pdf = compileResult.pdf ? ` pdf=${compileResult.pdf}` : "";
+		const cleanOk = status === "ok" && !compileResult.warning_count;
+		const log = !cleanOk && compileResult.log ? `\nLog: ${compileResult.log}` : "";
 		return {
-			text: `${status}:${pdfId}${pdf}${warningCount}\nLog: ${compileResult.log}${warningSummary}`,
+			text: `${status}:${pdfId}${pdf}${warningCount}${log}${warningSummary}`,
 			pdfPath: compileResult.pdf,
 			logPath: compileResult.log,
 			compileStatus: compileResult.compile_status,
@@ -94,6 +97,7 @@ const showLatexPreviewPipeline = createShowLatexPreviewPipeline({
 			operationPdfPath: compileResult.operation_pdf,
 			targetPdfId: compileResult.pdf_id,
 			managedRecord: compileResult.managed_record,
+			viewerUrlNoticeDetails: compileResult,
 		};
 	},
 	rememberInlinePreviewRenderState,
@@ -149,7 +153,7 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 		name: "show_latex",
 		label: "Show LaTeX",
 		description:
-			"FREEFORM/raw LaTeX preview. Pass LaTeX code directly; optional YAML-like front matter may set compiler and inline. Example: ---\ncompiler: lualatex\ninline: false\n---\n\\begin{equation}\nx\n\\end{equation}\nThe \\begin{document}...\\end{document} wrapper is accepted but not required. Defaults to inline preview with lualatex; set inline=false to request host-service external open instead.",
+			"FREEFORM/raw LaTeX preview. Pass LaTeX code directly; optional YAML-like front matter may set compiler and inline. Example: ---\ncompiler: lualatex\ninline: false\n---\n\\begin{equation}\nx\n\\end{equation}\nThe \\begin{document}...\\end{document} wrapper is accepted but not required. Defaults to inline preview with lualatex; set inline=false to request host-service external open instead. For external opens, if a browser viewer is detected after launch/focus, only pdf_id/status is returned because the user can already see the output; if no live browser viewer is detected, the result includes a Viewer URL to pass to the user.",
 		promptSnippet: "FREEFORM LaTeX preview; optional front matter can set compiler and inline",
 		promptGuidelines: [
 			"Use show_latex when the user asks for a LaTeX PDF preview. Prefer passing only the LaTeX body, for example \\[x\\]; \\begin{document}...\\end{document} is accepted but usually unnecessary.",
@@ -245,7 +249,7 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 					throw new Error("Host service compile/open response missing pdf_id");
 				}
 				return {
-					content: [{ type: "text", text: preview.text }],
+					content: [{ type: "text", text: appendViewerUrlAgentNotice(preview.text, preview.viewerUrlNoticeDetails ?? {}) }],
 					details: {
 						pdf: managedRecord?.pdfPath || preview.previewPdfPath,
 						source: managedRecord?.defaultSourcePath ?? preview.sourcePath,

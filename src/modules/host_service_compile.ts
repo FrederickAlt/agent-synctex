@@ -286,6 +286,7 @@ export class HostServiceCompileService {
 					...compileDiagnosticsDetails(result),
 					pdf_id: openResponse?.status_details.pdf_id,
 					viewer_url: openResponse?.status_details.viewer_url,
+					browser_launch: openResponse?.status_details.browser_launch,
 					managed_record: openResponse?.status_details.managed_record,
 				},
 			};
@@ -434,6 +435,7 @@ export class HostServiceCompileService {
 					operation_artifact_paths: operationArtifactPaths,
 					pdf_id: openResponse?.status_details.pdf_id,
 					viewer_url: openResponse?.status_details.viewer_url,
+					browser_launch: openResponse?.status_details.browser_launch,
 					managed_record: openResponse?.status_details.managed_record,
 				},
 			};
@@ -578,6 +580,7 @@ export class HostServiceCompileService {
 				openCallback,
 				request.details.reuse_existing,
 				request.details.require_persistent_viewer,
+				request.details.debug_synctex,
 			);
 		} catch (error) {
 			return buildCompileOpenFailureResponse(
@@ -664,6 +667,7 @@ export class HostServiceCompileService {
 		callback: HostServiceCallbackTarget | undefined,
 		reuseExisting?: boolean,
 		requirePersistentViewer?: boolean,
+		debugSynctex?: boolean,
 	): Promise<HostServiceOpenResponseEnvelope> {
 		return this.managedViewerService.openViewer({
 			protocol_version: this.protocolVersion,
@@ -676,6 +680,7 @@ export class HostServiceCompileService {
 				...(callback === undefined ? {} : { callback }),
 				reuse_existing: reuseExisting ?? true,
 				require_persistent_viewer: requirePersistentViewer ?? false,
+				...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
 			},
 		});
 	}

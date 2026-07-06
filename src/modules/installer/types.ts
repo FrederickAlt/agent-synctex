@@ -7,6 +7,7 @@ export interface InstallerContext {
 	scope: InstallScope;
 	dryRun: boolean;
 	yes: boolean;
+	noHooks: boolean;
 	stdout: Pick<NodeJS.WritableStream, "write">;
 	stderr: Pick<NodeJS.WritableStream, "write">;
 }

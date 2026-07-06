@@ -260,7 +260,33 @@ test("PDF annotation socket payloads are coalesced for MCP drain and clear viewe
 		const payload = await response.json() as { ok?: boolean; events?: unknown[] };
 		assert.equal(payload.ok, true);
 		assert.deepEqual(payload.events, [{ type: "pdf_annotation", pdf_id: 33, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, source_line: "new", comment: "new" }]);
-		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 33 });
+		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 33, pdf_ids: [33] });
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("clear_pdf_annotations reaches active viewer sockets for inactive PDFs", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-clear-inactive-"));
+	const activePdfPath = join(baseDir, "active.pdf");
+	const inactivePdfPath = join(baseDir, "inactive.pdf");
+	writeFakePdf(activePdfPath, "active");
+	writeFakePdf(inactivePdfPath, "inactive");
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 33, pdfPath: inactivePdfPath, title: basename(inactivePdfPath), revision: 1, fileSnapshot: snapshotPdf(inactivePdfPath) });
+		registry.registerPdf({ pdfId: 34, pdfPath: activePdfPath, title: basename(activePdfPath), revision: 1, fileSnapshot: snapshotPdf(activePdfPath) });
+		await server.start();
+		const token = await getViewerSocketToken(server.origin, 34);
+		socket = await openViewerSocket(server.origin, 34, token);
+		const clearMessage = nextJsonMessage(socket);
+		const response = await new ViewerHostControlClient({ origin: server.origin }).send({ type: "clear_pdf_annotations", pdf_id: 33 });
+		assert.deepEqual(response, { ok: true, result: { type: "clear_pdf_annotations", pdf_id: 33 } });
+		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 33, pdf_ids: [33] });
 	} finally {
 		socket?.close();
 		await server.stop();

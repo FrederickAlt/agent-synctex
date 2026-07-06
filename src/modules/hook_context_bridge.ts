@@ -4,7 +4,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join } from "node:path";
 import { getMcpTmpDir } from "./runtime_paths.ts";
 import { sanitizeTexActionsAgentId } from "./agent_runtime_context.ts";
-import type { FetchPdfContextRequest, PostUserPdfContextResult } from "./post_user_pdf_context.ts";
+import { collectPostUserPdfContextFromEvents, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
+import type { PdfAnnotationEvent, PdfEvent } from "./pdf_events.ts";
+import { validateViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
 
 export const HOOK_CONTEXT_BRIDGE_FILE_NAME = "hook-context-bridge.json";
 const HOOK_CONTEXT_BRIDGE_VERSION = 1;
@@ -85,6 +87,7 @@ export interface FetchHookContextOptions {
 	runtimeRoot?: string;
 	agentId?: string;
 	prompt?: string;
+	cwd?: string;
 	fetchImpl?: typeof fetch;
 }
 
@@ -102,12 +105,13 @@ export async function fetchHookContext(options: FetchHookContextOptions = {}): P
 				body: JSON.stringify({ prompt: options.prompt ?? "" }),
 			});
 			if (!response.ok) continue;
-			return (await response.text()).trim();
+			const text = (await response.text()).trim();
+			if (text) return text;
 		} catch {
 			continue;
 		}
 	}
-	return "";
+	return await fetchPersistentViewerHostContext(options);
 }
 
 export function findHookContextBridgeDiscoveries(options: Pick<FetchHookContextOptions, "runtimeRoot" | "agentId"> = {}): HookContextBridgeDiscovery[] {
@@ -188,6 +192,72 @@ function textResponse(response: ServerResponse, status: number, text: string): v
 		"cache-control": "no-store",
 	});
 	response.end(text);
+}
+
+async function fetchPersistentViewerHostContext(options: FetchHookContextOptions): Promise<string> {
+	const runtimeRoot = options.runtimeRoot ?? getMcpTmpDir();
+	const agentId = options.agentId ?? process.env.TEX_ACTIONS_AGENT_ID;
+	if (!agentId?.trim()) return "";
+	const state = readPersistentViewerHostState(join(runtimeRoot, "agents", sanitizeTexActionsAgentId(agentId)));
+	if (!state) return "";
+	const fetchImpl = options.fetchImpl ?? fetch;
+	try {
+		const response = await fetchImpl(`${state.origin}/mcp-events/drain`, { method: "POST" });
+		const payload = await response.json() as { ok?: unknown; events?: unknown[] };
+		if (!response.ok || payload.ok !== true || !Array.isArray(payload.events)) return "";
+		const events = hostMessagesToPdfEvents(payload.events);
+		const result = collectPostUserPdfContextFromEvents(events, { maxEvents: 20, clearViewer: true, cwd: options.cwd ?? process.cwd() });
+		if (result.cleared) {
+			await Promise.allSettled(result.pdfIds.map((pdfId) => fetchImpl(`${state.origin}/control`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ type: "clear_pdf_annotations", pdf_id: pdfId }),
+			})));
+		}
+		return result.text;
+	} catch {
+		return "";
+	}
+}
+
+function hostMessagesToPdfEvents(messages: unknown[]): PdfEvent[] {
+	let sequence = 0;
+	const events: PdfAnnotationEvent[] = [];
+	for (const message of messages) {
+		let parsed: ReturnType<typeof validateViewerHostToMcpMessage>;
+		try {
+			parsed = validateViewerHostToMcpMessage(message);
+		} catch {
+			continue;
+		}
+		if (parsed.type !== "pdf_annotation") continue;
+		sequence += 1;
+		events.push({
+			type: "pdf_annotation",
+			sequence,
+			pdf_id: parsed.pdf_id,
+			annotation_id: parsed.annotation_id,
+			timestamp: new Date().toISOString(),
+			source_file: parsed.source_file,
+			line: parsed.line,
+			...(parsed.source_line === undefined ? {} : { source_line: parsed.source_line }),
+			page: parsed.page,
+			x: parsed.x,
+			y: parsed.y,
+			...(parsed.comment === undefined ? {} : { comment: parsed.comment }),
+		});
+	}
+	return events;
+}
+
+function readPersistentViewerHostState(runtimeDir: string): { origin: string } | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(join(runtimeDir, "viewer-host.json"), "utf8")) as { origin?: unknown };
+		if (typeof raw.origin !== "string" || !raw.origin.startsWith("http://127.0.0.1:")) return undefined;
+		return { origin: raw.origin.replace(/\/$/, "") };
+	} catch {
+		return undefined;
+	}
 }
 
 function readDiscoveryFile(path: string): HookContextBridgeDiscovery | undefined {

@@ -68,7 +68,7 @@ test("compile_latex_file performs one fake one-shot compile and returns source/p
 			assert.equal(response.result?.isError, undefined);
 			const details = response.result?.details ?? {};
 			assert.equal(details.source, join(baseDir, "paper.tex"));
-			assert.equal(details.pdf, join(baseDir, "paper.pdf"));
+			assert.equal(details.pdf, undefined);
 			assert.equal(details.log, join(baseDir, "paper.log"));
 			assert.equal(details.compile_status, "ok_with_warnings");
 			assert.equal(details.warning_count, 1);
@@ -135,9 +135,11 @@ test("compile_latex_file open_pdf uses Viewer Host and reuses an already tracked
 	const service = new ViewerHostMcpService({ client, makePdfId: () => 42 });
 	try {
 		await withPath(`${join(baseDir, "bin")}:${process.env.PATH ?? ""}`, async () => {
-			const first = await callCompile({ latex_file_path: "paper.tex", open_pdf: true, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
+			const first = await callCompile({ latex_file_path: "paper.tex", open_pdf: true, workspace_context: { cwd: baseDir } }, service) as { result?: { content?: Array<{ text?: string }>; details?: Record<string, unknown> } };
 			assert.equal(first.result?.details?.pdf_id, 42);
-			assert.equal(first.result?.details?.viewer_url, "http://127.0.0.1:43125/viewer-lw/42");
+			assert.equal(first.result?.details?.viewer_url, undefined);
+			assert.match(first.result?.content?.[0]?.text ?? "", /^ok_with_warnings: pdf_id=42 warnings=1[\s\S]*Warnings: 1 warnings hidden\.$/);
+			assert.doesNotMatch(JSON.stringify(first.result), /127\.0\.0\.1|viewer_url/);
 
 			const second = await callCompile({ latex_file_path: "paper.tex", open_pdf: true, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 			assert.equal(second.result?.details?.pdf_id, 42);

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
-import { createDefaultViewerHostClientFactory, DesktopViewerAppProcessLauncher, FakeViewerHostClient, resolveDefaultDesktopViewerAppLaunchConfig, ViewerHostMcpService, type DesktopViewerAppLaunchTarget, type DesktopViewerAppLauncher, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import { createDefaultViewerHostClientFactory, FakeViewerHostClient, ViewerHostMcpService, type BrowserViewerLaunchTarget, type BrowserViewerLauncher, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
 import type { McpToViewerHostMessage, ViewerHostControlResponse, ViewerHostToMcpMessage } from "../../src/modules/viewer_host_protocol.ts";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
@@ -58,41 +58,6 @@ async function withPath<T>(pathValue: string, fn: () => Promise<T>): Promise<T> 
 	} finally {
 		if (previous === undefined) delete process.env.PATH;
 		else process.env.PATH = previous;
-	}
-}
-
-function writeFakeDesktopAppLauncher(baseDir: string): { command: string; logPath: string } {
-	const command = join(baseDir, "fake-desktop-viewer-app.js");
-	const logPath = join(baseDir, "desktop-app-launches.jsonl");
-	writeFileSync(command, `#!/usr/bin/env node
-const fs = require("node:fs");
-fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({
-  appUrl: process.env.PDF_PREVIEW_VIEWER_HOST_APP_URL,
-  origin: process.env.PDF_PREVIEW_VIEWER_HOST_ORIGIN,
-  custom: process.env.CUSTOM_APP_ENV,
-  argv: process.argv.slice(2)
-}) + "\\n");
-setInterval(() => {}, 1000);
-`);
-	chmodSync(command, 0o700);
-	return { command, logPath };
-}
-
-function writeFailingDesktopAppLauncher(baseDir: string): string {
-	const command = join(baseDir, "failing-desktop-viewer-app.js");
-	writeFileSync(command, `#!/usr/bin/env node
-console.error("desktop app startup failed intentionally");
-process.exit(42);
-`);
-	chmodSync(command, 0o700);
-	return command;
-}
-
-async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
-	const started = Date.now();
-	while (!existsSync(path)) {
-		if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 }
 
@@ -172,11 +137,37 @@ class ScriptedViewerHostClient implements ViewerHostClient {
 	}
 }
 
-class RecordingDesktopViewerAppLauncher implements DesktopViewerAppLauncher {
-	readonly calls: DesktopViewerAppLaunchTarget[] = [];
+class RecordingBrowserViewerLauncher implements BrowserViewerLauncher {
+	readonly calls: BrowserViewerLaunchTarget[] = [];
 
-	async launchOrFocus(target: DesktopViewerAppLaunchTarget): Promise<void> {
+	async launchOrFocus(target: BrowserViewerLaunchTarget): Promise<void> {
 		this.calls.push(target);
+	}
+}
+
+class ViewerSocketBrowserLauncher extends RecordingBrowserViewerLauncher {
+	private readonly pdfId: number;
+	private socket: WebSocket | undefined;
+
+	constructor(pdfId: number) {
+		super();
+		this.pdfId = pdfId;
+	}
+
+	override async launchOrFocus(target: BrowserViewerLaunchTarget): Promise<void> {
+		await super.launchOrFocus(target);
+		const config = await (await fetch(`${target.origin}/config/${this.pdfId}.json`)).json() as { viewer_socket_url?: unknown };
+		if (typeof config.viewer_socket_url !== "string") throw new Error("viewer socket URL missing");
+		this.socket = new WebSocket(config.viewer_socket_url);
+		await new Promise<void>((resolveOpen, rejectOpen) => {
+			const timer = setTimeout(() => rejectOpen(new Error("timed out opening simulated viewer socket")), 1_000);
+			this.socket?.addEventListener("open", () => { clearTimeout(timer); resolveOpen(); }, { once: true });
+			this.socket?.addEventListener("error", () => { clearTimeout(timer); rejectOpen(new Error("simulated viewer socket errored")); }, { once: true });
+		});
+	}
+
+	close(): void {
+		this.socket?.close();
 	}
 }
 
@@ -223,96 +214,79 @@ test("reverse-forward probe is handled by ViewerHostServer without mcpEventSink 
 	}
 });
 
-test("desktop app process launcher passes the Host /app target through a configurable app command", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-app-process-contract-"));
-	const fakeApp = writeFakeDesktopAppLauncher(baseDir);
-	const launcher = new DesktopViewerAppProcessLauncher({ command: fakeApp.command, args: ["--from-test"], env: { CUSTOM_APP_ENV: "set" } });
+test("default Viewer Host client factory reuses agent runtime server origin", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-reuse-"));
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	const launches: BrowserViewerLaunchTarget[] = [];
 	try {
-		await launcher.launchOrFocus({ origin: "http://127.0.0.1:49152", appUrl: "http://127.0.0.1:49152/app" });
-		await waitForFile(fakeApp.logPath);
-		const launch = JSON.parse(readFileSync(fakeApp.logPath, "utf8").trim()) as { appUrl?: unknown; origin?: unknown; argv?: unknown; custom?: unknown };
-		assert.equal(launch.origin, "http://127.0.0.1:49152");
-		assert.equal(launch.appUrl, "http://127.0.0.1:49152/app");
-		assert.deepEqual(launch.argv, ["--from-test"]);
-		assert.equal(launch.custom, "set");
+		await server.start();
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, updated_at: new Date().toISOString() }) + "\n");
+		const factory = createDefaultViewerHostClientFactory({
+			agentRuntimeDir: baseDir,
+			command: join(baseDir, "must-not-launch"),
+			browserOpenAckTimeoutMs: 20,
+			browserLauncher: { launchOrFocus: (target) => { launches.push(target); } },
+		});
+		const client = await factory();
+		assert.equal(client.origin, server.origin);
+		const pdfPath = join(baseDir, "paper.pdf");
+		writeFakePdf(pdfPath);
+		const response = await client.send({ type: "open_pdf", pdf_id: 345, pdf_path: pdfPath, title: "paper.pdf", workspace_cwd: baseDir });
+		assert.equal(response?.ok, true);
+		assert.equal(registry.getPdf(345).pdfPath, resolve(pdfPath));
+		assert.equal(launches.length, 1);
+		assert.equal(launches[0]?.origin, server.origin);
+		assert.equal(response?.ok === true && "result" in response ? response.result.browser_open_confirmed : undefined, false);
+		assert.equal(JSON.parse(readFileSync(join(baseDir, "viewer-host.json"), "utf8")).browser_opened_at, undefined);
+		await client.close?.();
+		assert.equal((await fetch(`${server.origin}/config/345.json`)).status, 200, "reused server should not be shut down when client closes");
 	} finally {
-		await launcher.close();
+		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });
 
-test("default desktop app binary discovery uses the package root, not the user's LaTeX cwd", () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-package-root-discovery-"));
-	const userLatexCwd = join(baseDir, "latex-project");
-	const packageRoot = join(baseDir, "package-root");
-	const packageBinary = resolve(packageRoot, "apps", "viewer-desktop-tauri", "src-tauri", "target", "debug", process.platform === "win32" ? "pdf-preview-viewer.exe" : "pdf-preview-viewer");
-	mkdirSync(userLatexCwd, { recursive: true });
-	mkdirSync(resolve(packageBinary, ".."), { recursive: true });
-	writeFileSync(packageBinary, "#!/usr/bin/env sh\nexit 0\n");
-	chmodSync(packageBinary, 0o700);
-	const env = { ...process.env };
-	delete env.PDF_PREVIEW_VIEWER_APP_COMMAND;
-	delete env.PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK;
+
+test("default Viewer Host client factory reopens an already-opened reused host when no active viewer is connected", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-reuse-opened-"));
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	const launches: BrowserViewerLaunchTarget[] = [];
 	try {
-		const config = resolveDefaultDesktopViewerAppLaunchConfig(env, userLatexCwd, packageRoot);
-		assert.equal(config.command, packageBinary);
+		await server.start();
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, updated_at: new Date().toISOString(), browser_opened_at: new Date().toISOString() }) + "\n");
+		const factory = createDefaultViewerHostClientFactory({
+			agentRuntimeDir: baseDir,
+			command: join(baseDir, "must-not-launch"),
+			browserOpenAckTimeoutMs: 20,
+			browserLauncher: { launchOrFocus: (target) => { launches.push(target); } },
+		});
+		const client = await factory();
+		const pdfPath = join(baseDir, "paper.pdf");
+		writeFakePdf(pdfPath);
+		const response = await client.send({ type: "open_pdf", pdf_id: 346, pdf_path: pdfPath, title: "paper.pdf", workspace_cwd: baseDir });
+		assert.equal(response?.ok, true);
+		assert.equal(launches.length, 1);
+		assert.equal(response?.ok === true && "result" in response ? response.result.browser_open_confirmed : undefined, false);
 	} finally {
+		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });
 
-test("default desktop app dev fallback runs npm from the package root", () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-dev-fallback-cwd-"));
-	const userLatexCwd = join(baseDir, "latex-project");
-	const packageRoot = join(baseDir, "package-root");
-	mkdirSync(userLatexCwd, { recursive: true });
-	mkdirSync(packageRoot, { recursive: true });
-	const env = { ...process.env };
-	delete env.PDF_PREVIEW_VIEWER_APP_COMMAND;
-	env.PDF_PREVIEW_VIEWER_APP_DEV_FALLBACK = "1";
-	try {
-		const config = resolveDefaultDesktopViewerAppLaunchConfig(env, userLatexCwd, packageRoot);
-		assert.deepEqual(config, { command: "npm", args: ["run", "tauri:viewer:dev"], cwd: packageRoot });
-	} finally {
-		rmSync(baseDir, { recursive: true, force: true });
-	}
-});
 
-test("open_pdf returns an app-launch error when the desktop app exits immediately", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-app-launch-fails-"));
+test("default Viewer Host client factory opens the stable browser viewer before viewer operations", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-launch-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFakePdf(pdfPath);
-	const failingApp = writeFailingDesktopAppLauncher(baseDir);
+	const browserLauncher = new ViewerSocketBrowserLauncher(91);
 	const service = new ViewerHostMcpService({
 		clientFactory: createDefaultViewerHostClientFactory({
 			command: process.execPath,
 			args: [resolve(process.cwd(), "scripts", "viewer-host-server.ts")],
-			desktopAppLauncher: new DesktopViewerAppProcessLauncher({ command: failingApp }),
-		}),
-		makePdfId: () => 92,
-	});
-	try {
-		const response = await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { isError?: boolean; content?: Array<{ text?: string }>; details?: Record<string, unknown> } };
-		assert.equal(response.result?.isError, true);
-		assert.equal(response.result?.details?.error_code, "viewer_host_unavailable");
-		assert.equal(response.result?.details?.viewer_url, undefined, "failed app launch must not return an OK headless viewer handle");
-		assert.match(response.result?.content?.[0]?.text ?? "", /Desktop Viewer app exited during startup.*code 42.*desktop app startup failed intentionally/i);
-	} finally {
-		await service.stop();
-		rmSync(baseDir, { recursive: true, force: true });
-	}
-});
-
-test("default Viewer Host client factory launches/focuses the desktop app at Host /app before viewer operations", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-default-app-launch-"));
-	const pdfPath = join(baseDir, "paper.pdf");
-	writeFakePdf(pdfPath);
-	const appLauncher = new RecordingDesktopViewerAppLauncher();
-	const service = new ViewerHostMcpService({
-		clientFactory: createDefaultViewerHostClientFactory({
-			command: process.execPath,
-			args: [resolve(process.cwd(), "scripts", "viewer-host-server.ts")],
-			desktopAppLauncher: appLauncher,
+			browserOpenAckTimeoutMs: 1_000,
+			browserLauncher: browserLauncher,
 		}),
 		makePdfId: () => 91,
 	});
@@ -322,10 +296,10 @@ test("default Viewer Host client factory launches/focuses the desktop app at Hos
 
 		assert.equal(first.result?.details?.pdf_id, 91);
 		assert.equal(second.result?.details?.pdf_id, 91);
-		assert.equal(appLauncher.calls.length, 2, "open and focus operations should invoke the desktop app launcher/focuser");
-		assert.deepEqual(appLauncher.calls.map((call) => call.appUrl), appLauncher.calls.map((call) => `${call.origin}/app`));
-		assert.match(appLauncher.calls[0]?.appUrl ?? "", /^http:\/\/127\.0\.0\.1:\d+\/app$/);
-		const config = await fetch(`${appLauncher.calls[0].origin}/config/91.json`);
+		assert.equal(browserLauncher.calls.length, 1, "open/focus operations should only open the stable browser viewer once per host session");
+		assert.deepEqual(browserLauncher.calls.map((call) => call.appUrl), browserLauncher.calls.map((call) => `${call.origin}/viewer-lw`));
+		assert.match(browserLauncher.calls[0]?.appUrl ?? "", /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw$/);
+		const config = await fetch(`${browserLauncher.calls[0].origin}/config/91.json`);
 		assert.equal(config.status, 200, "returned viewer/config URL must remain reachable while the Host is alive");
 	} finally {
 		await service.stop();
@@ -348,6 +322,28 @@ test("open_pdf uses an MCP-owned pdf_id and routes open/focus messages through V
 		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "focus_pdf"]);
 		assert.deepEqual(client.messages[0], { type: "open_pdf", pdf_id: 77, pdf_path: pdfPath, title: basename(pdfPath), workspace_cwd: baseDir });
 		assert.deepEqual(client.messages[1], { type: "focus_pdf", pdf_id: 77 });
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("hidden debug_synctex option toggles reverse SyncTeX debug overlays without appearing in the tool schema", async () => {
+	const listResponse = await handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })) as { result?: { tools?: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown> } }> } };
+	const openPdfTool = listResponse.result?.tools?.find((tool) => tool.name === "open_pdf");
+	assert.equal(openPdfTool?.inputSchema?.properties?.debug_synctex, undefined);
+
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-hidden-debug-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const client = new FakeViewerHostClient({ origin: "http://127.0.0.1:43125" });
+	const service = new ViewerHostMcpService({ client, makePdfId: () => 78 });
+	try {
+		await callTool(2, "open_pdf", { pdf_file_path: pdfPath, debug_synctex: true, workspace_context: { cwd: baseDir } }, service);
+		await callTool(3, "open_pdf", { pdf_file_path: pdfPath, debug_synctex: false, workspace_context: { cwd: baseDir } }, service);
+
+		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "focus_pdf", "set_debug_synctex"]);
+		assert.deepEqual(client.messages[0], { type: "open_pdf", pdf_id: 78, pdf_path: pdfPath, title: basename(pdfPath), workspace_cwd: baseDir, debug_synctex: true });
+		assert.deepEqual(client.messages[2], { type: "set_debug_synctex", pdf_id: 78, enabled: false });
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
@@ -594,9 +590,9 @@ test("new open racing with reconnect joins the same Host generation and register
 	});
 	try {
 		await callTool(1, "open_pdf", { pdf_file_path: firstPdfPath, workspace_context: { cwd: baseDir } }, service);
-		const focusExisting = callTool(2, "open_pdf", { pdf_file_path: firstPdfPath, workspace_context: { cwd: baseDir } }, service) as Promise<{ result?: { details?: Record<string, unknown> } }>;
+		const focusExisting = callTool(2, "open_pdf", { pdf_file_path: firstPdfPath, workspace_context: { cwd: baseDir } }, service) as Promise<{ result?: { content?: Array<{ text?: string }>; details?: Record<string, unknown> } }>;
 		await reconnectStarted;
-		const openSecond = callTool(3, "open_pdf", { pdf_file_path: secondPdfPath, workspace_context: { cwd: baseDir } }, service) as Promise<{ result?: { details?: Record<string, unknown> } }>;
+		const openSecond = callTool(3, "open_pdf", { pdf_file_path: secondPdfPath, workspace_context: { cwd: baseDir } }, service) as Promise<{ result?: { content?: Array<{ text?: string }>; details?: Record<string, unknown> } }>;
 		await new Promise((resolve) => setImmediate(resolve));
 		releaseReconnect?.();
 
@@ -604,7 +600,9 @@ test("new open racing with reconnect joins the same Host generation and register
 
 		assert.equal(first.result?.details?.pdf_id, 70);
 		assert.equal(second.result?.details?.pdf_id, 71);
-		assert.equal(second.result?.details?.viewer_url, "http://127.0.0.1:42602/viewer-lw/71");
+		assert.equal(second.result?.details?.viewer_url, undefined);
+		assert.equal(second.result?.content?.[0]?.text, "open_pdf ok: pdf_id=71");
+		assert.doesNotMatch(JSON.stringify(second.result), /127\.0\.0\.1|viewer_url/);
 		assert.equal(launches, 2, "new open must not launch a second Host while reconnect is in progress");
 		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "focus_pdf", "open_pdf"]);
 		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 70, pdf_path: firstPdfPath, title: basename(firstPdfPath), workspace_cwd: baseDir });

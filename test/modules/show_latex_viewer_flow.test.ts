@@ -98,11 +98,12 @@ test("show_latex writes runtime preamble, compiles once with SyncTeX, registers 
 			const result = response.result as { isError?: boolean; content: Array<{ text: string }>; details: Record<string, unknown> };
 			assert.equal(result.isError, undefined);
 			assert.equal(result.details.pdf_id, 4242);
-			assert.equal(typeof result.details.pdf, "string");
+			assert.equal(result.details.pdf, undefined);
 			assert.equal(typeof result.details.source, "string");
 			assert.equal(typeof result.details.log, "string");
-			assert.equal(typeof result.details.viewer_url, "string");
-			assert.match(result.content[0].text, /viewer_url=http:\/\/127\.0\.0\.1:43125\/viewer-lw\/4242/);
+			assert.equal(result.details.viewer_url, undefined);
+			assert.equal(result.content[0].text, "ok: pdf_id=4242");
+			assert.doesNotMatch(JSON.stringify(result), /127\.0\.0\.1|viewer_url/);
 			assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf"]);
 			assert.equal(result.details.inline, undefined);
 			assert.equal(result.details.inline_preview, undefined);

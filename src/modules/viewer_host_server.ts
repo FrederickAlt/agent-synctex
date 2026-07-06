@@ -22,7 +22,7 @@ const LW_PDFJS_BUILD_ASSETS = new Map<string, { path: string; polyfillModernProm
 	["/viewer-lw/build/pdf.worker.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.worker.mjs"), polyfillModernPromiseHelpers: true }],
 	["/viewer-lw/build/pdf.sandbox.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.sandbox.mjs") }],
 ]);
-const PDFJS_MODERN_PROMISE_HELPERS_POLYFILL = `// PDF.js compatibility polyfills for older WebKit/Tauri webviews.
+const PDFJS_MODERN_PROMISE_HELPERS_POLYFILL = `// PDF.js compatibility polyfills for older WebKit webviews.
 if (typeof Promise.withResolvers !== "function") {
 	Promise.withResolvers = function withResolvers() {
 		let resolve, reject;
@@ -78,6 +78,13 @@ interface ViewerClientTabEvent {
 	visible_tab_token: string;
 }
 
+interface AppTabPayload {
+	pdf_id: number;
+	revision: number;
+	viewer_url: string;
+	visible_tab_token: string;
+}
+
 interface ViewerSocketConnection {
 	pdfId: number;
 	socket: Socket;
@@ -121,6 +128,8 @@ export class ViewerHostServer {
 	private viewerSocketClientsByPdfId = new Map<number, Set<ViewerSocketConnection>>();
 	private viewerSocketTokensByPdfId = new Map<number, string>();
 	private visibleViewerClientTabs = new Map<number, ViewerClientTabEvent>();
+	private activeVisibleViewerClientPdfId: number | undefined;
+	private debugSynctexByPdfId = new Map<number, boolean>();
 	private pendingPdfRefreshSnapshots = new Map<number, PendingPdfRefreshSnapshot>();
 	private pdfRefreshDiagnostics = new Map<number, ViewerHostPdfRefreshDiagnostic>();
 	private pdfChangePollTimer: ReturnType<typeof setInterval> | undefined;
@@ -170,6 +179,20 @@ export class ViewerHostServer {
 	getConnectedViewerCount(pdfId: number): number {
 		this.registry.getPdf(pdfId);
 		return this.viewerSocketClientsByPdfId.get(pdfId)?.size ?? 0;
+	}
+
+	hasActiveViewerClients(): boolean {
+		return this.activeViewerClientCount() > 0;
+	}
+
+	private activeViewerClientCount(): number {
+		let count = this.appEventClients.size;
+		for (const clients of this.viewerSocketClientsByPdfId.values()) {
+			for (const client of clients) {
+				if (!client.closed) count += 1;
+			}
+		}
+		return count;
 	}
 
 	sendPdfRefresh(pdfId: number): number {
@@ -241,6 +264,7 @@ export class ViewerHostServer {
 		this.controlReady = false;
 		this.controlProtocolVersion = undefined;
 		this.visibleViewerClientTabs.clear();
+		this.debugSynctexByPdfId.clear();
 		this.mcpEventBacklog.splice(0);
 		this.pendingPdfRefreshSnapshots.clear();
 		this.pdfRefreshDiagnostics.clear();
@@ -251,6 +275,7 @@ export class ViewerHostServer {
 			socket.destroy();
 		}
 		this.appEventClients.clear();
+		this.activeVisibleViewerClientPdfId = undefined;
 		if (!server) return;
 		await new Promise<void>((resolve, reject) => {
 			server.close((error) => error ? reject(error) : resolve());
@@ -271,6 +296,10 @@ export class ViewerHostServer {
 			await this.handleAppTabClosedRequest(request, response);
 			return;
 		}
+		if (requestUrl.pathname === "/app-tab-selected") {
+			await this.handleAppTabSelectedRequest(request, response);
+			return;
+		}
 		if (requestUrl.pathname === "/mcp-events/drain") {
 			this.handleMcpEventsDrainRequest(request, response);
 			return;
@@ -283,6 +312,17 @@ export class ViewerHostServer {
 
 		if (requestUrl.pathname === "/app") {
 			this.serveAppShell(response, request.method === "HEAD");
+			return;
+		}
+
+		if (requestUrl.pathname === "/viewer-lw" || requestUrl.pathname === "/viewer-lw/") {
+			const activeTab = this.lastVisibleViewerClientTab();
+			if (!activeTab) {
+				this.serveLaTeXWorkshopEmptyViewerShell(response, request.method === "HEAD");
+				return;
+			}
+			response.writeHead(302, { location: `/viewer-lw/${activeTab.pdf_id}`, "cache-control": "no-store" });
+			response.end();
 			return;
 		}
 
@@ -370,6 +410,17 @@ export class ViewerHostServer {
 	}
 
 	private async handleAppTabClosedRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		const payload = await this.readAppTabPayload(request, response, "invalid_close_payload");
+		if (!payload) return;
+		const current = this.visibleViewerClientTabs.get(payload.pdf_id);
+		if (current?.revision === payload.revision && current.viewer_url === payload.viewer_url && current.visible_tab_token === payload.visible_tab_token) {
+			this.visibleViewerClientTabs.delete(payload.pdf_id);
+			if (this.activeVisibleViewerClientPdfId === payload.pdf_id) this.activeVisibleViewerClientPdfId = this.lastVisibleViewerClientTab()?.pdf_id;
+		}
+		textResponse(response, 200, "application/json; charset=utf-8", JSON.stringify({ ok: true }), false);
+	}
+
+	private async handleAppTabSelectedRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
 		if (request.method !== "POST") {
 			textResponse(response, 405, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "method_not_allowed" }), false);
 			return;
@@ -381,15 +432,31 @@ export class ViewerHostServer {
 			textResponse(response, 400, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "malformed_json" }), false);
 			return;
 		}
-		if (!isAppTabClosedPayload(payload)) {
-			textResponse(response, 400, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "invalid_close_payload" }), false);
+		if (!isAppTabSelectedPayload(payload)) {
+			textResponse(response, 400, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "invalid_select_payload" }), false);
 			return;
 		}
-		const current = this.visibleViewerClientTabs.get(payload.pdf_id);
-		if (current?.revision === payload.revision && current.viewer_url === payload.viewer_url && current.visible_tab_token === payload.visible_tab_token) {
-			this.visibleViewerClientTabs.delete(payload.pdf_id);
-		}
+		if (this.visibleViewerClientTabs.has(payload.pdf_id)) this.activeVisibleViewerClientPdfId = payload.pdf_id;
 		textResponse(response, 200, "application/json; charset=utf-8", JSON.stringify({ ok: true }), false);
+	}
+
+	private async readAppTabPayload(request: IncomingMessage, response: ServerResponse, invalidPayloadError: string): Promise<AppTabPayload | undefined> {
+		if (request.method !== "POST") {
+			textResponse(response, 405, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "method_not_allowed" }), false);
+			return;
+		}
+		let payload: unknown;
+		try {
+			payload = JSON.parse(await readRequestBody(request));
+		} catch {
+			textResponse(response, 400, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "malformed_json" }), false);
+			return;
+		}
+		if (!isAppTabPayload(payload)) {
+			textResponse(response, 400, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: invalidPayloadError }), false);
+			return;
+		}
+		return payload;
 	}
 
 	private handleMcpEventsDrainRequest(request: IncomingMessage, response: ServerResponse): void {
@@ -398,7 +465,9 @@ export class ViewerHostServer {
 			return;
 		}
 		const events = this.mcpEventBacklog.splice(0);
-		this.broadcastAnnotationsCleared();
+		this.broadcastAnnotationsCleared(new Set(events
+			.filter((event) => event.type === "pdf_annotation" || event.type === "pdf_annotation_deleted")
+			.map((event) => event.pdf_id)));
 		jsonResponse(response, 200, { ok: true, events });
 	}
 
@@ -411,9 +480,18 @@ export class ViewerHostServer {
 	}
 
 	private serveLaTeXWorkshopViewerShell(response: ServerResponse, pdfId: number, headOnly: boolean): void {
+		this.serveLaTeXWorkshopViewerHtml(response, headOnly, `/config/${pdfId}.json`);
+	}
+
+	private serveLaTeXWorkshopEmptyViewerShell(response: ServerResponse, headOnly: boolean): void {
+		this.serveLaTeXWorkshopViewerHtml(response, headOnly);
+	}
+
+	private serveLaTeXWorkshopViewerHtml(response: ServerResponse, headOnly: boolean, configUrl?: string): void {
 		try {
+			const bodyTag = configUrl === undefined ? "<body tabindex=\"0\">" : `<body tabindex="0" data-config-url="${configUrl}">`;
 			const html = readFileSync(resolve(LW_VIEWER_ASSET_ROOT, "viewer.html"), "utf8")
-				.replace("<body tabindex=\"0\">", `<body tabindex="0" data-config-url="/config/${pdfId}.json">`);
+				.replace("<body tabindex=\"0\">", bodyTag);
 			textResponse(response, 200, "text/html; charset=utf-8", html, headOnly);
 		} catch {
 			textResponse(response, 404, "text/plain; charset=utf-8", "LaTeX Workshop viewer shell is not readable", headOnly);
@@ -471,6 +549,7 @@ export class ViewerHostServer {
 			viewer_socket_url: viewerSocketUrl,
 			ws_url: viewerSocketUrl,
 			viewer_socket_token: token,
+			debug_synctex: this.debugSynctexByPdfId.get(record.pdfId) === true,
 		});
 		textResponse(response, 200, "application/json; charset=utf-8", body, headOnly);
 	}
@@ -536,7 +615,7 @@ export class ViewerHostServer {
 				}
 				this.controlReady = true;
 				this.controlProtocolVersion = message.protocol_version;
-				return { ok: true, message: { type: "ready", protocol_version: VIEWER_HOST_PROTOCOL_VERSION, origin: this.origin } };
+				return { ok: true, message: { type: "ready", protocol_version: VIEWER_HOST_PROTOCOL_VERSION, origin: this.origin, active_viewer_clients: this.activeViewerClientCount() } };
 			case "open_pdf": {
 				const snapshot = await snapshotRegisteredPdf(this.fileSystem, message.pdf_path);
 				const revision = this.nextRegistrationRevision(message.pdf_id, message.pdf_path, snapshot);
@@ -550,6 +629,7 @@ export class ViewerHostServer {
 				});
 				this.pendingPdfRefreshSnapshots.delete(record.pdfId);
 				this.pdfRefreshDiagnostics.delete(record.pdfId);
+				this.debugSynctexByPdfId.set(record.pdfId, message.debug_synctex === true);
 				await this.viewerDispatch.openPdf(record);
 				this.broadcastViewerClientTabEvent("open_pdf", record);
 				return { ok: true, result: { type: "open_pdf", pdf_id: record.pdfId, revision: record.revision } };
@@ -559,6 +639,12 @@ export class ViewerHostServer {
 				await this.viewerDispatch.focusPdf(record);
 				this.broadcastViewerClientTabEvent("focus_pdf", record);
 				return { ok: true, result: { type: "focus_pdf", pdf_id: record.pdfId } };
+			}
+			case "set_debug_synctex": {
+				const record = this.registry.getPdf(message.pdf_id);
+				this.debugSynctexByPdfId.set(record.pdfId, message.enabled);
+				this.broadcastViewerSocketMessage(record.pdfId, message);
+				return { ok: true, result: { type: "set_debug_synctex", pdf_id: record.pdfId } };
 			}
 			case "synctex_forward": {
 				const record = this.registry.getPdf(message.pdf_id);
@@ -574,7 +660,7 @@ export class ViewerHostServer {
 			}
 			case "clear_pdf_annotations": {
 				const record = this.registry.getPdf(message.pdf_id);
-				this.broadcastViewerSocketMessage(record.pdfId, { type: "annotations_cleared", pdf_id: record.pdfId });
+				this.broadcastAnnotationsCleared([record.pdfId]);
 				return { ok: true, result: { type: "clear_pdf_annotations", pdf_id: record.pdfId } };
 			}
 			case "reverse_synctex_hover_result": {
@@ -712,10 +798,22 @@ export class ViewerHostServer {
 		this.mcpEventBacklog.push(message);
 	}
 
-	private broadcastAnnotationsCleared(): void {
-		for (const pdfId of this.viewerSocketClientsByPdfId.keys()) {
-			this.broadcastViewerSocketMessage(pdfId, { type: "annotations_cleared", pdf_id: pdfId });
+	private broadcastAnnotationsCleared(pdfIds: Iterable<number>): void {
+		for (const pdfId of pdfIds) {
+			this.broadcastAllViewerSocketMessages({ type: "annotations_cleared", pdf_id: pdfId, pdf_ids: [pdfId] });
 		}
+	}
+
+	private broadcastAllViewerSocketMessages(message: object): number {
+		let delivered = 0;
+		for (const clients of this.viewerSocketClientsByPdfId.values()) {
+			for (const connection of clients) {
+				if (connection.closed) continue;
+				sendViewerSocketJson(connection, message);
+				delivered += 1;
+			}
+		}
+		return delivered;
 	}
 
 	private handleReverseSynctexForwardProbeMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_forward_probe" }>): void {
@@ -781,8 +879,12 @@ export class ViewerHostServer {
 			viewer_url: this.accessPolicy.viewerUrl(record.pdfId, record.revision),
 			visible_tab_token: this.createVisibleTabToken(),
 		};
-		this.visibleViewerClientTabs.delete(record.pdfId);
-		this.visibleViewerClientTabs.set(record.pdfId, event);
+		if (this.visibleViewerClientTabs.has(record.pdfId)) {
+			this.visibleViewerClientTabs.set(record.pdfId, event);
+		} else {
+			this.visibleViewerClientTabs.set(record.pdfId, event);
+		}
+		this.activeVisibleViewerClientPdfId = record.pdfId;
 		this.broadcastAppEvent(event);
 	}
 
@@ -790,6 +892,16 @@ export class ViewerHostServer {
 		const token = `visible-tab-${this.nextVisibleTabToken}`;
 		this.nextVisibleTabToken += 1;
 		return token;
+	}
+
+	private lastVisibleViewerClientTab(): ViewerClientTabEvent | undefined {
+		if (this.activeVisibleViewerClientPdfId !== undefined) {
+			const active = this.visibleViewerClientTabs.get(this.activeVisibleViewerClientPdfId);
+			if (active) return active;
+		}
+		let last: ViewerClientTabEvent | undefined;
+		for (const event of this.visibleViewerClientTabs.values()) last = event;
+		return last;
 	}
 
 	private broadcastAppEvent(event: ViewerClientTabEvent | { type: "ready" }): void {
@@ -1068,7 +1180,7 @@ function writeAppEvent(response: ServerResponse, event: ViewerClientTabEvent | {
 	response.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function isAppTabClosedPayload(payload: unknown): payload is { pdf_id: number; revision: number; viewer_url: string; visible_tab_token: string } {
+function isAppTabPayload(payload: unknown): payload is AppTabPayload {
 	return typeof payload === "object"
 		&& payload !== null
 		&& Number.isInteger((payload as { pdf_id?: unknown }).pdf_id)
@@ -1079,6 +1191,13 @@ function isAppTabClosedPayload(payload: unknown): payload is { pdf_id: number; r
 		&& !!(payload as { viewer_url: string }).viewer_url
 		&& typeof (payload as { visible_tab_token?: unknown }).visible_tab_token === "string"
 		&& !!(payload as { visible_tab_token: string }).visible_tab_token;
+}
+
+function isAppTabSelectedPayload(payload: unknown): payload is { pdf_id: number } {
+	return typeof payload === "object"
+		&& payload !== null
+		&& Number.isInteger((payload as { pdf_id?: unknown }).pdf_id)
+		&& (payload as { pdf_id: number }).pdf_id > 0;
 }
 
 async function readRequestBody(request: IncomingMessage): Promise<string> {

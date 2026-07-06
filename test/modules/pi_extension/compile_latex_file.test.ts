@@ -533,7 +533,7 @@ test("compile_latex_file compiles without opening by default", async () => {
 				viewer_handle?: unknown;
 			};
 			assert.equal(result.content.length, 1);
-			assert.equal(result.content[0].text.startsWith(`ok: ${expectedPdf}\nLog: `), true);
+			assert.equal(result.content[0].text, `ok: ${expectedPdf}`);
 			assert.equal(details.source, sourcePath);
 			assert.equal(details.pdf, expectedPdf);
 			assert.equal(details.log, resolve(root, "paper.log"));

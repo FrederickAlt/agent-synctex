@@ -11,11 +11,18 @@ export interface ViewerHostOpenPdfMessage {
 	pdf_path: string;
 	title?: string;
 	workspace_cwd?: string;
+	debug_synctex?: boolean;
 }
 
 export interface ViewerHostFocusPdfMessage {
 	type: "focus_pdf";
 	pdf_id: number;
+}
+
+export interface ViewerHostSetDebugSynctexMessage {
+	type: "set_debug_synctex";
+	pdf_id: number;
+	enabled: boolean;
 }
 
 export interface ViewerHostSynctexForwardRange {
@@ -124,6 +131,7 @@ export type McpToViewerHostMessage =
 	| ViewerHostHelloMessage
 	| ViewerHostOpenPdfMessage
 	| ViewerHostFocusPdfMessage
+	| ViewerHostSetDebugSynctexMessage
 	| ViewerHostSynctexForwardMessage
 	| ViewerHostPdfMaybeUpdatedMessage
 	| ViewerHostClearPdfAnnotationsMessage
@@ -134,6 +142,7 @@ export interface ViewerHostReadyMessage {
 	type: "ready";
 	protocol_version: number;
 	origin: string;
+	active_viewer_clients?: number;
 }
 
 export interface ViewerHostViewerLoadedMessage {
@@ -226,6 +235,10 @@ export interface ViewerHostControlAcceptedResult {
 	type: McpToViewerHostMessage["type"];
 	pdf_id?: number;
 	revision?: number;
+	browser_open_attempted?: boolean;
+	browser_open_confirmed?: boolean;
+	browser_open_error?: string;
+	active_viewer_clients?: number;
 }
 
 export type ViewerHostControlResponse =
@@ -433,16 +446,20 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 		case "open_pdf": {
 			const title = optionalNonEmptyString(message.title, "title");
 			const workspaceCwd = optionalNonEmptyString(message.workspace_cwd, "workspace_cwd");
+			const debugSynctex = optionalBoolean(message.debug_synctex, "debug_synctex");
 			return {
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
 				pdf_path: requireNonEmptyString(message.pdf_path, "pdf_path"),
 				...(title === undefined ? {} : { title }),
 				...(workspaceCwd === undefined ? {} : { workspace_cwd: workspaceCwd }),
+				...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
 			};
 		}
 		case "focus_pdf":
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
+		case "set_debug_synctex":
+			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"), enabled: optionalBoolean(message.enabled, "enabled") ?? false };
 		case "synctex_forward": {
 			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
 			const sourceLine = optionalString(message.source_line, "source_line");

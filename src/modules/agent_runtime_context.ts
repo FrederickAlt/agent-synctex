@@ -52,12 +52,16 @@ export function ensureTexActionsAgentRuntimeDir(dir: string): void {
 }
 
 export function resolveAgentWorkspaceContext(ctx?: AgentWorkspaceContextSource): HostServiceWorkspaceContext {
-	const agentId = resolveTexActionsAgentId(ctx);
-	const agentRuntimeDir = resolveTexActionsAgentRuntimeDir(agentId);
+	return resolveAgentWorkspaceContextForAgentId(resolveTexActionsAgentId(ctx), ctx?.cwd);
+}
+
+export function resolveAgentWorkspaceContextForAgentId(agentId: string, cwd = process.cwd()): HostServiceWorkspaceContext {
+	const sanitizedAgentId = sanitizeTexActionsAgentId(agentId);
+	const agentRuntimeDir = resolveTexActionsAgentRuntimeDir(sanitizedAgentId);
 	ensureTexActionsAgentRuntimeDir(agentRuntimeDir);
 	return {
-		cwd: ctx?.cwd ?? process.cwd(),
-		session_id: agentId,
+		cwd,
+		session_id: sanitizedAgentId,
 		workspace_root: agentRuntimeDir,
 	};
 }

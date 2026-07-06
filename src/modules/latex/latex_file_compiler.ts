@@ -277,10 +277,16 @@ function diagnosticKey(diagnostic: LatexDiagnosticSummary): string {
 	return `${diagnostic.kind}\0${diagnostic.message}`;
 }
 
+function isSuppressedLatexWarning(diagnostic: LatexDiagnosticSummary): boolean {
+	return diagnostic.kind === "warning"
+		&& /^Package inputenc Warning: inputenc package ignored with utf8 based engines\.?$/i.test(diagnostic.message.trim());
+}
+
 function dedupeDiagnostics(diagnostics: LatexDiagnosticSummary[]): LatexDiagnosticSummary[] {
 	const seen = new Set<string>();
 	const result: LatexDiagnosticSummary[] = [];
 	for (const diagnostic of diagnostics) {
+		if (isSuppressedLatexWarning(diagnostic)) continue;
 		const key = diagnosticKey(diagnostic);
 		if (seen.has(key)) continue;
 		seen.add(key);

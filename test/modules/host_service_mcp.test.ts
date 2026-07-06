@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { getLatexPreamblePath, getMcpFixedPreviewPdfPath } from "../../src/modules/runtime_paths.ts";
 import { FakeViewerBackend, HostServiceServer } from "../../src/modules/host_service.ts";
-import { HostServiceMcpFrameReader } from "../../src/modules/host_service_mcp.ts";
+import { handleMcpRequest, HostServiceMcpFrameReader } from "../../src/modules/host_service_mcp.ts";
 
 function allocateMcpTmpDir(prefix = "host-service-mcp-runtime-") {
 	const previous = process.env.MCP_TMPDIR;
@@ -112,6 +112,153 @@ class TestManagedViewerBackend extends FakeViewerBackend {
 		return super.forwardSearch(requestId, details);
 	}
 }
+
+test("MCP open_pdf keeps viewer URL out of tool text when a browser viewer is detected", async () => {
+	const emittedUrls: string[] = [];
+	const response = await handleMcpRequest(JSON.stringify({
+		jsonrpc: "2.0",
+		id: 1,
+		method: "tools/call",
+		params: {
+			name: "open_pdf",
+			arguments: {
+				pdf_file_path: "/tmp/paper.pdf",
+				workspace_context: { cwd: "/tmp" },
+			},
+		},
+	}), {
+		openPdf: async () => ({
+			protocol_version: 1,
+			request_id: "test",
+			operation: "open_pdf",
+			status: "ok",
+			generated_at_ns: 1,
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				workspace_context: { cwd: "/tmp" },
+				request_id: "test",
+				operation: "open_pdf",
+				backend: "viewer-host-client",
+				backend_path: "viewer-host-client",
+				backend_identity_ok: true,
+				pdf_id: 123,
+				viewer_url: "http://127.0.0.1:40000/viewer-lw/123",
+				browser_launch: { attempted: false, confirmed: true, active_viewer_clients: 1 },
+			},
+		} as never),
+	}, {
+		emitViewerUrlFallback: (url) => emittedUrls.push(url),
+	});
+	assert.notEqual(response, null);
+	assert.equal(response !== null && "result" in response, true);
+	const result = (response as unknown as { result: { content: Array<{ text: string }>; details: Record<string, unknown>; _meta?: Record<string, unknown> } }).result;
+	assert.deepEqual(emittedUrls, []);
+	assert.equal(result.content[0].text, "open_pdf ok: pdf_id=123");
+	assert.equal(result.details.pdf_id, 123);
+	assert.equal(result.details.viewer_url, undefined);
+	assert.equal(result._meta, undefined);
+	assert.doesNotMatch(JSON.stringify(result), /127\.0\.0\.1|viewer_url/);
+});
+
+test("MCP open_pdf keeps viewer URL out of tool text when launch produces a live viewer", async () => {
+	const emittedUrls: string[] = [];
+	const response = await handleMcpRequest(JSON.stringify({
+		jsonrpc: "2.0",
+		id: 1,
+		method: "tools/call",
+		params: {
+			name: "open_pdf",
+			arguments: {
+				pdf_file_path: "/tmp/paper.pdf",
+				workspace_context: { cwd: "/tmp" },
+			},
+		},
+	}), {
+		openPdf: async () => ({
+			protocol_version: 1,
+			request_id: "test",
+			operation: "open_pdf",
+			status: "ok",
+			generated_at_ns: 1,
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				workspace_context: { cwd: "/tmp" },
+				request_id: "test",
+				operation: "open_pdf",
+				backend: "viewer-host-client",
+				backend_path: "viewer-host-client",
+				backend_identity_ok: true,
+				pdf_id: 123,
+				viewer_url: "http://127.0.0.1:40000/viewer-lw/123",
+				browser_launch: { attempted: true, confirmed: true, active_viewer_clients: 1 },
+			},
+		} as never),
+	}, {
+		emitViewerUrlFallback: (url) => emittedUrls.push(url),
+	});
+	assert.notEqual(response, null);
+	assert.equal(response !== null && "result" in response, true);
+	const result = (response as unknown as { result: { content: Array<{ text: string }>; details: Record<string, unknown>; _meta?: Record<string, unknown> } }).result;
+	assert.deepEqual(emittedUrls, []);
+	assert.equal(result.content[0].text, "open_pdf ok: pdf_id=123");
+	assert.equal(result.details.pdf_id, 123);
+	assert.equal(result.details.viewer_url, undefined);
+	assert.equal(result._meta, undefined);
+	assert.doesNotMatch(JSON.stringify(result), /127\.0\.0\.1|viewer_url/);
+});
+
+test("MCP open_pdf includes viewer URL in tool text when no live browser viewer is detected", async () => {
+	const emittedUrls: string[] = [];
+	const response = await handleMcpRequest(JSON.stringify({
+		jsonrpc: "2.0",
+		id: 1,
+		method: "tools/call",
+		params: {
+			name: "open_pdf",
+			arguments: {
+				pdf_file_path: "/tmp/paper.pdf",
+				workspace_context: { cwd: "/tmp" },
+			},
+		},
+	}), {
+		openPdf: async () => ({
+			protocol_version: 1,
+			request_id: "test",
+			operation: "open_pdf",
+			status: "ok",
+			generated_at_ns: 1,
+			status_details: {
+				protocol_version: 1,
+				supported: true,
+				service_available: true,
+				workspace_context: { cwd: "/tmp" },
+				request_id: "test",
+				operation: "open_pdf",
+				backend: "viewer-host-client",
+				backend_path: "viewer-host-client",
+				backend_identity_ok: true,
+				pdf_id: 123,
+				viewer_url: "http://127.0.0.1:40000/viewer-lw/123",
+				browser_launch: { attempted: true, confirmed: false, active_viewer_clients: 0 },
+			},
+		} as never),
+	}, {
+		emitViewerUrlFallback: (url) => emittedUrls.push(url),
+	});
+	assert.notEqual(response, null);
+	assert.equal(response !== null && "result" in response, true);
+	const result = (response as unknown as { result: { content: Array<{ text: string }>; details: Record<string, unknown>; _meta?: Record<string, unknown> } }).result;
+	assert.deepEqual(emittedUrls, ["http://127.0.0.1:40000/viewer-lw/123"]);
+	assert.equal(result.content[0].text, "open_pdf ok: pdf_id=123\nNo browser viewer was detected after launch; pass this Viewer URL to the user: http://127.0.0.1:40000/viewer-lw/123");
+	assert.equal(result.details.pdf_id, 123);
+	assert.equal(result.details.viewer_url, undefined);
+	assert.equal(result._meta, undefined);
+	assert.doesNotMatch(JSON.stringify(result.details), /127\.0\.0\.1|viewer_url/);
+});
 
 class FailingManagedViewerBackend extends TestManagedViewerBackend {
 	readonly behavior: { open?: boolean; forwardSearch?: boolean; close?: boolean };
@@ -853,7 +1000,7 @@ test("daemon resolves relative open_pdf and jump_pdf paths against workspace_con
 			};
 		};
 		assert.equal(openResponse.result.isError, undefined);
-		assert.equal(openResponse.result.details.managed_record?.pdfPath, pdfPath);
+		assert.equal(openResponse.result.details.managed_record, undefined);
 		const lastOpen = backend.openRequests.at(-1);
 		assert.ok(lastOpen !== undefined);
 		assert.equal(typeof lastOpen?.details.pdf_path, "string");
@@ -1318,8 +1465,9 @@ test("daemon compiles LaTeX file with relative path and workspace_context", asyn
 		})) as { result: { isError?: boolean; content: Array<{ text: string }> } };
 		assert.equal(response.result.isError, undefined);
 		const resultText = response.result.content[0].text;
-		const pdfPath = resultText.split(" ").at(-1);
-		assert.ok(pdfPath && existsSync(pdfPath));
+		assert.doesNotMatch(resultText, /\.pdf/);
+		const pdfPath = join(workspaceDir, "main.pdf");
+		assert.ok(existsSync(pdfPath));
 		assert.equal(dirname(pdfPath), workspaceDir);
 	} finally {
 		await server.stop();
@@ -1357,8 +1505,9 @@ test("daemon compiles LaTeX file with absolute path without workspace_context", 
 		})) as { result: { isError?: boolean; content: Array<{ text: string }> } };
 		assert.equal(response.result.isError, undefined);
 		const resultText = response.result.content[0].text;
-		const pdfPath = resultText.split(" ").at(-1);
-		assert.ok(pdfPath && existsSync(pdfPath));
+		assert.doesNotMatch(resultText, /\.pdf/);
+		const pdfPath = join(workspaceDir, "main.pdf");
+		assert.ok(existsSync(pdfPath));
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -1505,11 +1654,11 @@ test("daemon compile_latex_file open_pdf opens and returns a managed PDF id", as
 		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details: { pdf?: string; pdf_id?: number; managed_record?: { pdfPath?: string; id?: number } } } };
 		assert.equal(response.result.isError, undefined);
 		assert.equal(typeof response.result.details.pdf_id, "number");
-		assert.equal(response.result.details.managed_record?.id, response.result.details.pdf_id);
-		assert.equal(response.result.details.managed_record?.pdfPath, response.result.details.pdf);
+		assert.equal(response.result.details.managed_record, undefined);
+		assert.equal(response.result.details.pdf, undefined);
 		assert.match(response.result.content[0].text, /pdf_id=\d+/);
 		assert.equal(backend.openRequests.length, 1);
-		assert.equal(backend.openRequests[0]?.details.pdf_path, response.result.details.pdf);
+		assert.equal(backend.openRequests[0]?.details.pdf_path, join(workspaceDir, "main.pdf"));
 		assert.equal(backend.openRequests[0]?.details.callback, undefined);
 	} finally {
 		await server.stop();
@@ -1546,11 +1695,12 @@ test("daemon renders show_latex through compile flow", async () => {
 	try {
 		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
 			return await sendFramedRequest(socketPath, requestPayload);
-		})) as { result: { isError?: boolean; content: Array<{ text: string }> } };
+		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details?: { log?: string } } };
 		assert.equal(response.result.isError, undefined);
 		const resultText = response.result.content[0].text;
-		assert.match(resultText, /\.pdf/);
-		assert.match(resultText, /Log: .*\.log/);
+		assert.doesNotMatch(resultText, /\.pdf/);
+		assert.doesNotMatch(resultText, /Log: .*\.log/);
+		assert.match(response.result.details?.log ?? "", /\.log/);
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -1590,12 +1740,11 @@ test("daemon show_latex compiles, opens, and returns a managed PDF id", async ()
 		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details: { pdf?: string; pdf_id?: number; managed_record?: { pdfPath?: string; id?: number } } } };
 		assert.equal(response.result.isError, undefined);
 		assert.equal(typeof response.result.details.pdf_id, "number");
-		assert.equal(response.result.details.managed_record?.id, response.result.details.pdf_id);
-		assert.equal(response.result.details.managed_record?.pdfPath, response.result.details.pdf);
-		assert.notEqual(response.result.details.pdf, getMcpFixedPreviewPdfPath());
+		assert.equal(response.result.details.managed_record, undefined);
+		assert.equal(response.result.details.pdf, undefined);
 		assert.match(response.result.content[0].text, /pdf_id=\d+/);
 		assert.equal(backend.openRequests.length, 1);
-		assert.equal(backend.openRequests[0]?.details.pdf_path, response.result.details.pdf);
+		assert.notEqual(backend.openRequests[0]?.details.pdf_path, getMcpFixedPreviewPdfPath());
 		assert.equal(backend.openRequests[0]?.details.callback, undefined);
 		assert.equal(backend.openRequests[0]?.details.reuse_existing, true);
 		assert.equal(backend.openRequests[0]?.details.require_persistent_viewer, false);

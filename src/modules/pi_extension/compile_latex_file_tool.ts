@@ -24,6 +24,7 @@ import {
 } from "./host_service_client.ts";
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
 import { errorMessage, latexToolFailure } from "./error_utils.ts";
+import { appendViewerUrlAgentNotice } from "../viewer_url_agent_notice.ts";
 
 const latexFileCompileToolSupport = createLatexFileCompileToolSupport();
 
@@ -107,7 +108,9 @@ function compileSuccessText(details: HostServiceCompileResponseDetails, hideWarn
 	const warningCount = details.warning_count ? ` warnings=${details.warning_count}` : "";
 	const exitCode = status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 	const prefix = status === "ok" ? "ok" : status;
-	return `${prefix}: ${details.pdf}${exitCode}${warningCount}\nLog: ${details.log}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated, hideWarnings)}`;
+	const cleanOk = status === "ok" && !details.warning_count;
+	const log = !cleanOk && details.log ? `\nLog: ${details.log}` : "";
+	return `${prefix}: ${details.pdf}${exitCode}${warningCount}${log}${warningSummary(details.warnings, details.warning_count, details.warnings_truncated, hideWarnings)}`;
 }
 
 function describeCompileFailureContext(
@@ -229,8 +232,9 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 				const pidText = managedRecord?.pid === undefined ? "" : ` pid=${managedRecord.pid}`;
 				const status = compileResponse.compile_status ?? "ok";
 				const warningCount = compileResponse.warning_count ? ` warnings=${compileResponse.warning_count}` : "";
+				const text = appendViewerUrlAgentNotice(`${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated, hideWarnings)}`, compileResponse);
 				return {
-					content: [{ type: "text", text: `${status}: pdf_id=${compileResponse.pdf_id}${pidText} pdf=${compileResponse.pdf}${warningCount}\nLog: ${compileResponse.log}${warningSummary(compileResponse.warnings, compileResponse.warning_count, compileResponse.warnings_truncated, hideWarnings)}` }],
+					content: [{ type: "text", text }],
 					details: agentFacingCompileDetails({
 						source: compileResponse.source,
 						pdf: compileResponse.pdf,
@@ -286,7 +290,7 @@ export function registerCompileLatexFileTool(pi: ExtensionAPI, callbackManager: 
 		name: "compile_latex_file",
 		label: "Compile LaTeX File",
 		description:
-			"Compile an existing local LaTeX source file once from its own directory using latexmk. Defaults to lualatex; pass compiler to choose the TeX engine latexmk should run: lualatex, pdflatex, xelatex, or latexmk default behavior. The Host Service coordinates same-root compiles to avoid overlapping latexmk processes. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track after compilation succeeds; leave it false (the default) to compile without requesting viewer state. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
+			"Compile an existing local LaTeX source file once from its own directory using latexmk. Defaults to lualatex; pass compiler to choose the TeX engine latexmk should run: lualatex, pdflatex, xelatex, or latexmk default behavior. The Host Service coordinates same-root compiles to avoid overlapping latexmk processes. Set clean=true to remove common same-basename LaTeX artifacts before compiling. Set open_pdf=true to request a host-service open/track after compilation succeeds; when a browser viewer is detected after launch/focus, only pdf_id/status is returned because the user can already see the output; when no live browser viewer is detected, the result includes a Viewer URL to pass to the user. Leave open_pdf false (the default) to compile without requesting viewer state. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
 		promptSnippet: "Compile a local LaTeX file as PDF",
 		promptGuidelines: [
 			"Prefer compile_latex_file over invoking a bare compiler directly when the user has an existing .tex file to build.",

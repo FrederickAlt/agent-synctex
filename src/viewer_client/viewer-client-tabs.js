@@ -63,6 +63,30 @@ function postNavigationToActiveViewer(direction) {
 	return true;
 }
 
+function tabsStatePayload() {
+	return {
+		type: "host_lw_tabs_state",
+		activePdfId: state.activePdfId,
+		tabs: state.tabs.map((tab) => ({
+			pdfId: tab.pdfId,
+			title: tab.title,
+			revision: tab.revision,
+			viewerUrl: tab.viewerUrl,
+			visibleTabToken: tab.visibleTabToken,
+		})),
+	};
+}
+
+function postTabsStateToViewer(iframe = activeViewerIframe()) {
+	if (!iframe || !iframe.contentWindow) return false;
+	iframe.contentWindow.postMessage(tabsStatePayload(), location.origin);
+	return true;
+}
+
+function postTabsStateToAllViewers() {
+	for (const iframe of document.querySelectorAll("iframe[data-pdf-id]")) postTabsStateToViewer(iframe);
+}
+
 const recentAppShellRawMouseEvents = [];
 const MAX_APP_SHELL_RAW_MOUSE_EVENTS = 20;
 
@@ -160,6 +184,25 @@ function bindAppShellViewerShortcuts() {
 	}
 }
 
+function bindViewerToolbarTabMessages() {
+	window.addEventListener("message", (event) => {
+		if (event.origin !== location.origin) return;
+		const message = event.data;
+		if (!message || typeof message !== "object") return;
+		if (message.type === "host_lw_tabs_ready") {
+			postTabsStateToAllViewers();
+		} else if (message.type === "host_lw_select_tab") {
+			const pdfId = Number(message.pdfId);
+			if (!state.tabs.some((tab) => tab.pdfId === pdfId)) return;
+			state.activePdfId = pdfId;
+			renderTabs();
+		} else if (message.type === "host_lw_close_tab") {
+			const pdfId = Number(message.pdfId);
+			closeTab(pdfId);
+		}
+	});
+}
+
 function openOrFocusTab(message) {
 	const pdfId = Number(message.pdf_id);
 	const existing = state.tabs.find((tab) => tab.pdfId === pdfId);
@@ -246,6 +289,7 @@ function renderTabs() {
 			panel.dataset.pdfId = pdfIdKey(tab.pdfId);
 			iframe = document.createElement("iframe");
 			iframe.dataset.pdfId = pdfIdKey(tab.pdfId);
+			iframe.addEventListener("load", () => postTabsStateToViewer(iframe));
 			panel.appendChild(iframe);
 		}
 		panel.hidden = !selected;
@@ -255,6 +299,7 @@ function renderTabs() {
 	}
 	if (tabList.scrollLeft > tabList.scrollWidth - tabList.clientWidth) tabList.scrollLeft = Math.max(0, tabList.scrollWidth - tabList.clientWidth);
 	scheduleTabScrollButtonUpdate();
+	postTabsStateToAllViewers();
 }
 
 function connectAppEvents() {
@@ -270,5 +315,6 @@ function connectAppEvents() {
 window.__hostAppShellRawMouseDebug = () => recentAppShellRawMouseEvents.slice();
 bindTabOverflowControls();
 bindAppShellViewerShortcuts();
+bindViewerToolbarTabMessages();
 renderTabs();
 connectAppEvents();

@@ -61,7 +61,7 @@ async function waitForAppEvents(page: Page): Promise<void> {
 
 type AppEventMessage = Record<string, unknown>;
 
-async function readAppEventSnapshot(origin: string): Promise<AppEventMessage[]> {
+async function readAppEventSnapshot(origin: string, count = 2): Promise<AppEventMessage[]> {
 	const controller = new AbortController();
 	const response = await fetch(`${origin}/app-events`, { signal: controller.signal });
 	assert.equal(response.status, 200);
@@ -70,7 +70,7 @@ async function readAppEventSnapshot(origin: string): Promise<AppEventMessage[]> 
 	let buffer = "";
 	const messages: AppEventMessage[] = [];
 	try {
-		while (messages.length < 2) {
+		while (messages.length < count) {
 			const { value, done } = await reader.read();
 			if (done) break;
 			buffer += Buffer.from(value).toString("utf8");
@@ -238,6 +238,44 @@ test("Viewer Host ignores stale same-revision tab-close notifications from an ol
 	}
 });
 
+test("/viewer-lw redirects to the last selected Host PDF tab and serves empty shell with no tabs", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-active-direct-route-"));
+	const firstPdf = join(baseDir, "first.pdf");
+	const secondPdf = join(baseDir, "second.pdf");
+	writeFakePdf(firstPdf, "first");
+	writeFakePdf(secondPdf, "second");
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	try {
+		await server.start();
+		const client = new ViewerHostControlClient({ origin: server.origin });
+		const empty = await fetch(`${server.origin}/viewer-lw`, { redirect: "manual" });
+		assert.equal(empty.status, 200);
+		assert.match(empty.headers.get("content-type") ?? "", /text\/html/);
+		assert.doesNotMatch(await empty.text(), /data-config-url=/);
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 1, pdf_path: firstPdf, title: "First" })).ok, true);
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 2, pdf_path: secondPdf, title: "Second" })).ok, true);
+		let response = await fetch(`${server.origin}/viewer-lw`, { redirect: "manual" });
+		assert.equal(response.status, 302);
+		assert.equal(response.headers.get("location"), "/viewer-lw/2");
+		const select = await fetch(`${server.origin}/app-tab-selected`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ pdf_id: 1 }),
+		});
+		assert.equal(select.status, 200);
+		response = await fetch(`${server.origin}/viewer-lw`, { redirect: "manual" });
+		assert.equal(response.status, 302);
+		assert.equal(response.headers.get("location"), "/viewer-lw/1");
+		const replay = await readAppEventSnapshot(server.origin, 3);
+		assert.deepEqual(replay.filter((event) => event.type === "open_pdf").map((event) => event.pdf_id), [1, 2]);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
 test("Viewer Client tab shell opens, focuses, closes, and reopens Host-registered PDFs without unregistering them", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-tabs-"));
 	const firstPdf = join(baseDir, "first.pdf");
@@ -275,6 +313,11 @@ test("Viewer Client tab shell opens, focuses, closes, and reopens Host-registere
 		assert.equal((await client.send({ type: "open_pdf", pdf_id: 2, pdf_path: secondPdf, title: "Second" })).ok, true);
 		await waitForActivePdf(page, 2);
 		assert.deepEqual(await tabState(page), { tabs: ["1", "2"], iframes: ["1", "2"], active: "2", emptyVisible: false });
+		const activeSecondFrame = page.frameLocator("iframe[data-pdf-id='2']");
+		await activeSecondFrame.locator("button.hostPdfTabButton[data-pdf-id='2']").click();
+		await activeSecondFrame.locator("input.hostPdfTabRenameInput").fill("Second custom title");
+		await activeSecondFrame.locator("input.hostPdfTabRenameInput").press("Enter");
+		await page.waitForFunction(() => localStorage.getItem("agent-synctex.pdfTabTitles")?.includes("Second custom title"));
 
 		assert.equal((await client.send({ type: "open_pdf", pdf_id: 1, pdf_path: firstPdf, title: "First renamed" })).ok, true);
 		await waitForActivePdf(page, 1);
@@ -283,7 +326,7 @@ test("Viewer Client tab shell opens, focuses, closes, and reopens Host-registere
 		assert.match(await page.locator("[role='tab'][data-pdf-id='1']").innerText(), /First renamed/);
 
 		const firstClose = page.waitForResponse((response) => response.url() === `${server.origin}/app-tab-closed` && response.status() === 200);
-		await page.locator("button[data-close-pdf-id='1']").click();
+		await page.frameLocator("iframe[data-pdf-id='1']").locator("button[data-close-pdf-id='1']").click();
 		await firstClose;
 		await page.waitForFunction(() => !document.querySelector("[role='tab'][data-pdf-id='1']") && !document.querySelector("iframe[data-pdf-id='1']"));
 		assert.deepEqual(await tabState(page), { tabs: ["2"], iframes: ["2"], active: "2", emptyVisible: false });
@@ -291,7 +334,7 @@ test("Viewer Client tab shell opens, focuses, closes, and reopens Host-registere
 		assert.equal(registry.getPdf(2).pdfPath, secondPdf);
 
 		const secondClose = page.waitForResponse((response) => response.url() === `${server.origin}/app-tab-closed` && response.status() === 200);
-		await page.locator("button[data-close-pdf-id='2']").click();
+		await page.frameLocator("iframe[data-pdf-id='2']").locator("button[data-close-pdf-id='2']").click();
 		await secondClose;
 		await page.waitForFunction(() => document.querySelectorAll("[role='tab'][data-pdf-id]").length === 0 && !document.getElementById("empty-state")?.hasAttribute("hidden"));
 		assert.deepEqual(await tabState(page), { tabs: [], iframes: [], active: null, emptyVisible: true });
@@ -302,6 +345,10 @@ test("Viewer Client tab shell opens, focuses, closes, and reopens Host-registere
 			await freshPage.goto(`${server.origin}/app`, { waitUntil: "domcontentloaded" });
 			await waitForAppEvents(freshPage);
 			assert.deepEqual(await tabState(freshPage), { tabs: [], iframes: [], active: null, emptyVisible: true });
+			await freshPage.goto(`${server.origin}/viewer-lw`, { waitUntil: "domcontentloaded" });
+			await freshPage.waitForSelector("#viewerContainer");
+			assert.equal(await freshPage.evaluate(() => document.body.dataset.configUrl ?? ""), "");
+			assert.equal(await freshPage.locator("text=no active PDF").count(), 0);
 		} finally {
 			await freshPage.close();
 		}

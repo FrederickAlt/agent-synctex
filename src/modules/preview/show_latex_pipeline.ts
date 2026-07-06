@@ -1,4 +1,5 @@
 import { type HostServiceManagedViewerRecord } from "../host_service_protocol.ts";
+import type { ViewerUrlAgentNoticeDetails } from "../viewer_url_agent_notice.ts";
 import type { LatexCompiler, LatexCompileStatus, LatexDiagnosticSummary } from "../latex/latex_file_compiler.ts";
 import { mergeInlinePreviewArtifacts, rasterizePdfPages, type InlinePreviewArtifact } from "./inline_preview.ts";
 import { buildInlinePreviewToolPayload, type InlinePreviewToolPayload } from "./inline_preview_payload.ts";
@@ -24,6 +25,7 @@ export interface ShowLatexPreviewResult {
 	operationPdfPath?: string;
 	targetPdfId?: number;
 	managedRecord?: HostServiceManagedViewerRecord;
+	viewerUrlNoticeDetails?: ViewerUrlAgentNoticeDetails;
 }
 
 export interface ShowLatexCallOptions {
@@ -111,6 +113,7 @@ export interface ShowLatexCompiledPreview {
 	operationPdfPath?: string;
 	targetPdfId?: number;
 	managedRecord?: HostServiceManagedViewerRecord;
+	viewerUrlNoticeDetails?: ViewerUrlAgentNoticeDetails;
 	workspaceContext?: ShowLatexWorkspaceContext;
 }
 
@@ -247,6 +250,7 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 			operationPdfPath: preview.operationPdfPath,
 			targetPdfId: preview.targetPdfId,
 			managedRecord: preview.managedRecord,
+			viewerUrlNoticeDetails: preview.viewerUrlNoticeDetails,
 			inline,
 			workspaceContext: request.workspaceContext,
 		};

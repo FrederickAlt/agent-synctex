@@ -56,18 +56,17 @@ function writeReverseSynctexFixture(baseDir: string): { pdfPath: string; sourceP
 	return { pdfPath, sourcePath };
 }
 
-function writeFakeDesktopAppLauncher(baseDir: string): { command: string; logPath: string } {
-	const command = join(baseDir, "fake-desktop-viewer-app.js");
-	const logPath = join(baseDir, "desktop-app-launches.jsonl");
+function writeFakeBrowserLauncher(baseDir: string): { command: string; logPath: string } {
+	const command = join(baseDir, "fake-browser-launcher.js");
+	const logPath = join(baseDir, "browser-launches.jsonl");
 	writeFileSync(command, `#!/usr/bin/env node
 const fs = require("node:fs");
-const logPath = ${JSON.stringify(logPath)};
-fs.appendFileSync(logPath, JSON.stringify({
-  appUrl: process.env.PDF_PREVIEW_VIEWER_HOST_APP_URL,
-  origin: process.env.PDF_PREVIEW_VIEWER_HOST_ORIGIN,
+const appUrl = process.argv[2];
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({
+  appUrl,
+  origin: appUrl ? new URL(appUrl).origin : undefined,
   argv: process.argv.slice(2)
 }) + "\\n");
-setInterval(() => {}, 1000);
 `);
 	chmodSync(command, 0o700);
 	return { command, logPath };
@@ -77,6 +76,14 @@ async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
 	const started = Date.now();
 	while (!existsSync(path)) {
 		if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${path}`);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+}
+
+async function waitForMissingFile(path: string, timeoutMs = 2_000): Promise<void> {
+	const started = Date.now();
+	while (existsSync(path)) {
+		if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${path} to be removed`);
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 }
@@ -96,13 +103,167 @@ async function withRuntimeEnv<T>(runtimeRoot: string, fn: () => Promise<T>): Pro
 	}
 }
 
-test("actual tex-actions-mcp entrypoint answers initialize and tools/list over stdio without a daemon", async () => {
+async function withHome<T>(home: string, fn: () => Promise<T>): Promise<T> {
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	try {
+		return await fn();
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+	}
+}
+
+test("stdio runtime closes hook bridge when stdio closes", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-stdio-close-"));
+	const launchCwd = join(baseDir, "project");
+	const runtimeRoot = join(baseDir, "runtime");
+	mkdirSync(launchCwd, { recursive: true });
+	try {
+		await withRuntimeEnv(runtimeRoot, async () => {
+			const stdin = new PassThrough();
+			const runtime = new TexActionsStdioMcpRuntime({ stdin, stdout: new PassThrough(), stderr: new PassThrough(), launchCwd, hookMode: { kind: "hook-capable", harness: "codex" }, pdfOperations: {} });
+			runtime.start();
+			const discoveryPath = join(runtimeRoot, "agents", "agent-synctex-codex", "hook-context-bridge.json");
+			try {
+				await waitForFile(discoveryPath);
+				stdin.end();
+				await waitForMissingFile(discoveryPath);
+			} finally {
+				runtime.close();
+			}
+		});
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("stdio runtime prints viewer URL to the agent when no live browser viewer is detected", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-viewer-url-agent-"));
+	const stdin = new PassThrough();
+	const stdout = new PassThrough();
+	const stderr = new PassThrough();
+	const userMessages: string[] = [];
+	const runtime = new TexActionsStdioMcpRuntime({
+		stdin,
+		stdout,
+		stderr,
+		launchCwd: baseDir,
+		hookMode: { kind: "no-hooks" },
+		viewerUrlFallbackWriter: (message) => userMessages.push(message),
+		pdfOperations: {
+			openPdf: async () => ({
+				protocol_version: 1,
+				request_id: "open-test",
+				operation: "open_pdf",
+				status: "ok",
+				generated_at_ns: 1,
+				status_details: {
+					protocol_version: 1,
+					supported: true,
+					service_available: true,
+					backend: "viewer-host-client",
+					backend_identity_ok: true,
+					pdf_id: 9,
+					viewer_url: "http://127.0.0.1:44417/viewer-lw/9",
+					browser_launch: { attempted: true, confirmed: false, active_viewer_clients: 0 },
+				},
+			} as unknown as HostServiceOpenResponseEnvelope),
+		},
+	});
+	try {
+		runtime.start();
+		const output = collectMcpFrames(stdout, 1);
+		stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "open_pdf", arguments: { pdf_file_path: "/tmp/paper.pdf" } } }));
+		const [toolResult] = await output as Array<{ result?: { content?: Array<{ text?: string }>; details?: Record<string, unknown> } }>;
+		assert.equal(toolResult.result?.content?.[0]?.text, "open_pdf ok: pdf_id=9\nNo browser viewer was detected after launch; pass this Viewer URL to the user: http://127.0.0.1:44417/viewer-lw/9");
+		assert.doesNotMatch(JSON.stringify(toolResult.result?.details), /127\.0\.0\.1|viewer_url/);
+		assert.deepEqual(userMessages, ["Agent SyncTeX: no browser viewer was detected after launch; pass this Viewer URL to the user: http://127.0.0.1:44417/viewer-lw/9\n"]);
+	} finally {
+		runtime.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("stdio runtime hides fetch_pdf_context when user/global managed hooks are installed", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-global-hooks-"));
+	const launchCwd = join(baseDir, "project");
+	const runtimeRoot = join(baseDir, "runtime");
+	const home = join(baseDir, "home");
+	mkdirSync(join(home, ".claude", "hooks"), { recursive: true });
+	mkdirSync(launchCwd, { recursive: true });
+	writeFileSync(join(home, ".claude", "hooks", "agent-synctex-fetch-info.sh"), "# Managed by agent-synctex\n");
+	try {
+		await withHome(home, async () => await withRuntimeEnv(runtimeRoot, async () => {
+			const stdin = new PassThrough();
+			const stdout = new PassThrough();
+			const runtime = new TexActionsStdioMcpRuntime({ stdin, stdout, stderr: new PassThrough(), launchCwd, hookMode: { kind: "hook-capable", harness: "claude" }, pdfOperations: {} });
+			try {
+				runtime.start();
+				const output = collectMcpFrames(stdout, 1);
+				stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+				const [toolsList] = await output as Array<{ result: { tools: Array<{ name: string }> } }>;
+				assert.equal(toolsList.result.tools.some((tool) => tool.name === "fetch_pdf_context"), false);
+			} finally {
+				runtime.close();
+			}
+		}));
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("actual agent-synctex mcp --harness codex exits when stdio closes", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-codex-close-"));
+	const cwd = join(baseDir, "project");
+	const runtimeRoot = join(baseDir, "runtime");
+	mkdirSync(cwd, { recursive: true });
+	const scriptPath = resolve(process.cwd(), "scripts", "agent-synctex.ts");
+	const child = spawn(process.execPath, [scriptPath, "mcp", "--harness", "codex", "--cwd", cwd], {
+		cwd,
+		env: { ...process.env, MCP_TMPDIR: runtimeRoot },
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+	let stderr = "";
+	child.stderr.on("data", (chunk) => {
+		stderr += String(chunk);
+	});
+	const exitPromise = new Promise<number | null>((resolveExit, rejectExit) => {
+		child.once("exit", (code) => resolveExit(code));
+		child.once("error", rejectExit);
+	});
+
+	try {
+		await waitForFile(join(runtimeRoot, "agents", "agent-synctex-codex", "hook-context-bridge.json"));
+		child.stdin.end();
+		const exitCode = await Promise.race([
+			exitPromise,
+			new Promise<"timeout">((resolveTimeout) => setTimeout(() => resolveTimeout("timeout"), 2_000)),
+		]);
+		assert.notEqual(exitCode, "timeout", "MCP process should exit after Codex closes stdio");
+		assert.equal(exitCode, 0);
+	} finally {
+		child.kill("SIGKILL");
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.equal(stderr, "");
+});
+
+
+test("actual agent-synctex mcp entrypoint answers initialize and tools/list over stdio without a daemon", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-"));
 	const cwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
 	mkdirSync(cwd, { recursive: true });
-	const scriptPath = resolve(process.cwd(), "scripts", "tex-actions-mcp.ts");
-	const child = spawn(process.execPath, [scriptPath], {
+	const scriptPath = resolve(process.cwd(), "scripts", "agent-synctex.ts");
+	const child = spawn(process.execPath, [scriptPath, "mcp", "--no-hooks"], {
 		cwd,
 		env: { ...process.env, MCP_TMPDIR: runtimeRoot, TEX_ACTIONS_AGENT_ID: "entrypoint-test-agent" },
 		stdio: ["pipe", "pipe", "pipe"],
@@ -141,22 +302,22 @@ test("actual tex-actions-mcp entrypoint answers initialize and tools/list over s
 	assert.doesNotMatch(stderr, /daemon is unavailable|ENOENT|ECONNREFUSED/i);
 });
 
-test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host boundary without owning PDF serving", async () => {
+test("actual agent-synctex mcp entrypoint routes open_pdf to the Viewer Host boundary without owning PDF serving", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-viewer-"));
 	const cwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
 	const pdfPath = join(baseDir, "paper.pdf");
 	mkdirSync(cwd, { recursive: true });
 	writeFileSync(pdfPath, "%PDF-1.4\n% entrypoint viewer test\n%%EOF\n");
-	const fakeDesktopApp = writeFakeDesktopAppLauncher(baseDir);
-	const scriptPath = resolve(process.cwd(), "scripts", "tex-actions-mcp.ts");
-	const child = spawn(process.execPath, [scriptPath], {
+	const fakeBrowser = writeFakeBrowserLauncher(baseDir);
+	const scriptPath = resolve(process.cwd(), "scripts", "agent-synctex.ts");
+	const child = spawn(process.execPath, [scriptPath, "mcp", "--no-hooks"], {
 		cwd,
 		env: {
 			...process.env,
 			MCP_TMPDIR: runtimeRoot,
 			TEX_ACTIONS_AGENT_ID: "entrypoint-viewer-test-agent",
-			PDF_PREVIEW_VIEWER_APP_COMMAND: fakeDesktopApp.command,
+			AGENT_SYNCTEX_BROWSER_COMMAND: fakeBrowser.command,
 		},
 		stdio: ["pipe", "pipe", "pipe"],
 	});
@@ -174,27 +335,31 @@ test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host bound
 		child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
 		child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "open_pdf", arguments: { pdf_file_path: pdfPath } } }));
 		const frames = await output;
-		const openResponse = frames[1] as { id: number; result?: { details?: { viewer_url?: unknown; pdf_id?: unknown } }; error?: unknown };
+		const openResponse = frames[1] as { id: number; result?: { content?: Array<{ text?: string }>; details?: { viewer_url?: unknown; pdf_id?: unknown }; _meta?: Record<string, unknown> }; error?: unknown };
 		assert.equal(openResponse.id, 2);
 		assert.equal(openResponse.error, undefined);
-		const viewerUrl = openResponse.result?.details?.viewer_url;
 		const pdfId = openResponse.result?.details?.pdf_id;
-		assert.equal(typeof viewerUrl, "string");
+		assert.equal(openResponse.result?.details?.viewer_url, undefined);
+		assert.equal(openResponse.result?._meta?.["agent-synctex/viewer_url"], undefined);
 		assert.equal(typeof pdfId, "number");
-		assert.match(viewerUrl as string, /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/\d+$/);
-		assert.equal((viewerUrl as string).includes(pdfPath), false, "viewer URL must not expose raw PDF paths");
-		const origin = new URL(viewerUrl as string).origin;
-		const viewer = await fetch(viewerUrl as string);
+		await waitForFile(fakeBrowser.logPath);
+		const appLaunches = readFileSync(fakeBrowser.logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { appUrl?: unknown; origin?: unknown });
+		const origin = appLaunches[0]?.origin as string;
+		const viewerUrl = `${origin}/viewer-lw/${pdfId}`;
+		assert.match(viewerUrl, /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/\d+$/);
+		assert.equal(openResponse.result?.content?.[0]?.text, `open_pdf ok: pdf_id=${pdfId}\nNo browser viewer was detected after launch; pass this Viewer URL to the user: ${viewerUrl}`);
+		assert.doesNotMatch(JSON.stringify(openResponse.result?.details), /127\.0\.0\.1|viewer_url/);
+		assert.equal(viewerUrl.includes(pdfPath), false, "viewer URL must not expose raw PDF paths");
+		assert.match(stderr, /Agent SyncTeX: no browser viewer was detected after launch; pass this Viewer URL to the user: http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/\d+/);
+		const viewer = await fetch(viewerUrl);
 		assert.equal(viewer.status, 200, "returned viewer URL should remain reachable while the Host is alive");
 		const config = await fetch(`${origin}/config/${pdfId}.json`);
 		assert.equal(config.status, 200, "default stdio runtime should launch a real Viewer Host control target, not use FakeViewerHostClient");
 		const configBody = await config.json() as { pdf_id?: unknown; pdf_url?: unknown };
 		assert.equal(configBody.pdf_id, pdfId);
 		assert.equal(typeof configBody.pdf_url, "string");
-		await waitForFile(fakeDesktopApp.logPath);
-		const appLaunches = readFileSync(fakeDesktopApp.logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { appUrl?: unknown; origin?: unknown });
 		assert.equal(appLaunches[0]?.origin, origin);
-		assert.equal(appLaunches[0]?.appUrl, `${origin}/app`, "default stdio runtime must launch/focus the desktop app at the Host /app UI");
+		assert.equal(appLaunches[0]?.appUrl, `${origin}/viewer-lw`, "default stdio runtime must launch/focus the stable direct browser viewer URL");
 		assert.equal(child.exitCode, null, "MCP process must remain alive after routing open_pdf through the Viewer Host boundary");
 	} finally {
 		child.kill("SIGTERM");
@@ -205,21 +370,21 @@ test("actual tex-actions-mcp entrypoint routes open_pdf to the Viewer Host bound
 	assert.doesNotMatch(stderr, /daemon is unavailable|ENOENT|ECONNREFUSED/i);
 });
 
-test("actual tex-actions-mcp entrypoint bridges reverse SyncTeX events from the real Viewer Host process", async () => {
+test("actual agent-synctex mcp entrypoint bridges reverse SyncTeX events from the real Viewer Host process", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-reverse-"));
 	const cwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
 	mkdirSync(cwd, { recursive: true });
 	const { pdfPath, sourcePath } = writeReverseSynctexFixture(baseDir);
-	const fakeDesktopApp = writeFakeDesktopAppLauncher(baseDir);
-	const scriptPath = resolve(process.cwd(), "scripts", "tex-actions-mcp.ts");
-	const child = spawn(process.execPath, [scriptPath], {
+	const fakeBrowser = writeFakeBrowserLauncher(baseDir);
+	const scriptPath = resolve(process.cwd(), "scripts", "agent-synctex.ts");
+	const child = spawn(process.execPath, [scriptPath, "mcp", "--no-hooks"], {
 		cwd,
 		env: {
 			...process.env,
 			MCP_TMPDIR: runtimeRoot,
 			TEX_ACTIONS_AGENT_ID: "entrypoint-reverse-test-agent",
-			PDF_PREVIEW_VIEWER_APP_COMMAND: fakeDesktopApp.command,
+			AGENT_SYNCTEX_BROWSER_COMMAND: fakeBrowser.command,
 		},
 		stdio: ["pipe", "pipe", "pipe"],
 	});
@@ -233,12 +398,16 @@ test("actual tex-actions-mcp entrypoint bridges reverse SyncTeX events from the 
 		const initialOutput = collectMcpFrames(child.stdout as PassThrough, 2, 5_000);
 		child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
 		child.stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "open_pdf", arguments: { pdf_file_path: pdfPath } } }));
-		const [, openFrame] = await initialOutput as Array<{ id: number; result?: { details?: { pdf_id?: unknown; viewer_url?: unknown } } }>;
+		const [, openFrame] = await initialOutput as Array<{ id?: unknown; result?: { content?: Array<{ text?: string }>; details?: { pdf_id?: unknown; viewer_url?: unknown }; _meta?: Record<string, unknown> } }>;
 		const pdfId = openFrame.result?.details?.pdf_id;
-		const viewerUrl = openFrame.result?.details?.viewer_url;
+		assert.equal(openFrame.result?.details?.viewer_url, undefined);
+		assert.equal(openFrame.result?._meta?.["agent-synctex/viewer_url"], undefined);
 		assert.equal(typeof pdfId, "number");
-		assert.equal(typeof viewerUrl, "string");
-		const origin = new URL(viewerUrl as string).origin;
+		await waitForFile(fakeBrowser.logPath);
+		const appLaunches = readFileSync(fakeBrowser.logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { origin?: unknown });
+		const origin = appLaunches[0]?.origin as string;
+		assert.equal(openFrame.result?.content?.[0]?.text, `open_pdf ok: pdf_id=${pdfId}\nNo browser viewer was detected after launch; pass this Viewer URL to the user: ${origin}/viewer-lw/${pdfId}`);
+		assert.doesNotMatch(JSON.stringify(openFrame.result?.details), /127\.0\.0\.1|viewer_url/);
 		const configResponse = await fetch(`${origin}/config/${pdfId}.json`);
 		assert.equal(configResponse.status, 200);
 		const config = await configResponse.json() as { viewer_socket_url?: unknown };

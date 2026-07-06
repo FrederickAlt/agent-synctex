@@ -6,6 +6,7 @@ import { HostServiceCompileService } from "./host_service_compile.ts";
 import { buildLatexPreambleIndex } from "./latex/latex_preamble_index.ts";
 import type { GetPdfEventsRequest, PdfEvent } from "./pdf_events.ts";
 import { normalizeFetchPdfContextRequest, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
+import { appendViewerUrlAgentNotice, viewerUrlForAgentWhenNoLiveViewer } from "./viewer_url_agent_notice.ts";
 import type {
 	HostServiceCloseRequest,
 	HostServiceCloseResponseEnvelope,
@@ -99,6 +100,8 @@ type McpResponsePayload = McpSuccessResponse | McpErrorResponse;
 
 export interface HostServiceMcpOptions {
 	hooksEnabled?: boolean;
+	exposeFetchPdfContext?: boolean;
+	emitViewerUrlFallback?: (url: string) => void;
 }
 
 type ParsedMcpRequestId = McpRequestId | undefined;
@@ -225,12 +228,13 @@ function parseCompileWorkspaceContext(sourcePath: string, rawWorkspaceContext: u
 }
 function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompileSnippetRequest {
 	for (const key of Object.keys(args)) {
-		if (!["source", "compiler", "workspace_context"].includes(key)) {
+		if (!["source", "compiler", "workspace_context", "debug_synctex"].includes(key)) {
 			throw new Error(`show_latex unknown argument: ${key}`);
 		}
 	}
 	const source = parseStringArg(args, "source");
 	const compiler = parseOptionalStringArg(args, "compiler");
+	const debugSynctex = parseBooleanArg(args, "debug_synctex");
 	const rawWorkspaceContext = args.workspace_context;
 	const workspaceContext = rawWorkspaceContext === undefined
 		? { cwd: MCP_DEFAULT_WORKSPACE_CONTEXT.cwd }
@@ -248,6 +252,7 @@ function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompil
 			latex_source: source,
 			...(compiler === undefined ? {} : { compiler }),
 			open_pdf: true,
+			...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
 		},
 	};
 }
@@ -281,7 +286,7 @@ function parseJumpWorkspaceContext(rawWorkspaceContext: unknown, sourceFile?: st
 }
 
 function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileRequest: HostServiceCompileRequest; hideWarnings: boolean } {
-	const allowedArgs = new Set(["latex_file_path", "compiler", "clean", "open_pdf", "hide_warnings", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
+	const allowedArgs = new Set(["latex_file_path", "compiler", "clean", "open_pdf", "hide_warnings", "reuse_existing", "require_persistent_viewer", "debug_synctex", "workspace_context"]);
 	for (const key of Object.keys(args)) {
 		if (!allowedArgs.has(key)) {
 			throw new Error(`compile_latex_file unknown argument: ${key}`);
@@ -294,6 +299,7 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 	const hideWarnings = parseBooleanArg(args, "hide_warnings") ?? true;
 	const reuseExisting = openPdf ? parseBooleanArg(args, "reuse_existing") : undefined;
 	const requirePersistentViewer = openPdf ? parseBooleanArg(args, "require_persistent_viewer") : undefined;
+	const debugSynctex = openPdf ? parseBooleanArg(args, "debug_synctex") : undefined;
 	const workspaceContext = parseCompileWorkspaceContext(latexFilePath, args.workspace_context);
 	return {
 		compileRequest: {
@@ -309,6 +315,7 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 				...(openPdf === undefined ? {} : { open_pdf: openPdf }),
 				...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
 				...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
+				...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
 			},
 		},
 		hideWarnings,
@@ -316,7 +323,7 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 }
 
 function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequest {
-	const allowedArgs = new Set(["pdf_file_path", "reuse_existing", "require_persistent_viewer", "workspace_context"]);
+	const allowedArgs = new Set(["pdf_file_path", "reuse_existing", "require_persistent_viewer", "debug_synctex", "workspace_context"]);
 	for (const key of Object.keys(args)) {
 		if (!allowedArgs.has(key)) {
 			throw new Error(`open_pdf unknown argument: ${key}`);
@@ -331,6 +338,7 @@ function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequ
 	const resolvedPdfPath = isAbsolute(pdfPath) ? pdfPath : resolve(workspaceContext.cwd, pdfPath);
 	const reuseExisting = parseBooleanArg(args, "reuse_existing");
 	const requirePersistentViewer = parseBooleanArg(args, "require_persistent_viewer");
+	const debugSynctex = parseBooleanArg(args, "debug_synctex");
 	return {
 		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
 		request_id: nextHostServiceRequestId(),
@@ -341,12 +349,13 @@ function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequ
 			pdf_path: resolvedPdfPath,
 			...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
 			...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
+			...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
 		},
 	};
 }
 
 function parseJumpPdfRequest(args: Record<string, unknown>): HostServiceJumpRequest {
-	const allowedArgs = new Set(["pdf_id", "line", "source_file", "workspace_context"]);
+	const allowedArgs = new Set(["pdf_id", "line", "source_file", "debug_synctex", "workspace_context"]);
 	for (const key of Object.keys(args)) {
 		if (!allowedArgs.has(key)) {
 			throw new Error(`jump_pdf unknown argument: ${key}`);
@@ -355,6 +364,7 @@ function parseJumpPdfRequest(args: Record<string, unknown>): HostServiceJumpRequ
 	const pdfId = parsePositiveIntegerArg(args, "pdf_id");
 	const line = parsePositiveIntegerArg(args, "line");
 	const sourceFile = parseOptionalStringArg(args, "source_file");
+	const debugSynctex = parseBooleanArg(args, "debug_synctex");
 	const workspaceContext = parseJumpWorkspaceContext(args.workspace_context, sourceFile);
 	const resolvedSourceFile = sourceFile === undefined
 		? undefined
@@ -368,6 +378,7 @@ function parseJumpPdfRequest(args: Record<string, unknown>): HostServiceJumpRequ
 		pdf_id: pdfId,
 		line,
 		...(resolvedSourceFile === undefined ? {} : { source_file: resolvedSourceFile }),
+		...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
 	};
 }
 function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }, hideWarnings = false): string {
@@ -382,9 +393,28 @@ function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: 
 	return `\nWarnings:\n${lines.join("\n")}${details.warnings_truncated === true ? "\n- ... more warnings omitted" : ""}`;
 }
 
-function agentFacingCompileDetails<T extends { warning_count?: unknown; warnings?: unknown }>(details: T, hideWarnings: boolean): T | (Omit<T, "warnings"> & { warnings_hidden: true }) {
-	if (!hideWarnings || typeof details.warning_count !== "number" || details.warning_count <= 0) return details;
-	const { warnings: _warnings, ...filteredDetails } = details;
+function emitViewerUrlFallback(details: Record<string, unknown>, options: HostServiceMcpOptions): void {
+	const viewerUrl = viewerUrlForAgentWhenNoLiveViewer(details);
+	if (viewerUrl === undefined) return;
+	options.emitViewerUrlFallback?.(viewerUrl);
+}
+
+function agentFacingDetails<T extends Record<string, unknown>>(details: T): T {
+	const filtered = { ...details } as Record<string, unknown>;
+	delete filtered.pdf;
+	delete filtered.operation_pdf;
+	delete filtered.artifact_paths;
+	delete filtered.operation_artifact_paths;
+	delete filtered.managed_record;
+	delete filtered.handle;
+	delete filtered.viewer_url;
+	return filtered as T;
+}
+
+function agentFacingCompileDetails<T extends Record<string, unknown> & { warning_count?: unknown; warnings?: unknown }>(details: T, hideWarnings: boolean): T | (Omit<T, "warnings"> & { warnings_hidden: true }) {
+	const filtered = agentFacingDetails(details);
+	if (!hideWarnings || typeof filtered.warning_count !== "number" || filtered.warning_count <= 0) return filtered;
+	const { warnings: _warnings, ...filteredDetails } = filtered;
 	return { ...filteredDetails, warnings_hidden: true };
 }
 
@@ -397,15 +427,14 @@ function parseToolResult(
 	if (response.status === "ok") {
 		const status = details.compile_status ?? (successText.replace(/:$/, "") || "ok");
 		const pdfId = details.pdf_id === undefined ? "" : ` pdf_id=${details.pdf_id}`;
-		const pdf = details.pdf ? ` pdf=${details.pdf}` : "";
-		const compileOnlyPdf = !pdfId && details.pdf ? ` ${details.pdf}` : "";
 		const warningCount = details.warning_count ? ` warnings=${details.warning_count}` : "";
 		const exitCode = details.compile_status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
-		const log = details.log ? `\nLog: ${details.log}` : "";
-		const viewerUrl = typeof details.viewer_url === "string" && details.viewer_url ? ` viewer_url=${details.viewer_url}` : "";
+		const cleanOk = status === "ok" && !details.warning_count;
+		const log = !cleanOk && details.log ? `\nLog: ${details.log}` : "";
+		const text = `${status}:${pdfId}${exitCode}${warningCount}${log}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim();
 		return {
-			content: [{ type: "text", text: `${status}:${pdfId}${pdfId ? pdf : compileOnlyPdf}${viewerUrl}${exitCode}${warningCount}${log}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim() }],
-			details: agentFacingCompileDetails(details, options.hideWarnings === true),
+			content: [{ type: "text", text: appendViewerUrlAgentNotice(text, details as unknown as Record<string, unknown>) }],
+			details: agentFacingCompileDetails(details as unknown as Record<string, unknown> & typeof details, options.hideWarnings === true),
 		};
 	}
 	const errorCode = typeof details.error_code === "string" ? ` (code=${details.error_code})` : "";
@@ -414,7 +443,7 @@ function parseToolResult(
 	return {
 		isError: true,
 		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}` }],
-		details,
+		details: agentFacingDetails(details as unknown as Record<string, unknown>) as unknown as typeof details,
 	};
 }
 
@@ -431,35 +460,28 @@ function parseManagedPdfToolResult(
 		const sourceLine = typeof details.source_line === "string" && lineNumber !== undefined
 			? `\nline ${lineNumber} contains:\n${details.source_line}`
 			: "";
-		const pdf =
-			typeof details.pdf === "string" && details.pdf
-				? ` pdf=${details.pdf}`
-				: "";
 		const pdfId =
 			typeof details.pdf_id === "number" && details.pdf_id > 0
 				? ` pdf_id=${details.pdf_id}`
-				: "";
-		const viewerUrl =
-			typeof details.viewer_url === "string" && details.viewer_url
-				? ` viewer_url=${details.viewer_url}`
 				: "";
 		const handled =
 				typeof details.handled === "boolean" && details.handled
 					? " handled"
 					: "";
+		const text = (`${successPrefix}${pdfId}${line}${handled}`.trim() || successPrefix) + sourceLine;
 		return {
 			content: [{
 				type: "text",
-				text: (`${successPrefix}${pdf}${pdfId}${viewerUrl}${line}${handled}`.trim() || successPrefix) + sourceLine,
+				text: appendViewerUrlAgentNotice(text, details),
 			}],
-			details,
+			details: agentFacingDetails(details),
 		};
 	}
 	const errorCode = typeof details.error_code === "string" ? ` (code=${details.error_code})` : "";
 	return {
 		isError: true,
 		content: [{ type: "text", text: `${response.error || "operation failed"}${errorCode}` }],
-		details,
+		details: agentFacingDetails(details),
 	};
 }
 
@@ -586,7 +608,7 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 	const tools: McpToolDefinition[] = [
 		{
 			name: "show_latex",
-			description: "Render a LaTeX snippet as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Raw string/FREEFORM tool arguments are accepted as LaTeX source; callers may pass a full document, a \\begin{document}...\\end{document} body, or just document body content.",
+			description: "Render a LaTeX snippet as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Raw string/FREEFORM tool arguments are accepted as LaTeX source; callers may pass a full document, a \\begin{document}...\\end{document} body, or just document body content. If a browser viewer is detected after launch/focus, the tool returns only pdf_id because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -600,7 +622,7 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 		},
 		{
 			name: "compile_latex_file",
-			description: "Compile a LaTeX source file once with latexmk and optionally route the output PDF open request through the Viewer Host Client boundary. The compiler option selects the TeX engine latexmk should run. Same-root requests are coordinated by the Host Service to avoid overlapping latexmk processes. Set clean=true to remove common same-basename artifacts before compiling. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings.",
+			description: "Compile a LaTeX source file once with latexmk and optionally route the output PDF open request through the Viewer Host Client boundary. The compiler option selects the TeX engine latexmk should run. Same-root requests are coordinated by the Host Service to avoid overlapping latexmk processes. Set clean=true to remove common same-basename artifacts before compiling. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings. When open_pdf=true, if a browser viewer is detected after launch/focus, the tool returns only pdf_id because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -619,7 +641,7 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 		},
 		{
 			name: "open_pdf",
-			description: "Register a PDF in MCP state, send an open/focus request through the Viewer Host Client boundary, and return a runtime PDF id.",
+			description: "Register a PDF in MCP state, send an open/focus request through the Viewer Host Client boundary, and return a runtime PDF id. If a browser viewer is detected after launch/focus, the tool returns only pdf_id because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -634,7 +656,7 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 		},
 		{
 			name: "jump_pdf",
-			description: "Jump a tracked PDF to a source line via forward SyncTeX.",
+			description: "Jump a tracked PDF to a source line via forward SyncTeX. If a browser viewer is detected after launch/focus, the tool returns only pdf_id/handled status because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -662,7 +684,7 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 			},
 		},
 	];
-	if (options.hooksEnabled !== true) {
+	if (shouldExposeFetchPdfContext(options)) {
 		tools.push({
 			name: "fetch_pdf_context",
 			description: "Fetch unread PDF viewer marks/comments as concise source-cited context. Returns user comments attached to LaTeX source lines and consumes pending viewer marks.",
@@ -696,7 +718,11 @@ export const HOST_SERVICE_TOOL_NAMES = [
 type HostServiceToolName = (typeof HOST_SERVICE_TOOL_NAMES)[number];
 
 function hostServiceToolNames(options: HostServiceMcpOptions = {}): readonly HostServiceToolName[] {
-	return options.hooksEnabled === true ? HOST_SERVICE_BASE_TOOL_NAMES : HOST_SERVICE_TOOL_NAMES;
+	return shouldExposeFetchPdfContext(options) ? HOST_SERVICE_TOOL_NAMES : HOST_SERVICE_BASE_TOOL_NAMES;
+}
+
+function shouldExposeFetchPdfContext(options: HostServiceMcpOptions = {}): boolean {
+	return options.exposeFetchPdfContext ?? options.hooksEnabled !== true;
 }
 
 type HostServiceMcpToolHandler = (
@@ -704,6 +730,7 @@ type HostServiceMcpToolHandler = (
 	args: Record<string, unknown>,
 	pdfOperations: HostServiceMcpPdfOperations,
 	mcpCompileService: HostServiceCompileService,
+	options: HostServiceMcpOptions,
 ) => Promise<McpResponsePayload>;
 
 async function handleShowLatexTool(
@@ -711,6 +738,7 @@ async function handleShowLatexTool(
 	args: Record<string, unknown>,
 	_pdfOperations: HostServiceMcpPdfOperations,
 	mcpCompileService: HostServiceCompileService,
+	options: HostServiceMcpOptions,
 ): Promise<McpResponsePayload> {
 	let compileRequest: HostServiceCompileSnippetRequest;
 	try {
@@ -724,6 +752,7 @@ async function handleShowLatexTool(
 	}
 	try {
 		const compileResponse = await mcpCompileService.compileLatexSnippetRequest(compileRequest);
+		emitViewerUrlFallback(compileResponse.status_details as unknown as Record<string, unknown>, options);
 		return buildSuccess(requestId, parseToolResult(compileResponse, "ok"));
 	} catch (error) {
 		const details = error instanceof Error ? error.message : String(error);
@@ -739,6 +768,7 @@ async function handleCompileLatexFileTool(
 	args: Record<string, unknown>,
 	pdfOperations: HostServiceMcpPdfOperations,
 	mcpCompileService: HostServiceCompileService,
+	options: HostServiceMcpOptions,
 ): Promise<McpResponsePayload> {
 	let compileRequest: HostServiceCompileRequest;
 	let hideWarnings = true;
@@ -755,6 +785,7 @@ async function handleCompileLatexFileTool(
 	}
 	try {
 		const compileResponse = await mcpCompileService.compileLatexFileRequest(compileRequest);
+		emitViewerUrlFallback(compileResponse.status_details as unknown as Record<string, unknown>, options);
 		return buildSuccess(requestId, parseToolResult(compileResponse, "ok:", { hideWarnings }));
 	} catch (error) {
 		const details = error instanceof Error ? error.message : String(error);
@@ -770,6 +801,7 @@ async function handleOpenPdfTool(
 	args: Record<string, unknown>,
 	pdfOperations: HostServiceMcpPdfOperations,
 	_mcpCompileService: HostServiceCompileService,
+	options: HostServiceMcpOptions,
 ): Promise<McpResponsePayload> {
 	let openRequest: HostServiceOpenRequest;
 	try {
@@ -789,6 +821,7 @@ async function handleOpenPdfTool(
 	}
 	try {
 		const openResponse = await pdfOperations.openPdf(openRequest);
+		emitViewerUrlFallback(openResponse.status_details as unknown as Record<string, unknown>, options);
 		return buildSuccess(requestId, parseManagedPdfToolResult(openResponse, "open_pdf ok:"));
 	} catch (error) {
 		const details = error instanceof Error ? error.message : String(error);
@@ -804,6 +837,7 @@ async function handleJumpPdfTool(
 	args: Record<string, unknown>,
 	pdfOperations: HostServiceMcpPdfOperations,
 	_mcpCompileService: HostServiceCompileService,
+	options: HostServiceMcpOptions,
 ): Promise<McpResponsePayload> {
 	let jumpRequest: HostServiceJumpRequest;
 	try {
@@ -823,6 +857,7 @@ async function handleJumpPdfTool(
 	}
 	try {
 		const jumpResponse = await pdfOperations.jumpPdf(jumpRequest);
+		emitViewerUrlFallback(jumpResponse.status_details as unknown as Record<string, unknown>, options);
 		return buildSuccess(requestId, parseManagedPdfToolResult(jumpResponse, "jump_pdf ok:"));
 	} catch (error) {
 		const details = error instanceof Error ? error.message : String(error);
@@ -838,6 +873,7 @@ async function handleSetLatexPreambleTool(
 	args: Record<string, unknown>,
 	_pdfOperations: HostServiceMcpPdfOperations,
 	_mcpCompileService: HostServiceCompileService,
+	_options: HostServiceMcpOptions,
 ): Promise<McpResponsePayload> {
 	for (const key of Object.keys(args)) {
 		if (!["latex_preamble", "root_file", "workspace_context"].includes(key)) {
@@ -911,6 +947,7 @@ async function handleFetchPdfContextTool(
 	args: Record<string, unknown>,
 	pdfOperations: HostServiceMcpPdfOperations,
 	_mcpCompileService: HostServiceCompileService,
+	_options: HostServiceMcpOptions,
 ): Promise<McpResponsePayload> {
 	let request: FetchPdfContextRequest;
 	try {
@@ -1021,7 +1058,7 @@ export async function handleMcpRequest(
 				});
 			}
 
-			return await handler(request.id, call.args, pdfOperations, mcpCompileService);
+			return await handler(request.id, call.args, pdfOperations, mcpCompileService, options);
 		}
 		default:
 			return buildMcpErrorResponse(request.id, MCP_ERROR_METHOD_NOT_FOUND, `method not found: ${request.method}`);
