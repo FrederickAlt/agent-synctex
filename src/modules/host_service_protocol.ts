@@ -303,6 +303,7 @@ export interface HostServiceCompileSnippetResponseDetails {
 	request_id: string;
 	operation: "compile_latex_snippet";
 	source: string;
+	source_dir?: string;
 	pdf: string;
 	log: string;
 	artifact_paths: string[];

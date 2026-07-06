@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { getLatexPreambleFilePath } from "./runtime_preamble.ts";
 import { writeLatexPreambleToTmpdir } from "./runtime_preamble.ts";
 import { resolveTexActionsAgentRuntimeDir } from "./agent_runtime_context.ts";
@@ -418,10 +418,19 @@ function agentFacingCompileDetails<T extends Record<string, unknown> & { warning
 	return { ...filteredDetails, warnings_hidden: true };
 }
 
+function formatSourceDirectoryNotice(details: { source?: unknown; source_dir?: unknown }, includeSourceDirectory: boolean): string {
+	if (!includeSourceDirectory) return "";
+	if (typeof details.source !== "string" || details.source.length === 0) return "";
+	const sourceDir = typeof details.source_dir === "string" && details.source_dir.length > 0
+		? details.source_dir
+		: dirname(details.source);
+	return `\nSource: ${details.source}\nSource dir: ${sourceDir}`;
+}
+
 function parseToolResult(
 	response: HostServiceCompileResponseEnvelope | HostServiceCompileSnippetResponseEnvelope,
 	successText: string,
-	options: { hideWarnings?: boolean } = {},
+	options: { hideWarnings?: boolean; includeSourceDirectory?: boolean } = {},
 ): McpToolResult {
 	const details = response.status_details;
 	if (response.status === "ok") {
@@ -431,7 +440,8 @@ function parseToolResult(
 		const exitCode = details.compile_status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 		const cleanOk = status === "ok" && !details.warning_count;
 		const log = !cleanOk && details.log ? `\nLog: ${details.log}` : "";
-		const text = `${status}:${pdfId}${exitCode}${warningCount}${log}${formatDiagnosticSummary(details, options.hideWarnings === true)}`.trim();
+		const sourceDirectory = formatSourceDirectoryNotice(details, options.includeSourceDirectory === true);
+		const text = `${status}:${pdfId}${exitCode}${warningCount}${log}${formatDiagnosticSummary(details, options.hideWarnings === true)}${sourceDirectory}`.trim();
 		return {
 			content: [{ type: "text", text: appendViewerUrlAgentNotice(text, details as unknown as Record<string, unknown>) }],
 			details: agentFacingCompileDetails(details as unknown as Record<string, unknown> & typeof details, options.hideWarnings === true),
@@ -440,9 +450,10 @@ function parseToolResult(
 	const errorCode = typeof details.error_code === "string" ? ` (code=${details.error_code})` : "";
 	const summary = typeof details.error_summary === "string" && details.error_summary ? `\n${details.error_summary}` : "";
 	const log = details.log ? `\nLog: ${details.log}` : "";
+	const sourceDirectory = formatSourceDirectoryNotice(details, options.includeSourceDirectory === true);
 	return {
 		isError: true,
-		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}` }],
+		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}${sourceDirectory}` }],
 		details: agentFacingDetails(details as unknown as Record<string, unknown>) as unknown as typeof details,
 	};
 }
@@ -608,7 +619,7 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 	const tools: McpToolDefinition[] = [
 		{
 			name: "show_latex",
-			description: "Render a LaTeX snippet as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Raw string/FREEFORM tool arguments are accepted as LaTeX source; callers may pass a full document, a \\begin{document}...\\end{document} body, or just document body content. If a browser viewer is detected after launch/focus, the tool returns only pdf_id because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
+			description: "Render a LaTeX snippet as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Raw string/FREEFORM tool arguments are accepted as LaTeX source; callers may pass a full document, a \\begin{document}...\\end{document} body, or just document body content. The response includes the generated .tex source path and source directory so callers can edit it and recompile. If a browser viewer is detected after launch/focus, the tool returns only pdf_id plus that source location because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -753,7 +764,7 @@ async function handleShowLatexTool(
 	try {
 		const compileResponse = await mcpCompileService.compileLatexSnippetRequest(compileRequest);
 		emitViewerUrlFallback(compileResponse.status_details as unknown as Record<string, unknown>, options);
-		return buildSuccess(requestId, parseToolResult(compileResponse, "ok"));
+		return buildSuccess(requestId, parseToolResult(compileResponse, "ok", { includeSourceDirectory: true }));
 	} catch (error) {
 		const details = error instanceof Error ? error.message : String(error);
 		return buildSuccess(requestId, {

@@ -1695,12 +1695,16 @@ test("daemon renders show_latex through compile flow", async () => {
 	try {
 		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
 			return await sendFramedRequest(socketPath, requestPayload);
-		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details?: { log?: string } } };
+		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details?: { log?: string; source?: string; source_dir?: string } } };
 		assert.equal(response.result.isError, undefined);
 		const resultText = response.result.content[0].text;
 		assert.doesNotMatch(resultText, /\.pdf/);
 		assert.doesNotMatch(resultText, /Log: .*\.log/);
+		assert.match(resultText, /Source: .*snippet\.tex/);
+		assert.match(resultText, /Source dir: /);
 		assert.match(response.result.details?.log ?? "", /\.log/);
+		assert.match(response.result.details?.source ?? "", /snippet\.tex/);
+		assert.equal(response.result.details?.source_dir, dirname(response.result.details?.source ?? ""));
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -1708,6 +1712,61 @@ test("daemon renders show_latex through compile flow", async () => {
 		runtime.restore();
 	}
 });
+
+test("daemon show_latex reports source directory on compile errors", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-show-error-"));
+	const source = join(baseDir, "snippet.tex");
+	const sourceDir = dirname(source);
+	try {
+		const response = await handleMcpRequest(JSON.stringify({
+			jsonrpc: "2.0",
+			id: 121,
+			method: "tools/call",
+			params: {
+				name: "show_latex",
+				arguments: {
+					source: "x",
+					workspace_context: { cwd: baseDir },
+				},
+			},
+		}), {
+			compileService: {
+				async compileLatexSnippetRequest(request: { request_id: string; workspace_context: { cwd: string } }) {
+					return {
+						protocol_version: 1,
+						request_id: request.request_id,
+						operation: "compile_latex_snippet",
+						status: "error",
+						generated_at_ns: 1,
+						error: "compile failed",
+						status_details: {
+							protocol_version: 1,
+							supported: true,
+							service_available: true,
+							workspace_context: request.workspace_context,
+							request_id: request.request_id,
+							operation: "compile_latex_snippet",
+							source,
+							source_dir: sourceDir,
+							pdf: "",
+							log: join(baseDir, "snippet.log"),
+							artifact_paths: [],
+							clean: false,
+							cleaned_artifacts: [],
+							error_code: "compile_failed",
+						},
+					};
+				},
+			} as never,
+		}) as unknown as { result: { isError?: boolean; content: Array<{ text: string }>; details?: { source_dir?: string } } };
+		assert.equal(response.result.isError, true);
+		assert.match(response.result.content[0].text, /Source dir: /);
+		assert.equal(response.result.details?.source_dir, sourceDir);
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 
 test("daemon show_latex compiles, opens, and returns a managed PDF id", async () => {
 	const runtime = allocateMcpTmpDir("host-service-mcp-show-open-");
@@ -1737,12 +1796,14 @@ test("daemon show_latex compiles, opens, and returns a managed PDF id", async ()
 	try {
 		const response = (await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => {
 			return await sendFramedRequest(socketPath, requestPayload);
-		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details: { pdf?: string; pdf_id?: number; managed_record?: { pdfPath?: string; id?: number } } } };
+		})) as { result: { isError?: boolean; content: Array<{ text: string }>; details: { pdf?: string; pdf_id?: number; source?: string; source_dir?: string; managed_record?: { pdfPath?: string; id?: number } } } };
 		assert.equal(response.result.isError, undefined);
 		assert.equal(typeof response.result.details.pdf_id, "number");
 		assert.equal(response.result.details.managed_record, undefined);
 		assert.equal(response.result.details.pdf, undefined);
 		assert.match(response.result.content[0].text, /pdf_id=\d+/);
+		assert.match(response.result.content[0].text, /Source dir: /);
+		assert.equal(response.result.details.source_dir, dirname(response.result.details.source ?? ""));
 		assert.equal(backend.openRequests.length, 1);
 		assert.notEqual(backend.openRequests[0]?.details.pdf_path, getMcpFixedPreviewPdfPath());
 		assert.equal(backend.openRequests[0]?.details.callback, undefined);
