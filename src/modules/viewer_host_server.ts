@@ -97,6 +97,11 @@ interface PendingPdfRefreshSnapshot {
 	observedAtMs: number;
 }
 
+export interface ViewerHostShutdownRequestHandler {
+	token: string;
+	shutdown(reason: string): Promise<void> | void;
+}
+
 export interface ViewerHostServerOptions {
 	registry: ViewerHostPdfRegistry;
 	port?: number;
@@ -106,6 +111,7 @@ export interface ViewerHostServerOptions {
 	mcpEventSink?: (message: ViewerHostToMcpMessage) => Promise<void> | void;
 	pdfChangeDetection?: ViewerHostPdfChangeDetectionOptions;
 	accessPolicy?: ViewerHostAccessPolicy;
+	shutdownRequest?: ViewerHostShutdownRequestHandler;
 }
 
 export class ViewerHostServer {
@@ -119,6 +125,7 @@ export class ViewerHostServer {
 	private readonly pdfChangePollIntervalMs: number;
 	private readonly nowMs: () => number;
 	private readonly accessPolicy: ViewerHostAccessPolicy;
+	private readonly shutdownRequest: ViewerHostShutdownRequestHandler | undefined;
 	private controlReady = false;
 	private controlProtocolVersion: number | undefined;
 	private server: Server | undefined;
@@ -149,6 +156,7 @@ export class ViewerHostServer {
 		this.pdfChangePollIntervalMs = nonNegativeNumber(options.pdfChangeDetection?.pollIntervalMs, 1_000);
 		this.nowMs = options.pdfChangeDetection?.nowMs ?? (() => Date.now());
 		this.accessPolicy = options.accessPolicy ?? DEFAULT_VIEWER_HOST_ACCESS_POLICY;
+		this.shutdownRequest = options.shutdownRequest;
 	}
 
 	get origin(): string {
@@ -286,6 +294,10 @@ export class ViewerHostServer {
 		const requestUrl = new URL(request.url ?? "/", this.originValue ?? `http://${LOCAL_HOST}`);
 		if (requestUrl.pathname === "/control") {
 			await this.handleControlRequest(request, response);
+			return;
+		}
+		if (requestUrl.pathname === "/shutdown") {
+			this.handleShutdownRequest(request, response);
 			return;
 		}
 		if (requestUrl.pathname === "/app-events") {
@@ -574,6 +586,28 @@ export class ViewerHostServer {
 		} catch {
 			return false;
 		}
+	}
+
+	private handleShutdownRequest(request: IncomingMessage, response: ServerResponse): void {
+		if (request.method !== "POST") {
+			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "shutdown requires POST" } });
+			return;
+		}
+		if (!this.shutdownRequest) {
+			jsonResponse(response, 404, { ok: false, error: { code: "shutdown_unavailable", message: "shutdown endpoint is not enabled" } });
+			return;
+		}
+		if (request.headers["x-agent-synctex-shutdown-token"] !== this.shutdownRequest.token) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid shutdown token" } });
+			return;
+		}
+		const shutdownRequest = this.shutdownRequest;
+		response.once("finish", () => {
+			setImmediate(() => {
+				void Promise.resolve(shutdownRequest.shutdown("http_shutdown")).catch(() => undefined);
+			});
+		});
+		jsonResponse(response, 200, { ok: true });
 	}
 
 	private async handleControlRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {

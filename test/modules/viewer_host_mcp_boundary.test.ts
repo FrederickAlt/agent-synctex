@@ -61,6 +61,25 @@ async function withPath<T>(pathValue: string, fn: () => Promise<T>): Promise<T> 
 	}
 }
 
+function isPidRunning(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		throw error;
+	}
+}
+
+async function waitForPidExit(pid: number, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isPidRunning(pid)) return;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	throw new Error(`pid ${pid} was still running after ${timeoutMs}ms`);
+}
+
 function callTool(id: number, name: string, args: Record<string, unknown>, service: ViewerHostMcpService) {
 	return handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }), service.pdfOperations);
 }
@@ -259,6 +278,54 @@ test("default Viewer Host client factory reuses agent runtime server origin", as
 		assert.equal((await fetch(`${server.origin}/config/345.json`)).status, 200, "reused server should not be shut down when client closes");
 	} finally {
 		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("ViewerHostMcpService.stop shuts down a persistent Viewer Host server", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-persistent-stop-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	const statePath = join(baseDir, "viewer-host.json");
+	writeFakePdf(pdfPath);
+	let pid: number | undefined;
+	const service = new ViewerHostMcpService({
+		clientFactory: createDefaultViewerHostClientFactory({
+			agentRuntimeDir: baseDir,
+			command: process.execPath,
+			args: [resolve(process.cwd(), "scripts", "viewer-host-server.ts")],
+			browserOpenAckTimeoutMs: 20,
+			shutdownTimeoutMs: 2_000,
+			browserLauncher: { launchOrFocus: () => undefined },
+		}),
+		makePdfId: () => 347,
+	});
+	try {
+		const opened = await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
+		assert.equal(opened.result?.details?.pdf_id, 347);
+		const state = JSON.parse(readFileSync(statePath, "utf8")) as { origin?: unknown; pid?: unknown; shutdown_token?: unknown };
+		assert.equal(typeof state.origin, "string");
+		assert.equal(typeof state.pid, "number");
+		assert.equal(typeof state.shutdown_token, "string");
+		pid = state.pid as number;
+		assert.equal(isPidRunning(pid), true);
+
+		await service.stop();
+
+		await waitForPidExit(pid);
+		assert.throws(() => readFileSync(statePath, "utf8"), /ENOENT/);
+	} finally {
+		try {
+			await service.stop();
+		} catch {
+			// Best-effort test cleanup.
+		}
+		if (pid !== undefined && isPidRunning(pid)) {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// Best-effort test cleanup.
+			}
+		}
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });

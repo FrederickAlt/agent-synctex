@@ -346,6 +346,38 @@ test("Viewer Host Server shutdown closes sockets and releases the port", async (
 	}
 });
 
+test("Viewer Host Server HTTP shutdown endpoint requires its local token", async () => {
+	const registry = new ViewerHostPdfRegistry();
+	let shutdownReason: string | undefined;
+	let resolveShutdown: (() => void) | undefined;
+	const shutdownRequested = new Promise<void>((resolve) => { resolveShutdown = resolve; });
+	const server = new ViewerHostServer({
+		registry,
+		shutdownRequest: {
+			token: "test-token",
+			shutdown: (reason) => {
+				shutdownReason = reason;
+				resolveShutdown?.();
+			},
+		},
+	});
+	try {
+		await server.start();
+		const forbidden = await readHttp(`${server.origin}/shutdown`, { method: "POST" });
+		assert.equal(forbidden.status, 403);
+
+		const accepted = await readHttp(`${server.origin}/shutdown`, { method: "POST", headers: { "x-agent-synctex-shutdown-token": "test-token" } });
+		assert.equal(accepted.status, 200);
+		await Promise.race([
+			shutdownRequested,
+			new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timed out waiting for shutdown handler")), 1_000)),
+		]);
+		assert.equal(shutdownReason, "http_shutdown");
+	} finally {
+		await server.stop();
+	}
+});
+
 test("Viewer Host Server serves side-by-side LaTeX Workshop viewer route and assets", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-routes-"));
 	const pdfPath = join(baseDir, "paper.pdf");
