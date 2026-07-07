@@ -1578,6 +1578,12 @@ function isEditableTarget(target) {
   return !!element.closest("input, textarea, select, button, a[href], [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only'], [role='button'], [role='textbox'], [role='combobox'], [role='listbox'], [role='slider'], [role='spinbutton']");
 }
 
+function isEditableEventTarget(event) {
+  if (isEditableTarget(event.target)) return true;
+  const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+  return path.some((target) => isEditableTarget(target));
+}
+
 function hasEditableFocus() {
   return isEditableTarget(document.activeElement);
 }
@@ -2200,6 +2206,7 @@ function sendPendingProbe() {
 
 function sendProbe(event, pageNumber) {
   if (!hostState.hoverEnabled || event.ctrlKey || event.metaKey) return;
+  if (isEditableEventTarget(event)) return;
   if ((window.getSelection()?.toString() ?? "").length > 0) return;
   const point = clientPointToPdfPoint(event, pageNumber);
   if (!point) return;
@@ -2288,6 +2295,7 @@ function installPageEventHandlers() {
   viewer.dataset.hostSynctexHandlers = "true";
   viewer.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : undefined;
+    if (isEditableEventTarget(event)) return;
     if (target?.closest("[data-pdf-annotation]")) return;
     if (target?.closest("[data-synctex-marker]")) {
       event.preventDefault();

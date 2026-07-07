@@ -1342,6 +1342,32 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 		}));
 		assert.ok(afterDrag.x2 > beforeDrag.x2 + 30, "connector should follow the dragged bubble horizontally");
 		assert.ok(afterDrag.y2 > beforeDrag.y2 + 20, "connector should follow the dragged bubble vertically");
+
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "annotation should still exist after dragging the comment bubble");
+		await drainHostMcpEvents(server.origin);
+		await page.evaluate(() => {
+			const pageElement = document.querySelector("#viewer .page[data-page-number='1']") as HTMLElement | null;
+			const wrapper = pageElement?.querySelector(".canvasWrapper") as HTMLElement | null;
+			if (!pageElement || !wrapper) throw new Error("missing LW page wrapper");
+			const pageRect = pageElement.getBoundingClientRect();
+			const wrapperRect = wrapper.getBoundingClientRect();
+			const textarea = document.createElement("textarea");
+			textarea.dataset.hostEditableProbe = "true";
+			textarea.value = "focus target";
+			textarea.style.position = "absolute";
+			textarea.style.left = `${wrapperRect.left - pageRect.left + 100}px`;
+			textarea.style.top = `${wrapperRect.top - pageRect.top + 85}px`;
+			textarea.style.width = "120px";
+			textarea.style.height = "28px";
+			textarea.style.zIndex = "100050";
+			pageElement.appendChild(textarea);
+		});
+		await page.locator("[data-host-editable-probe]").click();
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		assert.equal(await page.locator("[data-host-editable-probe]").evaluate((element) => document.activeElement === element), true, "editable target inside the viewer should receive focus");
+		assert.ok(await page.locator("[data-pdf-annotation]").count() <= 1, "clicking an editable target inside the viewer should not create another annotation");
+		const eventsAfterEditableClick = await drainHostMcpEvents(server.origin);
+		assert.equal(eventsAfterEditableClick.some((event) => event.type === "pdf_annotation"), false, "editable click should not emit a PDF annotation update");
 	} finally {
 		await browser?.close();
 		await server.stop();
