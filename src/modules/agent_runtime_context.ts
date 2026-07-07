@@ -1,10 +1,13 @@
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { HostServiceWorkspaceContext } from "./host_service_protocol.ts";
 import { getMcpTmpDir } from "./runtime_paths.ts";
 
 export const TEX_ACTIONS_AGENT_ID_ENV_VAR = "TEX_ACTIONS_AGENT_ID";
+export const AGENT_SYNCTEX_INSTANCE_ID_ENV_VAR = "AGENT_SYNCTEX_INSTANCE_ID";
+
+const MAX_LINEAGE_CANDIDATES = 8;
 
 let processStableAgentId: string | undefined;
 
@@ -40,13 +43,30 @@ export function sanitizeTexActionsAgentId(agentId: string): string {
 	return sanitized;
 }
 
+export function explicitTexActionsAgentId(): string | undefined {
+	const instanceId = process.env[AGENT_SYNCTEX_INSTANCE_ID_ENV_VAR];
+	if (instanceId?.trim()) return sanitizeTexActionsAgentId(instanceId);
+	const legacyAgentId = process.env[TEX_ACTIONS_AGENT_ID_ENV_VAR];
+	return legacyAgentId?.trim() ? sanitizeTexActionsAgentId(legacyAgentId) : undefined;
+}
+
 export function resolveTexActionsAgentId(ctx?: AgentWorkspaceContextSource): string {
-	const envAgentId = process.env[TEX_ACTIONS_AGENT_ID_ENV_VAR];
-	return sanitizeTexActionsAgentId(
-		(envAgentId && envAgentId.trim().length > 0)
-			? envAgentId
-			: rawPiSessionId(ctx) ?? processStableUuid(),
-	);
+	return sanitizeTexActionsAgentId(explicitTexActionsAgentId() ?? rawPiSessionId(ctx) ?? processStableUuid());
+}
+
+export function resolveTexActionsHookInstanceId(ctx?: AgentWorkspaceContextSource): string {
+	return explicitTexActionsAgentId() ?? rawPiSessionId(ctx) ?? resolveProcessLineageTexActionsAgentIds()[0] ?? sanitizeTexActionsAgentId(`process-${process.pid}-${processStableUuid()}`);
+}
+
+export function resolveTexActionsHookInstanceCandidates(ctx?: AgentWorkspaceContextSource): string[] {
+	const explicit = explicitTexActionsAgentId() ?? rawPiSessionId(ctx);
+	if (explicit) return [sanitizeTexActionsAgentId(explicit)];
+	return uniqueStrings(resolveProcessLineageTexActionsAgentIds());
+}
+
+export function resolveProcessLineageTexActionsAgentIds(): string[] {
+	const identities = processLineageIdentities(process.pid, MAX_LINEAGE_CANDIDATES);
+	return identities.map((identity) => sanitizeTexActionsAgentId(`lineage-${identity.pid}-${identity.startTime ?? "unknown"}`));
 }
 
 export function resolveTexActionsAgentRuntimeDir(agentId: string): string {
@@ -62,6 +82,10 @@ export function resolveAgentWorkspaceContext(ctx?: AgentWorkspaceContextSource):
 	return resolveAgentWorkspaceContextForAgentId(resolveTexActionsAgentId(ctx), ctx?.cwd);
 }
 
+export function resolveHookAgentWorkspaceContext(ctx?: AgentWorkspaceContextSource): HostServiceWorkspaceContext {
+	return resolveAgentWorkspaceContextForAgentId(resolveTexActionsHookInstanceId(ctx), ctx?.cwd);
+}
+
 export function resolveAgentWorkspaceContextForAgentId(agentId: string, cwd = process.cwd()): HostServiceWorkspaceContext {
 	const sanitizedAgentId = sanitizeTexActionsAgentId(agentId);
 	const agentRuntimeDir = resolveTexActionsAgentRuntimeDir(sanitizedAgentId);
@@ -71,4 +95,50 @@ export function resolveAgentWorkspaceContextForAgentId(agentId: string, cwd = pr
 		session_id: sanitizedAgentId,
 		workspace_root: agentRuntimeDir,
 	};
+}
+
+interface ProcessIdentity {
+	pid: number;
+	ppid?: number;
+	startTime?: string;
+}
+
+function processLineageIdentities(startPid: number, maxCount: number): ProcessIdentity[] {
+	const identities: ProcessIdentity[] = [];
+	const seen = new Set<number>();
+	let nextPid = parentPidFor(startPid);
+	while (nextPid !== undefined && nextPid > 0 && !seen.has(nextPid) && identities.length < maxCount) {
+		seen.add(nextPid);
+		const identity = readLinuxProcessIdentity(nextPid) ?? { pid: nextPid };
+		identities.push(identity);
+		nextPid = identity.ppid;
+	}
+	return identities;
+}
+
+function parentPidFor(pid: number): number | undefined {
+	if (pid === process.pid) return process.ppid > 0 ? process.ppid : undefined;
+	return readLinuxProcessIdentity(pid)?.ppid;
+}
+
+function readLinuxProcessIdentity(pid: number): ProcessIdentity | undefined {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const closeParen = stat.lastIndexOf(")");
+		if (closeParen < 0) return undefined;
+		const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+		const ppid = Number(fields[1]);
+		const startTime = fields[19];
+		return {
+			pid,
+			...(Number.isInteger(ppid) && ppid > 0 ? { ppid } : {}),
+			...(startTime ? { startTime } : {}),
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function uniqueStrings(values: string[]): string[] {
+	return Array.from(new Set(values));
 }

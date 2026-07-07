@@ -9,6 +9,7 @@ const panels = document.getElementById("viewer-panels");
 const emptyState = document.getElementById("empty-state");
 const tabScrollLeftButton = document.getElementById("tab-scroll-left");
 const tabScrollRightButton = document.getElementById("tab-scroll-right");
+const PDF_ANNOTATIONS_STORAGE_KEY = "agent-synctex.pdfAnnotations";
 
 function updateTabScrollButtons() {
 	const maxScrollLeft = Math.max(0, tabList.scrollWidth - tabList.clientWidth);
@@ -218,10 +219,20 @@ function openOrFocusTab(message) {
 	renderTabs();
 }
 
+function clearPersistedAnnotationsForPdfId(pdfId) {
+	try {
+		const all = JSON.parse(localStorage.getItem(PDF_ANNOTATIONS_STORAGE_KEY) || "{}");
+		if (!all || typeof all !== "object") return;
+		delete all[String(Number(pdfId))];
+		localStorage.setItem(PDF_ANNOTATIONS_STORAGE_KEY, JSON.stringify(all));
+	} catch {}
+}
+
 function closeTab(pdfId) {
 	const index = state.tabs.findIndex((tab) => tab.pdfId === pdfId);
 	if (index === -1) return;
 	const closedTab = state.tabs[index];
+	clearPersistedAnnotationsForPdfId(pdfId);
 	state.tabs.splice(index, 1);
 	void fetch("/app-tab-closed", {
 		method: "POST",

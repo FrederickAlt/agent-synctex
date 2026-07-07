@@ -8,6 +8,7 @@ apps/viewer-desktop-tauri/src-tauri/gen/
 /tmp/
 /host-service-snippets/
 /pdf-tools-test.*
+/dummy-scattered-latex/
 
 tmux-client-*.log
 tmux-server-*.log

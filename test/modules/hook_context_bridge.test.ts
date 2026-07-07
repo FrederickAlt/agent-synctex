@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
+import { resolveTexActionsHookInstanceCandidates } from "../../src/modules/agent_runtime_context.ts";
 import { fetchHookContext, hookContextBridgeDiscoveryPath, startHookContextBridge } from "../../src/modules/hook_context_bridge.ts";
 import { TexActionsStdioMcpRuntime } from "../../src/modules/stdio_mcp_runtime.ts";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
@@ -94,6 +95,45 @@ test("hook context bridge requires bearer token and returns formatted context th
 		await withRuntimeEnv(join(baseDir, "runtime"), "bridge-agent", async () => {
 			assert.equal(await fetchHookContext({ prompt: "please use marks" }), "## PDF marks from Agent SyncTeX\n\n- `main.tex:42` — `x`\n  User comment: note");
 		});
+	} finally {
+		await bridge.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("hook context discovery uses this process namespace and does not scan harness-level bridges", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "hook-context-instance-"));
+	const runtimeRoot = join(baseDir, "runtime");
+	const instanceId = resolveTexActionsHookInstanceCandidates()[0];
+	assert.ok(instanceId);
+	const ownedBridge = startHookContextBridge({
+		runtimeDir: join(runtimeRoot, "agents", instanceId),
+		fetchContext: async () => ({ text: "owned marks", pdfIds: [1], eventCount: 1, cleared: true, events: [] }),
+	});
+	const harnessBridge = startHookContextBridge({
+		runtimeDir: join(runtimeRoot, "agents", "agent-synctex-codex"),
+		fetchContext: async () => ({ text: "wrong marks", pdfIds: [2], eventCount: 1, cleared: true, events: [] }),
+	});
+	try {
+		await Promise.all([ownedBridge.ready, harnessBridge.ready]);
+		assert.equal(await fetchHookContext({ runtimeRoot, prompt: "next prompt" }), "owned marks");
+	} finally {
+		await ownedBridge.close();
+		await harnessBridge.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("hook context discovery returns empty instead of scanning unrelated bridges", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "hook-context-no-scan-"));
+	const runtimeRoot = join(baseDir, "runtime");
+	const bridge = startHookContextBridge({
+		runtimeDir: join(runtimeRoot, "agents", "agent-synctex-codex"),
+		fetchContext: async () => ({ text: "wrong marks", pdfIds: [2], eventCount: 1, cleared: true, events: [] }),
+	});
+	try {
+		await bridge.ready;
+		assert.equal(await fetchHookContext({ runtimeRoot, prompt: "next prompt" }), "");
 	} finally {
 		await bridge.close();
 		rmSync(baseDir, { recursive: true, force: true });

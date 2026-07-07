@@ -2,8 +2,7 @@ import { stdin as processStdin, stdout as processStdout, stderr as processStderr
 import { resolve } from "node:path";
 import { fetchHookContext } from "../hook_context_bridge.ts";
 import { startTexActionsStdioMcpRuntime } from "../stdio_mcp_runtime.ts";
-import { agentIdForHarness } from "./config_edit.ts";
-import { selectHarnessAdapters, isHarnessId } from "./detect_harnesses.ts";
+import { selectHarnessAdapters, selectInstallHarnessAdapters, isHarnessId } from "./detect_harnesses.ts";
 import { recordManifest, removeManifestHarness } from "./manifest.ts";
 import type { HarnessId, HarnessSelection, InstallerContext, InstallScope } from "./types.ts";
 
@@ -65,7 +64,7 @@ export async function runAgentSynctexCli(argv: string[], io: { stdin?: NodeJS.Re
 	if (parsed.command === "fetch-info") {
 		const prompt = await readStdin(io.stdin ?? processStdin).catch(() => "");
 		if (!isHarnessId(parsed.harness)) return 0;
-		const context = await fetchHookContext({ prompt, agentId: parsed.agentId ?? process.env.TEX_ACTIONS_AGENT_ID ?? agentIdForHarness(parsed.harness), cwd: parsed.cwd }).catch(() => "");
+		const context = await fetchHookContext({ prompt, agentId: parsed.agentId, cwd: parsed.cwd }).catch(() => "");
 		if (context) stdout.write(context);
 		return 0;
 	}
@@ -84,7 +83,7 @@ export async function runAgentSynctexCli(argv: string[], io: { stdin?: NodeJS.Re
 		if (parsed.command === "install") {
 			if (parsed.subcommand !== undefined && parsed.subcommand !== "mcp" && parsed.subcommand !== "hooks") throw new Error("install subcommand must be mcp or hooks");
 			if (parsed.subcommand === "hooks" && parsed.noHooks) throw new Error("install hooks cannot be combined with --no-hooks");
-			const adapters = await selectHarnessAdapters(ctx, parsed.harness);
+			const adapters = await selectInstallHarnessAdapters(ctx, parsed.harness);
 			for (const adapter of adapters) {
 				const installMcp = parsed.subcommand === undefined || parsed.subcommand === "mcp";
 				const installHooks = parsed.subcommand === "hooks" || (parsed.subcommand === undefined && !parsed.noHooks);

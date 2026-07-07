@@ -8,7 +8,7 @@ Agent SyncTeX is a local stdio MCP server for LaTeX workflows. It can compile La
 npm install -g agent-synctex
 ```
 
-Install MCP config and current-turn PDF comment injection hooks for all supported harnesses:
+Install MCP config and current-turn PDF comment injection hooks for all detected harness directories:
 
 ```bash
 agent-synctex install --harness all

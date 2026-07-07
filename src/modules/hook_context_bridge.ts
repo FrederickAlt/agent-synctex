@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { getMcpTmpDir } from "./runtime_paths.ts";
-import { sanitizeTexActionsAgentId } from "./agent_runtime_context.ts";
+import { resolveTexActionsHookInstanceCandidates, sanitizeTexActionsAgentId } from "./agent_runtime_context.ts";
 import { collectPostUserPdfContextFromEvents, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
 import type { PdfAnnotationEvent, PdfEvent } from "./pdf_events.ts";
 import { VIEWER_HOST_CONTROL_TOKEN_HEADER, validateViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
@@ -116,25 +116,13 @@ export async function fetchHookContext(options: FetchHookContextOptions = {}): P
 
 export function findHookContextBridgeDiscoveries(options: Pick<FetchHookContextOptions, "runtimeRoot" | "agentId"> = {}): HookContextBridgeDiscovery[] {
 	const runtimeRoot = options.runtimeRoot ?? getMcpTmpDir();
-	const agentId = options.agentId ?? process.env.TEX_ACTIONS_AGENT_ID;
-	if (agentId && agentId.trim()) {
-		const path = hookContextBridgeDiscoveryPath(join(runtimeRoot, "agents", sanitizeTexActionsAgentId(agentId)));
-		const discovery = readDiscoveryFile(path);
-		return discovery ? [discovery] : [];
-	}
-	const agentsDir = join(runtimeRoot, "agents");
-	let entries: Array<{ path: string; mtimeMs: number }> = [];
-	try {
-		entries = readdirSync(agentsDir, { withFileTypes: true })
-			.filter((entry) => entry.isDirectory())
-			.map((entry) => hookContextBridgeDiscoveryPath(join(agentsDir, entry.name)))
-			.map((path) => ({ path, mtimeMs: safeMtimeMs(path) }))
-			.filter((entry) => entry.mtimeMs >= 0)
-			.sort((left, right) => right.mtimeMs - left.mtimeMs);
-	} catch {
-		return [];
-	}
-	return entries.map((entry) => readDiscoveryFile(entry.path)).filter((entry): entry is HookContextBridgeDiscovery => entry !== undefined);
+	const agentIds = options.agentId?.trim()
+		? [sanitizeTexActionsAgentId(options.agentId)]
+		: resolveTexActionsHookInstanceCandidates();
+	return agentIds
+		.map((agentId) => hookContextBridgeDiscoveryPath(join(runtimeRoot, "agents", sanitizeTexActionsAgentId(agentId))))
+		.map(readDiscoveryFile)
+		.filter((entry): entry is HookContextBridgeDiscovery => entry !== undefined);
 }
 
 async function handleHookContextRequest(
@@ -196,8 +184,17 @@ function textResponse(response: ServerResponse, status: number, text: string): v
 
 async function fetchPersistentViewerHostContext(options: FetchHookContextOptions): Promise<string> {
 	const runtimeRoot = options.runtimeRoot ?? getMcpTmpDir();
-	const agentId = options.agentId ?? process.env.TEX_ACTIONS_AGENT_ID;
-	if (!agentId?.trim()) return "";
+	const agentIds = options.agentId?.trim()
+		? [sanitizeTexActionsAgentId(options.agentId)]
+		: resolveTexActionsHookInstanceCandidates();
+	for (const agentId of agentIds) {
+		const text = await fetchPersistentViewerHostContextForAgent(runtimeRoot, agentId, options);
+		if (text) return text;
+	}
+	return "";
+}
+
+async function fetchPersistentViewerHostContextForAgent(runtimeRoot: string, agentId: string, options: FetchHookContextOptions): Promise<string> {
 	const state = readPersistentViewerHostState(join(runtimeRoot, "agents", sanitizeTexActionsAgentId(agentId)));
 	if (!state) return "";
 	const fetchImpl = options.fetchImpl ?? fetch;
@@ -272,13 +269,5 @@ function readDiscoveryFile(path: string): HookContextBridgeDiscovery | undefined
 		return raw as HookContextBridgeDiscovery;
 	} catch {
 		return undefined;
-	}
-}
-
-function safeMtimeMs(path: string): number {
-	try {
-		return statSync(path).mtimeMs;
-	} catch {
-		return -1;
 	}
 }

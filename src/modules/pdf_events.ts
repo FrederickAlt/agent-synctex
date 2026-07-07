@@ -148,6 +148,15 @@ export class PdfEventStore {
 		return returned;
 	}
 
+	clearPdfEvents(pdfId: number): void {
+		for (let index = this.events.length - 1; index >= 0; index -= 1) {
+			const event = this.events[index];
+			if (event?.pdf_id !== pdfId) continue;
+			this.readSequences.delete(event.sequence);
+			this.events.splice(index, 1);
+		}
+	}
+
 	clear(): void {
 		this.events.length = 0;
 		this.readSequences.clear();

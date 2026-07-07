@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
 import type { Readable, Writable } from "node:stream";
 import { MCP_ERROR_PARSE_ERROR, buildMcpErrorResponse, handleMcpRequest } from "./host_service_mcp.ts";
-import { resolveAgentWorkspaceContext, resolveAgentWorkspaceContextForAgentId, TEX_ACTIONS_AGENT_ID_ENV_VAR } from "./agent_runtime_context.ts";
+import { resolveAgentWorkspaceContext, resolveAgentWorkspaceContextForAgentId, resolveHookAgentWorkspaceContext } from "./agent_runtime_context.ts";
 import { initializeLatexPreambleFile } from "./pi_extension/latex_preamble_manager.ts";
 import { ViewerHostMcpService } from "./viewer_host_client.ts";
 import { startHookContextBridge, type HookContextBridgeHandle } from "./hook_context_bridge.ts";
@@ -123,9 +123,9 @@ export class TexActionsStdioMcpRuntime {
 	};
 
 	private workspaceContext() {
+		if (this.explicitAgentId) return resolveAgentWorkspaceContextForAgentId(this.explicitAgentId, this.launchCwd);
 		if (this.hookMode.kind !== "legacy-hooks" && this.hookMode.harness) {
-			const envAgentId = process.env[TEX_ACTIONS_AGENT_ID_ENV_VAR]?.trim();
-			return resolveAgentWorkspaceContextForAgentId(this.explicitAgentId ?? (envAgentId || undefined) ?? `agent-synctex-${this.hookMode.harness}`, this.launchCwd);
+			return resolveHookAgentWorkspaceContext({ cwd: this.launchCwd });
 		}
 		return resolveAgentWorkspaceContext({ cwd: this.launchCwd });
 	}

@@ -325,10 +325,12 @@ test("Viewer Client tab shell opens, focuses, closes, and reopens Host-registere
 		assert.equal(await page.evaluate(() => (document.querySelector("iframe[data-pdf-id='1']") as HTMLIFrameElement & { testToken?: string })?.testToken), firstIframeToken);
 		assert.match(await page.locator("[role='tab'][data-pdf-id='1']").innerText(), /First renamed/);
 
+		await page.evaluate(() => localStorage.setItem("agent-synctex.pdfAnnotations", JSON.stringify({ "1": [{ id: "a1" }], "2": [{ id: "a2" }] })));
 		const firstClose = page.waitForResponse((response) => response.url() === `${server.origin}/app-tab-closed` && response.status() === 200);
 		await page.frameLocator("iframe[data-pdf-id='1']").locator("button[data-close-pdf-id='1']").click();
 		await firstClose;
 		await page.waitForFunction(() => !document.querySelector("[role='tab'][data-pdf-id='1']") && !document.querySelector("iframe[data-pdf-id='1']"));
+		assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem("agent-synctex.pdfAnnotations") ?? "{}")), { "2": [{ id: "a2" }] });
 		assert.deepEqual(await tabState(page), { tabs: ["2"], iframes: ["2"], active: "2", emptyVisible: false });
 		assert.equal(registry.getPdf(1).pdfPath, firstPdf);
 		assert.equal(registry.getPdf(2).pdfPath, secondPdf);

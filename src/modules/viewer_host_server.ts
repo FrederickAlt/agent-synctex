@@ -431,6 +431,9 @@ export class ViewerHostServer {
 		if (current?.revision === payload.revision && current.viewer_url === payload.viewer_url && current.visible_tab_token === payload.visible_tab_token) {
 			this.visibleViewerClientTabs.delete(payload.pdf_id);
 			if (this.activeVisibleViewerClientPdfId === payload.pdf_id) this.activeVisibleViewerClientPdfId = this.lastVisibleViewerClientTab()?.pdf_id;
+			this.discardMcpEventsForPdfId(payload.pdf_id);
+			this.broadcastAnnotationsCleared([payload.pdf_id]);
+			void Promise.resolve(this.mcpEventSink({ type: "viewer_tab_closed", pdf_id: payload.pdf_id })).catch(() => undefined);
 		}
 		textResponse(response, 200, "application/json; charset=utf-8", JSON.stringify({ ok: true }), false);
 	}
@@ -868,6 +871,11 @@ export class ViewerHostServer {
 		} catch (error) {
 			sendViewerSocketJson(connection, { type: "error", code: "invalid_viewer_message", message: errorMessage(error) });
 		}
+	}
+
+	private discardMcpEventsForPdfId(pdfId: number): void {
+		const kept = this.mcpEventBacklog.filter((event) => !("pdf_id" in event) || event.pdf_id !== pdfId);
+		this.mcpEventBacklog.splice(0, this.mcpEventBacklog.length, ...kept);
 	}
 
 	private queueMcpEvent(message: ViewerHostToMcpMessage): void {

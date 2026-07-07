@@ -123,6 +123,25 @@ test("Viewer Host MCP service fetches context and clears consumed viewer annotat
 	}
 });
 
+test("Viewer Host MCP service discards pending marks when the owning viewer tab closes", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "viewer-host-tab-close-context-clear-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		const service = new ViewerHostMcpService({ client: new SelectionDebugTestClient(), makePdfId: () => 88 });
+		await service.openPdf({ protocol_version: 1, request_id: "open", operation: "open_pdf", created_at_ns: 1, workspace_context: { cwd: dir }, details: { pdf_path: pdfPath } });
+		service.handleHostMessage({ type: "pdf_annotation", pdf_id: 88, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(dir, "main.tex"), line: 7, source_line: "marked source", comment: "user note" });
+		service.handleHostMessage({ type: "viewer_tab_closed", pdf_id: 88 });
+
+		const result = await service.fetchPdfContext({ pdf_id: 88, max_events: 5, cwd: dir });
+
+		assert.equal(result.text, "");
+		assert.equal(result.eventCount, 0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("Viewer Host MCP service accepts and stores selection debug messages", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "viewer-host-selection-debug-"));
 	try {

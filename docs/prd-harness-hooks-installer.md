@@ -13,7 +13,7 @@ Agent SyncTeX must inject PDF marks/comments into the current agent turn without
 - Publish one public CLI: `agent-synctex`.
 - Start MCP with `agent-synctex mcp [--harness <harness>] [--no-hooks]`.
 - Install MCP and hooks together by default:
-  - `agent-synctex install --harness <harness|all> [--local]`
+  - `agent-synctex install --harness <harness|all> [--local]` (`all` installs only harnesses with an existing target-scope harness directory)
 - Keep split/manual modes available:
   - `agent-synctex install mcp --harness <harness> [--local|--scope project|user] [--no-hooks]`
   - `agent-synctex install hooks --harness <harness> [--local|--scope project|user]`

@@ -813,6 +813,8 @@ export class ViewerHostMcpService {
 				y: parsed.y,
 				...(parsed.comment === undefined ? {} : { comment: parsed.comment }),
 			});
+		} else if (parsed.type === "viewer_tab_closed") {
+			this.eventStore.clearPdfEvents(parsed.pdf_id);
 		} else if (parsed.type === "reverse_synctex_hover") {
 			void this.sendReverseSynctexHoverResult(parsed).catch(() => undefined);
 		} else if (parsed.type === "selection_debug") {

@@ -228,7 +228,7 @@ test("actual agent-synctex mcp --harness codex exits when stdio closes", async (
 	const scriptPath = resolve(process.cwd(), "scripts", "agent-synctex.ts");
 	const child = spawn(process.execPath, [scriptPath, "mcp", "--harness", "codex", "--cwd", cwd], {
 		cwd,
-		env: { ...process.env, MCP_TMPDIR: runtimeRoot },
+		env: { ...process.env, MCP_TMPDIR: runtimeRoot, TEX_ACTIONS_AGENT_ID: "entrypoint-codex-close-agent" },
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 	let stderr = "";
@@ -241,7 +241,7 @@ test("actual agent-synctex mcp --harness codex exits when stdio closes", async (
 	});
 
 	try {
-		await waitForFile(join(runtimeRoot, "agents", "agent-synctex-codex", "hook-context-bridge.json"));
+		await waitForFile(join(runtimeRoot, "agents", "entrypoint-codex-close-agent", "hook-context-bridge.json"));
 		child.stdin.end();
 		const exitCode = await Promise.race([
 			exitPromise,

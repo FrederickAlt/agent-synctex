@@ -308,6 +308,41 @@ test("MCP event drain can be scoped to owned pdf_ids without consuming other eve
 });
 
 
+test("closing a visible viewer tab discards queued marks and clears viewer annotations", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-tab-close-clear-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		await server.start();
+		const client = new ViewerHostControlClient({ origin: server.origin });
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 33, pdf_path: pdfPath, title: "Paper" })).ok, true);
+		const token = await getViewerSocketToken(server.origin, 33);
+		socket = await openViewerSocket(server.origin, 33, token);
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, source_line: "marked", comment: "note" }));
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		const clearMessage = nextJsonMessage(socket);
+		const closeResponse = await fetch(`${server.origin}/app-tab-closed`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ pdf_id: 33, revision: 1, viewer_url: "/viewer-lw/33?revision=1", visible_tab_token: "visible-tab-1" }),
+		});
+
+		assert.equal(closeResponse.status, 200);
+		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 33, pdf_ids: [33] });
+		const drain = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
+		const payload = await drain.json() as { events?: unknown[] };
+		assert.deepEqual(payload.events, []);
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("clear_pdf_annotations reaches active viewer sockets for inactive PDFs", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-clear-inactive-"));
 	const activePdfPath = join(baseDir, "active.pdf");

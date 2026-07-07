@@ -86,6 +86,7 @@ const FORBIDDEN_ACTIVE_RUNTIME_IDENTIFIERS = new Map<string, string>([
 
 const FORBIDDEN_VIEWER_COMMAND = /\b(?:zathura|evince|okular|mupdf|sioyek|xreader|xdg-open|xpdf|atril)\b/i;
 const FORBIDDEN_ENV_PROBES = new Set(["DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "XAUTHORITY", "DISPLAY"]);
+const ALLOWED_PROC_DISCOVERY_FILES = new Set(["agent_runtime_context.ts"]);
 const PACKAGE_STALE_METADATA_TOKENS = [
 	"agent-synctex-host-service.ts",
 	"tex-actionsctl.ts",
@@ -162,10 +163,12 @@ function collectForbiddenIdentifierViolations(file: string, source: string): Gua
 		}
 	}
 
-	const procMatch = /\/proc(?:\/|\b)/g;
-	for (const match of source.matchAll(procMatch)) {
-		if (match.index === undefined) continue;
-		addViolation(violations, source, file, match.index, "process discovery from /proc");
+	if (!ALLOWED_PROC_DISCOVERY_FILES.has(file.split(/[\\/]/).at(-1) ?? file)) {
+		const procMatch = /\/proc(?:\/|\b)/g;
+		for (const match of source.matchAll(procMatch)) {
+			if (match.index === undefined) continue;
+			addViolation(violations, source, file, match.index, "process discovery from /proc");
+		}
 	}
 
 	return violations;

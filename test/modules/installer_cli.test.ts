@@ -42,11 +42,16 @@ async function withInstallerHome<T>(home: string, fn: () => Promise<T>): Promise
 	}
 }
 
-test("default installer writes user/global MCP config and hooks for all harnesses", async () => {
+test("default all installer writes user/global MCP config and hooks for detected harness directories", async () => {
 	const cwd = tempProject("agent-synctex-global-cwd-{}");
 	const home = tempProject("agent-synctex-global-home-{}");
 	try {
 		await withInstallerHome(home, async () => {
+			mkdirSync(join(home, ".claude"), { recursive: true });
+			mkdirSync(join(home, ".codex"), { recursive: true });
+			mkdirSync(join(home, "Documents", "Cline"), { recursive: true });
+			mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+			mkdirSync(join(home, ".config", "opencode"), { recursive: true });
 			const result = await runCli(cwd, ["install", "--harness", "all"]);
 			assert.equal(result.code, 0, result.stderr);
 
@@ -76,6 +81,27 @@ test("default installer writes user/global MCP config and hooks for all harnesse
 			const opencode = JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8"));
 			assert.deepEqual(opencode.mcp["agent-synctex"].command, ["agent-synctex", "mcp", "--harness", "opencode"]);
 			assert.match(readFileSync(join(home, ".config", "opencode", "plugins", "agent-synctex-post-user.ts"), "utf8"), /spawnSync\("agent-synctex", \["fetch-info", "--harness", "opencode"\]/);
+		});
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("all installer skips harnesses without a scope directory", async () => {
+	const cwd = tempProject("agent-synctex-all-skip-cwd-{}");
+	const home = tempProject("agent-synctex-all-skip-home-{}");
+	try {
+		await withInstallerHome(home, async () => {
+			mkdirSync(join(home, ".claude"), { recursive: true });
+			const result = await runCli(cwd, ["install", "--harness", "all"]);
+			assert.equal(result.code, 0, result.stderr);
+
+			assert.equal(existsSync(join(home, ".claude.json")), true);
+			assert.equal(existsSync(join(home, ".codex", "config.toml")), false);
+			assert.equal(existsSync(join(home, ".cline", "data", "settings", "cline_mcp_settings.json")), false);
+			assert.equal(existsSync(join(home, ".pi", "agent", "mcp.json")), false);
+			assert.equal(existsSync(join(home, ".config", "opencode", "opencode.json")), false);
 		});
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
