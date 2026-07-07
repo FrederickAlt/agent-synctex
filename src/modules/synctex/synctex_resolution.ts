@@ -1,4 +1,5 @@
 import { dirname } from "node:path";
+import { parseSyncTexForPdf } from "./latex_workshop/worker.ts";
 import type { ReverseSynctexPdfEventInput, ReverseSynctexSourceLocationEvent } from "../pdf_events.ts";
 import type {
 	ViewerHostReverseSynctexForwardProbeMessage,
@@ -24,6 +25,14 @@ export interface RegisteredSynctexPdf {
 	pdfId: number;
 	pdfPath: string;
 	workspaceCwd?: string;
+}
+
+export function prewarmSynctexForPdf(pdfPath: string): void {
+	try {
+		parseSyncTexForPdf(pdfPath);
+	} catch {
+		// Prewarming is a latency optimization only; real SyncTeX calls report errors.
+	}
 }
 
 export function resolveForwardSynctexJump(input: MapForwardSynctexInput): ForwardSynctexJump {

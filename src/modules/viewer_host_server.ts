@@ -7,7 +7,7 @@ import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath, URL } from "node:url";
 import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_CONTROL_TOKEN_HEADER, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
-import { reverseSynctexForwardProbeResult, reverseSynctexHoverResult } from "./synctex/synctex_resolution.ts";
+import { prewarmSynctexForPdf, reverseSynctexForwardProbeResult, reverseSynctexHoverResult } from "./synctex/synctex_resolution.ts";
 import { DEFAULT_VIEWER_HOST_ACCESS_POLICY, type ViewerHostAccessPolicy, type ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
 export type { ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
@@ -209,6 +209,11 @@ export class ViewerHostServer {
 	sendPdfRefresh(pdfId: number): number {
 		const record = this.registry.getPdf(pdfId);
 		return this.broadcastViewerSocketMessage(record.pdfId, { type: "pdf_refresh", pdf_id: record.pdfId, revision: record.revision, pdf_url: this.pdfUrl(record.pdfId, record.revision) });
+	}
+
+	private scheduleSynctexPrewarm(record: ViewerHostPdfRecord): void {
+		const pdfPath = record.pdfPath;
+		setImmediate(() => prewarmSynctexForPdf(pdfPath));
 	}
 
 	getPdfRefreshDiagnostic(pdfId: number): ViewerHostPdfRefreshDiagnostic | undefined {
@@ -723,6 +728,7 @@ export class ViewerHostServer {
 				this.debugSynctexByPdfId.set(record.pdfId, message.debug_synctex === true);
 				await this.viewerDispatch.openPdf(record);
 				this.broadcastViewerClientTabEvent("open_pdf", record);
+				this.scheduleSynctexPrewarm(record);
 				return { ok: true, result: { type: "open_pdf", pdf_id: record.pdfId, revision: record.revision } };
 			}
 			case "focus_pdf": {
@@ -1060,13 +1066,14 @@ export class ViewerHostServer {
 		if (now - pending.observedAtMs < this.pdfChangeDebounceMs) return;
 
 		this.pendingPdfRefreshSnapshots.delete(record.pdfId);
-		this.registry.registerPdf({
+		const updated = this.registry.registerPdf({
 			pdfId: record.pdfId,
 			pdfPath: record.pdfPath,
 			title: record.title,
 			revision: record.revision + 1,
 			fileSnapshot: snapshot,
 		});
+		this.scheduleSynctexPrewarm(updated);
 		this.sendPdfRefresh(record.pdfId);
 	}
 

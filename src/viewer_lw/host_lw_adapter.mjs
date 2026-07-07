@@ -51,6 +51,7 @@ const ANNOTATION_BUBBLE_MAX_HEIGHT_PX = 140;
 const ANNOTATION_BUBBLE_MIN_WIDTH_PX = 220;
 const ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX = 360;
 const ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX = 12;
+const SELECTION_DEBUG_TEXT_MAX_LENGTH = 2000;
 
 const hostState = {
   config: initialConfig,
@@ -67,7 +68,6 @@ let activeRefreshLoadingTask;
 let activeSocket;
 let reconnectTimer;
 let selectionGeneration = 0;
-let lastSelectionSignature;
 let lastSentSelectionSignature;
 let lastSentSelectionGeneration = -1;
 let pendingSelectionSend;
@@ -379,15 +379,28 @@ function conciseRawMouseDiagnosticText(phase, details) {
   return parts.join(" ");
 }
 
+function truncateSelectionDebugText(value) {
+  const text = String(value ?? "");
+  return text.length <= SELECTION_DEBUG_TEXT_MAX_LENGTH
+    ? text
+    : `${text.slice(0, SELECTION_DEBUG_TEXT_MAX_LENGTH)}… [truncated ${text.length - SELECTION_DEBUG_TEXT_MAX_LENGTH} chars]`;
+}
+
+function sanitizeSelectionDebugDetails(details = {}) {
+  return Object.fromEntries(Object.entries(details).map(([key, value]) => [key, typeof value === "string" ? truncateSelectionDebugText(value) : value]));
+}
+
 function sendSelectionDebug(phase, page, details = {}) {
+  if (!hostState.debugSynctexEnabled) return;
+  const safeDetails = sanitizeSelectionDebugDetails(details);
   const selectedText = window.getSelection()?.toString() ?? "";
-  const text = conciseRawMouseDiagnosticText(phase, details) ?? selectedText;
+  const text = truncateSelectionDebugText(conciseRawMouseDiagnosticText(phase, safeDetails) ?? selectedText);
   sendViewerSocketPayload({
     type: "selection_debug",
     phase,
     ...(page === undefined ? {} : { page }),
     text,
-    details,
+    details: safeDetails,
   });
 }
 
@@ -1464,10 +1477,12 @@ function sendSelectionPayload(pageNumber) {
   const payload = selectionPayload(pageNumber, context);
   sendSelectionDebug("send", pageNumber, { signature, generation: selectionGeneration, selectedPayloadText: payload.selectedText, selectedPayloadTextLength: payload.selectedText.length, selectionStartX: payload.selectionStartX, selectionStartY: payload.selectionStartY, selectionEndX: payload.selectionEndX, selectionEndY: payload.selectionEndY });
   const sent = sendViewerSocketPayload(payload);
-  setTimeout(() => {
-    const currentText = window.getSelection()?.toString() ?? "";
-    sendSelectionDebug("post_send_audit", pageNumber, { sentText: payload.selectedText, sentTextLength: payload.selectedText.length, currentText, currentTextLength: currentText.length, changed: currentText !== payload.selectedText });
-  }, 300);
+  if (hostState.debugSynctexEnabled) {
+    setTimeout(() => {
+      const currentText = window.getSelection()?.toString() ?? "";
+      sendSelectionDebug("post_send_audit", pageNumber, { sentText: payload.selectedText, sentTextLength: payload.selectedText.length, currentText, currentTextLength: currentText.length, changed: currentText !== payload.selectedText });
+    }, 300);
+  }
   return sent;
 }
 
@@ -1500,9 +1515,9 @@ function scheduleSelectionPayload(pageNumber) {
 }
 
 document.addEventListener("selectionchange", () => {
+  selectionGeneration += 1;
+  if (!hostState.debugSynctexEnabled) return;
   const signature = currentSelectionSignature();
-  if (signature !== lastSelectionSignature) selectionGeneration += 1;
-  lastSelectionSignature = signature;
   sendSelectionDebug("selectionchange", undefined, { observedSignature: signature, generation: selectionGeneration });
 });
 

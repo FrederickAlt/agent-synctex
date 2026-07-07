@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
 import { inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar, type ReverseSyncTeXCandidate, type ReverseSyncTeXCandidatesInspection } from "./latex_workshop/worker.ts";
 import { lineColumnForSourceIndex } from "./source_index.ts";
@@ -288,6 +288,53 @@ export const defaultNativeSynctexRunner: NativeSynctexRunner = (command, args, o
 	};
 };
 
+const MAX_CACHED_FORWARD_SYNCTEX_JUMPS = 512;
+const cachedForwardSynctexJumps = new Map<string, ForwardSynctexJump>();
+
+function fileSnapshotCacheKey(filePath: string): string | undefined {
+	try {
+		const status = statSync(filePath);
+		return `${resolve(filePath)}:${status.size}:${status.mtimeMs}`;
+	} catch {
+		return undefined;
+	}
+}
+
+function cacheKeyForForwardSynctex(input: MapForwardSynctexInput): string | undefined {
+	if (input.nativeRunner !== undefined || input.jsFallback !== undefined) return undefined;
+	const pdfPath = resolve(input.pdfPath);
+	const sourceFile = isAbsolute(input.sourceFile) ? resolve(input.sourceFile) : resolve(input.cwd, input.sourceFile);
+	const sidecarPath = resolveSynctexSidecar(pdfPath);
+	if (sidecarPath === undefined) return undefined;
+	const sidecarSnapshot = fileSnapshotCacheKey(sidecarPath);
+	const sourceSnapshot = fileSnapshotCacheKey(sourceFile);
+	if (sidecarSnapshot === undefined || sourceSnapshot === undefined) return undefined;
+	return [input.synctexCommand ?? "synctex", pdfPath, sidecarSnapshot, sourceFile, sourceSnapshot, input.line].join("\0");
+}
+
+function cloneForwardSynctexJump(jump: ForwardSynctexJump): ForwardSynctexJump {
+	return structuredClone(jump);
+}
+
+function rememberForwardSynctexJump(cacheKey: string, jump: ForwardSynctexJump): void {
+	cachedForwardSynctexJumps.delete(cacheKey);
+	cachedForwardSynctexJumps.set(cacheKey, cloneForwardSynctexJump(jump));
+	while (cachedForwardSynctexJumps.size > MAX_CACHED_FORWARD_SYNCTEX_JUMPS) {
+		const oldestKey = cachedForwardSynctexJumps.keys().next().value;
+		if (oldestKey === undefined) break;
+		cachedForwardSynctexJumps.delete(oldestKey);
+	}
+}
+
+function cachedMapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctexJump {
+	const cacheKey = cacheKeyForForwardSynctex(input);
+	const cached = cacheKey === undefined ? undefined : cachedForwardSynctexJumps.get(cacheKey);
+	if (cached !== undefined) return cloneForwardSynctexJump(cached);
+	const jump = mapForwardSynctex(input);
+	if (cacheKey !== undefined) rememberForwardSynctexJump(cacheKey, jump);
+	return jump;
+}
+
 interface NativeForwardRecord {
 	page?: number;
 	x?: number;
@@ -438,7 +485,7 @@ function withForwardGlue(input: { mapped: ForwardSynctexPoint; branch: ForwardSy
 }
 
 export function mapReverseForwardSynctexProbe(input: ReverseForwardSynctexProbeInput): ReverseForwardSynctexProbe {
-	const mapForward = input.mapForward ?? mapForwardSynctex;
+	const mapForward = input.mapForward ?? cachedMapForwardSynctex;
 	const reverse = input.inspectReverse === undefined
 		? reverseLocationToHoverInspection(mapReverseSynctex({
 			pdfPath: input.pdfPath,
@@ -648,7 +695,7 @@ function compactReverseCandidate(candidate: ReverseSyncTeXCandidate, cwd?: strin
 function forwardBoxesForSourceLine(input: { sourceFile: string; line: number; pdfPath: string; cwd: string; nativeRunner?: NativeSynctexRunner; forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine; synctexCommand?: string }): ForwardSynctexRange[] {
 	if (input.forwardBoxesForLine !== undefined) return input.forwardBoxesForLine(input);
 	try {
-		const forward = mapForwardSynctex({
+		const forward = cachedMapForwardSynctex({
 			pdfPath: input.pdfPath,
 			sourceFile: input.sourceFile,
 			line: input.line,
