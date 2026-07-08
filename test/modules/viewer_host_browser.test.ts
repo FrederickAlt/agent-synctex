@@ -1230,6 +1230,41 @@ test("LaTeX Workshop viewer annotation is active by default and hidden debug swi
 });
 
 
+test("LaTeX Workshop viewer shows a SyncTeX capability banner when annotations cannot resolve", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-synctex-banner-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFileSync(pdfPath, makeOnePagePdf());
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 152, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		await page.goto(`${server.origin}/viewer-lw/152`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		const point = await lwCanvasPoint(page, 1, 120, 70);
+		await page.mouse.click(point.clientX, point.clientY);
+
+		await page.waitForSelector("#hostSynctexCapabilityBanner[data-issue-code='synctex_missing']", { state: "attached", timeout: 5_000 });
+		const banner = await page.locator("#hostSynctexCapabilityBanner").evaluate((element) => ({
+			top: element.getBoundingClientRect().top,
+			title: element.querySelector(".hostSynctexCapabilityBannerTitle")?.textContent,
+			detail: element.querySelector(".hostSynctexCapabilityBannerDetail")?.textContent,
+			toolbarBottom: document.getElementById("toolbarContainer")?.getBoundingClientRect().bottom,
+		}));
+		assert.equal(banner.title, "SyncTeX artifacts are missing");
+		assert.match(banner.detail ?? "", /missing SyncTeX sidecar/i);
+		assert.ok(banner.top >= (banner.toolbarBottom ?? 0), "capability banner should appear under the toolbar");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
 test("direct LaTeX Workshop viewer reloads after the last toolbar tab is closed and focused again", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-direct-reopen-"));
 	const { pdfPath } = writeBrowserSynctexFixture(baseDir);

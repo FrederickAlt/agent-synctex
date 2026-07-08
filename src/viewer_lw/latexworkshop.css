@@ -203,6 +203,60 @@ body {
     z-index: 10;
 }
 
+#hostSynctexCapabilityBanner {
+    position: fixed;
+    top: calc(var(--toolbar-height, 32px) + 6px);
+    left: 50%;
+    z-index: 100100;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    width: min(760px, calc(100vw - 32px));
+    padding: 10px 12px;
+    border: 1px solid rgb(245 158 11 / .55);
+    border-radius: 8px;
+    background: rgb(31 41 55 / .96);
+    color: white;
+    box-shadow: 0 12px 32px rgb(0 0 0 / .28);
+    transform: translateX(-50%);
+}
+
+.hostSynctexCapabilityBannerBody {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+}
+
+.hostSynctexCapabilityBannerTitle {
+    color: rgb(253 230 138);
+    font: 600 13px/1.3 sans-serif;
+}
+
+.hostSynctexCapabilityBannerDetail {
+    max-height: 4.8em;
+    overflow: auto;
+    color: rgb(243 244 246);
+    font: 12px/1.35 sans-serif;
+    overflow-wrap: anywhere;
+}
+
+.hostSynctexCapabilityBannerClose {
+    flex: 0 0 auto;
+    width: 24px;
+    height: 24px;
+    border: 0;
+    border-radius: 999px;
+    background: rgb(255 255 255 / .10);
+    color: white;
+    cursor: pointer;
+    font: 18px/1 sans-serif;
+}
+
+.hostSynctexCapabilityBannerClose:hover,
+.hostSynctexCapabilityBannerClose:focus-visible {
+    background: rgb(255 255 255 / .20);
+}
+
 #toolbarContainer #toolbarViewer > #toolbarViewerLeft {
     flex: 0 0 auto;
     min-width: 0;

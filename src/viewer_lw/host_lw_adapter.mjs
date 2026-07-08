@@ -64,6 +64,7 @@ const hostState = {
   refreshSerial: 0,
   socketStatus: "disconnected",
   lastError: undefined,
+  synctexCapabilityIssue: undefined,
   hoverEnabled: true,
   debugSynctexEnabled: false,
   lastPdfLoadSource: "url",
@@ -444,8 +445,92 @@ function updateHostDataset() {
   document.body.dataset.hostLwVisibleRevision = String(hostState.visibleRevision ?? "");
   document.body.dataset.hostLwLatestRevision = String(hostState.latestRevision ?? "");
   document.body.dataset.hostLwLastError = hostState.lastError ?? "";
+  document.body.dataset.hostLwSynctexIssue = hostState.synctexCapabilityIssue?.code ?? "";
   document.body.dataset.hostLwHoverEnabled = hostState.hoverEnabled ? "true" : "false";
   document.body.dataset.hostLwDebugSynctexEnabled = hostState.debugSynctexEnabled ? "true" : "false";
+}
+
+function renderSynctexCapabilityIssue() {
+  let banner = document.getElementById("hostSynctexCapabilityBanner");
+  const issue = hostState.synctexCapabilityIssue;
+  if (!issue) {
+    banner?.remove();
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "hostSynctexCapabilityBanner";
+    banner.setAttribute("role", "alert");
+    banner.setAttribute("aria-live", "polite");
+    const body = document.createElement("div");
+    body.className = "hostSynctexCapabilityBannerBody";
+    const title = document.createElement("strong");
+    title.className = "hostSynctexCapabilityBannerTitle";
+    const detail = document.createElement("span");
+    detail.className = "hostSynctexCapabilityBannerDetail";
+    body.append(title, detail);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "hostSynctexCapabilityBannerClose";
+    close.setAttribute("aria-label", "Dismiss SyncTeX capability warning");
+    close.textContent = "×";
+    close.addEventListener("click", () => clearSynctexCapabilityIssue());
+    banner.append(body, close);
+    document.body.appendChild(banner);
+  }
+  banner.dataset.issueCode = issue.code;
+  banner.querySelector(".hostSynctexCapabilityBannerTitle").textContent = issue.title;
+  banner.querySelector(".hostSynctexCapabilityBannerDetail").textContent = issue.detail;
+}
+
+function setSynctexCapabilityIssue(issue) {
+  hostState.synctexCapabilityIssue = issue;
+  updateHostDataset();
+  renderSynctexCapabilityIssue();
+}
+
+function clearSynctexCapabilityIssue(code) {
+  if (code !== undefined && hostState.synctexCapabilityIssue?.code !== code) return;
+  hostState.synctexCapabilityIssue = undefined;
+  updateHostDataset();
+  renderSynctexCapabilityIssue();
+}
+
+function synctexCapabilityIssueFromError(rawError, fallbackCode = "synctex_failed") {
+  const raw = String(rawError || "Unknown SyncTeX error");
+  if (/missing SyncTeX sidecar/i.test(raw)) {
+    return {
+      code: "synctex_missing",
+      title: "SyncTeX artifacts are missing",
+      detail: `${raw} Compile with SyncTeX enabled, then refresh or reopen the PDF.`,
+    };
+  }
+  if (/incorrect header|gzip|gunzip|zlib|unexpected end|invalid.+synctex|parse/i.test(raw)) {
+    return {
+      code: "synctex_parse_failed",
+      title: "Could not parse SyncTeX artifacts",
+      detail: `${raw} Recompile the document with SyncTeX enabled to regenerate the .synctex/.synctex.gz file.`,
+    };
+  }
+  if (/No usable SyncTeX mapping|No SyncTeX mapping/i.test(raw)) {
+    return {
+      code: "synctex_unmapped",
+      title: "No SyncTeX mapping for this PDF position",
+      detail: raw,
+    };
+  }
+  if (/viewer host|websocket|socket|server|network|connection/i.test(raw) || fallbackCode === "server_unreachable") {
+    return {
+      code: "server_unreachable",
+      title: "Viewer Host connection is unavailable",
+      detail: raw,
+    };
+  }
+  return {
+    code: fallbackCode,
+    title: "SyncTeX capability problem",
+    detail: raw,
+  };
 }
 
 function captureRefreshState() {
@@ -2127,6 +2212,7 @@ function closeDirectViewerTab(pdfId) {
       hostState.latestRevision = 0;
       hostState.lastError = undefined;
       hostState.debugSynctexEnabled = false;
+      clearSynctexCapabilityIssue();
       document.title = "PDF Viewer";
       void app()?.close?.();
       updateHostDataset();
@@ -2287,6 +2373,7 @@ function showHoverResult(message, options = {}) {
 function showProbeResult(message, options = {}) {
   if (Number(message.request_id) !== latestProbeRequestId) return;
   if (message.error) {
+    setSynctexCapabilityIssue(synctexCapabilityIssueFromError(message.error));
     const label = document.createElement("div");
     label.dataset.reverseSynctexForwardProbe = "label";
     label.className = "hostSynctexOverlayLabel";
@@ -2300,7 +2387,7 @@ function showProbeResult(message, options = {}) {
     renderAnnotations(false);
     return;
   }
-  createAnnotationFromMessage(message, { select: true, bubble: false, scroll: options.scroll !== false });
+  if (createAnnotationFromMessage(message, { select: true, bubble: false, scroll: options.scroll !== false })) clearSynctexCapabilityIssue();
 }
 
 function installPageEventHandlers() {
@@ -2349,6 +2436,10 @@ function installPageEventHandlers() {
 
 function handleHostMessage(message) {
   if (!message) return;
+  if (message.type === "error") {
+    setSynctexCapabilityIssue(synctexCapabilityIssueFromError(message.message ?? message.code, "viewer_message_error"));
+    return;
+  }
   if (message.type === "annotations_cleared") {
     clearAnnotationsFromHostMessage(message);
     return;
@@ -2367,6 +2458,8 @@ function handleHostMessage(message) {
   } else if (message.type === "set_debug_synctex") {
     setDebugSynctexEnabled(message.enabled === true);
   } else if (message.type === "reverse_synctex_hover_result") {
+    if (message.error) setSynctexCapabilityIssue(synctexCapabilityIssueFromError(message.error));
+    else clearSynctexCapabilityIssue();
     showHoverResult(message);
   } else if (message.type === "reverse_synctex_forward_probe_result") {
     showProbeResult(message);
@@ -2417,7 +2510,14 @@ function disconnectViewerSocket() {
 
 function connectViewerSocket() {
   const socketUrl = hostState.config?.viewer_socket_url;
-  if (!socketUrl) return;
+  if (!socketUrl) {
+    if (hasActiveConfig(hostState.config)) setSynctexCapabilityIssue({
+      code: "server_unreachable",
+      title: "Viewer Host connection is unavailable",
+      detail: "The PDF has no Viewer Host socket URL, so SyncTeX annotations cannot be sent.",
+    });
+    return;
+  }
   const socket = new WebSocket(socketUrl);
   activeSocket = socket;
   hostState.socketStatus = "connecting";
@@ -2425,6 +2525,7 @@ function connectViewerSocket() {
   socket.addEventListener("open", () => {
     if (activeSocket !== socket) return;
     hostState.socketStatus = "connected";
+    clearSynctexCapabilityIssue("server_unreachable");
     updateHostDataset();
     sendLoadedStateDiagnostic("lw_loaded_state", { trigger: "socket_open" });
     sendToolsHitTargetDiagnostic("socket_open");
@@ -2436,18 +2537,29 @@ function connectViewerSocket() {
       handleHostMessage(JSON.parse(event.data));
     } catch (error) {
       hostState.lastError = `socket message failed: ${error?.message ?? String(error)}`;
+      setSynctexCapabilityIssue(synctexCapabilityIssueFromError(hostState.lastError, "viewer_message_error"));
       updateHostDataset();
     }
   });
   socket.addEventListener("close", () => {
     if (activeSocket !== socket) return;
     hostState.socketStatus = "disconnected";
+    if (hasActiveConfig(hostState.config)) setSynctexCapabilityIssue({
+      code: "server_unreachable",
+      title: "Viewer Host connection is unavailable",
+      detail: "The SyncTeX annotation socket disconnected. Reconnecting…",
+    });
     updateHostDataset();
     scheduleViewerSocketReconnect();
   });
   socket.addEventListener("error", () => {
     if (activeSocket !== socket) return;
     hostState.socketStatus = "error";
+    setSynctexCapabilityIssue({
+      code: "server_unreachable",
+      title: "Viewer Host connection is unavailable",
+      detail: "The browser could not reach the local Viewer Host socket. Check that the Viewer Host process is still running and reopen the PDF if needed.",
+    });
     updateHostDataset();
   });
 }
