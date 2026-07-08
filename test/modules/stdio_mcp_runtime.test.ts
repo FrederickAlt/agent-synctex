@@ -289,9 +289,9 @@ test("actual agent-synctex mcp entrypoint answers initialize and tools/list over
 		assert.equal(initialize.result.capabilities.tools.listChanged, false);
 		assert.equal(toolsList.id, 2);
 		const names = toolsList.result.tools.map((tool) => tool.name);
-		assert.deepEqual(names, ["show_latex", "compile_latex_file", "open_pdf", "jump_pdf", "set_latex_preamble", "fetch_pdf_context"]);
+		assert.deepEqual(names, ["show_latex", "compile_latex_file", "open_pdf", "jump_pdf", "fetch_pdf_context"]);
 		const showLatexProperties = toolsList.result.tools.find((tool) => tool.name === "show_latex")?.inputSchema.properties ?? {};
-		assert.deepEqual(Object.keys(showLatexProperties).sort(), ["compiler", "source"]);
+		assert.deepEqual(Object.keys(showLatexProperties).sort(), ["compiler", "preamble_root_file", "source"]);
 		assert.equal(toolsList.result.tools.find((tool) => tool.name === "compile_latex_file")?.inputSchema.properties?.continuous, undefined);
 	} finally {
 		child.kill("SIGTERM");
@@ -686,25 +686,18 @@ test("stdio runtime injects launch-cwd workspace context into compile_latex_file
 	}
 });
 
-test("stdio runtime ignores launch-cwd preamble files and set_latex_preamble updates the runtime preamble", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-preamble-"));
+test("stdio runtime does not auto-load a launch-cwd root preamble", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-no-autoload-preamble-"));
 	const launchCwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
 	mkdirSync(launchCwd, { recursive: true });
 	await withRuntimeEnv(runtimeRoot, async () => {
-		writeFileSync(join(launchCwd, "preamble.tex"), "\\usepackage{array}\n");
-		writeFileSync(join(launchCwd, "praeamble.tex"), "\\usepackage{booktabs}\n");
-		const stdin = new PassThrough();
-		const stdout = new PassThrough();
-		const runtime = new TexActionsStdioMcpRuntime({ stdin, stdout, stderr: new PassThrough(), launchCwd });
+		writeFileSync(join(launchCwd, "macros.tex"), "\\usepackage{amsmath}\n\\newcommand{\\fromInput}{I}\n");
+		writeFileSync(join(launchCwd, "main.tex"), "\\documentclass{article}\n\\input{macros}\n\\begin{document}\nHello\n\\end{document}\n");
+		const runtime = new TexActionsStdioMcpRuntime({ stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), launchCwd });
 		try {
 			runtime.start();
-			const runtimePreamblePath = join(runtimeRoot, "agents", "stdio-test-agent", "preamble.tex");
-			assert.equal(existsSync(runtimePreamblePath), false);
-			const output = collectMcpFrames(stdout, 1);
-			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "set_latex_preamble", arguments: { latex_preamble: "\\usepackage{mathtools}" } } }));
-			await output;
-			assert.equal(readFileSync(runtimePreamblePath, "utf8"), "\\usepackage{mathtools}\n");
+			assert.equal(existsSync(join(runtimeRoot, "agents", "stdio-test-agent", "preamble.tex")), false);
 		} finally {
 			runtime.close();
 		}
@@ -712,12 +705,12 @@ test("stdio runtime ignores launch-cwd preamble files and set_latex_preamble upd
 	rmSync(baseDir, { recursive: true, force: true });
 });
 
-test("set_latex_preamble updates preamble seen by subsequent show_latex snippets", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-snippet-preamble-"));
+test("stdio runtime forwards show_latex preamble_root_file to snippet compilation", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-snippet-preamble-root-"));
 	const launchCwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
 	mkdirSync(launchCwd, { recursive: true });
-	let observedSnippetPreamble = "";
+	let observedPreambleRootFile: string | undefined;
 	await withRuntimeEnv(runtimeRoot, async () => {
 		const stdin = new PassThrough();
 		const stdout = new PassThrough();
@@ -729,7 +722,7 @@ test("set_latex_preamble updates preamble seen by subsequent show_latex snippets
 			pdfOperations: {
 				compileService: {
 					async compileLatexSnippetRequest(request: HostServiceCompileSnippetRequest): Promise<HostServiceCompileSnippetResponseEnvelope> {
-						observedSnippetPreamble = readFileSync(join(request.workspace_context.workspace_root!, "preamble.tex"), "utf8");
+						observedPreambleRootFile = request.details.preamble_root_file;
 						return {
 							protocol_version: 1,
 							request_id: request.request_id,
@@ -744,92 +737,16 @@ test("set_latex_preamble updates preamble seen by subsequent show_latex snippets
 		});
 		try {
 			runtime.start();
-			let output = collectMcpFrames(stdout, 1);
-			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "set_latex_preamble", arguments: { latex_preamble: "\\usepackage{physics}" } } }));
-			await output;
-			output = collectMcpFrames(stdout, 1);
-			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "show_latex", arguments: { source: "\\[x\\]" } } }));
+			const output = collectMcpFrames(stdout, 1);
+			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "show_latex", arguments: { source: "\\[x\\]", preamble_root_file: "main.tex" } } }));
 			await output;
 		} finally {
 			runtime.close();
 		}
 	});
 	try {
-		assert.equal(observedSnippetPreamble, "\\usepackage{physics}\n");
+		assert.equal(observedPreambleRootFile, "main.tex");
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
-});
-
-test("stdio runtime ignores launch-cwd praeamble.tex when there is no LaTeX root", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-praeamble-"));
-	const launchCwd = join(baseDir, "project");
-	const runtimeRoot = join(baseDir, "runtime");
-	mkdirSync(launchCwd, { recursive: true });
-	await withRuntimeEnv(runtimeRoot, async () => {
-		writeFileSync(join(launchCwd, "praeamble.tex"), "\\usepackage{fallback}\n");
-		const runtime = new TexActionsStdioMcpRuntime({ stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), launchCwd });
-		try {
-			runtime.start();
-			assert.equal(existsSync(join(runtimeRoot, "agents", "stdio-test-agent", "preamble.tex")), false);
-		} finally {
-			runtime.close();
-		}
-	});
-	rmSync(baseDir, { recursive: true, force: true });
-});
-
-test("stdio runtime auto-loads the preamble when launch cwd has one LaTeX root", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-single-root-preamble-"));
-	const launchCwd = join(baseDir, "project");
-	const runtimeRoot = join(baseDir, "runtime");
-	mkdirSync(launchCwd, { recursive: true });
-	await withRuntimeEnv(runtimeRoot, async () => {
-		writeFileSync(join(launchCwd, "macros.tex"), "\\usepackage{amsmath}\n\\newcommand{\\fromInput}{I}\n");
-		writeFileSync(join(launchCwd, "main.tex"), "\\documentclass{article}\n\\input{macros}\n\\newcommand{\\mainMacro}{M}\n\\begin{document}\nHello\n\\end{document}\n");
-		const runtime = new TexActionsStdioMcpRuntime({ stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), launchCwd });
-		try {
-			runtime.start();
-			const preamble = readFileSync(join(runtimeRoot, "agents", "stdio-test-agent", "preamble.tex"), "utf8");
-			assert.match(preamble, /\\documentclass\{article\}/);
-			assert.match(preamble, /\\usepackage\{amsmath\}/);
-			assert.match(preamble, /\\newcommand\{\\mainMacro\}/);
-			assert.doesNotMatch(preamble, /\\begin\{document\}/);
-		} finally {
-			runtime.close();
-		}
-	});
-	rmSync(baseDir, { recursive: true, force: true });
-});
-
-test("stdio runtime silently skips auto-load when launch cwd has multiple roots and root_file can choose one", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-multi-root-preamble-"));
-	const launchCwd = join(baseDir, "project");
-	const runtimeRoot = join(baseDir, "runtime");
-	mkdirSync(launchCwd, { recursive: true });
-	await withRuntimeEnv(runtimeRoot, async () => {
-		writeFileSync(join(launchCwd, "main.tex"), "\\documentclass{article}\n\\newcommand{\\mainMacro}{M}\n\\begin{document}\nMain\n\\end{document}\n");
-		writeFileSync(join(launchCwd, "supplement.tex"), "\\documentclass{article}\n\\newcommand{\\suppMacro}{S}\n\\begin{document}\nSupp\n\\end{document}\n");
-		const stdin = new PassThrough();
-		const stdout = new PassThrough();
-		const stderr = new PassThrough();
-		let stderrText = "";
-		stderr.on("data", (chunk) => { stderrText += String(chunk); });
-		const runtime = new TexActionsStdioMcpRuntime({ stdin, stdout, stderr, launchCwd });
-		try {
-			runtime.start();
-			const runtimePreamblePath = join(runtimeRoot, "agents", "stdio-test-agent", "preamble.tex");
-			assert.equal(existsSync(runtimePreamblePath), false);
-			assert.equal(stderrText, "");
-			const output = collectMcpFrames(stdout, 1);
-			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "set_latex_preamble", arguments: { root_file: "supplement.tex" } } }));
-			await output;
-			const preamble = readFileSync(runtimePreamblePath, "utf8");
-			assert.match(preamble, /\\newcommand\{\\suppMacro\}/);
-			assert.doesNotMatch(preamble, /\\newcommand\{\\mainMacro\}/);
-		} finally {
-			runtime.close();
-		}
-	});
-	rmSync(baseDir, { recursive: true, force: true });
 });

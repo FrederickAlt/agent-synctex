@@ -66,6 +66,7 @@ export interface HostServiceCompileSnippetRequest {
 	workspace_context: HostServiceWorkspaceContext;
 	details: {
 		latex_source: string;
+		preamble_root_file?: string;
 		compiler?: unknown;
 		suppress_page_numbers?: boolean;
 		crop_to_content?: boolean;
@@ -304,6 +305,7 @@ export interface HostServiceCompileSnippetResponseDetails {
 	operation: "compile_latex_snippet";
 	source: string;
 	source_dir?: string;
+	preamble_root_file?: string;
 	pdf: string;
 	log: string;
 	artifact_paths: string[];

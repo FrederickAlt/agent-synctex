@@ -2558,7 +2558,7 @@ test("host service compile_latex_file rejects unsupported compiler strings", asy
 });
 
 
-test("host service compile_latex_snippet wraps bare snippets when no workspace preamble exists", async () => {
+test("host service compile_latex_snippet writes source unchanged when no preamble_root_file is provided", async () => {
 	const baseDir = temporaryDir("host-service-snippet-no-preamble-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const originalPath = process.env.PATH ?? "";
@@ -2583,10 +2583,7 @@ test("host service compile_latex_snippet wraps bare snippets when no workspace p
 		assert.equal(existsSync(result.pdf), true);
 		assert.equal(existsSync(result.log), true);
 		const renderedSource = readFileSync(result.source, "utf8");
-		assert.match(renderedSource, /\\documentclass\{article\}/);
-		assert.match(renderedSource, /\\begin\{document\}/);
-		assert.match(renderedSource, /\\end\{document\}/);
-		assert.match(renderedSource, /\\section\{Hello\}/);
+		assert.equal(renderedSource, "\\section{Hello}");
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
@@ -2595,13 +2592,14 @@ test("host service compile_latex_snippet wraps bare snippets when no workspace p
 });
 
 
-test("host service compile_latex_snippet applies workspace preamble and document wrapper", async () => {
+test("host service compile_latex_snippet applies preamble_root_file and document wrapper", async () => {
 	const baseDir = temporaryDir("host-service-snippet-success-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const originalPath = process.env.PATH ?? "";
 	writeFakeLatexCompiler(join(baseDir, "bin"));
 	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
-	writeFileSync(join(baseDir, "preamble.tex"), "\\usepackage{paper}");
+	writeFileSync(join(baseDir, "praeamble.tex"), "\\documentclass{article}\n\\usepackage{paper}\n");
+	writeFileSync(join(baseDir, "main.tex"), "\\input{praeamble}\n\\begin{document}\nHello\n\\end{document}\n");
 
 	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-success" });
 	await server.start();
@@ -2611,11 +2609,12 @@ test("host service compile_latex_snippet applies workspace preamble and document
 	});
 	try {
 		const result = await client.requestCompileLatexSnippet(
-			{ latex_source: "\\section{Hello}" },
+			{ latex_source: "\\section{Hello}", preamble_root_file: "main.tex" },
 			{ cwd: baseDir },
 		);
 		assert.equal(result.operation, "compile_latex_snippet");
 		assert.equal(result.clean, false);
+		assert.equal(result.preamble_root_file, join(baseDir, "main.tex"));
 		assert.equal(result.artifact_paths.includes(result.pdf), true);
 		assert.equal(result.artifact_paths.includes(result.log), true);
 		assert.equal(existsSync(result.pdf), true);
@@ -2664,40 +2663,7 @@ test("host service compile_latex_snippet keeps explicit document wrappers when p
 });
 
 
-test("host service compile_latex_snippet resolves workspace_root preamble", async () => {
-	const baseDir = temporaryDir("host-service-snippet-workspace-root-");
-	const socketPath = join(baseDir, "host-service.sock");
-	const originalPath = process.env.PATH ?? "";
-	writeFakeLatexCompiler(join(baseDir, "bin"));
-	process.env.PATH = `${join(baseDir, "bin")}:${originalPath}`;
-	const workspaceRoot = join(baseDir, "workspace");
-	const compileCwd = join(baseDir, "cwd");
-	mkdirSync(workspaceRoot, { recursive: true });
-	mkdirSync(compileCwd, { recursive: true });
-	writeFileSync(join(workspaceRoot, "preamble.tex"), "\\usepackage{hyperref}");
-
-	const server = new HostServiceServer({ socketPath, serviceName: "agent-synctex-compile-snippet-workspace-root" });
-	await server.start();
-	const client = new HostServiceClient({
-		socketPath,
-		requestTimeoutMs: 2_000,
-	});
-	try {
-		const result = await client.requestCompileLatexSnippet(
-			{ latex_source: "\\section{Root}" },
-			{ cwd: compileCwd, workspace_root: workspaceRoot },
-		);
-		const renderedSource = readFileSync(result.source, "utf8");
-		assert.match(renderedSource, /\\usepackage\{hyperref\}/);
-	} finally {
-		process.env.PATH = originalPath;
-		await server.stop();
-		rmSync(baseDir, { recursive: true, force: true });
-	}
-});
-
-
-test("host service compile_latex_snippet places snippets under workspace_root", async () => {
+test("host service compile_latex_snippet places snippets under compile cwd", async () => {
 	const baseDir = temporaryDir("host-service-snippet-output-root-");
 	const socketPath = join(baseDir, "host-service.sock");
 	const originalPath = process.env.PATH ?? "";
@@ -2719,12 +2685,12 @@ test("host service compile_latex_snippet places snippets under workspace_root", 
 			{ latex_source: "\\section{Output}" },
 			{ cwd: compileCwd, workspace_root: workspaceRoot },
 		);
-		assert.equal(result.source.startsWith(workspaceRoot), true);
-		assert.equal(result.source.includes("snippet.tex"), true);
-		assert.equal(result.pdf.startsWith(workspaceRoot), true);
+		assert.equal(result.source.startsWith(compileCwd), true);
+		assert.match(result.source, /\.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex$/);
+		assert.equal(result.pdf.startsWith(compileCwd), true);
 		assert.equal(existsSync(result.pdf), true);
 		assert.equal(result.artifact_paths.includes(result.pdf), true);
-		assert.equal(result.source.includes("host-service-snippets"), true);
+		assert.equal(result.source.includes(".agent-synctex/tmp"), true);
 	} finally {
 		process.env.PATH = originalPath;
 		await server.stop();
@@ -2757,8 +2723,8 @@ test("host service compile_latex_snippet preserves caller workspace_root permiss
 		);
 		const workspaceRootMode = socketMode(workspaceRoot);
 		assert.equal(workspaceRootMode, 0o755);
-		assert.equal(result.source.includes("host-service-snippets"), true);
-		assert.equal(result.source.startsWith(join(workspaceRoot, "host-service-snippets")), true);
+		assert.equal(result.source.includes(".agent-synctex/tmp"), true);
+		assert.equal(result.source.startsWith(join(compileCwd, ".agent-synctex", "tmp")), true);
 		assert.equal(existsSync(result.pdf), true);
 	} finally {
 		process.env.PATH = originalPath;

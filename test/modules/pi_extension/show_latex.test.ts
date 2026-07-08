@@ -128,7 +128,7 @@ type ShowLatexTool = {
 };
 
 type ShowLatexToolSet = {
-	showLatex: ShowLatexTool;	jumpPdf: ShowLatexTool;	closePdf: ShowLatexTool;	setLatexPreamble: ShowLatexTool;
+	showLatex: ShowLatexTool;	jumpPdf: ShowLatexTool;	closePdf: ShowLatexTool;
 };
 
 let sessionShutdownHandler: SessionLifecycleHandler | undefined;
@@ -221,7 +221,6 @@ async function captureTools(): Promise<ShowLatexToolSet> {
 	let capturedShowLatex: ShowLatexTool | undefined;
 	let capturedJumpPdf: ShowLatexTool | undefined;
 	let capturedClosePdf: ShowLatexTool | undefined;
-	let capturedSetLatexPreamble: ShowLatexTool | undefined;
 
 	extensionModule.default({
 		registerTool(tool) {
@@ -235,9 +234,6 @@ async function captureTools(): Promise<ShowLatexToolSet> {
 			}
 			if (tool.name === "close_pdf") {
 				capturedClosePdf = tool as unknown as ShowLatexTool;
-			}
-			if (tool.name === "set_latex_preamble") {
-				capturedSetLatexPreamble = tool as unknown as ShowLatexTool;
 			}
 		},
 		registerCommand() {},
@@ -257,15 +253,10 @@ async function captureTools(): Promise<ShowLatexToolSet> {
 	if (!capturedClosePdf) {
 		throw new Error("close_pdf tool was not registered by index module");
 	}
-	if (!capturedSetLatexPreamble) {
-		throw new Error("set_latex_preamble tool was not registered by index module");
-	}
-
 	return {
 		showLatex: capturedShowLatex,
 		jumpPdf: capturedJumpPdf,
 		closePdf: capturedClosePdf,
-		setLatexPreamble: capturedSetLatexPreamble,
 	};
 }
 
@@ -865,7 +856,7 @@ test("show_latex external flow supports jump_pdf and close_pdf through host serv
 			const jumpDetails = jumpResult.details as { source_line?: string; pdf: string; source?: string };
 			assert.equal(jumpDetails.pdf, openDetails.pdf);
 			assert.equal(typeof jumpDetails.source, "string");
-			assert.equal(jumpDetails.source?.endsWith("snippet.tex"), true);
+			assert.match(jumpDetails.source ?? "", /\.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex$/);
 			assert.equal(typeof jumpDetails.source_line, "string");
 			assert.equal(jumpResult.content[0].text.includes("line 1 contains:"), true);
 
@@ -920,90 +911,6 @@ test("show_latex external flow copies SyncTeX sidecars to fixed preview path", a
 		}, backend);
 	} finally {
 		await runSessionShutdown(context);
-		process.env.PATH = originalPath;
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("set_latex_preamble is honored by host-service snippet compilation", async () => {
-	const { root, sourceContent } = withTemporaryProject();
-	const { showLatex, setLatexPreamble } = await captureTools();
-	const capturedSourcePath = resolve(root, "captured-snippet-source.txt");
-	const originalPath = process.env.PATH ?? "";
-	const binDir = resolve(root, "bin");
-	mkdirSync(binDir, { recursive: true });
-	writeFakeCompilerWithSourceCapture(binDir, capturedSourcePath);
-	process.env.PATH = `${binDir}:${originalPath}`;
-	const context = createSessionContext(root);
-
-	try {
-		const preamble = "\\usepackage{array}";
-		await withHostService("ok", async () => {
-			const preambleResult = await setLatexPreamble.execute(
-				"show-latex-set-preamble",
-				{
-					latex_preamble: preamble,
-				},
-				undefined,
-				undefined,
-				context,
-			);
-			assert.equal((preambleResult as { details: { preambleLength?: number } }).details?.preambleLength, preamble.length);
-
-			await showLatex.execute(
-				"show-latex-inline-preamble",
-				{ source: sourceContent, inline: false },
-				undefined,
-				undefined,
-				context,
-			);
-			const renderedSource = readFileSync(capturedSourcePath, "utf8");
-			assert.equal(renderedSource.includes(preamble), true);
-		});
-	} finally {
-		await runSessionShutdown(context);
-		process.env.PATH = originalPath;
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("set_latex_preamble and show_latex use independent per-session preambles", async () => {
-	const { root, sourceContent } = withTemporaryProject();
-	const { showLatex, setLatexPreamble } = await captureTools();
-	const capturedSourcePath = resolve(root, "captured-snippet-source.txt");
-	const originalPath = process.env.PATH ?? "";
-	const binDir = resolve(root, "bin");
-	mkdirSync(binDir, { recursive: true });
-	writeFakeCompilerWithSourceCapture(binDir, capturedSourcePath);
-	process.env.PATH = `${binDir}:${originalPath}`;
-	const contextA = createSessionContext(root, "session-A");
-	const contextB = createSessionContext(root, "session-B");
-	const preambleA = "\\usepackage{array}";
-	const preambleB = "\\usepackage{booktabs}";
-	const preamblePathA = resolve(MCP_TMPDIR, "agents", "session-A", "preamble.tex");
-	const preamblePathB = resolve(MCP_TMPDIR, "agents", "session-B", "preamble.tex");
-
-	try {
-		await withHostService("ok", async () => {
-			await setLatexPreamble.execute("set-preamble-A", { latex_preamble: preambleA }, undefined, undefined, contextA);
-			await setLatexPreamble.execute("set-preamble-B", { latex_preamble: preambleB }, undefined, undefined, contextB);
-
-			assert.equal(readFileSync(preamblePathA, "utf8"), `${preambleA}\n`);
-			assert.equal(readFileSync(preamblePathB, "utf8"), `${preambleB}\n`);
-
-			await showLatex.execute("show-latex-A", { source: sourceContent, inline: false }, undefined, undefined, contextA);
-			const renderedSourceA = readFileSync(capturedSourcePath, "utf8");
-			assert.equal(renderedSourceA.includes(preambleA), true);
-			assert.equal(renderedSourceA.includes(preambleB), false);
-
-			await showLatex.execute("show-latex-B", { source: sourceContent, inline: false }, undefined, undefined, contextB);
-			const renderedSourceB = readFileSync(capturedSourcePath, "utf8");
-			assert.equal(renderedSourceB.includes(preambleA), false);
-			assert.equal(renderedSourceB.includes(preambleB), true);
-		});
-	} finally {
-		await runSessionShutdown(contextA);
-		await runSessionShutdown(contextB);
 		process.env.PATH = originalPath;
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1067,7 +974,7 @@ test("show_latex inline flow returns warning summaries from successful compiles"
 			assert.equal(details.compile_status, "ok_with_warnings");
 			assert.equal(details.warning_count, 2);
 			assert.equal(details.warnings?.some((warning) => /Overfull/.test(warning.message)), true);
-			assert.match(details.log ?? "", /snippet\.log$/);
+			assert.match(details.log ?? "", /\.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.log$/);
 		});
 	} finally {
 		await runSessionShutdown(context);

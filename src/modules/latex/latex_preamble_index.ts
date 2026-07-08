@@ -87,7 +87,7 @@ export function buildLatexPreambleIndex(cwd = process.cwd(), timeoutMs = 5_000):
 		const texFiles = discoverTexFiles(absCwd, deadline);
 		const rootFiles = texFiles.filter((file) => {
 			try {
-				return isLikelyRootFile(file, deadline);
+				return isLikelyRootFile(file, absCwd, deadline);
 			} catch (error) {
 				if (error instanceof TimeoutError) throw error;
 				errors.push(`${path.relative(absCwd, file)}: ${error instanceof Error ? error.message : String(error)}`);
@@ -150,11 +150,13 @@ function discoverTexFiles(dir: string, deadline: Deadline): string[] {
 	return out.sort();
 }
 
-function isLikelyRootFile(file: string, deadline: Deadline): boolean {
+function isLikelyRootFile(file: string, cwd: string, deadline: Deadline): boolean {
 	deadline.check();
-	const text = readTexFile(file).split("\n").map(stripTexComment).join("\n");
-	return /\\documentclass(?:\s*\[[^\]]*\])?\s*\{[^}]+\}/.test(text)
-		&& /\\begin\s*\{\s*document\s*\}/.test(text);
+	const rootText = readTexFile(file).split("\n").map(stripTexComment).join("\n");
+	if (!/\\begin\s*\{\s*document\s*\}/.test(rootText)) {
+		return false;
+	}
+	return collectPreambleForRoot(file, cwd, deadline).facts.documentClass !== null;
 }
 
 function collectPreambleForRoot(rootFile: string, cwd: string, deadline: Deadline): RootPreamble {

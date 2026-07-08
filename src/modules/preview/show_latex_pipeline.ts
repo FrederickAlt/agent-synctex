@@ -8,6 +8,7 @@ import { type InlinePreviewRenderState } from "./inline_preview_metadata.ts";
 export interface ParsedShowLatexInput {
 	latexSource: string;
 	compiler?: LatexCompiler;
+	preambleRootFile?: string;
 	inline?: boolean;
 }
 
@@ -29,6 +30,7 @@ export interface ShowLatexPreviewResult {
 }
 
 export interface ShowLatexCallOptions {
+	preambleRootFile?: string;
 	openPdf?: boolean;
 	openPdfReuseExisting?: boolean;
 	openPdfRequirePersistentViewer?: boolean;
@@ -83,6 +85,7 @@ export interface ShowLatexPipelineDependencies {
 export interface ShowLatexPipelineCompileRequest {
 	latexSource: string;
 	compiler?: LatexCompiler;
+	preambleRootFile?: string;
 	inline?: boolean;
 	signal?: AbortSignal;
 	workspaceContext?: ShowLatexWorkspaceContext;
@@ -181,6 +184,9 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 				case "inline":
 					parsed.inline = parseFrontMatterBoolean(key, value);
 					break;
+				case "preamble_root_file":
+					parsed.preambleRootFile = unquoteFrontMatterScalar(value);
+					break;
 				default:
 					throw new Error(`Unsupported show_latex front matter key: ${key}`);
 			}
@@ -192,6 +198,7 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 	function compactShowLatexArguments(parsed: ParsedShowLatexInput): Record<string, unknown> {
 		const result: Record<string, unknown> = { source: parsed.latexSource };
 		if (parsed.compiler !== undefined) result.compiler = parsed.compiler;
+		if (parsed.preambleRootFile !== undefined) result.preamble_root_file = parsed.preambleRootFile;
 		if (parsed.inline !== undefined) result.inline = parsed.inline;
 		return result;
 	}
@@ -207,6 +214,7 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 			const result: Record<string, unknown> = {};
 			if (source !== undefined) result.source = source;
 			if (record.compiler !== undefined) result.compiler = record.compiler;
+			if (record.preamble_root_file !== undefined) result.preamble_root_file = record.preamble_root_file;
 			if (record.inline !== undefined) result.inline = record.inline;
 			return Object.keys(result).length ? result : record;
 		}
@@ -225,6 +233,7 @@ export function createShowLatexPreviewPipeline(dependencies: ShowLatexPipelineDe
 			request.compiler,
 			request.signal,
 			{
+				preambleRootFile: request.preambleRootFile,
 				cropToContent: false,
 				openPdf: request.openPdf === undefined ? !inline : request.openPdf,
 				openPdfReuseExisting: request.openPdfReuseExisting,

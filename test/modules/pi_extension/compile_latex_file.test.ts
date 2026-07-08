@@ -482,31 +482,22 @@ function readCompileFailureLog(error: unknown): string {
 	return readFileSync(logPath, "utf8");
 }
 
-test("session_start copies single-root preambles into independent per-session runtime dirs", async () => {
+test("session_start does not auto-copy single-root preambles into session runtime dirs", async () => {
 	await captureTools();
 	const projectA = mkdtempSync(resolve(tmpdir(), "pdf-preview-preamble-A-"));
-	const projectB = mkdtempSync(resolve(tmpdir(), "pdf-preview-preamble-B-"));
 	const preambleA = "\\documentclass{article}\n\\usepackage{array}";
-	const preambleB = "\\documentclass{article}\n\\usepackage{booktabs}";
 	writeFileSync(resolve(projectA, "main.tex"), `${preambleA}\n\\begin{document}\nA\n\\end{document}\n`);
-	writeFileSync(resolve(projectB, "main.tex"), `${preambleB}\n\\begin{document}\nB\n\\end{document}\n`);
 	const contextA = createSessionContext(projectA, "compile-session-A");
-	const contextB = createSessionContext(projectB, "compile-session-B");
 	const preamblePathA = resolve(MCP_TMPDIR, "agents", "compile-session-A", "preamble.tex");
-	const preamblePathB = resolve(MCP_TMPDIR, "agents", "compile-session-B", "preamble.tex");
 
 	try {
 		await withHostServiceDefault(async () => {
 			await runSessionStart(contextA);
-			await runSessionStart(contextB);
-			assert.equal(readFileSync(preamblePathA, "utf8"), `${preambleA}\n`);
-			assert.equal(readFileSync(preamblePathB, "utf8"), `${preambleB}\n`);
+			assert.equal(existsSync(preamblePathA), false);
 		});
 	} finally {
 		await runSessionShutdown(contextA);
-		await runSessionShutdown(contextB);
 		rmSync(projectA, { recursive: true, force: true });
-		rmSync(projectB, { recursive: true, force: true });
 	}
 });
 

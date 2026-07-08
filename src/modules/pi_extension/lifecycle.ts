@@ -3,7 +3,6 @@ import { errorMessage } from "./error_utils.ts";
 import { SynctexCallbackManager } from "./synctex_callback_manager.ts";
 import { cleanupTerminalRefresh, clearTerminalInvalidators, installTerminalRefreshForSession } from "./inline_renderer.ts";
 import { resolveAgentWorkspaceContext } from "../agent_runtime_context.ts";
-import { initializeLatexPreambleFile } from "./latex_preamble_manager.ts";
 import { createHostServiceClient, hostServiceSocketPath, hostServiceWorkspaceContextForSession } from "./host_service_client.ts";
 import { contextSessionKey } from "./context_session.ts";
 import { createLogger } from "../logging.ts";
@@ -105,7 +104,6 @@ export function registerLifecycleHandlers(
 		try {
 			if (ctx) {
 				const workspaceContext = resolveAgentWorkspaceContext(ctx);
-				initializeLatexPreambleFile({ cwd: ctx.cwd, runtimeDirectory: workspaceContext.workspace_root });
 				await startSessionHeartbeat(ctx);
 				await injectPendingSystemInfo(ctx);
 				await callbackManager.rotateSynctexCallbacks(ctx);

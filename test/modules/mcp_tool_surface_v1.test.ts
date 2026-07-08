@@ -15,7 +15,6 @@ test("v1 tools/list exposes Viewer Host tools and omits raw event and close tool
 		"compile_latex_file",
 		"open_pdf",
 		"jump_pdf",
-		"set_latex_preamble",
 		"fetch_pdf_context",
 	]);
 	assert.equal(names.includes("get_pdf_events"), false);
@@ -31,7 +30,6 @@ test("hook-aware tools/list hides manual PDF context tool", async () => {
 		"compile_latex_file",
 		"open_pdf",
 		"jump_pdf",
-		"set_latex_preamble",
 	]);
 	assert.equal(names.includes("fetch_pdf_context"), false);
 	assert.equal(names.includes("get_pdf_events"), false);

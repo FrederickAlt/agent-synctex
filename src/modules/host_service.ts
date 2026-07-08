@@ -581,6 +581,7 @@ export class HostServiceClient {
 			workspace_context: context,
 			details: {
 				latex_source: request.latex_source,
+				...(request.preamble_root_file === undefined ? {} : { preamble_root_file: request.preamble_root_file }),
 				...(request.compiler === undefined ? {} : { compiler: request.compiler }),
 				...(request.suppress_page_numbers === undefined
 					? {}
@@ -2004,6 +2005,9 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 			if (rawDetails.compiler !== undefined && typeof rawDetails.compiler !== "string") {
 				throw new Error("compiler must be a string");
 			}
+			if (rawDetails.preamble_root_file !== undefined && (typeof rawDetails.preamble_root_file !== "string" || !rawDetails.preamble_root_file.trim())) {
+				throw new Error("preamble_root_file must be a non-empty string");
+			}
 			if (rawDetails.suppress_page_numbers !== undefined && typeof rawDetails.suppress_page_numbers !== "boolean") {
 				throw new Error("suppress_page_numbers must be a boolean");
 			}
@@ -2044,6 +2048,7 @@ function validateHostServiceRequest(value: unknown): HostServiceRequest {
 				workspace_context: workspaceContext,
 				details: {
 					latex_source: rawDetails.latex_source,
+					preamble_root_file: rawDetails.preamble_root_file,
 					compiler: rawDetails.compiler,
 					suppress_page_numbers: rawDetails.suppress_page_numbers,
 					crop_to_content: rawDetails.crop_to_content,

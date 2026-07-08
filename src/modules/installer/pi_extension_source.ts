@@ -7,7 +7,6 @@ const AGENT_SYNCTEX_TOOL_NAMES = new Set([
 	"compile_latex_file",
 	"open_pdf",
 	"jump_pdf",
-	"set_latex_preamble",
 	"fetch_pdf_context",
 ]);
 

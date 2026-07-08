@@ -4,7 +4,6 @@ import type { Readable, Writable } from "node:stream";
 import { MCP_ERROR_PARSE_ERROR, buildMcpErrorResponse, handleMcpRequest } from "./host_service_mcp.ts";
 import { resolveAgentWorkspaceContext, resolveAgentWorkspaceContextForAgentId, resolveHookAgentWorkspaceContext } from "./agent_runtime_context.ts";
 import type { HostServiceWorkspaceContext } from "./host_service_protocol.ts";
-import { initializeLatexPreambleFile } from "./pi_extension/latex_preamble_manager.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
 import { ViewerHostMcpService } from "./viewer_host_client.ts";
 import { startHookContextBridge, type HookContextBridgeHandle } from "./hook_context_bridge.ts";
@@ -44,7 +43,6 @@ const STDIO_WORKSPACE_CONTEXT_TOOL_NAMES = new Set([
 	"compile_latex_file",
 	"open_pdf",
 	"jump_pdf",
-	"set_latex_preamble",
 ]);
 
 const STDIO_AGENT_SCOPED_TOOL_NAMES = new Set([
@@ -171,11 +169,6 @@ export class TexActionsStdioMcpRuntime {
 	}
 
 	private seedRuntimePreamble(workspaceContext = this.workspaceContext()): HostServiceWorkspaceContext {
-		initializeLatexPreambleFile({
-			cwd: workspaceContext.cwd,
-			runtimeDirectory: workspaceContext.workspace_root,
-			overwrite: false,
-		});
 		return workspaceContext;
 	}
 
@@ -264,9 +257,7 @@ export class TexActionsStdioMcpRuntime {
 				? rawArguments
 				: typeof rawArguments === "string" && parsed.params.name === "show_latex"
 					? { source: rawArguments }
-					: typeof rawArguments === "string" && parsed.params.name === "set_latex_preamble"
-						? { latex_preamble: rawArguments }
-						: {};
+					: {};
 			const metadata = sessionMetadataFromArguments(currentArguments);
 			const workspaceContext = this.seedRuntimePreamble(this.workspaceContext(metadata));
 			const pdfOperations = this.pdfOperationsForWorkspace(workspaceContext);

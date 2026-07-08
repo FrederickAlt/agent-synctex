@@ -41,6 +41,10 @@ const ShowLatexParams = Type.Object(
 			minLength: 1,
 		}),
 		compiler: LatexCompilerParam,
+		preamble_root_file: Type.Optional(Type.String({
+			description: "LaTeX root file whose discovered preamble should wrap this source. Relative paths resolve from the workspace cwd.",
+			minLength: 1,
+		})),
 		inline: Type.Optional(Type.Boolean({
 			description: "When true, rasterize the compiled PDF and show it inline in the Pi TUI instead of requesting a host-service external preview. Defaults to true.",
 			default: true,
@@ -59,6 +63,7 @@ const showLatexPreviewPipeline = createShowLatexPreviewPipeline({
 		const compileResult = await client.requestCompileLatexSnippet(
 			{
 				latex_source: latexSource,
+				...(options?.preambleRootFile === undefined ? {} : { preamble_root_file: options.preambleRootFile }),
 				compiler: compiler,
 				...(options?.suppressPageNumbers === true ? { suppress_page_numbers: true } : {}),
 				...(options?.cropToContent === true ? { crop_to_content: true } : {}),
@@ -156,12 +161,12 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 			"FREEFORM/raw LaTeX preview. Pass LaTeX code directly; optional YAML-like front matter may set compiler and inline. Example: ---\ncompiler: lualatex\ninline: false\n---\n\\begin{equation}\nx\n\\end{equation}\nThe \\begin{document}...\\end{document} wrapper is accepted but not required. Defaults to inline preview with lualatex; set inline=false to request host-service external open instead. For external opens, if a browser viewer is detected after launch/focus, only pdf_id/status is returned because the user can already see the output; if no live browser viewer is detected, the result includes a Viewer URL to pass to the user.",
 		promptSnippet: "FREEFORM LaTeX preview; optional front matter can set compiler and inline",
 		promptGuidelines: [
-			"Use show_latex when the user asks for a LaTeX PDF preview. Prefer passing only the LaTeX body, for example \\[x\\]; \\begin{document}...\\end{document} is accepted but usually unnecessary.",
+			"Use show_latex when the user asks for a LaTeX PDF preview. Without preamble_root_file, pass a complete LaTeX document. With preamble_root_file, pass either only the LaTeX body or \\begin{document}...\\end{document}.",
 			"Use optional front matter only when changing options, for example: ---\ncompiler: xelatex\ninline: false\n---",
 			"show_latex renders inline by default; set inline=false only when the user wants an external viewer.",
 			"Do not use verbatim-like LaTeX constructs (for example, \\begin{verbatim}, lstlisting, minted, or \\verb) to show the user LaTeX code; provide real LaTeX that compiles and renders the requested content.",
-			"In an existing LaTeX project, the runtime preamble is auto-loaded only when exactly one root file is discovered. If multiple roots exist, auto-load silently skips; call set_latex_preamble with root_file when the user wants a specific project root preamble.",
-			"If a project snippet preview fails, inspect the log and active root preamble. Do not call set_latex_preamble with a minimal preamble as a workaround unless the user explicitly asks to change the active preview preamble."
+			"In an existing LaTeX project, pass preamble_root_file to use the discovered preamble from that root for a one-off preview.",
+			"If a project snippet preview fails, inspect the log and selected preamble_root_file. Do not add a minimal preamble as a workaround unless the user explicitly asks for a standalone document."
 		],
 		renderShell: "self",
 		parameters: ShowLatexParams,
@@ -179,6 +184,7 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 				const parsed = showLatexPreviewPipeline.parseShowLatexInput(String(params.source ?? ""));
 				latexSource = parsed.latexSource;
 				compiler = parsed.compiler !== undefined ? parsed.compiler : latexFileCompileToolSupport.resolveLatexCompiler(params.compiler);
+				const preambleRootFile = parsed.preambleRootFile ?? (typeof params.preamble_root_file === "string" ? params.preamble_root_file : undefined);
 				inline = parsed.inline !== undefined ? parsed.inline : params.inline !== false;
 				let openPdfCallback: { kind: "pi-synctex-callback-v1"; transport: "unix"; socket_path: string; token: string } | undefined;
 				if (!inline) {
@@ -190,6 +196,7 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 				preview = await showLatexPreviewPipeline.compileAndPreviewLatex({
 					latexSource,
 					compiler,
+					preambleRootFile,
 					inline,
 					signal,
 					workspaceContext,

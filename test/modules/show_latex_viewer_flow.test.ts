@@ -51,13 +51,13 @@ async function callShowLatex(args: Record<string, unknown>, service: ViewerHostM
 	return response as unknown as Record<string, unknown>;
 }
 
-test("show_latex schema exposes source and optional compiler but no inline or raster controls", async () => {
+test("show_latex schema exposes source, optional compiler, and preamble_root_file but no inline or raster controls", async () => {
 	const response = await handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
 	assert.ok(response && "result" in response);
 	const tools = (response.result as { tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown> } }> }).tools;
 	const showLatex = tools.find((tool) => tool.name === "show_latex");
 	assert.ok(showLatex);
-	assert.deepEqual(Object.keys(showLatex.inputSchema.properties).sort(), ["compiler", "source", "workspace_context"]);
+	assert.deepEqual(Object.keys(showLatex.inputSchema.properties).sort(), ["compiler", "preamble_root_file", "source", "workspace_context"]);
 	assert.equal(showLatex.inputSchema.properties.inline, undefined);
 	assert.equal(showLatex.inputSchema.properties.open_pdf, undefined);
 	assert.equal(showLatex.inputSchema.properties.fixed_preview, undefined);
@@ -79,19 +79,21 @@ test("show_latex rejects empty source and legacy inline arguments before compili
 	}
 });
 
-test("show_latex writes runtime preamble, compiles once with SyncTeX, registers Viewer Host PDF, and returns viewer metadata", async () => {
+test("show_latex uses preamble_root_file to wrap source, compiles once with SyncTeX, registers Viewer Host PDF, and returns viewer metadata", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "show-latex-viewer-flow-"));
 	const binDir = join(dir, "bin");
 	const recordFile = join(dir, "latexmk-records.jsonl");
 	const client = new FakeViewerHostClient({ origin: "http://127.0.0.1:43125" });
 	const service = new ViewerHostMcpService({ client, makePdfId: () => 4242 });
 	writeFakeLatexmk(binDir, recordFile);
-	writeFileSync(join(dir, "preamble.tex"), "\\usepackage{physics}\n\\newcommand{\\runtimeMacro}{R}\n");
+	writeFileSync(join(dir, "praeamble.tex"), "\\documentclass{article}\n\\usepackage{physics}\n\\newcommand{\\runtimeMacro}{R}\n");
+	writeFileSync(join(dir, "main.tex"), "\\input{praeamble}\n\\begin{document}\nHello\n\\end{document}\n");
 	try {
 		await withPath(binDir, async () => {
 			const response = await callShowLatex({
 				source: "\\[\\runtimeMacro + x\\]",
 				compiler: "pdflatex",
+				preamble_root_file: "main.tex",
 				workspace_context: { cwd: dir, workspace_root: dir },
 			}, service);
 			assert.equal(response.error, undefined);
@@ -113,6 +115,7 @@ test("show_latex writes runtime preamble, compiles once with SyncTeX, registers 
 
 			const sourceText = readFileSync(String(result.details.source), "utf8");
 			assert.match(sourceText, /\\usepackage\{physics\}/);
+			assert.match(sourceText, /\\begin\{document\}/);
 			assert.match(sourceText, /\\runtimeMacro \+ x/);
 			assert.doesNotMatch(sourceText, /\\usepackage(?:\[[^\]]*\])?\{preview\}/);
 			assert.notEqual(result.details.pdf, join(dir, "tex-actions.pdf"));

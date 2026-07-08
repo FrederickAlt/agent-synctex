@@ -1,9 +1,5 @@
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import { getLatexPreambleFilePath } from "./runtime_preamble.ts";
-import { writeLatexPreambleToTmpdir } from "./runtime_preamble.ts";
-import { resolveTexActionsAgentRuntimeDir } from "./agent_runtime_context.ts";
 import { HostServiceCompileService } from "./host_service_compile.ts";
-import { buildLatexPreambleIndex } from "./latex/latex_preamble_index.ts";
 import type { GetPdfEventsRequest, PdfEvent } from "./pdf_events.ts";
 import { normalizeFetchPdfContextRequest, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
 import { appendViewerUrlAgentNotice, viewerUrlForAgentWhenNoLiveViewer } from "./viewer_url_agent_notice.ts";
@@ -228,12 +224,13 @@ function parseCompileWorkspaceContext(sourcePath: string, rawWorkspaceContext: u
 }
 function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompileSnippetRequest {
 	for (const key of Object.keys(args)) {
-		if (!["source", "compiler", "workspace_context", "debug_synctex"].includes(key)) {
+		if (!["source", "compiler", "preamble_root_file", "workspace_context", "debug_synctex"].includes(key)) {
 			throw new Error(`show_latex unknown argument: ${key}`);
 		}
 	}
 	const source = parseStringArg(args, "source");
 	const compiler = parseOptionalStringArg(args, "compiler");
+	const preambleRootFile = parseOptionalStringArg(args, "preamble_root_file");
 	const debugSynctex = parseBooleanArg(args, "debug_synctex");
 	const rawWorkspaceContext = args.workspace_context;
 	const workspaceContext = rawWorkspaceContext === undefined
@@ -250,6 +247,7 @@ function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompil
 		workspace_context: workspaceContext,
 		details: {
 			latex_source: source,
+			...(preambleRootFile === undefined ? {} : { preamble_root_file: preambleRootFile }),
 			...(compiler === undefined ? {} : { compiler }),
 			open_pdf: true,
 			...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
@@ -531,7 +529,6 @@ function parseToolCallParams(params: unknown): { name: string; args: Record<stri
 	}
 	if (typeof rawArguments === "string") {
 		if (rawName === "show_latex") return { name: rawName, args: { source: rawArguments } };
-		if (rawName === "set_latex_preamble") return { name: rawName, args: { latex_preamble: rawArguments } };
 	}
 	if (!isRecord(rawArguments)) {
 		throw new McpRequestError(MCP_ERROR_INVALID_PARAMS, null, "tools/call arguments must be an object");
@@ -597,28 +594,6 @@ function encodeResponse(payload: McpResponsePayload): string {
 	return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`;
 }
 
-function mcpPreamblePath(runtimeDirectory?: string): string {
-	return getLatexPreambleFilePath(runtimeDirectory);
-}
-
-function resolveSetPreambleWorkspace(rawWorkspaceContext: unknown): { workspaceContext: HostServiceWorkspaceContext; runtimeDirectory?: string } {
-	if (rawWorkspaceContext === undefined) {
-		return { workspaceContext: MCP_DEFAULT_WORKSPACE_CONTEXT };
-	}
-	const workspaceContext = normalizeWorkspaceContext(rawWorkspaceContext);
-	if (workspaceContext.workspace_root === undefined) {
-		throw new Error("set_latex_preamble workspace_context requires workspace_root");
-	}
-	if (workspaceContext.session_id === undefined) {
-		throw new Error("set_latex_preamble workspace_context requires session_id");
-	}
-	const expectedRuntimeDirectory = resolveTexActionsAgentRuntimeDir(workspaceContext.session_id);
-	if (resolve(workspaceContext.workspace_root) !== expectedRuntimeDirectory) {
-		throw new Error("set_latex_preamble workspace_context.workspace_root must match the agent runtime directory");
-	}
-	return { workspaceContext, runtimeDirectory: expectedRuntimeDirectory };
-}
-
 function workspaceContextSchema(): { type: "object"; properties: Record<string, unknown>; required: string[]; additionalProperties: boolean } {
 	return {
 		type: "object",
@@ -636,12 +611,13 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 	const tools: McpToolDefinition[] = [
 		{
 			name: "show_latex",
-			description: "Render a LaTeX snippet as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Raw string/FREEFORM tool arguments are accepted as LaTeX source; callers may pass a full document, a \\begin{document}...\\end{document} body, or just document body content. The response includes the generated .tex source path and source directory so callers can edit it and recompile. If a browser viewer is detected after launch/focus, the tool returns only pdf_id plus that source location because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
+			description: "Render LaTeX as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Without preamble_root_file, source must be a complete LaTeX document. With preamble_root_file, the discovered preamble for that LaTeX root wraps either a \\begin{document}...\\end{document} body or document body content. The response includes the generated .tex source path and source directory so callers can edit it and recompile. If a browser viewer is detected after launch/focus, the tool returns only pdf_id plus that source location because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
 			inputSchema: {
 				type: "object",
 				properties: {
-					source: { type: "string", minLength: 1, description: "LaTeX source. May be a full document, a \\begin{document}...\\end{document} body, or only document body content." },
+					source: { type: "string", minLength: 1, description: "LaTeX source. Without preamble_root_file, pass a complete document. With preamble_root_file, pass either a \\begin{document}...\\end{document} body or only document body content." },
 					compiler: { type: "string" },
+					preamble_root_file: { type: "string", minLength: 1, description: "LaTeX root file whose discovered preamble should wrap this source. Relative paths resolve from the workspace cwd." },
 					workspace_context: workspaceContextSchema(),
 				},
 				required: ["source"],
@@ -697,20 +673,6 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 				additionalProperties: false,
 			},
 		},
-		{
-			name: "set_latex_preamble",
-			description: "Set the active LaTeX preview preamble in the provided workspace runtime. Pass raw LaTeX preamble text directly, or pass root_file to activate the discovered preamble for a LaTeX root when auto-load skipped because multiple roots exist.",
-			inputSchema: {
-				type: "object",
-				properties: {
-					latex_preamble: { type: "string", description: "Raw LaTeX preamble to activate. In FREEFORM/raw calls, pass the preamble text directly." },
-					root_file: { type: "string", minLength: 1, description: "LaTeX root file whose discovered preamble should be activated." },
-					workspace_context: workspaceContextSchema(),
-				},
-				required: [],
-				additionalProperties: false,
-			},
-		},
 	];
 	if (shouldExposeFetchPdfContext(options)) {
 		tools.push({
@@ -735,7 +697,6 @@ const HOST_SERVICE_BASE_TOOL_NAMES = [
 	"compile_latex_file",
 	"open_pdf",
 	"jump_pdf",
-	"set_latex_preamble",
 ] as const;
 
 export const HOST_SERVICE_TOOL_NAMES = [
@@ -896,80 +857,6 @@ async function handleJumpPdfTool(
 	}
 }
 
-async function handleSetLatexPreambleTool(
-	requestId: ParsedMcpRequestId,
-	args: Record<string, unknown>,
-	_pdfOperations: HostServiceMcpPdfOperations,
-	_mcpCompileService: HostServiceCompileService,
-	_options: HostServiceMcpOptions,
-): Promise<McpResponsePayload> {
-	for (const key of Object.keys(args)) {
-		if (!["latex_preamble", "root_file", "workspace_context"].includes(key)) {
-			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, `set_latex_preamble unknown argument: ${key}`);
-		}
-	}
-	const hasRawPreamble = Object.prototype.hasOwnProperty.call(args, "latex_preamble");
-	const hasRootFile = Object.prototype.hasOwnProperty.call(args, "root_file");
-	if (hasRawPreamble === hasRootFile) {
-		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble requires exactly one of latex_preamble or root_file");
-	}
-	let runtimeDirectory: string | undefined;
-	let workspaceContext: HostServiceWorkspaceContext;
-	try {
-		const resolvedWorkspace = resolveSetPreambleWorkspace(args.workspace_context);
-		runtimeDirectory = resolvedWorkspace.runtimeDirectory;
-		workspaceContext = resolvedWorkspace.workspaceContext;
-	} catch (error) {
-		return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, error instanceof Error ? error.message : String(error));
-	}
-	let preamble: string;
-	let sourceRoot: string | undefined;
-	if (hasRawPreamble) {
-		if (typeof args.latex_preamble !== "string") {
-			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble latex_preamble must be a string");
-		}
-		preamble = args.latex_preamble;
-	} else {
-		if (typeof args.root_file !== "string" || !args.root_file.trim()) {
-			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble root_file must be a non-empty string");
-		}
-		try {
-			const timeoutMs = Number(process.env.LATEX_PREAMBLE_TIMEOUT_MS ?? "5000");
-			const index = buildLatexPreambleIndex(workspaceContext.cwd, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5_000);
-			if (index.timedOut) {
-				return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, "set_latex_preamble could not scan root files before the timeout");
-			}
-			const root = index.getRoot(args.root_file);
-			preamble = root.preamble;
-			sourceRoot = root.rootFile;
-		} catch (error) {
-			return buildMcpErrorResponse(requestId, MCP_ERROR_INVALID_PARAMS, error instanceof Error ? error.message : String(error));
-		}
-	}
-	try {
-		const preambleLength = writeLatexPreambleToTmpdir(
-			preamble,
-			runtimeDirectory === undefined ? {} : { runtimeDirectory },
-		);
-		const preamblePath = mcpPreamblePath(runtimeDirectory);
-		const sourceText = sourceRoot === undefined ? "" : ` from ${relative(workspaceContext.cwd, sourceRoot)}`;
-		const resultText = preambleLength
-			? `LaTeX preamble set${sourceText} (${preambleLength} characters) at ${preamblePath}`
-			: `LaTeX preamble cleared at ${preamblePath}`;
-		const toolResult: McpToolResult = {
-			content: [{ type: "text", text: resultText }],
-			details: { preambleLength, preamblePath, ...(sourceRoot === undefined ? {} : { root_file: sourceRoot }) },
-		};
-		return buildSuccess(requestId, toolResult);
-	} catch (error) {
-		const details = error instanceof Error ? error.message : String(error);
-		return buildSuccess(requestId, {
-			isError: true,
-			content: [{ type: "text", text: `set_latex_preamble failed: ${details}` }],
-		});
-	}
-}
-
 async function handleFetchPdfContextTool(
 	requestId: ParsedMcpRequestId,
 	args: Record<string, unknown>,
@@ -1075,7 +962,6 @@ export async function handleMcpRequest(
 				compile_latex_file: handleCompileLatexFileTool,
 				open_pdf: handleOpenPdfTool,
 				jump_pdf: handleJumpPdfTool,
-				set_latex_preamble: handleSetLatexPreambleTool,
 				fetch_pdf_context: handleFetchPdfContextTool,
 			};
 			const handler = toolHandlers[call.name as HostServiceToolName] ?? null;

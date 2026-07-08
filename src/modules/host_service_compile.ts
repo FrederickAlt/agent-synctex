@@ -1,11 +1,8 @@
 import { randomInt } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
-import {
-	applyLatexPreamble,
-	DEFAULT_SNIPPET_PREAMBLE,
-} from "./latex/latex_preamble.ts";
+import { applyLatexPreamble } from "./latex/latex_preamble.ts";
 import {
 	createLatexFileCompileToolSupport,
 	latexmkEngineIdentity,
@@ -33,6 +30,7 @@ import {
 	HostServiceCompileCoordinationError,
 	HostServiceRootCompileCoordinator,
 } from "./host_service_root_compile_coordinator.ts";
+import { buildLatexPreambleIndex, type RootPreamble } from "./latex/latex_preamble_index.ts";
 
 const logger = createLogger("host-service.compile");
 
@@ -53,10 +51,6 @@ const SNIPPET_ARTIFACT_EXTENSIONS = [
 	".fls",
 	".fdb_latexmk",
 	".out",
-] as const;
-const HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES = [
-	"preamble.tex",
-	"praeamble.tex",
 ] as const;
 const hostServiceLatexFileCompiler = createLatexFileCompileToolSupport();
 
@@ -354,6 +348,7 @@ export class HostServiceCompileService {
 		const shouldClean = false;
 		const cleanArtifacts: string[] = [];
 		let sourcePath = "";
+		let preambleRoot: RootPreamble | undefined;
 		logger.info("compile_snippet.begin", {
 			request_id: request.request_id,
 			compiler: request.details.compiler,
@@ -361,19 +356,21 @@ export class HostServiceCompileService {
 			fixed_preview: request.details.fixed_preview === true,
 			crop_to_content: request.details.crop_to_content === true,
 			suppress_page_numbers: request.details.suppress_page_numbers === true,
+			preamble_root_file: request.details.preamble_root_file,
 		});
 
 		try {
 			sourcePath = buildSnippetLatexSourcePath(request.workspace_context);
 			this.snippetArtifactBases.add(pathWithoutExtension(sourcePath));
 			const source = request.details.latex_source;
-			const workspacePreamble = resolveWorkspacePreambleForCompile(request.workspace_context);
-			const preamble = workspacePreamble || DEFAULT_SNIPPET_PREAMBLE;
-			const wrappedSource = applyLatexPreamble(source, preamble, {
-				cropToContent: request.details.crop_to_content === true,
-				suppressPageNumbers: request.details.suppress_page_numbers === true,
-			});
-			writeFileSync(sourcePath, wrappedSource, { mode: 0o600 });
+			preambleRoot = resolvePreambleRootForCompile(request.workspace_context, request.details.preamble_root_file);
+			const compileSource = preambleRoot === undefined
+				? source
+				: applyLatexPreamble(source, preambleRoot.preamble, {
+					cropToContent: request.details.crop_to_content === true,
+					suppressPageNumbers: request.details.suppress_page_numbers === true,
+				});
+			writeFileSync(sourcePath, compileSource, { mode: 0o600 });
 			const compileRequest: LatexFileCompileRequest = {
 				requestedPath: sourcePath,
 				compiler: request.details.compiler,
@@ -445,6 +442,7 @@ export class HostServiceCompileService {
 					operation: request.operation,
 					source: result.source,
 					source_dir: dirname(result.source),
+						...(preambleRoot === undefined ? {} : { preamble_root_file: preambleRoot.rootFile }),
 					pdf: previewPdfPath,
 					operation_pdf: operationPdfPath,
 					log: logPath,
@@ -490,6 +488,7 @@ export class HostServiceCompileService {
 					operation: request.operation,
 					source,
 					...(source ? { source_dir: dirname(source) } : {}),
+						...(preambleRoot === undefined ? {} : { preamble_root_file: preambleRoot.rootFile }),
 					pdf: errorPdf,
 					log,
 					clean: shouldClean,
@@ -770,28 +769,16 @@ function pathWithoutExtension(sourcePath: string): string {
 	return join(dirname(sourcePath), basename(sourcePath, extname(sourcePath)));
 }
 
-function resolveWorkspacePreambleForCompile(context: HostServiceWorkspaceContext): string {
-	const workspaceRoot = context.workspace_root ?? context.cwd;
-	const preambleFile = resolveWorkspacePreambleFile(workspaceRoot);
-	if (!preambleFile) {
-		return "";
+function resolvePreambleRootForCompile(context: HostServiceWorkspaceContext, preambleRootFile: string | undefined): RootPreamble | undefined {
+	if (preambleRootFile === undefined) {
+		return undefined;
 	}
-	try {
-		return readFileSync(preambleFile, "utf8").trim();
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`failed to read workspace preamble ${preambleFile}: ${message}`);
+	const timeoutMs = Number(process.env.LATEX_PREAMBLE_TIMEOUT_MS ?? "5000");
+	const index = buildLatexPreambleIndex(context.cwd, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5_000);
+	if (index.timedOut) {
+		throw new Error("could not scan LaTeX root files before the timeout");
 	}
-}
-
-function resolveWorkspacePreambleFile(workspaceRoot: string): string | null {
-	for (const fileName of HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES) {
-		const candidate = resolve(workspaceRoot, fileName);
-		if (existsSync(candidate)) {
-			return candidate;
-		}
-	}
-	return null;
+	return index.getRoot(preambleRootFile);
 }
 
 function expandHomePath(rawPath: string): string {
