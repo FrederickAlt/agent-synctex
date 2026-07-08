@@ -1,4 +1,5 @@
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { randomInt } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -37,7 +38,22 @@ const logger = createLogger("host-service.compile");
 
 const REQUIRED_DIRECTORY_MODE = 0o700;
 const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "tex-actions");
-const HOST_SERVICE_SNIPPET_WORKDIR_NAME = "host-service-snippets";
+const AGENT_SYNCTEX_WORKDIR_NAME = ".agent-synctex";
+const HOST_SERVICE_SNIPPET_WORKDIR_NAME = "tmp";
+const SNIPPET_DOCUMENT_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const SNIPPET_DOCUMENT_ID_LENGTH = 6;
+const MAX_SNIPPET_DOCUMENT_ID_ATTEMPTS = 1_000;
+const SNIPPET_ARTIFACT_EXTENSIONS = [
+	".tex",
+	".pdf",
+	".log",
+	".aux",
+	".synctex",
+	".synctex.gz",
+	".fls",
+	".fdb_latexmk",
+	".out",
+] as const;
 const HOST_SERVICE_SNIPPET_PREAMBLE_FILE_NAMES = [
 	"preamble.tex",
 	"praeamble.tex",
@@ -81,6 +97,7 @@ export class HostServiceCompileService {
 	private readonly nowNs: () => number;
 	private readonly rootCompileCoordinator: HostServiceRootCompileCoordinator;
 	private readonly activeCompileAbortControllers = new Set<AbortController>();
+	private readonly snippetArtifactBases = new Set<string>();
 
 	constructor(options: HostServiceCompileServiceOptions) {
 		this.protocolVersion = options.protocolVersion;
@@ -103,6 +120,7 @@ export class HostServiceCompileService {
 			controller.abort(stoppedError);
 		}
 		this.rootCompileCoordinator.stop(stoppedError);
+		this.cleanupSnippetArtifacts();
 	}
 
 	private recordLastCompileSuccess(
@@ -347,6 +365,7 @@ export class HostServiceCompileService {
 
 		try {
 			sourcePath = buildSnippetLatexSourcePath(request.workspace_context);
+			this.snippetArtifactBases.add(pathWithoutExtension(sourcePath));
 			const source = request.details.latex_source;
 			const workspacePreamble = resolveWorkspacePreambleForCompile(request.workspace_context);
 			const preamble = workspacePreamble || DEFAULT_SNIPPET_PREAMBLE;
@@ -481,6 +500,15 @@ export class HostServiceCompileService {
 				},
 			};
 		}
+	}
+
+	private cleanupSnippetArtifacts(): void {
+		for (const artifactBase of this.snippetArtifactBases) {
+			for (const extension of SNIPPET_ARTIFACT_EXTENSIONS) {
+				rmSync(`${artifactBase}${extension}`, { force: true });
+			}
+		}
+		this.snippetArtifactBases.clear();
 	}
 
 	private async markCompiledPdfUpdated(pdfPath: string, requestId: string): Promise<void> {
@@ -715,21 +743,31 @@ export class HostServiceCompileService {
 }
 
 function buildSnippetLatexSourcePath(workspaceContext: HostServiceWorkspaceContext): string {
-	const workspaceRoot = workspaceContext.workspace_root ?? DEFAULT_HOST_SERVICE_TMPDIR;
-	const snippetRoot = workspaceContext.workspace_root
-		? join(workspaceRoot, HOST_SERVICE_SNIPPET_WORKDIR_NAME)
-		: workspaceRoot;
+	const workspaceRoot = workspaceContext.cwd && workspaceContext.cwd !== "/"
+		? resolve(workspaceContext.cwd)
+		: workspaceContext.workspace_root ?? DEFAULT_HOST_SERVICE_TMPDIR;
+	const agentSynctexRoot = join(workspaceRoot, AGENT_SYNCTEX_WORKDIR_NAME);
+	const snippetRoot = join(agentSynctexRoot, HOST_SERVICE_SNIPPET_WORKDIR_NAME);
 
-	if (workspaceContext.workspace_root === undefined) {
-		ensureDirectory(snippetRoot);
-	} else {
-		assertDirectorySafe(workspaceRoot, { enforceMode: false });
-		ensureDirectory(snippetRoot);
+	ensureDirectory(agentSynctexRoot);
+	ensureDirectory(snippetRoot);
+	for (let attempt = 0; attempt < MAX_SNIPPET_DOCUMENT_ID_ATTEMPTS; attempt += 1) {
+		const sourcePath = join(snippetRoot, `${randomSnippetDocumentId()}.tex`);
+		if (!existsSync(sourcePath)) return sourcePath;
 	}
+	throw new Error("failed to allocate a unique show_latex source file name");
+}
 
-	const runDir = mkdtempSync(`${join(snippetRoot, "snippet-")}xxxxxx`);
-	chmodSync(runDir, REQUIRED_DIRECTORY_MODE);
-	return join(runDir, "snippet.tex");
+function randomSnippetDocumentId(): string {
+	let id = "";
+	for (let index = 0; index < SNIPPET_DOCUMENT_ID_LENGTH; index += 1) {
+		id += SNIPPET_DOCUMENT_ID_ALPHABET[randomInt(SNIPPET_DOCUMENT_ID_ALPHABET.length)];
+	}
+	return id;
+}
+
+function pathWithoutExtension(sourcePath: string): string {
+	return join(dirname(sourcePath), basename(sourcePath, extname(sourcePath)));
 }
 
 function resolveWorkspacePreambleForCompile(context: HostServiceWorkspaceContext): string {

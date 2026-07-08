@@ -5,6 +5,7 @@ import { MCP_ERROR_PARSE_ERROR, buildMcpErrorResponse, handleMcpRequest } from "
 import { resolveAgentWorkspaceContext, resolveAgentWorkspaceContextForAgentId, resolveHookAgentWorkspaceContext } from "./agent_runtime_context.ts";
 import type { HostServiceWorkspaceContext } from "./host_service_protocol.ts";
 import { initializeLatexPreambleFile } from "./pi_extension/latex_preamble_manager.ts";
+import { HostServiceCompileService } from "./host_service_compile.ts";
 import { ViewerHostMcpService } from "./viewer_host_client.ts";
 import { startHookContextBridge, type HookContextBridgeHandle } from "./hook_context_bridge.ts";
 import { areHarnessHooksInstalled } from "./installer/hook_install_state.ts";
@@ -114,6 +115,8 @@ export class TexActionsStdioMcpRuntime {
 	private readonly hookMode: StdioMcpHookMode;
 	private readonly explicitAgentId: string | undefined;
 	private readonly pdfServicesByAgentId = new Map<string, ViewerHostMcpService>();
+	private readonly compileServicesByAgentId = new Map<string, HostServiceCompileService>();
+	private readonly pdfOperationsByAgentId = new Map<string, StdioMcpPdfOperations>();
 	private readonly hookContextBridgesByAgentId = new Map<string, HookContextBridgeHandle>();
 	private firstToolCallWarning: string | undefined;
 	private closed = false;
@@ -151,8 +154,11 @@ export class TexActionsStdioMcpRuntime {
 		this.frameLoop.close();
 		for (const bridge of this.hookContextBridgesByAgentId.values()) void bridge.close();
 		this.hookContextBridgesByAgentId.clear();
+		for (const service of this.compileServicesByAgentId.values()) service.stop();
+		this.compileServicesByAgentId.clear();
 		for (const service of this.pdfServicesByAgentId.values()) void service.stop();
 		this.pdfServicesByAgentId.clear();
+		this.pdfOperationsByAgentId.clear();
 	};
 
 	private workspaceContext(metadata?: AgentSynctexSessionMetadata): HostServiceWorkspaceContext {
@@ -176,12 +182,26 @@ export class TexActionsStdioMcpRuntime {
 	private pdfOperationsForWorkspace(workspaceContext: HostServiceWorkspaceContext): StdioMcpPdfOperations {
 		if (this.providedPdfOperations) return this.providedPdfOperations;
 		const agentId = workspaceContext.session_id ?? "default";
-		let service = this.pdfServicesByAgentId.get(agentId);
-		if (!service) {
-			service = new ViewerHostMcpService({ agentRuntimeDir: workspaceContext.workspace_root });
-			this.pdfServicesByAgentId.set(agentId, service);
-		}
-		return service.pdfOperations;
+		const existingOperations = this.pdfOperationsByAgentId.get(agentId);
+		if (existingOperations) return existingOperations;
+		const service = new ViewerHostMcpService({ agentRuntimeDir: workspaceContext.workspace_root });
+		this.pdfServicesByAgentId.set(agentId, service);
+		const compileService = new HostServiceCompileService({
+			protocolVersion: 1,
+			managedViewerService: {
+				async openViewer(openRequest) {
+					if (!service.pdfOperations.openPdf) throw new Error("open_pdf is not implemented by the runtime");
+					return service.pdfOperations.openPdf(openRequest);
+				},
+				markPdfUpdated: service.pdfOperations.markTrackedPdfUpdated,
+			},
+			resolveManagedOpenCallback: async () => undefined,
+		});
+		compileService.start();
+		this.compileServicesByAgentId.set(agentId, compileService);
+		const operations: StdioMcpPdfOperations = { ...service.pdfOperations, compileService };
+		this.pdfOperationsByAgentId.set(agentId, operations);
+		return operations;
 	}
 
 	private ensureHookContextBridge(workspaceContext: HostServiceWorkspaceContext, pdfOperations: StdioMcpPdfOperations): void {

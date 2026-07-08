@@ -418,13 +418,30 @@ function agentFacingCompileDetails<T extends Record<string, unknown> & { warning
 	return { ...filteredDetails, warnings_hidden: true };
 }
 
-function formatSourceDirectoryNotice(details: { source?: unknown; source_dir?: unknown }, includeSourceDirectory: boolean): string {
+function formatSourceDirectoryNotice(details: { source?: unknown; source_dir?: unknown; workspace_context?: unknown }, includeSourceDirectory: boolean): string {
 	if (!includeSourceDirectory) return "";
 	if (typeof details.source !== "string" || details.source.length === 0) return "";
-	const sourceDir = typeof details.source_dir === "string" && details.source_dir.length > 0
+	const cwd = isRecord(details.workspace_context) && typeof details.workspace_context.cwd === "string"
+		? details.workspace_context.cwd
+		: undefined;
+	const source = agentFacingPath(details.source, cwd);
+	const sourceDir = agentFacingPath(typeof details.source_dir === "string" && details.source_dir.length > 0
 		? details.source_dir
-		: dirname(details.source);
-	return `\nSource: ${details.source}\nSource dir: ${sourceDir}`;
+		: dirname(details.source), cwd);
+	return `\nSource: ${source}\nSource dir: ${sourceDir}`;
+}
+
+function agentFacingPath(path: string, cwd: string | undefined): string {
+	if (!cwd) return path;
+	try {
+		const resolvedCwd = resolve(cwd);
+		const resolvedPath = isAbsolute(path) ? resolve(path) : resolve(resolvedCwd, path);
+		const relativePath = relative(resolvedCwd, resolvedPath);
+		if (relativePath && !relativePath.startsWith("..") && !isAbsolute(relativePath)) return relativePath;
+	} catch {
+		return path;
+	}
+	return path;
 }
 
 function parseToolResult(

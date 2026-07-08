@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { getLatexPreamblePath, getMcpFixedPreviewPdfPath } from "../../src/modules/runtime_paths.ts";
 import { FakeViewerBackend, HostServiceServer } from "../../src/modules/host_service.ts";
+import { HostServiceCompileService } from "../../src/modules/host_service_compile.ts";
 import { handleMcpRequest, HostServiceMcpFrameReader } from "../../src/modules/host_service_mcp.ts";
 
 function allocateMcpTmpDir(prefix = "host-service-mcp-runtime-") {
@@ -47,6 +48,66 @@ process.exit(0);
 	);
 	chmodSync(compilerPath, 0o700);
 }
+
+test("compile snippet writes editable sources under .agent-synctex/tmp and cleans them on stop", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "host-service-snippet-source-path-"));
+	const fakeCompilerDir = join(baseDir, "fake-bin");
+	writeFakeLatexCompiler(fakeCompilerDir);
+	const service = new HostServiceCompileService({
+		protocolVersion: 1,
+		managedViewerService: {
+			async openViewer(request) {
+				return {
+					protocol_version: 1,
+					request_id: request.request_id,
+					operation: "open_pdf",
+					status: "ok",
+					generated_at_ns: 1,
+					pdf: request.details.pdf_path,
+					status_details: {
+						protocol_version: 1,
+						supported: true,
+						service_available: true,
+						workspace_context: request.workspace_context,
+						request_id: request.request_id,
+						operation: "open_pdf",
+						backend: "test",
+						backend_path: "test",
+						capabilities: { open: true, close: false, forward_search: true, inverse_search: true, reuse: true },
+						handle: "test-viewer",
+						owned: true,
+						reused: false,
+						pdf: request.details.pdf_path,
+						pdf_id: 7,
+					},
+				};
+			},
+		},
+		resolveManagedOpenCallback: async () => undefined,
+	});
+	try {
+		const response = await withPathOverride(`${fakeCompilerDir}:${process.env.PATH}`, async () => service.compileLatexSnippetRequest({
+			protocol_version: 1,
+			request_id: "show-latex-1",
+			operation: "compile_latex_snippet",
+			created_at_ns: 1,
+			workspace_context: { cwd: baseDir, workspace_root: baseDir, session_id: "pi-session-1" },
+			details: { latex_source: "x", open_pdf: true },
+		})) as Awaited<ReturnType<HostServiceCompileService["compileLatexSnippetRequest"]>>;
+		const source = response.status_details.source;
+		assert.match(source, /\/\.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex$/);
+		assert.equal(response.status_details.source_dir, join(baseDir, ".agent-synctex", "tmp"));
+		assert.equal(existsSync(source), true);
+		const pdfPath = source.replace(/\.tex$/, ".pdf");
+		assert.equal(existsSync(pdfPath), true);
+		service.stop();
+		assert.equal(existsSync(source), false);
+		assert.equal(existsSync(pdfPath), false);
+	} finally {
+		service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
 
 function encodeMcpFrame(jsonText: string): string {
 	return `Content-Length: ${Buffer.byteLength(jsonText, "utf8")}\r\n\r\n${jsonText}`;
@@ -1700,10 +1761,10 @@ test("daemon renders show_latex through compile flow", async () => {
 		const resultText = response.result.content[0].text;
 		assert.doesNotMatch(resultText, /\.pdf/);
 		assert.doesNotMatch(resultText, /Log: .*\.log/);
-		assert.match(resultText, /Source: .*snippet\.tex/);
+		assert.match(resultText, /Source: \.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex/);
 		assert.match(resultText, /Source dir: /);
 		assert.match(response.result.details?.log ?? "", /\.log/);
-		assert.match(response.result.details?.source ?? "", /snippet\.tex/);
+		assert.match(response.result.details?.source ?? "", /\.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex/);
 		assert.equal(response.result.details?.source_dir, dirname(response.result.details?.source ?? ""));
 	} finally {
 		await server.stop();
