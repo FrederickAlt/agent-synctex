@@ -62,8 +62,11 @@ test("default all installer writes user/global MCP config and hooks for detected
 			const codexConfig = readFileSync(join(home, ".codex", "config.toml"), "utf8");
 			assert.match(codexConfig, /command = "agent-synctex"\nargs = \["mcp", "--harness", "codex"\]/);
 			const codexHooks = JSON.parse(readFileSync(join(home, ".codex", "hooks.json"), "utf8"));
-			assert.equal(codexHooks.hooks.UserPromptSubmit[0].hooks[0].command, join(home, ".codex", "hooks", "agent-synctex-fetch-info.sh"));
-			assert.match(readFileSync(join(home, ".codex", "hooks", "agent-synctex-fetch-info.sh"), "utf8"), /hookSpecificOutput: \{ hookEventName: "UserPromptSubmit", additionalContext:/);
+			assert.equal(codexHooks.hooks.UserPromptSubmit[0].hooks[0].command, join(home, ".codex", "hooks", "agent-synctex-user-prompt-submit.mjs"));
+			assert.equal(codexHooks.hooks.PreToolUse[0].matcher, "mcp__agent[-_]synctex__.*");
+			assert.equal(codexHooks.hooks.PreToolUse[0].hooks[0].command, join(home, ".codex", "hooks", "agent-synctex-pre-tool-use.mjs"));
+			assert.match(readFileSync(join(home, ".codex", "hooks", "agent-synctex-user-prompt-submit.mjs"), "utf8"), /hookEventName: "UserPromptSubmit"/);
+			assert.match(readFileSync(join(home, ".codex", "hooks", "agent-synctex-pre-tool-use.mjs"), "utf8"), /updatedInput/);
 
 			const clineMcp = JSON.parse(readFileSync(join(home, ".cline", "data", "settings", "cline_mcp_settings.json"), "utf8"));
 			assert.deepEqual(clineMcp.mcpServers["agent-synctex"].args, ["mcp", "--harness", "cline"]);
@@ -77,6 +80,9 @@ test("default all installer writes user/global MCP config and hooks for detected
 			assert.match(piExtension, /spawnSync\(shell, \["-lc", "exec agent-synctex/);
 			assert.match(piExtension, /Agent SyncTeX hook failed: " \+ context\.error/);
 			assert.match(piExtension, /args = \["fetch-info", "--harness", "pi"\]/);
+			assert.match(piExtension, /pi\.on\("tool_call"/);
+			assert.match(piExtension, /sessionIdFromContext/);
+			assert.match(piExtension, /args\.push\("--agent-id", sessionId\)/);
 
 			const opencode = JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8"));
 			assert.deepEqual(opencode.mcp["agent-synctex"].command, ["agent-synctex", "mcp", "--harness", "opencode"]);
@@ -204,6 +210,9 @@ test("Pi installer combined install reports MCP config once and writes standalon
 		assert.match(extension, /fetch-info", "--harness", "pi"/);
 		assert.match(extension, /systemPromptOptions\?\.cwd/);
 		assert.match(extension, /args\.push\("--cwd", cwd\)/);
+		assert.match(extension, /args\.push\("--agent-id", sessionId\)/);
+		assert.match(extension, /pi\.on\("tool_call"/);
+		assert.match(extension, /_agent_synctex/);
 		assert.match(extension, /process\.env\.SHELL\?\.trim\(\) \|\| "\/bin\/sh"/);
 		assert.match(extension, /Agent SyncTeX hook failed/);
 		assert.doesNotMatch(extension, /registerTool/);
@@ -220,10 +229,14 @@ test("Codex and Cline installers write new single-CLI MCP and hook commands", as
 		mkdirSync(join(cwd, ".codex"), { recursive: true });
 		writeFileSync(join(cwd, ".codex", "hooks.json"), JSON.stringify({ hooks: { UserPromptSubmit: [{ type: "command", command: "./.codex/hooks/agent-synctex-fetch-info.sh" }] } }) + "\n");
 		assert.equal((await runCli(cwd, ["install", "hooks", "--harness", "codex", "--local"])).code, 0);
-		assert.match(readFileSync(join(cwd, ".codex", "hooks", "agent-synctex-fetch-info.sh"), "utf8"), /agent-synctex fetch-info --harness 'codex'/);
+		assert.match(readFileSync(join(cwd, ".codex", "hooks", "agent-synctex-user-prompt-submit.mjs"), "utf8"), /--agent-id/);
+		assert.match(readFileSync(join(cwd, ".codex", "hooks", "agent-synctex-pre-tool-use.mjs"), "utf8"), /_agent_synctex/);
+		assert.equal(existsSync(join(cwd, ".codex", "hooks", "agent-synctex-fetch-info.sh")), false);
 		const codexHooks = JSON.parse(readFileSync(join(cwd, ".codex", "hooks.json"), "utf8"));
 		assert.equal(codexHooks.hooks.UserPromptSubmit.length, 1);
 		assert.equal(codexHooks.hooks.UserPromptSubmit[0].hooks[0].type, "command");
+		assert.equal(codexHooks.hooks.PreToolUse.length, 1);
+		assert.equal(codexHooks.hooks.PreToolUse[0].matcher, "mcp__agent[-_]synctex__.*");
 
 		assert.equal((await runCli(cwd, ["install", "mcp", "--harness", "cline", "--no-hooks", "--local"])).code, 0);
 		const clineMcp = JSON.parse(readFileSync(join(cwd, ".cline_mcp_settings.json"), "utf8"));

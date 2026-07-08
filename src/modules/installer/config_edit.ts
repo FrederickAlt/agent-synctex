@@ -157,9 +157,17 @@ export function managedShellScript(harness: HarnessId, jsonWrapper: "claude" | "
 		return `#!/usr/bin/env bash\n# ${MANAGED_MARKER}\nset -euo pipefail\ncontext="$(${fetchCommand} || true)"\nif [ -z "$context" ]; then exit 0; fi\nHOOK_CONTEXT="$context" node -e 'process.stdout.write(JSON.stringify({ contextModification: process.env.HOOK_CONTEXT || "" }))'\n`;
 	}
 	if (jsonWrapper === "codex") {
-		return `#!/usr/bin/env bash\n# ${MANAGED_MARKER}\nset -euo pipefail\ncontext="$(${fetchCommand} || true)"\nif [ -z "$context" ]; then exit 0; fi\nHOOK_CONTEXT="$context" node -e 'process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: process.env.HOOK_CONTEXT || "" } }))'\n`;
+		return managedCodexUserPromptSubmitScript();
 	}
 	return `#!/usr/bin/env bash\n# ${MANAGED_MARKER}\nset -euo pipefail\ncontext="$(${fetchCommand} || true)"\nif [ -z "$context" ]; then exit 0; fi\nHOOK_CONTEXT="$context" node -e 'process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: process.env.HOOK_CONTEXT || "" } }))'\n`;
+}
+
+export function managedCodexUserPromptSubmitScript(): string {
+	return `#!/usr/bin/env node\n// ${MANAGED_MARKER}\nimport { spawnSync } from "node:child_process";\nimport { readFileSync } from "node:fs";\n\nconst raw = readFileSync(0, "utf8");\nlet event;\ntry { event = raw.trim() ? JSON.parse(raw) : {}; } catch { event = { prompt: raw }; }\nconst prompt = typeof event?.prompt === "string" ? event.prompt : "";\nconst sessionId = typeof event?.session_id === "string" && event.session_id.trim() ? event.session_id : undefined;\nconst args = ["fetch-info", "--harness", "codex"];\nif (sessionId) args.push("--agent-id", sessionId);\nconst result = spawnSync("agent-synctex", args, { input: prompt, encoding: "utf8" });\nif (result.status !== 0) process.exit(0);\nconst context = String(result.stdout ?? "").trim();\nif (!context) process.exit(0);\nprocess.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context } }));\n`;
+}
+
+export function managedCodexPreToolUseScript(): string {
+	return `#!/usr/bin/env node\n// ${MANAGED_MARKER}\nimport { readFileSync } from "node:fs";\n\nconst raw = readFileSync(0, "utf8");\nlet event;\ntry { event = raw.trim() ? JSON.parse(raw) : {}; } catch { process.exit(0); }\nconst input = event?.tool_input && typeof event.tool_input === "object" && !Array.isArray(event.tool_input) ? event.tool_input : {};\nconst sessionId = typeof event?.session_id === "string" && event.session_id.trim() ? event.session_id : undefined;\nif (!sessionId) process.exit(0);\nconst updatedInput = {\n  ...input,\n  _agent_synctex: {\n    harness: "codex",\n    session_id: sessionId,\n    turn_id: event?.turn_id,\n    tool_use_id: event?.tool_use_id,\n    cwd: process.cwd(),\n  },\n  _codex: {\n    session_id: sessionId,\n    turn_id: event?.turn_id,\n    tool_use_id: event?.tool_use_id,\n  },\n};\nprocess.stdout.write(JSON.stringify({\n  hookSpecificOutput: {\n    hookEventName: "PreToolUse",\n    permissionDecision: "allow",\n    updatedInput,\n  },\n}));\n`;
 }
 
 export function removeManagedFile(ctx: InstallerContext, path: string): InstallChange[] {

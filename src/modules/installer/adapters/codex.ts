@@ -1,14 +1,22 @@
 import type { DoctorFinding, HarnessAdapter, HarnessDetection, InstallChange, InstallerContext } from "../types.ts";
-import { MANAGED_MARKER, change, homePath, isRecord, managedShellScript, pathExists, projectPath, readJsonObject, readText, removeManagedFile, removeManagedTomlBlock, scopePath, upsertManagedTomlBlock, writeJsonObject, writeText } from "../config_edit.ts";
+import { MANAGED_MARKER, change, homePath, isRecord, managedCodexPreToolUseScript, managedCodexUserPromptSubmitScript, pathExists, projectPath, readJsonObject, readText, removeManagedFile, removeManagedTomlBlock, scopePath, upsertManagedTomlBlock, writeJsonObject, writeText } from "../config_edit.ts";
 
 const MCP_BLOCK_ID = "mcp:codex";
 
-function hookScriptPath(ctx: InstallerContext): string {
-	return scopePath(ctx, [".codex", "hooks", "agent-synctex-fetch-info.sh"], [".codex", "hooks", "agent-synctex-fetch-info.sh"]);
+function userPromptHookScriptPath(ctx: InstallerContext): string {
+	return scopePath(ctx, [".codex", "hooks", "agent-synctex-user-prompt-submit.mjs"], [".codex", "hooks", "agent-synctex-user-prompt-submit.mjs"]);
 }
 
-function hookCommand(ctx: InstallerContext): string {
-	return ctx.scope === "user" ? homePath(".codex", "hooks", "agent-synctex-fetch-info.sh") : "./.codex/hooks/agent-synctex-fetch-info.sh";
+function preToolUseHookScriptPath(ctx: InstallerContext): string {
+	return scopePath(ctx, [".codex", "hooks", "agent-synctex-pre-tool-use.mjs"], [".codex", "hooks", "agent-synctex-pre-tool-use.mjs"]);
+}
+
+function userPromptHookCommand(ctx: InstallerContext): string {
+	return ctx.scope === "user" ? homePath(".codex", "hooks", "agent-synctex-user-prompt-submit.mjs") : "./.codex/hooks/agent-synctex-user-prompt-submit.mjs";
+}
+
+function preToolUseHookCommand(ctx: InstallerContext): string {
+	return ctx.scope === "user" ? homePath(".codex", "hooks", "agent-synctex-pre-tool-use.mjs") : "./.codex/hooks/agent-synctex-pre-tool-use.mjs";
 }
 
 function hooksJsonPath(ctx: InstallerContext): string {
@@ -30,10 +38,14 @@ export const codexAdapter: HarnessAdapter = {
 	},
 	installHooks(ctx): InstallChange[] {
 		const changes: InstallChange[] = [];
-		const scriptPath = hookScriptPath(ctx);
-		writeText(ctx, scriptPath, managedShellScript("codex", "codex"), 0o755);
-		changes.push(change("installed Codex UserPromptSubmit hook script", scriptPath));
+		const userPromptScriptPath = userPromptHookScriptPath(ctx);
+		const preToolUseScriptPath = preToolUseHookScriptPath(ctx);
+		writeText(ctx, userPromptScriptPath, managedCodexUserPromptSubmitScript(), 0o755);
+		writeText(ctx, preToolUseScriptPath, managedCodexPreToolUseScript(), 0o755);
+		changes.push(change("installed Codex UserPromptSubmit hook script", userPromptScriptPath));
+		changes.push(change("installed Codex PreToolUse session injection hook script", preToolUseScriptPath));
 		changes.push(...upsertCodexHook(ctx));
+		changes.push(...removeManagedFile(ctx, legacyHookScriptPath(ctx)));
 		changes.push(...removeNoHooksFromManagedMcp(ctx));
 		return changes;
 	},
@@ -41,7 +53,9 @@ export const codexAdapter: HarnessAdapter = {
 		return [
 			...removeManagedTomlBlock(ctx, mcpPath(ctx), MCP_BLOCK_ID),
 			...removeCodexHook(ctx),
-			...removeManagedFile(ctx, hookScriptPath(ctx)),
+			...removeManagedFile(ctx, userPromptHookScriptPath(ctx)),
+			...removeManagedFile(ctx, preToolUseHookScriptPath(ctx)),
+			...removeManagedFile(ctx, legacyHookScriptPath(ctx)),
 		];
 	},
 	doctor(ctx): DoctorFinding[] {
@@ -59,16 +73,23 @@ args = ${args}
 	return upsertManagedTomlBlock(ctx, mcpPath(ctx), MCP_BLOCK_ID, body);
 }
 
+function legacyHookScriptPath(ctx: InstallerContext): string {
+	return scopePath(ctx, [".codex", "hooks", "agent-synctex-fetch-info.sh"], [".codex", "hooks", "agent-synctex-fetch-info.sh"]);
+}
+
 function upsertCodexHook(ctx: InstallerContext): InstallChange[] {
 	const path = hooksJsonPath(ctx);
 	const config = readJsonObject(path);
 	const hooks = isRecord(config.hooks) ? { ...config.hooks } : {};
-	const existing = Array.isArray(hooks.UserPromptSubmit) ? hooks.UserPromptSubmit.filter((entry) => !isManagedHookEntry(entry)) : [];
-	existing.push({ hooks: [{ type: "command", command: hookCommand(ctx) }] });
-	hooks.UserPromptSubmit = existing;
+	const existingUserPrompt = Array.isArray(hooks.UserPromptSubmit) ? hooks.UserPromptSubmit.filter((entry) => !isManagedHookEntry(entry)) : [];
+	existingUserPrompt.push({ hooks: [{ type: "command", command: userPromptHookCommand(ctx) }] });
+	hooks.UserPromptSubmit = existingUserPrompt;
+	const existingPreToolUse = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse.filter((entry) => !isManagedHookEntry(entry)) : [];
+	existingPreToolUse.push({ matcher: "mcp__agent[-_]synctex__.*", hooks: [{ type: "command", command: preToolUseHookCommand(ctx) }] });
+	hooks.PreToolUse = existingPreToolUse;
 	config.hooks = hooks;
 	writeJsonObject(ctx, path, config);
-	return [change("installed Codex UserPromptSubmit hook entry", path)];
+	return [change("installed Codex UserPromptSubmit and PreToolUse hook entries", path)];
 }
 
 function removeNoHooksFromManagedMcp(ctx: InstallerContext): InstallChange[] {
@@ -82,20 +103,32 @@ function removeCodexHook(ctx: InstallerContext): InstallChange[] {
 	const path = hooksJsonPath(ctx);
 	if (!pathExists(path)) return [];
 	const config = readJsonObject(path);
-	if (!isRecord(config.hooks) || !Array.isArray(config.hooks.UserPromptSubmit)) return [];
-	const next = config.hooks.UserPromptSubmit.filter((entry) => !isManagedHookEntry(entry));
-	if (next.length === config.hooks.UserPromptSubmit.length) return [];
+	if (!isRecord(config.hooks)) return [];
+	let changed = false;
 	const hooks = { ...config.hooks };
-	if (next.length === 0) delete hooks.UserPromptSubmit;
-	else hooks.UserPromptSubmit = next;
+	for (const hookName of ["UserPromptSubmit", "PreToolUse"]) {
+		if (!Array.isArray(hooks[hookName])) continue;
+		const next = hooks[hookName].filter((entry) => !isManagedHookEntry(entry));
+		if (next.length === hooks[hookName].length) continue;
+		changed = true;
+		if (next.length === 0) delete hooks[hookName];
+		else hooks[hookName] = next;
+	}
+	if (!changed) return [];
 	config.hooks = hooks;
 	writeJsonObject(ctx, path, config);
-	return [change("removed Codex UserPromptSubmit hook entry", path)];
+	return [change("removed Codex hook entries", path)];
 }
 
 function isManagedHookEntry(entry: unknown): boolean {
 	if (!isRecord(entry)) return false;
-	if (typeof entry.command === "string" && entry.command.includes("agent-synctex-fetch-info.sh")) return true;
+	if (typeof entry.command === "string" && isManagedCodexHookCommand(entry.command)) return true;
 	if (!Array.isArray(entry.hooks)) return false;
-	return entry.hooks.some((hook) => isRecord(hook) && typeof hook.command === "string" && hook.command.includes("agent-synctex-fetch-info.sh"));
+	return entry.hooks.some((hook) => isRecord(hook) && typeof hook.command === "string" && isManagedCodexHookCommand(hook.command));
+}
+
+function isManagedCodexHookCommand(command: string): boolean {
+	return command.includes("agent-synctex-fetch-info.sh")
+		|| command.includes("agent-synctex-user-prompt-submit.mjs")
+		|| command.includes("agent-synctex-pre-tool-use.mjs");
 }

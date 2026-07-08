@@ -585,6 +585,59 @@ test("stdio runtime resolves relative PDF paths from the MCP launch cwd", async 
 	}
 });
 
+test("stdio runtime routes hook-injected session ids to separate runtime workspaces", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-session-metadata-"));
+	const launchCwd = join(baseDir, "project");
+	const runtimeRoot = join(baseDir, "runtime");
+	mkdirSync(launchCwd, { recursive: true });
+	const observed: Array<{ sessionId?: string; workspaceRoot?: string }> = [];
+	await withRuntimeEnv(runtimeRoot, async () => {
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const runtime = new TexActionsStdioMcpRuntime({
+			stdin,
+			stdout,
+			stderr: new PassThrough(),
+			launchCwd,
+			hookMode: { kind: "hook-capable", harness: "pi" },
+			pdfOperations: {
+				compileService: {
+					async compileLatexSnippetRequest(request: HostServiceCompileSnippetRequest): Promise<HostServiceCompileSnippetResponseEnvelope> {
+						observed.push({ sessionId: request.workspace_context.session_id, workspaceRoot: request.workspace_context.workspace_root });
+						return {
+							protocol_version: 1,
+							request_id: request.request_id,
+							operation: "compile_latex_snippet",
+							status: "ok",
+							generated_at_ns: 1,
+							status_details: { protocol_version: 1, supported: true, service_available: true, workspace_context: request.workspace_context, request_id: request.request_id, operation: "compile_latex_snippet", source: join(request.workspace_context.workspace_root!, "snippet.tex"), pdf: join(request.workspace_context.workspace_root!, "snippet.pdf"), log: join(request.workspace_context.workspace_root!, "snippet.log"), artifact_paths: [], clean: false, cleaned_artifacts: [], compile_status: "ok", warning_count: 0 },
+						};
+					},
+				} as never,
+			},
+		});
+		try {
+			runtime.start();
+			const output = collectMcpFrames(stdout, 2);
+			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 40, method: "tools/call", params: { name: "show_latex", arguments: { source: "\\[a\\]", workspace_context: { cwd: launchCwd, session_id: "model-supplied-wrong-session" }, _agent_synctex: { session_id: "pi-session-one", cwd: launchCwd } } } }));
+			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 41, method: "tools/call", params: { name: "show_latex", arguments: { source: "\\[b\\]", _pi: { session_id: "pi-session-two" } } } }));
+			await output;
+			await waitForFile(join(runtimeRoot, "agents", "pi-session-one", "hook-context-bridge.json"));
+			await waitForFile(join(runtimeRoot, "agents", "pi-session-two", "hook-context-bridge.json"));
+		} finally {
+			runtime.close();
+		}
+	});
+	try {
+		assert.deepEqual(observed, [
+			{ sessionId: "pi-session-one", workspaceRoot: join(runtimeRoot, "agents", "pi-session-one") },
+			{ sessionId: "pi-session-two", workspaceRoot: join(runtimeRoot, "agents", "pi-session-two") },
+		]);
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("stdio runtime injects launch-cwd workspace context into compile_latex_file calls", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-compile-cwd-"));
 	const launchCwd = join(baseDir, "project");

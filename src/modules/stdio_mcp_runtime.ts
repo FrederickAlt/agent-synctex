@@ -3,6 +3,7 @@ import { stdin as processStdin, stdout as processStdout, stderr as processStderr
 import type { Readable, Writable } from "node:stream";
 import { MCP_ERROR_PARSE_ERROR, buildMcpErrorResponse, handleMcpRequest } from "./host_service_mcp.ts";
 import { resolveAgentWorkspaceContext, resolveAgentWorkspaceContextForAgentId, resolveHookAgentWorkspaceContext } from "./agent_runtime_context.ts";
+import type { HostServiceWorkspaceContext } from "./host_service_protocol.ts";
 import { initializeLatexPreambleFile } from "./pi_extension/latex_preamble_manager.ts";
 import { ViewerHostMcpService } from "./viewer_host_client.ts";
 import { startHookContextBridge, type HookContextBridgeHandle } from "./hook_context_bridge.ts";
@@ -45,6 +46,20 @@ const STDIO_WORKSPACE_CONTEXT_TOOL_NAMES = new Set([
 	"set_latex_preamble",
 ]);
 
+const STDIO_AGENT_SCOPED_TOOL_NAMES = new Set([
+	...STDIO_WORKSPACE_CONTEXT_TOOL_NAMES,
+	"fetch_pdf_context",
+]);
+
+const AGENT_SYNCTEX_SESSION_METADATA_KEYS = [
+	"_agent_synctex",
+	"_codex",
+	"_pi",
+	"_claude",
+	"_cline",
+	"_opencode",
+];
+
 function sanitizeToolForV1(tool: unknown): unknown {
 	return omitToolInputSchemaProperties(tool, ["workspace_context"]);
 }
@@ -62,17 +77,44 @@ function rewriteToolsListForV1(response: unknown): unknown {
 	};
 }
 
+interface AgentSynctexSessionMetadata {
+	sessionId: string;
+	cwd?: string;
+}
+
+function sessionMetadataFromArguments(args: Record<string, unknown>): AgentSynctexSessionMetadata | undefined {
+	for (const key of AGENT_SYNCTEX_SESSION_METADATA_KEYS) {
+		const metadata = isRecord(args[key]) ? args[key] : undefined;
+		const sessionId = stringValue(metadata?.session_id) ?? stringValue(metadata?.sessionId);
+		if (sessionId) return { sessionId, cwd: stringValue(metadata?.cwd) };
+	}
+	const workspaceContext = isRecord(args.workspace_context) ? args.workspace_context : undefined;
+	const workspaceSessionId = stringValue(workspaceContext?.session_id);
+	if (workspaceSessionId) return { sessionId: workspaceSessionId, cwd: stringValue(workspaceContext?.cwd) };
+	return undefined;
+}
+
+function stripAgentSynctexSessionMetadata(args: Record<string, unknown>): Record<string, unknown> {
+	const stripped = { ...args };
+	for (const key of AGENT_SYNCTEX_SESSION_METADATA_KEYS) delete stripped[key];
+	return stripped;
+}
+
+function stringValue(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
 export class TexActionsStdioMcpRuntime {
 	private readonly stdout: Writable;
 	private readonly stderr: Writable;
 	private readonly viewerUrlFallbackWriter: (message: string) => void;
 	private readonly launchCwd: string;
 	private readonly frameLoop: McpStdioFrameLoop;
-	private readonly pdfOperations: StdioMcpPdfOperations;
+	private readonly providedPdfOperations: StdioMcpPdfOperations | undefined;
 	private readonly hookMode: StdioMcpHookMode;
 	private readonly explicitAgentId: string | undefined;
-	private readonly defaultPdfService?: ViewerHostMcpService;
-	private hookContextBridge?: HookContextBridgeHandle;
+	private readonly pdfServicesByAgentId = new Map<string, ViewerHostMcpService>();
+	private readonly hookContextBridgesByAgentId = new Map<string, HookContextBridgeHandle>();
 	private firstToolCallWarning: string | undefined;
 	private closed = false;
 
@@ -84,9 +126,7 @@ export class TexActionsStdioMcpRuntime {
 		this.launchCwd = options.launchCwd ?? process.cwd();
 		this.hookMode = normalizeHookMode(options, this.launchCwd);
 		this.explicitAgentId = options.agentId;
-		const workspaceContext = this.workspaceContext();
-		this.defaultPdfService = options.pdfOperations === undefined ? new ViewerHostMcpService({ agentRuntimeDir: workspaceContext.workspace_root }) : undefined;
-		this.pdfOperations = options.pdfOperations ?? this.defaultPdfService?.pdfOperations ?? {};
+		this.providedPdfOperations = options.pdfOperations;
 		this.firstToolCallWarning = firstToolCallWarning(this.hookMode);
 		this.frameLoop = new McpStdioFrameLoop({
 			stdin: options.stdin ?? processStdin,
@@ -101,16 +141,7 @@ export class TexActionsStdioMcpRuntime {
 	start(): void {
 		if (this.closed) return;
 		const workspaceContext = this.seedRuntimePreamble();
-		if (this.hookMode.kind === "hook-capable" || this.hookMode.kind === "legacy-hooks") {
-			this.hookContextBridge = startHookContextBridge({
-				runtimeDir: workspaceContext.workspace_root!,
-				fetchContext: async (request) => {
-					if (!this.pdfOperations.fetchPdfContext) return { text: "", pdfIds: [], eventCount: 0, cleared: false, events: [] };
-					return this.pdfOperations.fetchPdfContext({ ...request, cwd: workspaceContext.cwd });
-				},
-			});
-			void this.hookContextBridge.ready.catch(() => undefined);
-		}
+		this.ensureHookContextBridge(workspaceContext, this.pdfOperationsForWorkspace(workspaceContext));
 		this.frameLoop.start();
 	}
 
@@ -118,11 +149,14 @@ export class TexActionsStdioMcpRuntime {
 		if (this.closed) return;
 		this.closed = true;
 		this.frameLoop.close();
-		void this.hookContextBridge?.close();
-		void this.defaultPdfService?.stop();
+		for (const bridge of this.hookContextBridgesByAgentId.values()) void bridge.close();
+		this.hookContextBridgesByAgentId.clear();
+		for (const service of this.pdfServicesByAgentId.values()) void service.stop();
+		this.pdfServicesByAgentId.clear();
 	};
 
-	private workspaceContext() {
+	private workspaceContext(metadata?: AgentSynctexSessionMetadata): HostServiceWorkspaceContext {
+		if (metadata?.sessionId) return resolveAgentWorkspaceContextForAgentId(metadata.sessionId, metadata.cwd ?? this.launchCwd);
 		if (this.explicitAgentId) return resolveAgentWorkspaceContextForAgentId(this.explicitAgentId, this.launchCwd);
 		if (this.hookMode.kind !== "legacy-hooks" && this.hookMode.harness) {
 			return resolveHookAgentWorkspaceContext({ cwd: this.launchCwd });
@@ -130,8 +164,7 @@ export class TexActionsStdioMcpRuntime {
 		return resolveAgentWorkspaceContext({ cwd: this.launchCwd });
 	}
 
-	private seedRuntimePreamble() {
-		const workspaceContext = this.workspaceContext();
+	private seedRuntimePreamble(workspaceContext = this.workspaceContext()): HostServiceWorkspaceContext {
 		initializeLatexPreambleFile({
 			cwd: workspaceContext.cwd,
 			runtimeDirectory: workspaceContext.workspace_root,
@@ -140,14 +173,42 @@ export class TexActionsStdioMcpRuntime {
 		return workspaceContext;
 	}
 
+	private pdfOperationsForWorkspace(workspaceContext: HostServiceWorkspaceContext): StdioMcpPdfOperations {
+		if (this.providedPdfOperations) return this.providedPdfOperations;
+		const agentId = workspaceContext.session_id ?? "default";
+		let service = this.pdfServicesByAgentId.get(agentId);
+		if (!service) {
+			service = new ViewerHostMcpService({ agentRuntimeDir: workspaceContext.workspace_root });
+			this.pdfServicesByAgentId.set(agentId, service);
+		}
+		return service.pdfOperations;
+	}
+
+	private ensureHookContextBridge(workspaceContext: HostServiceWorkspaceContext, pdfOperations: StdioMcpPdfOperations): void {
+		if (this.hookMode.kind !== "hook-capable" && this.hookMode.kind !== "legacy-hooks") return;
+		const agentId = workspaceContext.session_id ?? "default";
+		if (this.hookContextBridgesByAgentId.has(agentId)) return;
+		const runtimeDir = workspaceContext.workspace_root;
+		if (!runtimeDir) return;
+		const bridge = startHookContextBridge({
+			runtimeDir,
+			fetchContext: async (request) => {
+				if (!pdfOperations.fetchPdfContext) return { text: "", pdfIds: [], eventCount: 0, cleared: false, events: [] };
+				return pdfOperations.fetchPdfContext({ ...request, cwd: workspaceContext.cwd });
+			},
+		});
+		this.hookContextBridgesByAgentId.set(agentId, bridge);
+		void bridge.ready.catch(() => undefined);
+	}
+
 	private async handleFrame(payload: string, protocol: McpClientFrameProtocol): Promise<void> {
-		const rewrittenPayload = this.rewriteRequestPayload(payload);
-		const response = await handleMcpRequest(rewrittenPayload, this.pdfOperations, {
+		const routedRequest = this.rewriteRequestPayload(payload);
+		const response = await handleMcpRequest(routedRequest.payload, routedRequest.pdfOperations, {
 			exposeFetchPdfContext: this.exposeFetchPdfContext(),
 			emitViewerUrlFallback: (url) => this.writeViewerUrlFallback(url),
 		});
 		if (response === null) return;
-		const warnedResponse = this.maybeAttachFirstToolCallWarning(response, rewrittenPayload);
+		const warnedResponse = this.maybeAttachFirstToolCallWarning(response, routedRequest.payload);
 		const rewrittenResponse = rewriteToolsListForV1(warnedResponse);
 		await this.writePayload(JSON.stringify(rewrittenResponse), protocol);
 	}
@@ -163,16 +224,22 @@ export class TexActionsStdioMcpRuntime {
 		return appendTextToToolResult(response, warning);
 	}
 
-	private rewriteRequestPayload(payload: string): string {
+	private rewriteRequestPayload(payload: string): { payload: string; pdfOperations: StdioMcpPdfOperations } {
 		try {
 			const parsed: unknown = JSON.parse(payload);
 			if (!isRecord(parsed) || parsed.method !== "tools/call" || !isRecord(parsed.params) || typeof parsed.params.name !== "string") {
-				return payload;
+				const workspaceContext = this.workspaceContext();
+				return { payload, pdfOperations: this.pdfOperationsForWorkspace(workspaceContext) };
 			}
-			if (!STDIO_WORKSPACE_CONTEXT_TOOL_NAMES.has(parsed.params.name)) {
-				return payload;
+			if (!STDIO_AGENT_SCOPED_TOOL_NAMES.has(parsed.params.name)) {
+				const workspaceContext = this.workspaceContext();
+				return { payload, pdfOperations: this.pdfOperationsForWorkspace(workspaceContext) };
 			}
 			const rawArguments = parsed.params.arguments;
+			if (parsed.params.name === "fetch_pdf_context" && rawArguments !== undefined && !isRecord(rawArguments)) {
+				const workspaceContext = this.workspaceContext();
+				return { payload, pdfOperations: this.pdfOperationsForWorkspace(workspaceContext) };
+			}
 			const currentArguments = isRecord(rawArguments)
 				? rawArguments
 				: typeof rawArguments === "string" && parsed.params.name === "show_latex"
@@ -180,20 +247,28 @@ export class TexActionsStdioMcpRuntime {
 					: typeof rawArguments === "string" && parsed.params.name === "set_latex_preamble"
 						? { latex_preamble: rawArguments }
 						: {};
-			const nextArguments = { ...currentArguments };
+			const metadata = sessionMetadataFromArguments(currentArguments);
+			const workspaceContext = this.seedRuntimePreamble(this.workspaceContext(metadata));
+			const pdfOperations = this.pdfOperationsForWorkspace(workspaceContext);
+			this.ensureHookContextBridge(workspaceContext, pdfOperations);
+			const nextArguments = stripAgentSynctexSessionMetadata(currentArguments);
 			delete nextArguments.workspace_context;
-			return JSON.stringify({
-				...parsed,
-				params: {
-					...parsed.params,
-					arguments: {
-						...nextArguments,
-						workspace_context: this.workspaceContext(),
+			const rewrittenArguments = STDIO_WORKSPACE_CONTEXT_TOOL_NAMES.has(parsed.params.name)
+				? { ...nextArguments, workspace_context: workspaceContext }
+				: nextArguments;
+			return {
+				payload: JSON.stringify({
+					...parsed,
+					params: {
+						...parsed.params,
+						arguments: rewrittenArguments,
 					},
-				},
-			});
+				}),
+				pdfOperations,
+			};
 		} catch {
-			return payload;
+			const workspaceContext = this.workspaceContext();
+			return { payload, pdfOperations: this.pdfOperationsForWorkspace(workspaceContext) };
 		}
 	}
 
