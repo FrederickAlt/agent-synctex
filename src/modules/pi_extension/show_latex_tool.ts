@@ -37,7 +37,7 @@ const LatexCompilerParam = Type.Optional(Type.Union(
 const ShowLatexParams = Type.Object(
 	{
 		source: Type.String({
-			description: "Raw LaTeX source code to compile. Prefer passing this tool as FREEFORM/raw text. Optional leading front matter can set compiler and inline, for example: ---\ncompiler: lualatex\ninline: false\n---",
+			description: "LaTeX source. Without preamble_root_file, pass a complete document. With preamble_root_file, pass body content or a \\begin{document}...\\end{document} block. Optional front matter may set compiler, inline, or preamble_root_file.",
 			minLength: 1,
 		}),
 		compiler: LatexCompilerParam,
@@ -158,11 +158,11 @@ export function registerShowLatexTool(pi: ExtensionAPI, callbackManager: Synctex
 		name: "show_latex",
 		label: "Show LaTeX",
 		description:
-			"FREEFORM/raw LaTeX preview. Pass LaTeX code directly; optional YAML-like front matter may set compiler and inline. Example: ---\ncompiler: lualatex\ninline: false\n---\n\\begin{equation}\nx\n\\end{equation}\nThe \\begin{document}...\\end{document} wrapper is accepted but not required. Defaults to inline preview with lualatex; set inline=false to request host-service external open instead. For external opens, if a browser viewer is detected after launch/focus, only pdf_id/status is returned because the user can already see the output; if no live browser viewer is detected, the result includes a Viewer URL to pass to the user.",
-		promptSnippet: "FREEFORM LaTeX preview; optional front matter can set compiler and inline",
+			"FREEFORM/raw LaTeX preview. Without preamble_root_file, pass a complete document. With preamble_root_file, pass body content or a \\begin{document}...\\end{document} block to wrap with that root's detected preamble. Optional front matter may set compiler, inline, or preamble_root_file. Defaults to inline preview with lualatex; set inline=false to request host-service external open.",
+		promptSnippet: "FREEFORM LaTeX preview; use preamble_root_file for project snippets",
 		promptGuidelines: [
 			"Use show_latex when the user asks for a LaTeX PDF preview. Without preamble_root_file, pass a complete LaTeX document. With preamble_root_file, pass either only the LaTeX body or \\begin{document}...\\end{document}.",
-			"Use optional front matter only when changing options, for example: ---\ncompiler: xelatex\ninline: false\n---",
+			"Use optional front matter only when changing options, for example: ---\ncompiler: xelatex\npreamble_root_file: main.tex\ninline: false\n---",
 			"show_latex renders inline by default; set inline=false only when the user wants an external viewer.",
 			"Do not use verbatim-like LaTeX constructs (for example, \\begin{verbatim}, lstlisting, minted, or \\verb) to show the user LaTeX code; provide real LaTeX that compiles and renders the requested content.",
 			"In an existing LaTeX project, pass preamble_root_file to use the discovered preamble from that root for a one-off preview.",

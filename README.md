@@ -67,11 +67,10 @@ agent-synctex install --harness claude --no-hooks
 
 ## Tools
 
-- `show_latex` — compile a LaTeX snippet and open the result.
+- `show_latex` — render LaTeX and open the result. Pass a complete document, or pass `preamble_root_file` to wrap body content with a root preamble.
 - `compile_latex_file` — compile a `.tex` file, optionally opening the PDF.
 - `open_pdf` — open/register an existing PDF.
 - `jump_pdf` — forward SyncTeX jump to a source line.
-- `set_latex_preamble` — set the snippet compilation preamble.
 - `fetch_pdf_context` — fetch pending PDF marks/comments as source-cited context. Hidden when hook-capable mode detects installed hooks.
 
 ## Development
