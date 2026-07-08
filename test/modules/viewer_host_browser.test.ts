@@ -112,10 +112,10 @@ function writeBrowserLinkFixture(baseDir: string): { pdfPath: string } {
 \usepackage[pdfborder={0 0 0}]{hyperref}
 \begin{document}
 \section*{Page A}
-\Large Click \hyperlink{target-b}{internal reference to B}.\\[2em]
+\Large Click \hyperlink{Mean-field coupled system}{mean-field decoupled measurement system}.\\[2em]
 \href{https://example.com/}{External URL that must not become viewer history.}
 \newpage
-\hypertarget{target-b}{}\section*{Page B}
+\section{Mean-field coupled system}\label{Mean-field coupled system}
 Destination page B.
 \end{document}
 `);
@@ -726,6 +726,38 @@ test("side-by-side LaTeX Workshop viewer route renders PDF with stock toolbar UI
 		await page.waitForTimeout(250);
 		const failedViewerAssetRequests = failedRequests.filter((request) => request.includes("/viewer-lw/") || /^[45]\d\d /.test(request));
 		assert.deepEqual(failedViewerAssetRequests, [], summarizeFailures(consoleMessages, pageErrors, failedRequests));
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("LaTeX Workshop viewer applies initial named destination hash for label-backed hyperlinks", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-label-hash-"));
+	const { pdfPath } = writeBrowserLinkFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 153, pdfPath, title: "links.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 520, height: 260 } });
+		await page.goto(`${server.origin}/viewer-lw/153?revision=1#Mean-field%20coupled%20system`, { waitUntil: "domcontentloaded" });
+		await page.waitForFunction(() => {
+			const application = (window as unknown as { PDFViewerApplication?: { page?: number; pdfViewer?: { currentPageNumber?: number } } }).PDFViewerApplication;
+			return application?.page === 2 || application?.pdfViewer?.currentPageNumber === 2;
+		}, undefined, { timeout: 10_000 });
+		assert.equal(await page.evaluate(() => location.hash), "#Mean-field%20coupled%20system");
+
+		await page.goto(`${server.origin}/viewer-lw/153?revision=1`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page, 1);
+		await page.locator("a[href$='#Mean-field%20coupled%20system']").click({ force: true });
+		await page.waitForFunction(() => {
+			const application = (window as unknown as { PDFViewerApplication?: { page?: number; pdfViewer?: { currentPageNumber?: number } } }).PDFViewerApplication;
+			return application?.page === 2 || application?.pdfViewer?.currentPageNumber === 2;
+		}, undefined, { timeout: 10_000 });
 	} finally {
 		await browser?.close();
 		await server.stop();
@@ -1415,7 +1447,27 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 		assert.ok(afterDrag.x2 > beforeDrag.x2 + 30, "connector should follow the dragged bubble horizontally");
 		assert.ok(afterDrag.y2 > beforeDrag.y2 + 20, "connector should follow the dragged bubble vertically");
 
-		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "annotation should still exist after dragging the comment bubble");
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "annotation should be visible before a transient page render gap");
+		await page.evaluate(() => {
+			const application = (window as unknown as { PDFViewerApplication?: { eventBus?: { dispatch: (name: string, payload: unknown) => void }; pdfViewer?: { _pages?: Array<{ viewport?: unknown; __hostSavedViewport?: unknown }> } } }).PDFViewerApplication;
+			const pageView = application?.pdfViewer?._pages?.[0];
+			if (!application?.eventBus || !pageView?.viewport) throw new Error("missing PDF.js page view");
+			pageView.__hostSavedViewport = pageView.viewport;
+			pageView.viewport = undefined;
+			application.eventBus.dispatch("pagerendered", { source: pageView, pageNumber: 1 });
+		});
+		await page.waitForTimeout(200);
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "transient PDF.js loading/rendering gaps must not clear visible annotations");
+		await page.evaluate(() => {
+			const application = (window as unknown as { PDFViewerApplication?: { eventBus?: { dispatch: (name: string, payload: unknown) => void }; pdfViewer?: { _pages?: Array<{ viewport?: unknown; __hostSavedViewport?: unknown }> } } }).PDFViewerApplication;
+			const pageView = application?.pdfViewer?._pages?.[0];
+			if (!application?.eventBus || !pageView?.__hostSavedViewport) throw new Error("missing saved PDF.js page viewport");
+			pageView.viewport = pageView.__hostSavedViewport;
+			delete pageView.__hostSavedViewport;
+			application.eventBus.dispatch("pagerendered", { source: pageView, pageNumber: 1 });
+		});
+		await page.waitForTimeout(200);
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "annotation should redraw once PDF.js page geometry is available again");
 		await drainHostMcpEvents(server.origin);
 		await page.evaluate(() => {
 			const pageElement = document.querySelector("#viewer .page[data-page-number='1']") as HTMLElement | null;
@@ -1440,6 +1492,7 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 		assert.ok(await page.locator("[data-pdf-annotation]").count() <= 1, "clicking an editable target inside the viewer should not create another annotation");
 		const eventsAfterEditableClick = await drainHostMcpEvents(server.origin);
 		assert.equal(eventsAfterEditableClick.some((event) => event.type === "pdf_annotation"), false, "editable click should not emit a PDF annotation update");
+
 	} finally {
 		await browser?.close();
 		await server.stop();

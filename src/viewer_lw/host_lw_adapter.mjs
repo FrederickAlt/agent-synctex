@@ -39,6 +39,7 @@ async function loadInitialConfig() {
 }
 
 const initialConfig = await loadInitialConfig();
+const initialViewerHash = location.hash.startsWith("#") ? location.hash.slice(1) : "";
 
 const HOVER_THROTTLE_MS = 60;
 const NAVIGATION_SETTLE_MS = 200;
@@ -83,6 +84,7 @@ let latestHoverRequestId = 0;
 let probeRequestId = 0;
 let latestProbeRequestId = 0;
 let pendingProbe;
+let outlinePromise;
 
 const synctexOverlayState = {
   forwardMessage: undefined,
@@ -810,6 +812,7 @@ async function refreshToConfig(config, options = {}) {
       return;
     }
     app().setTitleUsingUrl?.(config.pdf_url, config.pdf_url);
+    outlinePromise = undefined;
     app().load(pdfDocument);
     await waitForPagesReady(app());
     if (serial !== hostState.refreshSerial) return;
@@ -1309,8 +1312,7 @@ function renderAnnotationControls(annotation, root, anchor) {
   root.appendChild(controls);
 }
 
-function renderAnnotation(annotation, scroll = false) {
-  const overlay = synctexOverlayPositions(annotation.message);
+function renderAnnotation(annotation, scroll = false, overlay = synctexOverlayPositions(annotation.message)) {
   if (!overlay) return false;
   const selected = selectedAnnotationId === annotation.id;
   const pageOffset = pageRelativeOverlayOffset(overlay);
@@ -1355,9 +1357,24 @@ function renderAnnotation(annotation, scroll = false) {
   return true;
 }
 
+function removeAnnotationOverlays(annotationId) {
+  for (const marker of document.querySelectorAll("[data-pdf-annotation]")) {
+    if (marker instanceof HTMLElement && marker.dataset.pdfAnnotation === annotationId) marker.remove();
+  }
+}
+
 function renderAnnotations(scroll = false) {
-  removeOverlays("[data-pdf-annotation]");
-  for (const annotation of annotations.values()) renderAnnotation(annotation, scroll && selectedAnnotationId === annotation.id);
+  const liveAnnotationIds = new Set(annotations.keys());
+  for (const marker of document.querySelectorAll("[data-pdf-annotation]")) {
+    const annotationId = marker instanceof HTMLElement ? marker.dataset.pdfAnnotation : undefined;
+    if (!annotationId || !liveAnnotationIds.has(annotationId)) marker.remove();
+  }
+  for (const annotation of annotations.values()) {
+    const overlay = synctexOverlayPositions(annotation.message);
+    if (!overlay) continue;
+    removeAnnotationOverlays(annotation.id);
+    renderAnnotation(annotation, scroll && selectedAnnotationId === annotation.id, overlay);
+  }
 }
 
 function annotationSourceKey(message) {
@@ -2390,12 +2407,120 @@ function showProbeResult(message, options = {}) {
   if (createAnnotationFromMessage(message, { select: true, bubble: false, scroll: options.scroll !== false })) clearSynctexCapabilityIssue();
 }
 
+function decodePdfHashDestination(hash) {
+  const value = String(hash ?? "");
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    try {
+      return unescape(value);
+    } catch {
+      return value;
+    }
+  }
+}
+
+async function explicitDestinationPageNumber(destination) {
+  const application = app();
+  const pdfDocument = application?.pdfDocument;
+  if (!pdfDocument) return undefined;
+  const explicitDest = typeof destination === "string" ? await pdfDocument.getDestination(destination) : await destination;
+  if (!Array.isArray(explicitDest)) return undefined;
+  const [destRef] = explicitDest;
+  if (destRef && typeof destRef === "object") {
+    const cached = pdfDocument.cachedPageNumber(destRef);
+    if (cached) return cached;
+    try {
+      return (await pdfDocument.getPageIndex(destRef)) + 1;
+    } catch {
+      return undefined;
+    }
+  }
+  return Number.isInteger(destRef) ? destRef + 1 : undefined;
+}
+
+async function outlineItems() {
+  const pdfDocument = app()?.pdfDocument;
+  if (!pdfDocument) return [];
+  outlinePromise ??= pdfDocument.getOutline().catch(() => []);
+  return await outlinePromise;
+}
+
+function findOutlineDestinationByTitle(items, title) {
+  if (!Array.isArray(items)) return undefined;
+  for (const item of items) {
+    if (item?.title === title && item.dest) return item.dest;
+    const nested = findOutlineDestinationByTitle(item?.items, title);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+async function preferredNamedDestination(name) {
+  const application = app();
+  const pdfDocument = application?.pdfDocument;
+  if (!pdfDocument || !name) return undefined;
+  const directDest = await pdfDocument.getDestination(name).catch(() => undefined);
+  const outlineDest = findOutlineDestinationByTitle(await outlineItems(), name);
+  if (outlineDest) {
+    const [directPage, outlinePage] = await Promise.all([
+      directDest ? explicitDestinationPageNumber(directDest) : undefined,
+      explicitDestinationPageNumber(outlineDest),
+    ]);
+    if (outlinePage && outlinePage !== directPage) return outlineDest;
+  }
+  return directDest ? name : undefined;
+}
+
+async function navigateNamedDestinationHash(hash) {
+  if (!hash || hash.includes("=")) return false;
+  const name = decodePdfHashDestination(hash);
+  if (!name || name.trim().startsWith("[")) return false;
+  const destination = await preferredNamedDestination(name);
+  if (!destination) return false;
+  app()?.pdfLinkService?.goToDestination(destination);
+  return true;
+}
+
+async function applyInitialHashWhenReady() {
+  if (!initialViewerHash || !hasActiveConfig(hostState.config)) return;
+  const expectedPdfId = activePdfId();
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && activePdfId() === expectedPdfId && location.hash.slice(1) === initialViewerHash) {
+    await waitForPagesReady(app()).catch(() => undefined);
+    const application = app();
+    if (application?.pdfDocument && application?.pdfLinkService && application.isInitialViewSet) {
+      if (!await navigateNamedDestinationHash(initialViewerHash)) application.pdfLinkService.setHash(initialViewerHash);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+function internalLinkHashFromEvent(event) {
+  const target = event.target instanceof Element ? event.target : undefined;
+  const link = target?.closest?.("a[href]");
+  if (!(link instanceof HTMLAnchorElement)) return undefined;
+  const url = new URL(link.href, location.href);
+  if (url.origin !== location.origin || url.pathname !== location.pathname || url.search !== location.search || !url.hash) return undefined;
+  return url.hash.slice(1);
+}
+
 function installPageEventHandlers() {
   const viewer = document.getElementById("viewer");
   if (!viewer || viewer.dataset.hostSynctexHandlers === "true") return;
   viewer.dataset.hostSynctexHandlers = "true";
   viewer.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : undefined;
+    const linkHash = internalLinkHashFromEvent(event);
+    if (linkHash) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void navigateNamedDestinationHash(linkHash).then((handled) => {
+        if (!handled) app()?.pdfLinkService?.setHash(linkHash);
+      });
+      return;
+    }
     if (isEditableEventTarget(event)) return;
     if (target?.closest("[data-pdf-annotation]")) return;
     if (target?.closest("[data-synctex-marker]")) {
@@ -2580,6 +2705,7 @@ installHoverToolbarButton();
 setDebugSynctexEnabled(initialConfig.debug_synctex === true);
 installToolsHitboxFallback();
 installPageEventHandlers();
+void applyInitialHashWhenReady();
 void restoreAnnotationsForActivePdfWhenReady();
 if (hasActiveConfig(initialConfig)) connectViewerSocket();
 updateHostDataset();
