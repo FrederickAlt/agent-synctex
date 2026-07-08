@@ -458,8 +458,8 @@ body {
     display: none;
 }
 
-#hostSynctexHoverButton::before {
-    content: "💬";
+#hostSynctexHoverButton::before,
+#hostClearAnnotationsButton::before {
     width: auto;
     height: auto;
     background: none;
@@ -467,6 +467,14 @@ body {
     mask-image: none;
     font-size: 15px;
     line-height: 1;
+}
+
+#hostSynctexHoverButton::before {
+    content: "💬";
+}
+
+#hostClearAnnotationsButton::before {
+    content: "🧹";
 }
 
 #hostPdfThemeButton::before {
@@ -480,7 +488,8 @@ body {
     line-height: 1;
 }
 
-#hostSynctexHoverButton {
+#hostSynctexHoverButton,
+#hostClearAnnotationsButton {
     border-radius: 999px;
 }
 

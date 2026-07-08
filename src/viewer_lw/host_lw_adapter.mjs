@@ -1065,6 +1065,13 @@ function clearAnnotations(options = {}) {
   if (options.persist !== false) persistAnnotations();
 }
 
+function clearUserAnnotations() {
+  const annotationIds = Array.from(annotations.keys());
+  clearForwardSynctexMarker();
+  clearAnnotations();
+  for (const annotationId of annotationIds) sendViewerSocketPayload({ type: "pdf_annotation_deleted", annotation_id: annotationId });
+}
+
 function clearAnnotationsFromHostMessage(message) {
   const pdfIds = Array.isArray(message.pdf_ids) ? message.pdf_ids : [message.pdf_id];
   const clearedPdfIds = clearPersistedAnnotationsForPdfIds(pdfIds);
@@ -2288,11 +2295,28 @@ function installHoverToolbarButton() {
     event.stopPropagation();
     setHoverEnabled(!hostState.hoverEnabled);
   });
+  const clearButton = document.createElement("button");
+  clearButton.id = "hostClearAnnotationsButton";
+  clearButton.className = "toolbarButton hostAnnotationButton";
+  clearButton.type = "button";
+  clearButton.tabIndex = 0;
+  clearButton.title = "Clear all marks and comments";
+  clearButton.setAttribute("aria-label", clearButton.title);
+  const clearLabel = document.createElement("span");
+  clearLabel.textContent = "🧹";
+  clearLabel.setAttribute("aria-hidden", "true");
+  clearButton.appendChild(clearLabel);
+  clearButton.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    clearUserAnnotations();
+  });
   const separator = document.createElement("div");
   separator.className = "verticalToolbarSeparator hostSynctexSeparator";
   const anchor = document.getElementById("toolbarViewerRight")?.firstElementChild ?? document.getElementById("toolbarViewerRight");
   anchor?.parentNode?.insertBefore(separator, anchor);
   anchor?.parentNode?.insertBefore(button, anchor);
+  anchor?.parentNode?.insertBefore(clearButton, anchor);
   setHoverEnabled(true);
 }
 

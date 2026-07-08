@@ -1334,6 +1334,64 @@ test("direct LaTeX Workshop viewer reloads after the last toolbar tab is closed 
 });
 
 
+test("LaTeX Workshop clear annotations button removes marks and comments", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-clear-annotations-"));
+	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 154, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		await page.goto(`${server.origin}/viewer-lw/154`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		await page.waitForFunction(() => document.body.dataset.hostLwSocket === "connected", undefined, { timeout: 5_000 });
+		await page.locator("#hostClearAnnotationsButton").waitFor({ state: "visible", timeout: 2_000 });
+		assert.equal(await page.locator("#hostClearAnnotationsButton").getAttribute("aria-label"), "Clear all marks and comments");
+
+		await page.evaluate((source) => {
+			(globalThis as typeof globalThis & { __hostLwSynctexDebug?: { showSynctexMarker: (message: unknown, options?: unknown) => boolean } }).__hostLwSynctexDebug?.showSynctexMarker({
+				type: "synctex_forward",
+				pdf_id: 154,
+				page: 1,
+				x: 120,
+				y: 70,
+				width: 24,
+				height: 14,
+				source_file: source,
+				line: 3,
+				source_line: "First paragraph text that should wrap a little and create boxes.",
+			}, { scroll: false });
+		}, sourcePath);
+		await page.locator("[data-synctex-marker]").first().click();
+		await page.locator("[data-pdf-annotation-box]").first().click();
+		await page.locator("button[title='Add comment']").click();
+		await page.locator("[data-pdf-annotation-bubble] textarea").fill("Clear this comment.");
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1);
+		assert.equal(await page.locator("[data-pdf-annotation-bubble]").count(), 1);
+
+		await page.locator("#hostClearAnnotationsButton").click();
+		await page.waitForFunction(() => document.querySelectorAll("[data-pdf-annotation]").length === 0, undefined, { timeout: 2_000 });
+		assert.equal(await page.locator("[data-pdf-annotation-bubble]").count(), 0);
+		const storage = await page.evaluate(() => JSON.parse(localStorage.getItem("agent-synctex.pdfAnnotations") || "{}") as Record<string, unknown[]>);
+		assert.deepEqual(storage["154"], []);
+		await page.waitForTimeout(100);
+		const events = await drainHostMcpEvents(server.origin);
+		assert.equal(events.some((event) => event.type === "pdf_annotation" && event.pdf_id === 154), false, "cleared annotations should not remain queued for MCP context");
+
+		await page.reload({ waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 0, "cleared annotations should not restore from local storage");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
 test("LaTeX Workshop annotation comment bubble can extend outside the PDF page and accept typing", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-annotation-bubble-"));
 	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
