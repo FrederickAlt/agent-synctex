@@ -23,9 +23,13 @@ window.addEventListener("error", (event) => {
 
 globalThis.viewerTrim = 0;
 
+function emptyViewerConfig() {
+  return { empty: true, revision: 0, title: "PDF Viewer", pdf_url: "", debug_synctex: false };
+}
+
 async function loadInitialConfig() {
   if (!configUrl) {
-    return { empty: true, revision: 0, title: "PDF Viewer", pdf_url: "", debug_synctex: false };
+    return emptyViewerConfig();
   }
   const response = await fetch(configUrl, { cache: "no-store" });
   if (!response.ok) {
@@ -124,7 +128,7 @@ function viewerContainer() {
 }
 
 function activePdfId() {
-  const pdfId = Number(hostState.config?.pdf_id ?? initialConfig.pdf_id);
+  const pdfId = Number((hostState.config ?? initialConfig)?.pdf_id);
   return Number.isInteger(pdfId) && pdfId > 0 ? pdfId : undefined;
 }
 
@@ -2086,7 +2090,12 @@ function updateDirectViewerTab(message) {
     viewerUrl: message.viewer_url || `/viewer-lw/${encodeURIComponent(String(pdfId))}`,
     visibleTabToken: message.visible_tab_token,
   };
+  const shouldLoadIntoEmptyDirectViewer = window.parent === window && !hasActiveConfig(hostState.config);
   directViewerTabs.set(pdfId, tab);
+  if (shouldLoadIntoEmptyDirectViewer) {
+    void switchDirectViewerTab(pdfId, tab.viewerUrl);
+    return;
+  }
   if (pdfId === activePdfId()) document.title = tabDisplayTitle(tab, pdfId);
   renderToolbarTabs(currentDirectTabsState());
   const cached = pdfByteCache.get(pdfId);
@@ -2113,8 +2122,13 @@ function closeDirectViewerTab(pdfId) {
       disconnectViewerSocket();
       clearForwardSynctexMarker();
       clearAnnotations({ persist: false });
-      void app()?.close?.();
+      hostState.config = emptyViewerConfig();
+      hostState.visibleRevision = 0;
+      hostState.latestRevision = 0;
       hostState.lastError = undefined;
+      hostState.debugSynctexEnabled = false;
+      document.title = "PDF Viewer";
+      void app()?.close?.();
       updateHostDataset();
     }
   }

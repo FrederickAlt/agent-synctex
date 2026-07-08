@@ -1230,6 +1230,43 @@ test("LaTeX Workshop viewer annotation is active by default and hidden debug swi
 });
 
 
+test("direct LaTeX Workshop viewer reloads after the last toolbar tab is closed and focused again", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-direct-reopen-"));
+	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 151, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		await page.goto(`${server.origin}/viewer-lw/151`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		await page.waitForFunction(() => document.body.dataset.hostLwSocket === "connected", undefined, { timeout: 5_000 });
+		assert.equal(server.getConnectedViewerCount(151), 1);
+
+		await page.locator("button.hostPdfTabClose[data-close-pdf-id='151']").click();
+		await page.waitForFunction(() => document.body.dataset.hostLwSocket === "disconnected", undefined, { timeout: 5_000 });
+		for (let attempt = 0; attempt < 20 && server.getConnectedViewerCount(151) !== 0; attempt += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.equal(server.getConnectedViewerCount(151), 0);
+
+		assert.equal((await new ViewerHostControlClient({ origin: server.origin }).send({ type: "focus_pdf", pdf_id: 151 })).ok, true);
+		await page.waitForFunction(() => {
+			const loaded = (window as unknown as { __hostLwRefreshDebug?: { loadedState: () => { activePdfId?: number; pdfDocumentLoaded?: boolean; renderedCanvasCount?: number; socketStatus?: string } } }).__hostLwRefreshDebug?.loadedState?.();
+			return loaded?.activePdfId === 151 && loaded.pdfDocumentLoaded === true && (loaded.renderedCanvasCount ?? 0) > 0 && loaded.socketStatus === "connected";
+		}, undefined, { timeout: 5_000 });
+		assert.equal(server.getConnectedViewerCount(151), 1);
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
 test("LaTeX Workshop annotation comment bubble can extend outside the PDF page and accept typing", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-annotation-bubble-"));
 	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
