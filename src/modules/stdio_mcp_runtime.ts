@@ -188,7 +188,6 @@ export class TexActionsStdioMcpRuntime {
 				},
 				markPdfUpdated: service.pdfOperations.markTrackedPdfUpdated,
 			},
-			resolveManagedOpenCallback: async () => undefined,
 		});
 		compileService.start();
 		this.compileServicesByAgentId.set(agentId, compileService);

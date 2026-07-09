@@ -652,6 +652,7 @@ test("Package metadata keeps approved production entrypoints", () => {
 	const packageJson = JSON.parse(packageSource) as Record<string, unknown>;
 	const metadataViolations = collectMetadataReferenceViolations(packageSource, packagePath, packageJson);
 
+	assert.equal(packageJson.main, undefined, "package.json must not expose a stale native extension main entrypoint");
 	assert.equal(typeof packageJson.description, "string", "package.json must describe the active runtime");
 	assert.match(packageJson.description as string, /stdio MCP/i, "package.json description must identify stdio MCP runtime");
 	assert.match(packageJson.description as string, /Viewer Host/i, "package.json description must identify the Viewer Host boundary");
@@ -709,6 +710,19 @@ test("Legacy viewer and daemon entrypoints are removed", () => {
 	const callbackScriptPath = join(REPO_ROOT, "scripts", "pi_synctex_callback.mjs");
 	const pdfjsViewerBrokerScriptPath = join(REPO_ROOT, "scripts", "pdfjs-viewer-broker.ts");
 	const pdfjsViewerBrokerModulePath = join(REPO_ROOT, "src", "modules", "pdfjs_viewer_broker.ts");
+	const nativePiExtensionEntrypointPath = join(REPO_ROOT, "index.ts");
+	const nativePiExtensionModulePath = join(REPO_ROOT, "src", "modules", "pi_extension");
+	const legacyPreviewModulePath = join(REPO_ROOT, "src", "modules", "preview");
+	const legacyHostServiceModules = [
+		"host_service.ts",
+		"host_service_viewer_backends.ts",
+		"host_service_managed_viewer.ts",
+		"host_service_viewer_protocol.ts",
+		"host_service_continuous_compile.ts",
+		"host_service_session_leases.ts",
+		"host_service_rasterization.ts",
+		"host_service_fixed_preview_pdf_path.ts",
+	].map((file) => join(REPO_ROOT, "src", "modules", file));
 	const legacyPdfjsViewerModules = [
 		"pdfjs_viewer_mcp_service.ts",
 		"pdfjs_viewer_registry.ts",
@@ -722,6 +736,12 @@ test("Legacy viewer and daemon entrypoints are removed", () => {
 	assert.equal(existsSync(callbackScriptPath), false, "legacy callback script should be removed");
 	assert.equal(existsSync(pdfjsViewerBrokerScriptPath), false, "detached PDF.js viewer broker entrypoint should be removed");
 	assert.equal(existsSync(pdfjsViewerBrokerModulePath), false, "detached PDF.js viewer broker module should be removed");
+	assert.equal(existsSync(nativePiExtensionEntrypointPath), false, "stale native Pi extension entrypoint should be removed");
+	assert.equal(existsSync(nativePiExtensionModulePath), false, "stale native Pi extension modules should be removed");
+	assert.equal(existsSync(legacyPreviewModulePath), false, "legacy native inline preview modules should be removed");
+	for (const legacyHostServiceModule of legacyHostServiceModules) {
+		assert.equal(existsSync(legacyHostServiceModule), false, "legacy HostService/Zathura module should be removed");
+	}
 	for (const legacyPdfjsViewerModule of legacyPdfjsViewerModules) {
 		assert.equal(existsSync(legacyPdfjsViewerModule), false, "legacy PdfJsViewer module should be removed in favor of Viewer Host");
 	}

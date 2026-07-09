@@ -1,5 +1,5 @@
 import { randomInt } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
 import { applyLatexPreamble } from "./latex/latex_preamble.ts";
@@ -12,10 +12,7 @@ import {
 	type LatexFileCompileRequest,
 	type LatexFileCompileResult,
 } from "./latex/latex_file_compiler.ts";
-import { resolveFixedPreviewPdfPath } from "./host_service_fixed_preview_pdf_path.ts";
-import { getMcpFixedPreviewPdfPath } from "./runtime_paths.ts";
 import type {
-	HostServiceCallbackTarget,
 	HostServiceCompileRequest,
 	HostServiceCompileSnippetRequest,
 	HostServiceCompileSnippetResponseEnvelope,
@@ -32,7 +29,7 @@ import {
 } from "./host_service_root_compile_coordinator.ts";
 import { buildLatexPreambleIndex, type RootPreamble } from "./latex/latex_preamble_index.ts";
 
-const logger = createLogger("host-service.compile");
+const logger = createLogger("mcp-runtime.compile");
 
 const REQUIRED_DIRECTORY_MODE = 0o700;
 const DEFAULT_HOST_SERVICE_TMPDIR = process.env.MCP_TMPDIR ?? resolve(process.env.XDG_RUNTIME_DIR || process.env.HOME || process.cwd(), "tex-actions");
@@ -75,11 +72,6 @@ interface CompileDiagnosticsDetails {
 export interface HostServiceCompileServiceOptions {
 	protocolVersion: number;
 	managedViewerService: HostServiceManagedViewerServiceLike;
-	resolveManagedOpenCallback: (
-		workspaceContext: HostServiceWorkspaceContext,
-		callbackTargetId: string | undefined,
-		callbackTarget: HostServiceCallbackTarget | undefined,
-	) => Promise<HostServiceCallbackTarget | undefined>;
 	nowNs?: () => number;
 	rootCompileCoordinator?: HostServiceRootCompileCoordinator;
 }
@@ -87,7 +79,6 @@ export interface HostServiceCompileServiceOptions {
 export class HostServiceCompileService {
 	private readonly protocolVersion: number;
 	private readonly managedViewerService: HostServiceManagedViewerServiceLike;
-	private readonly resolveManagedOpenCallback: HostServiceCompileServiceOptions["resolveManagedOpenCallback"];
 	private readonly nowNs: () => number;
 	private readonly rootCompileCoordinator: HostServiceRootCompileCoordinator;
 	private readonly activeCompileAbortControllers = new Set<AbortController>();
@@ -96,7 +87,6 @@ export class HostServiceCompileService {
 	constructor(options: HostServiceCompileServiceOptions) {
 		this.protocolVersion = options.protocolVersion;
 		this.managedViewerService = options.managedViewerService;
-		this.resolveManagedOpenCallback = options.resolveManagedOpenCallback;
 		this.nowNs = options.nowNs ?? (() => Date.now() * 1_000_000);
 		this.rootCompileCoordinator = options.rootCompileCoordinator ?? new HostServiceRootCompileCoordinator();
 	}
@@ -107,8 +97,8 @@ export class HostServiceCompileService {
 
 	stop(): void {
 		const stoppedError = new HostServiceCompileCoordinationError(
-			"host service stopped while compile request was in progress",
-			"host_service_stopped",
+			"MCP runtime stopped while compile request was in progress",
+			"runtime_stopped",
 		);
 		for (const controller of this.activeCompileAbortControllers) {
 			controller.abort(stoppedError);
@@ -353,7 +343,6 @@ export class HostServiceCompileService {
 			request_id: request.request_id,
 			compiler: request.details.compiler,
 			open_pdf: request.details.open_pdf === true,
-			fixed_preview: request.details.fixed_preview === true,
 			crop_to_content: request.details.crop_to_content === true,
 			suppress_page_numbers: request.details.suppress_page_numbers === true,
 			preamble_root_file: request.details.preamble_root_file,
@@ -382,13 +371,8 @@ export class HostServiceCompileService {
 			const nowNs = this.nowNs();
 			const operationPdfPath = result.pdfPath;
 			const operationArtifactPaths = getExistingArtifacts(operationPdfPath, logPath);
-			const fixedPreviewPdfPath = request.details.open_pdf && request.details.fixed_preview === true
-				? resolveFixedPreviewPdfPath(getMcpFixedPreviewPdfPath())
-				: undefined;
-			const previewPdfPath = fixedPreviewPdfPath ?? operationPdfPath;
-			const artifactPaths = fixedPreviewPdfPath === undefined
-				? operationArtifactPaths
-				: [...this.copySnippetArtifactsToFixedPath(operationPdfPath, fixedPreviewPdfPath), ...getExistingArtifacts(logPath)];
+			const previewPdfPath = operationPdfPath;
+			const artifactPaths = operationArtifactPaths;
 			if (request.details.open_pdf !== true) {
 				await this.markCompiledPdfUpdated(previewPdfPath, request.request_id);
 			}
@@ -584,29 +568,12 @@ export class HostServiceCompileService {
 					);
 		};
 
-		const requiresCallbackResolution = request.details.callback_target_id !== undefined || request.details.callback !== undefined;
-		const openCallback = requiresCallbackResolution
-			? await this.resolveManagedOpenCallback(
-				request.workspace_context,
-				request.details.callback_target_id,
-				request.details.callback,
-			)
-			: undefined;
-
-		if (requiresCallbackResolution && openCallback === undefined) {
-			return buildCompileOpenFailureResponse(
-				"open_pdf callback configuration is missing or stale for this workspace",
-				"invalid_request",
-			);
-		}
-
 		let openResponse: HostServiceOpenResponseEnvelope;
 		try {
 			openResponse = await this.openCompiledPdfThroughManagedViewer(
 				request.request_id,
 				request.workspace_context,
 				pdf,
-				openCallback,
 				request.details.reuse_existing,
 				request.details.require_persistent_viewer,
 				request.details.debug_synctex,
@@ -693,7 +660,6 @@ export class HostServiceCompileService {
 		requestId: string,
 		workspaceContext: HostServiceWorkspaceContext,
 		pdfPath: string,
-		callback: HostServiceCallbackTarget | undefined,
 		reuseExisting?: boolean,
 		requirePersistentViewer?: boolean,
 		debugSynctex?: boolean,
@@ -706,7 +672,6 @@ export class HostServiceCompileService {
 			workspace_context: workspaceContext,
 			details: {
 				pdf_path: pdfPath,
-				...(callback === undefined ? {} : { callback }),
 				reuse_existing: reuseExisting ?? true,
 				require_persistent_viewer: requirePersistentViewer ?? false,
 				...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
@@ -714,31 +679,6 @@ export class HostServiceCompileService {
 		});
 	}
 
-	private copySnippetArtifactsToFixedPath(operationPdfPath: string, fixedPdfPath: string): string[] {
-		const operationBase = operationPdfPath.toLowerCase().endsWith(".pdf") ? operationPdfPath.slice(0, -4) : operationPdfPath;
-		const fixedBase = fixedPdfPath.toLowerCase().endsWith(".pdf") ? fixedPdfPath.slice(0, -4) : fixedPdfPath;
-		ensureDirectory(dirname(fixedPdfPath));
-		if (existsSync(operationPdfPath) && operationPdfPath !== fixedPdfPath) {
-			copyFileSync(operationPdfPath, fixedPdfPath);
-		}
-		for (const extension of [".synctex", ".synctex.gz"] as const) {
-			const operationArtifactPath = `${operationBase}${extension}`;
-			const fixedArtifactPath = `${fixedBase}${extension}`;
-			if (existsSync(operationArtifactPath)) {
-				if (operationArtifactPath !== fixedArtifactPath) {
-					copyFileSync(operationArtifactPath, fixedArtifactPath);
-				}
-				continue;
-			}
-			if (existsSync(fixedArtifactPath)) {
-				rmSync(fixedArtifactPath);
-			}
-		}
-		if (!existsSync(fixedPdfPath)) {
-			throw new Error(`failed to copy stable snippet PDF to fixed preview path: ${fixedPdfPath}`);
-		}
-		return getExistingArtifacts(fixedPdfPath, `${fixedBase}.synctex`, `${fixedBase}.synctex.gz`);
-	}
 }
 
 function buildSnippetLatexSourcePath(workspaceContext: HostServiceWorkspaceContext): string {
@@ -838,18 +778,18 @@ function assertDirectorySafe(path: string, options: { enforceMode?: boolean } = 
 	const { enforceMode = true } = options;
 	const st = lstatSync(path);
 	if (st.isSymbolicLink()) {
-		throw new Error(`host service path is a symlink: ${path}`);
+		throw new Error(`runtime path is a symlink: ${path}`);
 	}
 	if (!st.isDirectory()) {
-		throw new Error(`host service path is not a directory: ${path}`);
+		throw new Error(`runtime path is not a directory: ${path}`);
 	}
 	if (process.getuid?.() !== undefined && st.uid !== process.getuid()) {
-		throw new Error(`host service path is not owned by current user: ${path}`);
+		throw new Error(`runtime path is not owned by current user: ${path}`);
 	}
 	if (enforceMode && (st.mode & 0o777) !== REQUIRED_DIRECTORY_MODE) {
 		chmodSync(path, REQUIRED_DIRECTORY_MODE);
 		if ((statSync(path).mode & 0o777) !== REQUIRED_DIRECTORY_MODE) {
-			throw new Error(`host service path mode check failed after correction: ${path}`);
+			throw new Error(`runtime path mode check failed after correction: ${path}`);
 		}
 	}
 }

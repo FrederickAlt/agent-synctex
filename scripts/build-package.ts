@@ -6,7 +6,6 @@ import ts from "typescript";
 const repoRoot = process.cwd();
 const outDir = join(repoRoot, "dist");
 const tsRoots = [
-	"index.ts",
 	"scripts/agent-synctex.ts",
 	"scripts/viewer-host-server.ts",
 	"scripts/debug-forward-synctex.ts",

@@ -121,8 +121,8 @@ export class HostServiceRootCompileCoordinator {
 	}
 
 	stop(error = new HostServiceCompileCoordinationError(
-		"host service stopped while compile request was waiting behind an active same-root compile",
-		"host_service_stopped",
+		"MCP runtime stopped while compile request was waiting behind an active same-root compile",
+		"runtime_stopped",
 	)): void {
 		this.stoppedError = error;
 		this.lastCompileResults.clear();

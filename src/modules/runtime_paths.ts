@@ -11,11 +11,6 @@ export function getMcpTmpDir(): string {
 
 export const MCP_TMPDIR = resolveMcpRuntimeDir();
 
-export function getMcpFixedPreviewPdfPath(): string {
-	return resolve(getMcpTmpDir(), "tex-actions.pdf");
-}
-
-export const MCP_FIXED_PREVIEW_PDF_PATH = getMcpFixedPreviewPdfPath();
 
 export const LATEX_PREAMBLE_FILE_NAMES = ["preamble.tex", "praeamble.tex"] as const;
 

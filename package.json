@@ -4,7 +4,6 @@
   "description": "Agent SyncTeX stdio MCP server and harness hook installer for LaTeX PDF workflows with a Viewer Host boundary",
   "license": "MIT",
   "type": "module",
-  "main": "dist/index.js",
   "files": [
     "dist",
     "README.md",
@@ -20,7 +19,6 @@
     "test": "node --test --test-reporter=./scripts/fail-only-test-reporter.ts \"test/**/*.test.ts\"",
     "debug:forward-synctex": "node scripts/debug-forward-synctex.ts",
     "test:verbose": "node --test \"test/**/*.test.ts\"",
-    "test:real-tex-smoke": "AGENT_SYNCTEX_REAL_TEX_SMOKE=1 node --test test/modules/host_service_real_latexmk_smoke.test.ts",
     "smoke:stdio-viewer": "node --test --test-reporter=spec --test-name-pattern=\"routes open_pdf to the Viewer Host boundary without owning PDF serving\" test/modules/stdio_mcp_runtime.test.ts",
     "verify": "npm run check && npm test",
     "prepack": "npm run build",
@@ -36,10 +34,8 @@
     "viewer-host"
   ],
   "dependencies": {
-    "@mariozechner/pi-tui": "^0.73.1",
     "iconv-lite": "^0.7.2",
-    "pdfjs-dist": "^6.0.227",
-    "typebox": "^1.1.39"
+    "pdfjs-dist": "^6.0.227"
   },
   "devDependencies": {
     "@types/node": "^22.19.19",

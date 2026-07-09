@@ -125,7 +125,7 @@ const MAX_REPORTED_DIAGNOSTICS = 10;
 const MAX_SUMMARY_DIAGNOSTICS = 5;
 const MAX_DIAGNOSTIC_MESSAGE_CHARS = 500;
 const PDF_FRESHNESS_TOLERANCE_MS = 1000;
-const LATEXMK_MISSING_MESSAGE = "latexmk is required for this compile mode. Install MacTeX or TeX Live so the latexmk command is available on PATH; BasicTeX users may need to install latexmk separately (for example with tlmgr) and then restart the Host Service so it sees the updated PATH.";
+const LATEXMK_MISSING_MESSAGE = "latexmk is required for this compile mode. Install MacTeX or TeX Live so the latexmk command is available on PATH; BasicTeX users may need to install latexmk separately (for example with tlmgr) and then restart the MCP server so it sees the updated PATH.";
 const LATEX_FILE_ARTIFACT_EXTENSIONS = [
 	".aux",
 	".bbl",

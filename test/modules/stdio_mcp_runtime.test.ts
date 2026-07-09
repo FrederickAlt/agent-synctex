@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, type Readable } from "node:stream";
 import { test } from "node:test";
 import { TexActionsStdioMcpRuntime } from "../../src/modules/stdio_mcp_runtime.ts";
 import type { HostServiceCompileRequest, HostServiceCompileResponseEnvelope, HostServiceCompileSnippetRequest, HostServiceCompileSnippetResponseEnvelope, HostServiceOpenRequest, HostServiceOpenResponseEnvelope } from "../../src/modules/host_service_protocol.ts";
@@ -86,6 +86,28 @@ async function waitForMissingFile(path: string, timeoutMs = 2_000): Promise<void
 		if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${path} to be removed`);
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
+}
+
+function collectJsonLineFrame(stream: Readable, timeoutMs = 1_000): Promise<Record<string, unknown>> {
+	return new Promise((resolveFrame, rejectFrame) => {
+		let raw = "";
+		const timer = setTimeout(() => {
+			cleanup();
+			rejectFrame(new Error(`timed out waiting for JSON-line frame: ${raw}`));
+		}, timeoutMs);
+		const cleanup = () => {
+			clearTimeout(timer);
+			stream.off("data", onData);
+		};
+		const onData = (chunk: string | Buffer) => {
+			raw += String(chunk);
+			const lineBreak = raw.indexOf("\n");
+			if (lineBreak < 0) return;
+			cleanup();
+			resolveFrame(JSON.parse(raw.slice(0, lineBreak)) as Record<string, unknown>);
+		};
+		stream.on("data", onData);
+	});
 }
 
 async function withRuntimeEnv<T>(runtimeRoot: string, fn: () => Promise<T>): Promise<T> {
@@ -282,7 +304,7 @@ test("actual agent-synctex mcp --harness codex exits when stdio closes", async (
 });
 
 
-test("actual agent-synctex mcp entrypoint answers initialize and tools/list over stdio without a daemon", async () => {
+test("actual agent-synctex mcp entrypoint answers initialize and tools/list over stdio through the Viewer Host path", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-"));
 	const cwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
@@ -325,6 +347,41 @@ test("actual agent-synctex mcp entrypoint answers initialize and tools/list over
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 	assert.doesNotMatch(stderr, /daemon is unavailable|ENOENT|ECONNREFUSED/i);
+});
+
+test("actual agent-synctex mcp entrypoint answers JSON-line framed requests for Pi MCP adapters", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-entrypoint-json-line-"));
+	const cwd = join(baseDir, "project");
+	const runtimeRoot = join(baseDir, "runtime");
+	mkdirSync(cwd, { recursive: true });
+	const scriptPath = resolve(process.cwd(), "scripts", "agent-synctex.ts");
+	const child = spawn(process.execPath, [scriptPath, "mcp", "--no-hooks"], {
+		cwd,
+		env: { ...process.env, MCP_TMPDIR: runtimeRoot, TEX_ACTIONS_AGENT_ID: "entrypoint-json-line-agent" },
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+	let stderr = "";
+	child.stderr.on("data", (chunk) => {
+		stderr += String(chunk);
+	});
+	const exitPromise = new Promise<void>((resolveExit) => {
+		child.once("exit", () => resolveExit());
+		child.once("error", () => resolveExit());
+	});
+
+	try {
+		const output = collectJsonLineFrame(child.stdout, 2_000);
+		child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })}\n`);
+		const initialize = await output as { id?: unknown; result?: { serverInfo?: { name?: string } } };
+		assert.equal(initialize.id, 1);
+		assert.equal(initialize.result?.serverInfo?.name, "tex-actions");
+	} finally {
+		child.kill("SIGTERM");
+		await Promise.race([exitPromise, new Promise((resolve) => setTimeout(resolve, 300))]);
+		child.kill("SIGKILL");
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+	assert.doesNotMatch(stderr, /Unsupported MCP stdio framing|Malformed MCP frame header/i);
 });
 
 test("actual agent-synctex mcp entrypoint routes open_pdf to the Viewer Host boundary without owning PDF serving", async () => {

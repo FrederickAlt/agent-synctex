@@ -107,7 +107,7 @@ function writeLog(level: Exclude<PdfPreviewLogLevel, "off">, component: string, 
 		};
 		appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
 	} catch {
-		// Logging is diagnostic-only and must not break tools, MCP framing, or the daemon.
+		// Logging is diagnostic-only and must not break tools, MCP framing, or the runtime.
 	}
 }
 

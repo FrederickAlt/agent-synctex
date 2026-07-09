@@ -1,12 +1,12 @@
 import { once } from "node:events";
 import type { Readable, Writable } from "node:stream";
 import {
-	type HostServiceDaemonFrame,
+	type McpStdioFrame,
 	type McpRequestId,
-	HostServiceMcpFrameReader,
+	McpStdioFrameReader,
 } from "./host_service_mcp.ts";
 
-export type McpClientFrameProtocol = HostServiceDaemonFrame["protocol"];
+export type McpClientFrameProtocol = McpStdioFrame["protocol"];
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -21,10 +21,7 @@ export function frameMcpPayload(payload: string): string {
 }
 
 export function frameClientPayload(payload: string, protocol: McpClientFrameProtocol): string {
-	if (protocol === "mcp") {
-		return frameMcpPayload(payload);
-	}
-	return `${payload}\n`;
+	return protocol === "json-line" ? `${payload}\n` : frameMcpPayload(payload);
 }
 
 export function requestMetadata(payload: string): { requestId: McpRequestId; expectsResponse: boolean } {
@@ -77,7 +74,7 @@ export interface McpStdioFrameLoopOptions {
 	stdin: Readable;
 	stderr: Writable;
 	maxPayloadBytes?: number;
-	onFrame: (frame: HostServiceDaemonFrame) => Promise<void>;
+	onFrame: (frame: McpStdioFrame) => Promise<void>;
 	onParseError: (error: Error) => Promise<void> | void;
 	onDiagnostic?: (message: string) => void;
 	onClose?: () => void;
@@ -86,7 +83,7 @@ export interface McpStdioFrameLoopOptions {
 export class McpStdioFrameLoop {
 	private readonly stdin: Readable;
 	private readonly stderr: Writable;
-	private readonly frameReader: HostServiceMcpFrameReader;
+	private readonly frameReader: McpStdioFrameReader;
 	private readonly onFrame: McpStdioFrameLoopOptions["onFrame"];
 	private readonly onParseError: McpStdioFrameLoopOptions["onParseError"];
 	private readonly onDiagnostic: (message: string) => void;
@@ -97,7 +94,7 @@ export class McpStdioFrameLoop {
 	constructor(options: McpStdioFrameLoopOptions) {
 		this.stdin = options.stdin;
 		this.stderr = options.stderr;
-		this.frameReader = new HostServiceMcpFrameReader({ maxPayloadBytes: options.maxPayloadBytes });
+		this.frameReader = new McpStdioFrameReader({ maxPayloadBytes: options.maxPayloadBytes });
 		this.onFrame = options.onFrame;
 		this.onParseError = options.onParseError;
 		this.onDiagnostic = options.onDiagnostic ?? ((message) => this.stderr.write(`${message}\n`));

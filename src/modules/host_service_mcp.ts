@@ -4,8 +4,6 @@ import type { GetPdfEventsRequest, PdfEvent } from "./pdf_events.ts";
 import { normalizeFetchPdfContextRequest, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
 import { appendViewerUrlAgentNotice, viewerUrlForAgentWhenNoLiveViewer } from "./viewer_url_agent_notice.ts";
 import type {
-	HostServiceCloseRequest,
-	HostServiceCloseResponseEnvelope,
 	HostServiceCompileRequest,
 	HostServiceCompileResponseEnvelope,
 	HostServiceCompileSnippetRequest,
@@ -27,15 +25,14 @@ export const MCP_ERROR_INVALID_REQUEST = -32600;
 export const MCP_ERROR_METHOD_NOT_FOUND = -32601;
 export const MCP_ERROR_INVALID_PARAMS = -32602;
 export const MCP_ERROR_INTERNAL = -32603;
-const MCP_HOST_SERVICE_PROTOCOL_VERSION = 1;
-const MCP_HOST_SERVICE_DAEMON_REQUEST_PREFIX = "mcp-host-service";
+const MCP_RUNTIME_PROTOCOL_VERSION = 1;
+const MCP_RUNTIME_REQUEST_PREFIX = "mcp-runtime";
 const MCP_DEFAULT_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
-let mcpHostServiceRequestCounter = 0;
+let mcpRuntimeRequestCounter = 0;
 
 export interface HostServiceMcpPdfOperations {
 	openPdf?: (request: HostServiceOpenRequest) => Promise<HostServiceOpenResponseEnvelope>;
 	jumpPdf?: (request: HostServiceJumpRequest) => Promise<HostServiceJumpResponseEnvelope>;
-	closePdf?: (request: HostServiceCloseRequest) => Promise<HostServiceCloseResponseEnvelope>;
 	getPdfEvents?: (request: GetPdfEventsRequest) => PdfEvent[] | Promise<PdfEvent[]>;
 	fetchPdfContext?: (request: FetchPdfContextRequest) => PostUserPdfContextResult | Promise<PostUserPdfContextResult>;
 	markTrackedPdfUpdated?: (pdfPath: string) => Promise<unknown>;
@@ -47,7 +44,7 @@ function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): Ho
 		return pdfOperations.compileService;
 	}
 	return new HostServiceCompileService({
-		protocolVersion: MCP_HOST_SERVICE_PROTOCOL_VERSION,
+		protocolVersion: MCP_RUNTIME_PROTOCOL_VERSION,
 		managedViewerService: {
 			async openViewer(openRequest) {
 				if (!pdfOperations.openPdf) {
@@ -57,7 +54,6 @@ function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): Ho
 			},
 			markPdfUpdated: pdfOperations.markTrackedPdfUpdated,
 		},
-		resolveManagedOpenCallback: async () => undefined,
 	});
 }
 
@@ -130,9 +126,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
-function nextHostServiceRequestId(): string {
-	mcpHostServiceRequestCounter += 1;
-	return `${MCP_HOST_SERVICE_DAEMON_REQUEST_PREFIX}-${mcpHostServiceRequestCounter}`;
+function nextRuntimeRequestId(): string {
+	mcpRuntimeRequestCounter += 1;
+	return `${MCP_RUNTIME_REQUEST_PREFIX}-${mcpRuntimeRequestCounter}`;
 }
 
 function normalizeWorkspaceContext(rawWorkspaceContext: unknown): HostServiceWorkspaceContext {
@@ -240,8 +236,8 @@ function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompil
 		throw new Error("workspace_context.cwd must be absolute for show_latex");
 	}
 	return {
-		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
-		request_id: nextHostServiceRequestId(),
+		protocol_version: MCP_RUNTIME_PROTOCOL_VERSION,
+		request_id: nextRuntimeRequestId(),
 		operation: "compile_latex_snippet",
 		created_at_ns: Date.now() * 1_000_000,
 		workspace_context: workspaceContext,
@@ -301,8 +297,8 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 	const workspaceContext = parseCompileWorkspaceContext(latexFilePath, args.workspace_context);
 	return {
 		compileRequest: {
-			protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
-			request_id: nextHostServiceRequestId(),
+			protocol_version: MCP_RUNTIME_PROTOCOL_VERSION,
+			request_id: nextRuntimeRequestId(),
 			operation: "compile_latex_file",
 			created_at_ns: Date.now() * 1_000_000,
 			workspace_context: workspaceContext,
@@ -338,8 +334,8 @@ function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequ
 	const requirePersistentViewer = parseBooleanArg(args, "require_persistent_viewer");
 	const debugSynctex = parseBooleanArg(args, "debug_synctex");
 	return {
-		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
-		request_id: nextHostServiceRequestId(),
+		protocol_version: MCP_RUNTIME_PROTOCOL_VERSION,
+		request_id: nextRuntimeRequestId(),
 		operation: "open_pdf",
 		created_at_ns: Date.now() * 1_000_000,
 		workspace_context: workspaceContext,
@@ -368,8 +364,8 @@ function parseJumpPdfRequest(args: Record<string, unknown>): HostServiceJumpRequ
 		? undefined
 		: isAbsolute(sourceFile) ? sourceFile : resolve(workspaceContext.cwd, sourceFile);
 	return {
-		protocol_version: MCP_HOST_SERVICE_PROTOCOL_VERSION,
-		request_id: nextHostServiceRequestId(),
+		protocol_version: MCP_RUNTIME_PROTOCOL_VERSION,
+		request_id: nextRuntimeRequestId(),
 		operation: "jump_pdf",
 		created_at_ns: Date.now() * 1_000_000,
 		workspace_context: workspaceContext,
@@ -623,7 +619,7 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 		},
 		{
 			name: "compile_latex_file",
-			description: "Compile a LaTeX source file once with latexmk and optionally route the output PDF open request through the Viewer Host Client boundary. The compiler option selects the TeX engine latexmk should run. Same-root requests are coordinated by the Host Service to avoid overlapping latexmk processes. Set clean=true to remove common same-basename artifacts before compiling. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings. When open_pdf=true, if a browser viewer is detected after launch/focus, the tool returns only pdf_id because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
+			description: "Compile a LaTeX source file once with latexmk and optionally route the output PDF open request through the Viewer Host Client boundary. The compiler option selects the TeX engine latexmk should run. Same-root requests are coordinated in the MCP runtime to avoid overlapping latexmk processes. Set clean=true to remove common same-basename artifacts before compiling. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings. When open_pdf=true, if a browser viewer is detected after launch/focus, the tool returns only pdf_id because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -988,22 +984,18 @@ export async function handleFramedMcpRequest(
 	return mcpFramedResponse(response);
 }
 
-export interface HostServiceDaemonFrame {
-	protocol: "host-service" | "mcp";
+export interface McpStdioFrame {
+	protocol: "mcp" | "json-line";
 	payload: string;
 }
 
 const MCP_HEADER_PREFIX = "content-length:";
 
-export class HostServiceMcpFrameReader {
+export class McpStdioFrameReader {
 	private buffer: Buffer = Buffer.alloc(0);
-	private protocol: "host-service" | "mcp" | undefined;
+	private protocol: McpStdioFrame["protocol"] | undefined;
 	private contentLength: number | undefined;
 	private readonly maxPayloadBytes: number;
-
-	get detectedProtocol(): "host-service" | "mcp" | undefined {
-		return this.protocol;
-	}
 
 	constructor(options: { maxPayloadBytes?: number } = {}) {
 		this.maxPayloadBytes = options.maxPayloadBytes ?? 16_384;
@@ -1017,17 +1009,15 @@ export class HostServiceMcpFrameReader {
 		}
 	}
 
-	private consumeHostServiceFrame(): HostServiceDaemonFrame | null {
+	private consumeJsonLineFrame(): McpStdioFrame | null {
 		const lineBreak = this.buffer.indexOf(10);
-		if (lineBreak < 0) {
-			return null;
-		}
+		if (lineBreak < 0) return null;
 		if (lineBreak > this.maxPayloadBytes) {
-			throw new Error("host-service request payload too large");
+			throw new Error("JSON-line frame payload too large");
 		}
 		const payload = this.buffer.slice(0, lineBreak).toString("utf8").trim();
 		this.buffer = this.buffer.slice(lineBreak + 1);
-		return { protocol: "host-service", payload };
+		return { protocol: "json-line", payload };
 	}
 
 	private parseMcpHeader(): { contentLength: number; bodyStart: number } | null {
@@ -1046,13 +1036,9 @@ export class HostServiceMcpFrameReader {
 		let contentLength: number | undefined;
 		for (const rawLine of headerLines) {
 			const line = rawLine.trim();
-			if (!line) {
-				continue;
-			}
+			if (!line) continue;
 			const splitAt = line.indexOf(":");
-			if (splitAt < 0) {
-				continue;
-			}
+			if (splitAt < 0) continue;
 			const headerName = line.slice(0, splitAt).trim().toLowerCase();
 			const headerValue = line.slice(splitAt + 1).trim();
 			if (headerName === MCP_HEADER_PREFIX.slice(0, -1)) {
@@ -1075,36 +1061,28 @@ export class HostServiceMcpFrameReader {
 		return { contentLength, bodyStart };
 	}
 
-	private consumeMcpFrame(): HostServiceDaemonFrame | null {
+	private consumeMcpFrame(): McpStdioFrame | null {
 		if (this.contentLength === undefined) {
 			const header = this.parseMcpHeader();
-			if (!header) {
-				return null;
-			}
+			if (!header) return null;
 			const { contentLength, bodyStart } = header;
 			this.contentLength = contentLength;
 			this.buffer = this.buffer.slice(bodyStart);
 		}
-		if (this.buffer.length < this.contentLength) {
-			return null;
-		}
+		if (this.buffer.length < this.contentLength) return null;
 		const payload = this.buffer.slice(0, this.contentLength).toString("utf8");
 		this.buffer = this.buffer.slice(this.contentLength);
 		this.contentLength = undefined;
 		return { protocol: "mcp", payload };
 	}
 
-	private detectProtocol(): "host-service" | "mcp" | undefined {
-		if (this.protocol !== undefined) {
-			return this.protocol;
-		}
+	private detectProtocol(): McpStdioFrame["protocol"] | undefined {
+		if (this.protocol !== undefined) return this.protocol;
 		const preview = this.buffer.toString("utf8", 0, Math.min(this.buffer.length, 64)).trimStart();
-		if (!preview.length) {
-			return undefined;
-		}
+		if (!preview.length) return undefined;
 		if (preview[0] === "{") {
-			this.protocol = "host-service";
-			return "host-service";
+			this.protocol = "json-line";
+			return "json-line";
 		}
 		const lower = preview.toLowerCase();
 		if (lower.startsWith("content-length")) {
@@ -1112,26 +1090,16 @@ export class HostServiceMcpFrameReader {
 				this.protocol = "mcp";
 				return "mcp";
 			}
-			if (lower.length < MCP_HEADER_PREFIX.length) {
-				return undefined;
-			}
+			if (lower.length < MCP_HEADER_PREFIX.length) return undefined;
 			throw new Error("Malformed MCP header");
 		}
-		if (lower[0] === "c" && lower.length < MCP_HEADER_PREFIX.length) {
-			return undefined;
-		}
-		this.protocol = "host-service";
-		return "host-service";
+		if (lower[0] === "c" && lower.length < MCP_HEADER_PREFIX.length) return undefined;
+		throw new Error("Unsupported MCP stdio framing; expected Content-Length or JSON-line frame");
 	}
 
-	nextFrame(): HostServiceDaemonFrame | null {
+	nextFrame(): McpStdioFrame | null {
 		const protocol = this.detectProtocol();
-		if (!protocol) {
-			return null;
-		}
-		if (protocol === "host-service") {
-			return this.consumeHostServiceFrame();
-		}
-		return this.consumeMcpFrame();
+		if (!protocol) return null;
+		return protocol === "json-line" ? this.consumeJsonLineFrame() : this.consumeMcpFrame();
 	}
 }
