@@ -977,6 +977,7 @@ function annotationPayload(annotation) {
     source_file: sourceFile,
     line,
     ...(annotationSourceLine(message) === undefined ? {} : { source_line: annotationSourceLine(message) }),
+    ...(message.source_span === undefined ? {} : { source_span: message.source_span }),
     ...(annotation.comment ? { comment: annotation.comment } : {}),
   };
 }
@@ -1385,6 +1386,10 @@ function renderAnnotations(scroll = false) {
 }
 
 function annotationSourceKey(message) {
+  const span = message.source_span;
+  if (span?.source_file && Number.isInteger(Number(span.start_line)) && Number.isInteger(Number(span.end_line))) {
+    return `${span.source_file}:${Number(span.start_line)}-${Number(span.end_line)}`;
+  }
   const sourceFile = message.source_file ?? message.reverse_source_file;
   const line = Number(message.line ?? message.reverse_line);
   return sourceFile && Number.isInteger(line) && line > 0 ? `${sourceFile}:${line}` : undefined;

@@ -1834,6 +1834,63 @@ test("reverse SyncTeX adapter normalizes \\] to the matching display math opener
 	}
 });
 
+test("reverse SyncTeX adapter normalizes a standalone closing brace to its braced formula span", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\bas{\\label{eq:sample}",
+			"  x + \\} + y",
+			"  \\text{nested braces are balanced}",
+			"}",
+			"",
+		].join("\n"));
+
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: failNativeRunner,
+			jsFallback: () => ({ input: "main.tex", line: 4, column: 0 }),
+		});
+
+		assert.equal(location.line, 4);
+		assert.equal(location.sourceLine, "}");
+		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+		assert.equal(location.normalizedFormulaExcerpt, "\\bas{\\label{eq:sample}\n  x + \\} + y\n  \\text{nested braces are balanced}");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX adapter does not treat escaped closing braces as formula-span closes", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\bas{",
+			"  x + y",
+			"\\}",
+			"}",
+		].join("\n"));
+
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: failNativeRunner,
+			jsFallback: () => ({ input: "main.tex", line: 3, column: 0 }),
+		});
+
+		assert.equal(Object.hasOwn(location, "normalizedFormulaSpan"), false);
+		assert.equal(Object.hasOwn(location, "normalizedFormulaExcerpt"), false);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse SyncTeX adapter matches nested same-environment closes to the nearest opener", () => {
 	const project = makeFixtureProject({ sidecar: "synctex.gz" });
 	try {

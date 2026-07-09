@@ -49,8 +49,8 @@ export function formatPdfAnnotationContext(events: PdfAnnotationEvent[], options
 	const lines = ["## PDF marks from the User", ""];
 	for (const event of events) {
 		const sourceLine = sourceLineForEvent(event);
-		const sourceFile = displaySourceFile(event.source_file, options.cwd);
-		lines.push(`- \`${sourceFile}:${event.line}\`${sourceLine ? ` — \`${escapeInlineCode(compactText(sourceLine, DEFAULT_MAX_FIELD_LENGTH))}\`` : ""}`);
+		const sourceLocation = displaySourceLocation(event, options.cwd);
+		lines.push(`- \`${sourceLocation}\`${sourceLine ? ` — \`${escapeInlineCode(compactText(sourceLine, DEFAULT_MAX_FIELD_LENGTH))}\`` : ""}`);
 		if (event.comment?.trim()) {
 			lines.push(`  User comment: ${compactText(event.comment, DEFAULT_MAX_COMMENT_LENGTH)}`);
 		}
@@ -82,6 +82,15 @@ function dedupeAnnotations(events: PdfAnnotationEvent[]): PdfAnnotationEvent[] {
 		byKey.set(`${event.pdf_id}:${event.annotation_id}`, event);
 	}
 	return Array.from(byKey.values()).sort((left, right) => left.sequence - right.sequence);
+}
+
+function displaySourceLocation(event: PdfAnnotationEvent, cwd: string | undefined): string {
+	const span = event.source_span;
+	if (span !== undefined) {
+		const spanFile = displaySourceFile(span.source_file, cwd);
+		return `${spanFile}:${span.start_line}-${span.end_line}`;
+	}
+	return `${displaySourceFile(event.source_file, cwd)}:${event.line}`;
 }
 
 function displaySourceFile(sourceFile: string, cwd: string | undefined): string {

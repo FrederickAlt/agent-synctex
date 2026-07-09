@@ -34,6 +34,12 @@ export interface ViewerHostSynctexForwardRange {
 	H: number;
 }
 
+export interface ViewerHostSourceSpan {
+	source_file: string;
+	start_line: number;
+	end_line: number;
+}
+
 export interface ViewerHostSynctexForwardMessage {
 	type: "synctex_forward";
 	pdf_id: number;
@@ -115,6 +121,7 @@ export interface ViewerHostReverseSynctexForwardProbeResultMessage {
 	reverse_line?: number;
 	reverse_column?: number;
 	reverse_source_line?: string;
+	source_span?: ViewerHostSourceSpan;
 	page?: number;
 	x?: number;
 	y?: number;
@@ -181,6 +188,7 @@ export interface ViewerHostPdfAnnotationMessage {
 	source_file: string;
 	line: number;
 	source_line?: string;
+	source_span?: ViewerHostSourceSpan;
 	comment?: string;
 }
 
@@ -308,6 +316,23 @@ function parseHoverRect(value: unknown, field: string): { left: number; top: num
 		right: requireCoordinate(value.right, `${field}.right`),
 		bottom: requireCoordinate(value.bottom, `${field}.bottom`),
 	};
+}
+
+function parseSourceSpan(value: unknown, field: string): ViewerHostSourceSpan {
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	const startLine = requirePositiveInteger(value.start_line, `${field}.start_line`);
+	const endLine = requirePositiveInteger(value.end_line, `${field}.end_line`);
+	if (endLine < startLine) throw new Error(`${field}.end_line must be greater than or equal to start_line`);
+	return {
+		source_file: requireNonEmptyString(value.source_file, `${field}.source_file`),
+		start_line: startLine,
+		end_line: endLine,
+	};
+}
+
+function optionalSourceSpan(value: unknown, field: string): ViewerHostSourceSpan | undefined {
+	if (value === undefined) return undefined;
+	return parseSourceSpan(value, field);
 }
 
 function optionalHoverRect(value: unknown, field: string): { left: number; top: number; right: number; bottom: number } | undefined {
@@ -533,6 +558,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			const reverseLine = message.reverse_line === undefined ? undefined : requirePositiveInteger(message.reverse_line, "reverse_line");
 			const reverseColumn = message.reverse_column === undefined ? undefined : requireCoordinate(message.reverse_column, "reverse_column");
 			const reverseSourceLine = optionalString(message.reverse_source_line, "reverse_source_line");
+			const sourceSpan = optionalSourceSpan(message.source_span, "source_span");
 			const page = message.page === undefined ? undefined : requirePositiveInteger(message.page, "page");
 			const x = message.x === undefined ? undefined : requireCoordinate(message.x, "x");
 			const y = message.y === undefined ? undefined : requireCoordinate(message.y, "y");
@@ -558,6 +584,7 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				...(reverseLine === undefined ? {} : { reverse_line: reverseLine }),
 				...(reverseColumn === undefined ? {} : { reverse_column: reverseColumn }),
 				...(reverseSourceLine === undefined ? {} : { reverse_source_line: reverseSourceLine }),
+				...(sourceSpan === undefined ? {} : { source_span: sourceSpan }),
 				...(page === undefined ? {} : { page }),
 				...(x === undefined ? {} : { x }),
 				...(y === undefined ? {} : { y }),
@@ -617,6 +644,7 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 		}
 		case "pdf_annotation": {
 			const sourceLine = optionalString(message.source_line, "source_line");
+			const sourceSpan = optionalSourceSpan(message.source_span, "source_span");
 			const comment = optionalString(message.comment, "comment");
 			return {
 				type,
@@ -628,6 +656,7 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				source_file: requireNonEmptyString(message.source_file, "source_file"),
 				line: requirePositiveInteger(message.line, "line"),
 				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
+				...(sourceSpan === undefined ? {} : { source_span: sourceSpan }),
 				...(comment === undefined ? {} : { comment }),
 			};
 		}

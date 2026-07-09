@@ -72,6 +72,25 @@ test("PDF mark context keeps absolute source paths outside cwd", () => {
 	assert.equal(result.text, "## PDF marks from the User\n\n- `/tmp/outside/main.tex:3` — `outside`");
 });
 
+test("PDF mark context formats source spans instead of only the clicked line", () => {
+	const result = collectPostUserPdfContextFromEvents([{
+		type: "pdf_annotation",
+		sequence: 1,
+		pdf_id: 1,
+		annotation_id: "span",
+		timestamp: "2026-06-29T12:00:00.000Z",
+		source_file: "/tmp/workspace/main.tex",
+		line: 157,
+		source_line: "}",
+		source_span: { source_file: "/tmp/workspace/main.tex", start_line: 135, end_line: 156 },
+		page: 1,
+		x: 1,
+		y: 1,
+	}], { cwd: "/tmp/workspace", clearViewer: true });
+
+	assert.equal(result.text, "## PDF marks from the User\n\n- `main.tex:135-156` — `}`");
+});
+
 function eventInput(pdfId: number, line: number): ReverseSynctexPdfEventInput {
 	return {
 		type: "reverse_synctex",
@@ -110,12 +129,13 @@ test("Viewer Host MCP service fetches context and clears consumed viewer annotat
 			source_file: join(dir, "main.tex"),
 			line: 7,
 			source_line: "marked source",
+			source_span: { source_file: join(dir, "main.tex"), start_line: 5, end_line: 8 },
 			comment: "user note",
 		});
 
 		const result = await service.fetchPdfContext({ pdf_id: 513, max_events: 5, cwd: dir });
 
-		assert.equal(result.text, "## PDF marks from the User\n\n- `main.tex:7` — `marked source`\n  User comment: user note");
+		assert.equal(result.text, "## PDF marks from the User\n\n- `main.tex:5-8` — `marked source`\n  User comment: user note");
 		assert.deepEqual(client.messages.at(-1), { type: "clear_pdf_annotations", pdf_id: 513 });
 		assert.deepEqual(await service.getPdfEvents({ pdf_id: 513, max_events: 5 }), []);
 	} finally {

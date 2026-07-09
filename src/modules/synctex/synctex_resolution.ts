@@ -17,6 +17,7 @@ import {
 	mapReverseSynctex,
 	type ForwardSynctexJump,
 	type MapForwardSynctexInput,
+	type ReverseSynctexFormulaSpan,
 } from "./forward_synctex.ts";
 
 export type ReverseSynctexMapper = typeof mapReverseSynctex;
@@ -25,6 +26,10 @@ export interface RegisteredSynctexPdf {
 	pdfId: number;
 	pdfPath: string;
 	workspaceCwd?: string;
+}
+
+function sourceSpanPayload(span: ReverseSynctexFormulaSpan | undefined): { source_file: string; start_line: number; end_line: number } | undefined {
+	return span === undefined ? undefined : { source_file: span.sourceFile, start_line: span.startLine, end_line: span.endLine };
 }
 
 export function prewarmSynctexForPdf(pdfPath: string): void {
@@ -170,12 +175,8 @@ export function reverseSynctexPdfEventFromViewerMessage(input: {
 			raw_mapped_column: location.rawMappedColumn,
 			...(location.rawMappedSourceLine === undefined ? {} : { raw_mapped_source_line: location.rawMappedSourceLine }),
 		}),
-		...(location.normalizedFormulaSpan === undefined ? {} : {
-			normalized_formula_span: {
-				source_file: location.normalizedFormulaSpan.sourceFile,
-				start_line: location.normalizedFormulaSpan.startLine,
-				end_line: location.normalizedFormulaSpan.endLine,
-			},
+		...(sourceSpanPayload(location.normalizedFormulaSpan) === undefined ? {} : {
+			normalized_formula_span: sourceSpanPayload(location.normalizedFormulaSpan)!,
 			normalized_formula_excerpt: location.normalizedFormulaExcerpt,
 		}),
 	};
@@ -259,6 +260,7 @@ export function reverseSynctexForwardProbeResult(input: { message: ViewerHostRev
 		reverse_line: probe.reverse.line,
 		reverse_column: probe.reverse.column,
 		...(probe.reverse.sourceLine === undefined ? {} : { reverse_source_line: probe.reverse.sourceLine }),
+		...(sourceSpanPayload(probe.reverse.normalizedFormulaSpan) === undefined ? {} : { source_span: sourceSpanPayload(probe.reverse.normalizedFormulaSpan)! }),
 		page: probe.forward.page,
 		x: probe.forward.x,
 		y: probe.forward.y,

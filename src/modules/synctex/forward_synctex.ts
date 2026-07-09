@@ -177,6 +177,8 @@ export interface ReverseSynctexHoverInspection {
 	topCandidates?: unknown[];
 	repairedWinner?: { sourceFile: string; line: number; column: number; sourceLine?: string; precision: ReverseSynctexPrecision; score?: number };
 	forwardVerification?: ReverseSynctexDiagnostics["forwardVerification"];
+	normalizedFormulaSpan?: ReverseSynctexFormulaSpan;
+	normalizedFormulaExcerpt?: string;
 	rect: { left: number; top: number; right: number; bottom: number };
 	distanceFromCenter: number;
 }
@@ -956,9 +958,53 @@ function findDisplayMathSpanFromOpen(lines: string[], openLineIndex: number): { 
 	return undefined;
 }
 
+function isEscapedTeXBrace(line: string, charIndex: number): boolean {
+	let slashCount = 0;
+	for (let index = charIndex - 1; index >= 0 && line[index] === "\\"; index -= 1) {
+		slashCount += 1;
+	}
+	return slashCount % 2 === 1;
+}
+
+function findLastUnescapedCloseBrace(line: string): number | undefined {
+	for (let index = line.length - 1; index >= 0; index -= 1) {
+		if (line[index] === "}" && !isEscapedTeXBrace(line, index)) return index;
+	}
+	return undefined;
+}
+
+function findBracedMacroSpanFromClose(lines: string[], closeLineIndex: number): { startLine: number; endLine: number; excerpt: string } | undefined {
+	const closeLine = lines[closeLineIndex] ?? "";
+	const closeBraceIndex = findLastUnescapedCloseBrace(closeLine);
+	if (closeBraceIndex === undefined) return undefined;
+	let depth = 1;
+	for (let lineIndex = closeLineIndex; lineIndex >= 0; lineIndex -= 1) {
+		const line = lines[lineIndex] ?? "";
+		const startChar = lineIndex === closeLineIndex ? closeBraceIndex - 1 : line.length - 1;
+		for (let charIndex = startChar; charIndex >= 0; charIndex -= 1) {
+			const char = line[charIndex];
+			if ((char !== "{" && char !== "}") || isEscapedTeXBrace(line, charIndex)) continue;
+			if (char === "}") depth += 1;
+			else {
+				depth -= 1;
+				if (depth === 0) {
+					const startLine = lineIndex + 1;
+					const endLine = closeLineIndex;
+					if (endLine < startLine) return undefined;
+					return { startLine, endLine, excerpt: lines.slice(lineIndex, closeLineIndex).join("\n") };
+				}
+			}
+		}
+	}
+	return undefined;
+}
+
 function firstFormulaContentLine(span: { startLine: number; endLine: number }, sourceLines: string[]): number | undefined {
-	for (let line = span.startLine + 1; line < span.endLine; line += 1) {
-		if ((sourceLines[line - 1] ?? "").trim()) return line;
+	for (let line = span.startLine + 1; line <= span.endLine; line += 1) {
+		const trimmed = (sourceLines[line - 1] ?? "").trim();
+		if (!trimmed) continue;
+		if (line === span.endLine && (trimmed === "\\]" || formulaEnvironmentClose(trimmed) !== undefined)) continue;
+		return line;
 	}
 	return undefined;
 }
@@ -972,6 +1018,7 @@ function normalizeFormulaSpan(sourceFile: string, line: number, sourceLines: str
 	let span: { startLine: number; endLine: number; excerpt: string } | undefined;
 	if (trimmed === "\\]") span = findDisplayMathSpanFromClose(sourceLines, lineIndex);
 	else if (trimmed === "\\[") span = findDisplayMathSpanFromOpen(sourceLines, lineIndex);
+	else if (trimmed === "}") span = findBracedMacroSpanFromClose(sourceLines, lineIndex);
 	else {
 		const environment = formulaEnvironmentClose(sourceLine);
 		span = environment === undefined ? undefined : findFormulaEnvironmentSpan(sourceLines, lineIndex, environment);
@@ -1070,6 +1117,8 @@ function reverseLocationToHoverInspection(location: ReverseSynctexLocation): Rev
 		...(location.diagnostics.topCandidates === undefined ? {} : { topCandidates: location.diagnostics.topCandidates }),
 		repairedWinner: { sourceFile: location.sourceFile, line: location.line, column: location.column, ...(location.sourceLine === undefined ? {} : { sourceLine: location.sourceLine }), precision: location.precision, ...(location.diagnostics.selected.score === undefined ? {} : { score: location.diagnostics.selected.score }) },
 		...(location.diagnostics.forwardVerification === undefined ? {} : { forwardVerification: location.diagnostics.forwardVerification }),
+		...(location.normalizedFormulaSpan === undefined ? {} : { normalizedFormulaSpan: location.normalizedFormulaSpan }),
+		...(location.normalizedFormulaExcerpt === undefined ? {} : { normalizedFormulaExcerpt: location.normalizedFormulaExcerpt }),
 		rect: rectFromDiagnostics(location.diagnostics),
 		distanceFromCenter: 0,
 	};

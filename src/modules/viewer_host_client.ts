@@ -808,6 +808,7 @@ export class ViewerHostMcpService {
 				source_file: parsed.source_file,
 				line: parsed.line,
 				...(parsed.source_line === undefined ? {} : { source_line: parsed.source_line }),
+				...(parsed.source_span === undefined ? {} : { source_span: parsed.source_span }),
 				page: parsed.page,
 				x: parsed.x,
 				y: parsed.y,

@@ -60,6 +60,7 @@ export interface PdfAnnotationEventInput {
 	source_file: string;
 	line: number;
 	source_line?: string;
+	source_span?: ReverseSynctexFormulaSpanEvent;
 	page: number;
 	x: number;
 	y: number;
