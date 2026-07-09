@@ -57,6 +57,7 @@ const ANNOTATION_BUBBLE_MIN_WIDTH_PX = 220;
 const ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX = 360;
 const ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX = 12;
 const SELECTION_DEBUG_TEXT_MAX_LENGTH = 2000;
+const COMPILE_RUNNING_INDICATOR_DELAY_MS = 500;
 
 const hostState = {
   config: initialConfig,
@@ -70,10 +71,12 @@ const hostState = {
   debugSynctexEnabled: false,
   lastPdfLoadSource: "url",
   compileRunning: false,
+  compileRunningIndicator: false,
   continuousCompile: false,
   compileDiagnostic: undefined,
 };
 const compileStateByPdfId = new Map();
+const compileRunningIndicatorTimersByPdfId = new Map();
 let activeRefreshLoadingTask;
 let activeSocket;
 let reconnectTimer;
@@ -464,17 +467,51 @@ function sendCompileAction(action, extra = {}) {
 }
 
 function compileStateForPdfId(pdfId) {
-  return compileStateByPdfId.get(Number(pdfId)) ?? { running: false, continuous: false, diagnostic: undefined };
+  return compileStateByPdfId.get(Number(pdfId)) ?? { running: false, runningIndicator: false, continuous: false, diagnostic: undefined };
+}
+
+function clearCompileRunningIndicatorTimer(pdfId) {
+  const key = Number(pdfId);
+  const timer = compileRunningIndicatorTimersByPdfId.get(key);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  compileRunningIndicatorTimersByPdfId.delete(key);
+}
+
+function scheduleCompileRunningIndicator(pdfId) {
+  const key = Number(pdfId);
+  if (!Number.isInteger(key) || key <= 0 || compileRunningIndicatorTimersByPdfId.has(key)) return;
+  const timer = setTimeout(() => {
+    compileRunningIndicatorTimersByPdfId.delete(key);
+    const state = compileStateForPdfId(key);
+    if (state.running !== true) return;
+    compileStateByPdfId.set(key, { ...state, runningIndicator: true });
+    if (key === activePdfId()) {
+      hostState.compileRunningIndicator = true;
+      updateHostDataset();
+      updateCompileToolbarButtons();
+    }
+  }, COMPILE_RUNNING_INDICATOR_DELAY_MS);
+  compileRunningIndicatorTimersByPdfId.set(key, timer);
 }
 
 function setCompileStateForPdfId(pdfId, nextState) {
   const key = Number(pdfId);
   if (!Number.isInteger(key) || key <= 0) return;
   const current = compileStateForPdfId(key);
-  compileStateByPdfId.set(key, { ...current, ...nextState });
+  const next = { ...current, ...nextState };
+  if (nextState.running === true) {
+    if (current.running !== true && nextState.runningIndicator === undefined) next.runningIndicator = false;
+  } else if (nextState.running === false) {
+    clearCompileRunningIndicatorTimer(key);
+    next.runningIndicator = false;
+  }
+  compileStateByPdfId.set(key, next);
+  if (next.running === true && next.runningIndicator !== true) scheduleCompileRunningIndicator(key);
   if (key === activePdfId()) {
     const state = compileStateByPdfId.get(key);
     hostState.compileRunning = state.running === true;
+    hostState.compileRunningIndicator = state.runningIndicator === true;
     hostState.continuousCompile = state.continuous === true;
     hostState.compileDiagnostic = state.diagnostic;
   }
@@ -483,6 +520,7 @@ function setCompileStateForPdfId(pdfId, nextState) {
 function applyCompileStateForActivePdf() {
   const state = compileStateForPdfId(activePdfId());
   hostState.compileRunning = state.running === true;
+  hostState.compileRunningIndicator = state.runningIndicator === true;
   hostState.continuousCompile = state.continuous === true;
   hostState.compileDiagnostic = state.diagnostic;
   updateHostDataset();
@@ -495,13 +533,13 @@ function updateCompileToolbarButtons() {
   const continuousButton = document.getElementById("hostContinuousCompileButton");
   if (compileButton) {
     const disabledByContinuous = hostState.continuousCompile && !hostState.compileRunning;
-    compileButton.classList.toggle("hostCompileRunning", hostState.compileRunning);
+    compileButton.classList.toggle("hostCompileRunning", hostState.compileRunningIndicator);
     compileButton.disabled = disabledByContinuous;
     compileButton.title = hostState.compileRunning ? "Stop compilation" : disabledByContinuous ? "Compile once is disabled while continuous compilation is enabled" : "Compile once";
     compileButton.setAttribute("aria-label", compileButton.title);
     const icon = compileButton.querySelector("span");
     icon.textContent = "";
-    icon.className = hostState.compileRunning ? "hostCompileStopIcon" : "hostCompileOnceIcon";
+    icon.className = hostState.compileRunningIndicator ? "hostCompileStopIcon" : "hostCompileOnceIcon";
   }
   if (continuousButton) {
     continuousButton.classList.toggle("hostContinuousCompileActive", hostState.continuousCompile);
