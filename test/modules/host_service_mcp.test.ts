@@ -1599,8 +1599,8 @@ test("daemon renders show_latex through compile flow", async () => {
 		const resultText = response.result.content[0].text;
 		assert.doesNotMatch(resultText, /\.pdf/);
 		assert.doesNotMatch(resultText, /Log: .*\.log/);
-		assert.match(resultText, /Source: \.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex/);
-		assert.match(resultText, /Source dir: /);
+		assert.match(resultText, /Editable source: \.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex/);
+		assert.doesNotMatch(resultText, /Source dir: /);
 		assert.match(response.result.details?.log ?? "", /\.log/);
 		assert.match(response.result.details?.source ?? "", /\.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex/);
 		assert.equal(response.result.details?.source_dir, dirname(response.result.details?.source ?? ""));
@@ -1612,7 +1612,7 @@ test("daemon renders show_latex through compile flow", async () => {
 	}
 });
 
-test("daemon show_latex reports source directory on compile errors", async () => {
+test("daemon show_latex reports editable source on compile errors", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "host-service-mcp-show-error-"));
 	const source = join(baseDir, "snippet.tex");
 	const sourceDir = dirname(source);
@@ -1659,7 +1659,8 @@ test("daemon show_latex reports source directory on compile errors", async () =>
 			} as never,
 		}) as unknown as { result: { isError?: boolean; content: Array<{ text: string }>; details?: { source_dir?: string } } };
 		assert.equal(response.result.isError, true);
-		assert.match(response.result.content[0].text, /Source dir: /);
+		assert.match(response.result.content[0].text, /Editable source: /);
+		assert.doesNotMatch(response.result.content[0].text, /Source dir: /);
 		assert.equal(response.result.details?.source_dir, sourceDir);
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
@@ -1701,7 +1702,8 @@ test("daemon show_latex compiles, opens, and returns a managed PDF id", async ()
 		assert.equal(response.result.details.managed_record, undefined);
 		assert.equal(response.result.details.pdf, undefined);
 		assert.match(response.result.content[0].text, /pdf_id=\d+/);
-		assert.match(response.result.content[0].text, /Source dir: /);
+		assert.match(response.result.content[0].text, /Editable source: /);
+		assert.doesNotMatch(response.result.content[0].text, /Source dir: /);
 		assert.equal(response.result.details.source_dir, dirname(response.result.details.source ?? ""));
 		assert.equal(backend.openRequests.length, 1);
 		assert.notEqual(backend.openRequests[0]?.details.pdf_path, getMcpFixedPreviewPdfPath());

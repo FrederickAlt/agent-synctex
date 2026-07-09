@@ -105,7 +105,7 @@ test("show_latex uses preamble_root_file to wrap source, compiles once with Sync
 			assert.equal(typeof result.details.source_dir, "string");
 			assert.equal(typeof result.details.log, "string");
 			assert.equal(result.details.viewer_url, undefined);
-			assert.match(result.content[0].text, /^ok: pdf_id=4242\nSource: \.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex\nSource dir: \.agent-synctex\/tmp/);
+			assert.match(result.content[0].text, /^ok: pdf_id=4242\nEditable source: \.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex$/);
 			assert.doesNotMatch(JSON.stringify(result), /127\.0\.0\.1|viewer_url/);
 			assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf"]);
 			assert.equal(result.details.inline, undefined);

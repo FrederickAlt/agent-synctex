@@ -1,4 +1,4 @@
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { HostServiceCompileService } from "./host_service_compile.ts";
 import type { GetPdfEventsRequest, PdfEvent } from "./pdf_events.ts";
 import { normalizeFetchPdfContextRequest, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
@@ -416,17 +416,14 @@ function agentFacingCompileDetails<T extends Record<string, unknown> & { warning
 	return { ...filteredDetails, warnings_hidden: true };
 }
 
-function formatSourceDirectoryNotice(details: { source?: unknown; source_dir?: unknown; workspace_context?: unknown }, includeSourceDirectory: boolean): string {
-	if (!includeSourceDirectory) return "";
+function formatEditableSourceNotice(details: { source?: unknown; workspace_context?: unknown }, includeSource: boolean): string {
+	if (!includeSource) return "";
 	if (typeof details.source !== "string" || details.source.length === 0) return "";
 	const cwd = isRecord(details.workspace_context) && typeof details.workspace_context.cwd === "string"
 		? details.workspace_context.cwd
 		: undefined;
 	const source = agentFacingPath(details.source, cwd);
-	const sourceDir = agentFacingPath(typeof details.source_dir === "string" && details.source_dir.length > 0
-		? details.source_dir
-		: dirname(details.source), cwd);
-	return `\nSource: ${source}\nSource dir: ${sourceDir}`;
+	return `\nEditable source: ${source}`;
 }
 
 function agentFacingPath(path: string, cwd: string | undefined): string {
@@ -455,8 +452,8 @@ function parseToolResult(
 		const exitCode = details.compile_status === "nonzero_but_pdf_updated" ? ` exit_code=${details.compiler_exit_code ?? "unknown"}` : "";
 		const cleanOk = status === "ok" && !details.warning_count;
 		const log = !cleanOk && details.log ? `\nLog: ${details.log}` : "";
-		const sourceDirectory = formatSourceDirectoryNotice(details, options.includeSourceDirectory === true);
-		const text = `${status}:${pdfId}${exitCode}${warningCount}${log}${formatDiagnosticSummary(details, options.hideWarnings === true)}${sourceDirectory}`.trim();
+		const sourceNotice = formatEditableSourceNotice(details, options.includeSourceDirectory === true);
+		const text = `${status}:${pdfId}${exitCode}${warningCount}${log}${formatDiagnosticSummary(details, options.hideWarnings === true)}${sourceNotice}`.trim();
 		return {
 			content: [{ type: "text", text: appendViewerUrlAgentNotice(text, details as unknown as Record<string, unknown>) }],
 			details: agentFacingCompileDetails(details as unknown as Record<string, unknown> & typeof details, options.hideWarnings === true),
@@ -465,10 +462,10 @@ function parseToolResult(
 	const errorCode = typeof details.error_code === "string" ? ` (code=${details.error_code})` : "";
 	const summary = typeof details.error_summary === "string" && details.error_summary ? `\n${details.error_summary}` : "";
 	const log = details.log ? `\nLog: ${details.log}` : "";
-	const sourceDirectory = formatSourceDirectoryNotice(details, options.includeSourceDirectory === true);
+	const sourceNotice = formatEditableSourceNotice(details, options.includeSourceDirectory === true);
 	return {
 		isError: true,
-		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}${sourceDirectory}` }],
+		content: [{ type: "text", text: `${response.error || "compile failed"}${errorCode}${summary}${log}${sourceNotice}` }],
 		details: agentFacingDetails(details as unknown as Record<string, unknown>) as unknown as typeof details,
 	};
 }
@@ -611,7 +608,7 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 	const tools: McpToolDefinition[] = [
 		{
 			name: "show_latex",
-			description: "Render LaTeX as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Without preamble_root_file, source must be a complete LaTeX document. With preamble_root_file, the discovered preamble for that LaTeX root wraps either a \\begin{document}...\\end{document} body or document body content. The response includes the generated .tex source path and source directory so callers can edit it and recompile. If a browser viewer is detected after launch/focus, the tool returns only pdf_id plus that source location because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
+			description: "Render LaTeX as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Without preamble_root_file, source must be a complete LaTeX document. With preamble_root_file, the discovered preamble for that LaTeX root wraps either a \\begin{document}...\\end{document} body or document body content. The response includes the generated editable .tex source path so callers can edit it and recompile. If a browser viewer is detected after launch/focus, the tool returns only pdf_id plus that source location because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
 			inputSchema: {
 				type: "object",
 				properties: {
