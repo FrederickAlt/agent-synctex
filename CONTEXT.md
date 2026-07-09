@@ -40,7 +40,7 @@ The exported MCP tools are:
 - `open_pdf`
 - `jump_pdf`
 - `set_latex_preamble`
-- `fetch_pdf_context` (pure MCP mode only; hidden when launched with `--with-hooks`)
+- `fetch_pdf_context` (manual/no-hooks mode only; hidden in hook-capable harness mode)
 
 Tool handlers delegate PDF operations through the `HostServiceMcpPdfOperations` interface in `src/modules/host_service_mcp.ts`. In normal stdio runtime, those operations come from `ViewerHostMcpService.pdfOperations` in `src/modules/viewer_host_client.ts`.
 
@@ -283,7 +283,7 @@ Agent flow:
 2. Host queues/drains messages or sends them to MCP event sink.
 3. `ViewerHostMcpService.getPdfEvents` drains Host events for internal consumers.
 4. Reverse SyncTeX messages are resolved through SyncTeX resolution.
-5. In pure MCP mode, agents receive concise marked-comment context through `fetch_pdf_context`; in hook-aware mode (`--with-hooks`), harness hooks inject that context before the model turn.
+5. In manual/no-hooks mode, agents receive concise marked-comment context through `fetch_pdf_context`; in hook-capable harness mode, harness hooks inject that context before the model turn.
 
 ## Important tests and verification targets
 

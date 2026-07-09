@@ -19,8 +19,8 @@ Agent SyncTeX must inject PDF marks/comments into the current agent turn without
   - `agent-synctex install hooks --harness <harness> [--local|--scope project|user]`
 - Use `agent-synctex fetch-info --harness <harness>` from harness hooks.
 - Never advertise `get_pdf_events`.
-- Hide `fetch_pdf_context` when installed hooks inject PDF context automatically.
-- Show `fetch_pdf_context` in explicit `--no-hooks`, missing-harness fallback, or missing-hooks modes.
+- Hide `fetch_pdf_context` in hook-capable harness mode; hooks inject PDF context automatically.
+- Show `fetch_pdf_context` only in explicit `--no-hooks` or missing-harness fallback modes.
 - Clear consumed viewer marks/comments after successful collection.
 - Generate only managed hook/plugin/extension files containing `Managed by agent-synctex`.
 - Uninstall only managed entries/files.
@@ -41,7 +41,7 @@ Result: MCP config launches `agent-synctex mcp --harness claude --no-hooks`, and
 agent-synctex install --harness claude
 ```
 
-Result: MCP config launches `agent-synctex mcp --harness claude`; hooks call `agent-synctex fetch-info --harness claude`; `fetch_pdf_context` is hidden once managed hooks are detected.
+Result: MCP config launches `agent-synctex mcp --harness claude`; hooks call `agent-synctex fetch-info --harness claude`; `fetch_pdf_context` is hidden in hook-capable mode.
 
 ### Missing harness fallback
 
@@ -68,14 +68,14 @@ agent-synctex doctor --harness auto|all|claude|codex|cline|pi|opencode [--scope 
 
 ## MCP launch modes
 
-- `agent-synctex mcp --harness <harness>`: hook-capable mode. Starts a private bridge named `agent-synctex-<harness>` and hides `fetch_pdf_context` only when managed hooks are installed.
+- `agent-synctex mcp --harness <harness>`: hook-capable mode. Starts a private bridge named `agent-synctex-<harness>` and hides `fetch_pdf_context`.
 - `agent-synctex mcp --harness <harness> --no-hooks`: explicit manual mode. Does not start the bridge and advertises `fetch_pdf_context`.
 - `agent-synctex mcp`: missing-harness fallback. Behaves like no-hooks and warns.
 
 ## Context format
 
 ```md
-## PDF marks from Agent SyncTeX
+## PDF marks from the User
 
 - `main.tex:42` — `E = mc^2`
   User comment: Check notation here.
@@ -95,6 +95,6 @@ agent-synctex doctor --harness auto|all|claude|codex|cline|pi|opencode [--scope 
 - Generated configs use `agent-synctex mcp --harness <harness>` unless `--no-hooks` is requested.
 - Hook helpers use `agent-synctex fetch-info --harness <harness>`.
 - `get_pdf_events` is not advertised.
-- `fetch_pdf_context` visibility follows runtime hook mode and install state.
+- `fetch_pdf_context` visibility follows runtime hook mode: visible in no-hooks/manual mode, hidden in hook-capable mode.
 - Consumed viewer marks/comments are cleared.
 - `npm run check`, `npm test`, `npm pack`, and `npm publish --dry-run` pass.

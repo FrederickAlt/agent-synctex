@@ -191,6 +191,31 @@ test("stdio runtime prints viewer URL to the agent when no live browser viewer i
 });
 
 
+test("stdio runtime hides fetch_pdf_context in hook-capable mode even before managed hooks are detected", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-hook-capable-no-fetch-"));
+	const launchCwd = join(baseDir, "project");
+	const runtimeRoot = join(baseDir, "runtime");
+	mkdirSync(launchCwd, { recursive: true });
+	try {
+		await withRuntimeEnv(runtimeRoot, async () => {
+			const stdin = new PassThrough();
+			const stdout = new PassThrough();
+			const runtime = new TexActionsStdioMcpRuntime({ stdin, stdout, stderr: new PassThrough(), launchCwd, hookMode: { kind: "hook-capable", harness: "codex", hooksInstalled: false }, pdfOperations: {} });
+			try {
+				runtime.start();
+				const output = collectMcpFrames(stdout, 1);
+				stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+				const [toolsList] = await output as Array<{ result: { tools: Array<{ name: string }> } }>;
+				assert.equal(toolsList.result.tools.some((tool) => tool.name === "fetch_pdf_context"), false);
+			} finally {
+				runtime.close();
+			}
+		});
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("stdio runtime hides fetch_pdf_context when user/global managed hooks are installed", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-global-hooks-"));
 	const launchCwd = join(baseDir, "project");

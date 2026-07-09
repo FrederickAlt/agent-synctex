@@ -2,7 +2,7 @@
 
 ## Status
 
-**Native for current-turn injection.** Codex CLI supports `UserPromptSubmit`; plain stdout or `hookSpecificOutput.additionalContext` is added as extra developer context before the prompt proceeds. Current Codex hooks are command hooks, so the hook itself must call your helper or sidecar.
+**Native for current-turn injection.** Codex CLI supports `UserPromptSubmit`; plain stdout or `hookSpecificOutput.additionalContext` is added as extra context before the prompt proceeds. Current Codex exposes `additionalContext` only as a string and chooses the injected message role itself, so Agent SyncTeX cannot force it to be a `user` message from the hook output. Current Codex hooks are command hooks, so the hook itself must call your helper or sidecar.
 
 ## Shared helper contract
 

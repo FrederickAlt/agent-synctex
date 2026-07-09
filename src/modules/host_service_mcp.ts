@@ -872,7 +872,7 @@ async function handleFetchPdfContextTool(
 	}
 	const result = await collectPdfContext(pdfOperations, request);
 	return buildSuccess(requestId, {
-		content: [{ type: "text", text: result.text || "No PDF marks from Agent SyncTeX are pending." }],
+		content: [{ type: "text", text: result.text || "No PDF marks from the User are pending." }],
 		details: {
 			pdf_ids: result.pdfIds,
 			event_count: result.eventCount,

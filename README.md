@@ -71,7 +71,7 @@ agent-synctex install --harness claude --no-hooks
 - `compile_latex_file` — compile a `.tex` file, optionally opening the PDF.
 - `open_pdf` — open/register an existing PDF.
 - `jump_pdf` — forward SyncTeX jump to a source line.
-- `fetch_pdf_context` — fetch pending PDF marks/comments as source-cited context. Hidden when hook-capable mode detects installed hooks.
+- `fetch_pdf_context` — fetch pending PDF marks/comments as source-cited context. Advertised only in manual/no-hooks mode; hook-capable harness mode uses prompt hooks instead.
 
 ## Development
 

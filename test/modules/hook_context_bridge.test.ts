@@ -81,7 +81,7 @@ test("hook context bridge requires bearer token and returns formatted context th
 	const bridge = startHookContextBridge({
 		runtimeDir,
 		fetchContext: async () => ({
-			text: "## PDF marks from Agent SyncTeX\n\n- `main.tex:42` — `x`\n  User comment: note",
+			text: "## PDF marks from the User\n\n- `main.tex:42` — `x`\n  User comment: note",
 			pdfIds: [1],
 			eventCount: 1,
 			cleared: true,
@@ -93,7 +93,7 @@ test("hook context bridge requires bearer token and returns formatted context th
 		const unauthorized = await fetch(discovery.url, { method: "POST" });
 		assert.equal(unauthorized.status, 401);
 		await withRuntimeEnv(join(baseDir, "runtime"), "bridge-agent", async () => {
-			assert.equal(await fetchHookContext({ prompt: "please use marks" }), "## PDF marks from Agent SyncTeX\n\n- `main.tex:42` — `x`\n  User comment: note");
+			assert.equal(await fetchHookContext({ prompt: "please use marks" }), "## PDF marks from the User\n\n- `main.tex:42` — `x`\n  User comment: note");
 		});
 	} finally {
 		await bridge.close();
@@ -152,7 +152,7 @@ test("stdio runtime with hooks starts bridge and fetch-info drains it", async ()
 			hooksEnabled: true,
 			pdfOperations: {
 				fetchPdfContext: async () => ({
-					text: "## PDF marks from Agent SyncTeX\n\n- `main.tex:7` — `y`",
+					text: "## PDF marks from the User\n\n- `main.tex:7` — `y`",
 					pdfIds: [9],
 					eventCount: 1,
 					cleared: true,
@@ -163,7 +163,7 @@ test("stdio runtime with hooks starts bridge and fetch-info drains it", async ()
 		try {
 			runtime.start();
 			await waitForFile(hookContextBridgeDiscoveryPath(join(runtimeRoot, "agents", "stdio-hooks-agent")));
-			assert.equal(await fetchHookContext({ prompt: "next prompt" }), "## PDF marks from Agent SyncTeX\n\n- `main.tex:7` — `y`");
+			assert.equal(await fetchHookContext({ prompt: "next prompt" }), "## PDF marks from the User\n\n- `main.tex:7` — `y`");
 		} finally {
 			runtime.close();
 		}
@@ -219,7 +219,7 @@ test("fetchHookContext falls back to persistent Viewer Host when MCP bridge is g
 		await new Promise((resolve) => setTimeout(resolve, 50));
 
 		const context = await fetchHookContext({ runtimeRoot, agentId: "agent-synctex-codex", cwd: baseDir });
-		assert.equal(context, "## PDF marks from Agent SyncTeX\n\n- `main.tex:1` — `Marked source line.`\n  User comment: fallback note");
+		assert.equal(context, "## PDF marks from the User\n\n- `main.tex:1` — `Marked source line.`\n  User comment: fallback note");
 		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "agent-synctex-codex", cwd: baseDir }), "");
 	} finally {
 		socket?.close();
@@ -237,7 +237,7 @@ test("agent-synctex fetch-info prints bridge context", async () => {
 	const bridge = startHookContextBridge({
 		runtimeDir,
 		fetchContext: async () => ({
-			text: "## PDF marks from Agent SyncTeX\n\n- `main.tex:9` — `z`",
+			text: "## PDF marks from the User\n\n- `main.tex:9` — `z`",
 			pdfIds: [2],
 			eventCount: 1,
 			cleared: true,
@@ -256,7 +256,7 @@ test("agent-synctex fetch-info prints bridge context", async () => {
 		child.stdin.end("prompt");
 		const code = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
 		assert.equal(code, 0);
-		assert.equal(stdout, "## PDF marks from Agent SyncTeX\n\n- `main.tex:9` — `z`");
+		assert.equal(stdout, "## PDF marks from the User\n\n- `main.tex:9` — `z`");
 	} finally {
 		await bridge.close();
 		rmSync(baseDir, { recursive: true, force: true });

@@ -227,7 +227,7 @@ export class TexActionsStdioMcpRuntime {
 	}
 
 	private exposeFetchPdfContext(): boolean {
-		return this.hookMode.kind === "no-hooks" || (this.hookMode.kind === "hook-capable" && this.hookMode.hooksInstalled !== true);
+		return this.hookMode.kind === "no-hooks";
 	}
 
 	private maybeAttachFirstToolCallWarning(response: unknown, payload: string): unknown {
@@ -313,7 +313,7 @@ function normalizeHookMode(options: TexActionsStdioMcpRuntimeOptions, cwd: strin
 
 function firstToolCallWarning(hookMode: StdioMcpHookMode): string | undefined {
 	if (hookMode.kind === "hook-capable" && hookMode.hooksInstalled !== true) {
-		return `Agent SyncTeX hooks are not installed for ${hookMode.harness}.\n\nAsk the user to run:\n  agent-synctex install --harness ${hookMode.harness}\n\nOr install project-locally:\n  agent-synctex install --harness ${hookMode.harness} --local\n\nUntil hooks are installed, use fetch_pdf_context for PDF marks/comments.`;
+		return `Agent SyncTeX hooks are not installed for ${hookMode.harness}.\n\nAsk the user to run:\n  agent-synctex install --harness ${hookMode.harness}\n\nOr install project-locally:\n  agent-synctex install --harness ${hookMode.harness} --local`;
 	}
 	if (hookMode.kind === "no-hooks" && hookMode.fallbackReason === "missing-harness") {
 		return `Agent SyncTeX was started without --harness, so it fell back to --no-hooks mode.\n\nFor automatic PDF comment injection, configure the MCP as:\n  agent-synctex mcp --harness <harness>\n\nFor intentional manual-only mode, configure:\n  agent-synctex mcp --no-hooks\n\nUse fetch_pdf_context manually for PDF marks/comments in this session.`;

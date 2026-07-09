@@ -46,7 +46,7 @@ export function collectPostUserPdfContextFromEvents(events: PdfEvent[], request:
 
 export function formatPdfAnnotationContext(events: PdfAnnotationEvent[], options: { cwd?: string } = {}): string {
 	if (events.length === 0) return "";
-	const lines = ["## PDF marks from Agent SyncTeX", ""];
+	const lines = ["## PDF marks from the User", ""];
 	for (const event of events) {
 		const sourceLine = sourceLineForEvent(event);
 		const sourceFile = displaySourceFile(event.source_file, options.cwd);

@@ -22,7 +22,7 @@ agent-synctex doctor --harness <harness|all> [--local|--scope project|user]
    - bridge discovery path uses `agent-synctex-claude`.
    - `tools/list` excludes `fetch_pdf_context` and `get_pdf_events`.
 3. `agent-synctex mcp --harness claude` without managed hooks
-   - `tools/list` includes `fetch_pdf_context`.
+   - `tools/list` excludes `fetch_pdf_context` and `get_pdf_events`.
    - first tool call returns the missing-hooks note once.
 4. `agent-synctex mcp` without `--harness` and without `--no-hooks`
    - stderr warns on launch.
@@ -39,7 +39,7 @@ agent-synctex doctor --harness <harness|all> [--local|--scope project|user]
 - Produces concise Markdown:
 
 ```md
-## PDF marks from Agent SyncTeX
+## PDF marks from the User
 
 - `main.tex:42` — `...source line...`
   User comment: ...
