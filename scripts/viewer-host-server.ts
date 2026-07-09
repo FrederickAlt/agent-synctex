@@ -22,16 +22,30 @@ function parseIdleTimeoutMs(value: string | undefined): number {
 	return timeout;
 }
 
+function parseHeartbeatLeaseMs(value: string | undefined): number {
+	if (value === undefined || value === "") return 5_000;
+	const timeout = Number(value);
+	if (!Number.isInteger(timeout) || timeout < 1) {
+		throw new Error(`AGENT_SYNCTEX_VIEWER_HOST_HEARTBEAT_LEASE_MS must be a positive integer, got ${JSON.stringify(value)}`);
+	}
+	return timeout;
+}
+
 const persistent = process.env.AGENT_SYNCTEX_PERSISTENT_VIEWER_HOST === "1";
 const idleTimeoutMs = parseIdleTimeoutMs(process.env.AGENT_SYNCTEX_VIEWER_HOST_IDLE_MS);
 const shutdownToken = process.env.AGENT_SYNCTEX_VIEWER_HOST_SHUTDOWN_TOKEN;
 const controlToken = process.env.AGENT_SYNCTEX_VIEWER_HOST_CONTROL_TOKEN;
+const heartbeatToken = process.env.AGENT_SYNCTEX_VIEWER_HOST_HEARTBEAT_TOKEN;
+const heartbeatOwnerId = process.env.AGENT_SYNCTEX_VIEWER_HOST_OWNER_ID;
+const heartbeatLeaseMs = parseHeartbeatLeaseMs(process.env.AGENT_SYNCTEX_VIEWER_HOST_HEARTBEAT_LEASE_MS);
+let lastHeartbeatAt = Date.now();
 const registry = new ViewerHostPdfRegistry();
 let stopping = false;
 const server = new ViewerHostServer({
 	registry,
 	port: parsePort(process.env.PDF_PREVIEW_VIEWER_HOST_PORT),
 	...(shutdownToken === undefined ? {} : { shutdownRequest: { token: shutdownToken, shutdown: (reason: string) => shutdown(reason) } }),
+	...(heartbeatToken === undefined || heartbeatOwnerId === undefined ? {} : { heartbeatRequest: { token: heartbeatToken, ownerId: heartbeatOwnerId, heartbeat: () => { lastHeartbeatAt = Date.now(); } } }),
 	...(controlToken === undefined ? {} : { controlToken }),
 });
 await server.start();
@@ -45,7 +59,13 @@ async function shutdown(reason: string): Promise<void> {
 
 stdout.write(JSON.stringify({ type: "ready", origin: server.origin, app_url: server.appUrl, address: server.address }) + "\n");
 
-if (persistent && idleTimeoutMs > 0) {
+if (persistent && heartbeatToken !== undefined && heartbeatOwnerId !== undefined) {
+	setInterval(() => {
+		if (Date.now() - lastHeartbeatAt >= heartbeatLeaseMs) {
+			void shutdown("heartbeat_timeout").then(() => process.exit(0));
+		}
+	}, Math.min(1_000, Math.max(50, Math.floor(heartbeatLeaseMs / 4)))).unref();
+} else if (persistent && idleTimeoutMs > 0) {
 	let lastActiveAt = Date.now();
 	setInterval(() => {
 		if (server.hasActiveViewerClients()) {

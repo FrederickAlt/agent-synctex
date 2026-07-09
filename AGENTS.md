@@ -33,6 +33,10 @@ Avoid reintroducing direct viewer-command spawning in production TypeScript. `te
 
 Reverse SyncTeX hover/debug overlays are intentionally not advertised in MCP tool schemas and should not be used during normal user work. Use them only when the user explicitly asks for SyncTeX/debug overlay diagnostics by passing `debug_synctex: true` to `show_latex`, `compile_latex_file` with `open_pdf: true`, `open_pdf`, or `jump_pdf`. Omit it or pass `debug_synctex: false` for the normal mode.
 
+## MCP runtime concurrency
+
+One agent session owns one MCP runtime. Normal request-flow coordination should assume a single MCP process per agent and serialize intra-runtime tool calls instead of adding cross-process locks. Add cross-process locks only for explicitly supported multi-process scenarios.
+
 ## Test guardrails
 
 Do not add tests that assert documentation files exist. Documentation may be absent, moved, or pruned in worktrees; tests should verify executable behavior, APIs, protocols, and production guardrails instead of using doc-file existence as a pass/fail condition.

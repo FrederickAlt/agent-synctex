@@ -28,6 +28,8 @@ export const MCP_ERROR_INTERNAL = -32603;
 const MCP_RUNTIME_PROTOCOL_VERSION = 1;
 const MCP_RUNTIME_REQUEST_PREFIX = "mcp-runtime";
 const MCP_DEFAULT_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
+const mcpCompileServicesByPdfOperations = new WeakMap<HostServiceMcpPdfOperations, HostServiceCompileService>();
+const mcpToolCallQueuesByPdfOperations = new WeakMap<HostServiceMcpPdfOperations, Promise<void>>();
 let mcpRuntimeRequestCounter = 0;
 
 export interface HostServiceMcpPdfOperations {
@@ -43,7 +45,11 @@ function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): Ho
 	if (pdfOperations.compileService) {
 		return pdfOperations.compileService;
 	}
-	return new HostServiceCompileService({
+	const existing = mcpCompileServicesByPdfOperations.get(pdfOperations);
+	if (existing) {
+		return existing;
+	}
+	const created = new HostServiceCompileService({
 		protocolVersion: MCP_RUNTIME_PROTOCOL_VERSION,
 		managedViewerService: {
 			async openViewer(openRequest) {
@@ -55,6 +61,9 @@ function createMcpCompileService(pdfOperations: HostServiceMcpPdfOperations): Ho
 			markPdfUpdated: pdfOperations.markTrackedPdfUpdated,
 		},
 	});
+	created.start();
+	mcpCompileServicesByPdfOperations.set(pdfOperations, created);
+	return created;
 }
 
 export type McpRequestId = string | number | null;
@@ -888,6 +897,50 @@ export function mcpFramedResponse(payload: McpResponsePayload): string {
 	return encodeResponse(payload);
 }
 
+async function enqueueMcpToolCall<T>(pdfOperations: HostServiceMcpPdfOperations, operation: () => Promise<T>): Promise<T> {
+	const previous = mcpToolCallQueuesByPdfOperations.get(pdfOperations) ?? Promise.resolve();
+	const queued = previous.then(operation, operation);
+	mcpToolCallQueuesByPdfOperations.set(pdfOperations, queued.then(() => undefined, () => undefined));
+	return await queued;
+}
+
+async function handleMcpToolCall(request: McpParsedRequest, pdfOperations: HostServiceMcpPdfOperations, options: HostServiceMcpOptions): Promise<McpResponsePayload> {
+	let call: { name: string; args: Record<string, unknown> };
+	try {
+		call = parseToolCallParams(request.params);
+	} catch (error) {
+		if (error instanceof McpRequestError) {
+			return buildMcpErrorResponse(request.id, MCP_ERROR_INVALID_PARAMS, error.message, error.data);
+		}
+		return buildMcpErrorResponse(request.id, MCP_ERROR_INTERNAL, error instanceof Error ? error.message : String(error));
+	}
+
+	if (!hostServiceToolNames(options).includes(call.name as HostServiceToolName)) {
+		return buildSuccess(request.id, {
+			isError: true,
+			content: [{ type: "text", text: `Tool not implemented by runtime: ${call.name}` }],
+		});
+	}
+
+	const mcpCompileService = createMcpCompileService(pdfOperations);
+	const toolHandlers: Record<HostServiceToolName, HostServiceMcpToolHandler> = {
+		show_latex: handleShowLatexTool,
+		compile_latex_file: handleCompileLatexFileTool,
+		open_pdf: handleOpenPdfTool,
+		jump_pdf: handleJumpPdfTool,
+		fetch_pdf_context: handleFetchPdfContextTool,
+	};
+	const handler = toolHandlers[call.name as HostServiceToolName] ?? null;
+	if (handler === null) {
+		return buildSuccess(request.id, {
+			isError: true,
+			content: [{ type: "text", text: `${call.name} is not yet implemented by the runtime` }],
+		});
+	}
+
+	return await handler(request.id, call.args, pdfOperations, mcpCompileService, options);
+}
+
 export async function handleMcpRequest(
 	rawPayload: string,
 	pdfOperations: HostServiceMcpPdfOperations = {},
@@ -931,42 +984,8 @@ export async function handleMcpRequest(
 			return buildSuccess(request.id, {
 				tools: mcpToolDescriptions(options),
 			});
-		case "tools/call": {
-			let call: { name: string; args: Record<string, unknown> };
-			try {
-				call = parseToolCallParams(request.params);
-			} catch (error) {
-				if (error instanceof McpRequestError) {
-					return buildMcpErrorResponse(request.id, MCP_ERROR_INVALID_PARAMS, error.message, error.data);
-				}
-				return buildMcpErrorResponse(request.id, MCP_ERROR_INTERNAL, error instanceof Error ? error.message : String(error));
-			}
-
-			if (!hostServiceToolNames(options).includes(call.name as HostServiceToolName)) {
-				return buildSuccess(request.id, {
-					isError: true,
-					content: [{ type: "text", text: `Tool not implemented by runtime: ${call.name}` }],
-				});
-			}
-
-			const mcpCompileService = createMcpCompileService(pdfOperations);
-			const toolHandlers: Record<HostServiceToolName, HostServiceMcpToolHandler> = {
-				show_latex: handleShowLatexTool,
-				compile_latex_file: handleCompileLatexFileTool,
-				open_pdf: handleOpenPdfTool,
-				jump_pdf: handleJumpPdfTool,
-				fetch_pdf_context: handleFetchPdfContextTool,
-			};
-			const handler = toolHandlers[call.name as HostServiceToolName] ?? null;
-			if (handler === null) {
-				return buildSuccess(request.id, {
-					isError: true,
-					content: [{ type: "text", text: `${call.name} is not yet implemented by the runtime` }],
-				});
-			}
-
-			return await handler(request.id, call.args, pdfOperations, mcpCompileService, options);
-		}
+		case "tools/call":
+			return await enqueueMcpToolCall(pdfOperations, () => handleMcpToolCall(request, pdfOperations, options));
 		default:
 			return buildMcpErrorResponse(request.id, MCP_ERROR_METHOD_NOT_FOUND, `method not found: ${request.method}`);
 	}

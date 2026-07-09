@@ -107,6 +107,13 @@ export class HostServiceCompileService {
 		this.cleanupSnippetArtifacts();
 	}
 
+	cancelActiveFileCompiles(reason = "compile stopped by viewer"): void {
+		const stoppedError = new HostServiceCompileCoordinationError(reason, "compile_cancelled");
+		for (const controller of this.activeCompileAbortControllers) {
+			controller.abort(stoppedError);
+		}
+	}
+
 	private recordLastCompileSuccess(
 		rootKey: string,
 		rootSource: string,
@@ -208,6 +215,14 @@ export class HostServiceCompileService {
 				async () => {
 					if (shouldClean) {
 						this.rootCompileCoordinator.clearLastResult(rootKey);
+					} else {
+						const cached = this.rootCompileCoordinator.freshCachedResult<LatexFileCompileResult>(rootKey, normalizedPath, compilerIdentity);
+						if (cached?.status === "success") {
+							return cached.value;
+						}
+						if (cached?.status === "failure") {
+							throw cached.error;
+						}
 					}
 					const compiledAfterMs = Date.now();
 					try {

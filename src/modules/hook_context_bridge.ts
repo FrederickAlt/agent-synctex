@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import { getMcpTmpDir } from "./runtime_paths.ts";
 import { resolveTexActionsHookInstanceCandidates, sanitizeTexActionsAgentId } from "./agent_runtime_context.ts";
 import { collectPostUserPdfContextFromEvents, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
@@ -18,6 +18,7 @@ export interface HookContextBridgeDiscovery {
 	url: string;
 	token: string;
 	createdAt: string;
+	cwd?: string;
 }
 
 export interface HookContextBridgeHandle {
@@ -28,6 +29,7 @@ export interface HookContextBridgeHandle {
 export interface HookContextBridgeOptions {
 	runtimeDir: string;
 	fetchContext(request: FetchPdfContextRequest): Promise<PostUserPdfContextResult> | PostUserPdfContextResult;
+	cwd?: string;
 	now?: () => Date;
 }
 
@@ -61,6 +63,7 @@ export function startHookContextBridge(options: HookContextBridgeOptions): HookC
 				url: `http://127.0.0.1:${address.port}/fetch_info`,
 				token,
 				createdAt: (options.now?.() ?? new Date()).toISOString(),
+				...(options.cwd === undefined ? {} : { cwd: resolvePath(options.cwd) }),
 			};
 			writeFileSync(discoveryPath, `${JSON.stringify(discovery, null, 2)}\n`, { mode: 0o600 });
 			chmodSync(discoveryPath, 0o600);
@@ -114,15 +117,45 @@ export async function fetchHookContext(options: FetchHookContextOptions = {}): P
 	return await fetchPersistentViewerHostContext(options);
 }
 
-export function findHookContextBridgeDiscoveries(options: Pick<FetchHookContextOptions, "runtimeRoot" | "agentId"> = {}): HookContextBridgeDiscovery[] {
+export function findHookContextBridgeDiscoveries(options: Pick<FetchHookContextOptions, "runtimeRoot" | "agentId" | "cwd"> = {}): HookContextBridgeDiscovery[] {
 	const runtimeRoot = options.runtimeRoot ?? getMcpTmpDir();
 	const agentIds = options.agentId?.trim()
 		? [sanitizeTexActionsAgentId(options.agentId)]
 		: resolveTexActionsHookInstanceCandidates();
-	return agentIds
+	const direct = agentIds
 		.map((agentId) => hookContextBridgeDiscoveryPath(join(runtimeRoot, "agents", sanitizeTexActionsAgentId(agentId))))
 		.map(readDiscoveryFile)
 		.filter((entry): entry is HookContextBridgeDiscovery => entry !== undefined);
+	if (!options.cwd) return direct;
+	return uniqueDiscoveries([...direct, ...findHookContextBridgeDiscoveriesByCwd(runtimeRoot, options.cwd)]);
+}
+
+function findHookContextBridgeDiscoveriesByCwd(runtimeRoot: string, cwd: string): HookContextBridgeDiscovery[] {
+	const agentsDir = join(runtimeRoot, "agents");
+	let entries: string[];
+	try {
+		entries = readdirSync(agentsDir, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name);
+	} catch {
+		return [];
+	}
+	const resolvedCwd = resolvePath(cwd);
+	return entries
+		.map((agentId) => readDiscoveryFile(hookContextBridgeDiscoveryPath(join(agentsDir, agentId))))
+		.filter((entry): entry is HookContextBridgeDiscovery => entry !== undefined && entry.cwd !== undefined && resolvePath(entry.cwd) === resolvedCwd);
+}
+
+function uniqueDiscoveries(discoveries: HookContextBridgeDiscovery[]): HookContextBridgeDiscovery[] {
+	const seen = new Set<string>();
+	const unique: HookContextBridgeDiscovery[] = [];
+	for (const discovery of discoveries) {
+		const key = `${discovery.url}\0${discovery.token}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		unique.push(discovery);
+	}
+	return unique;
 }
 
 async function handleHookContextRequest(
@@ -267,6 +300,7 @@ function readDiscoveryFile(path: string): HookContextBridgeDiscovery | undefined
 		if (typeof raw.token !== "string" || raw.token.length < 16) return undefined;
 		if (typeof raw.pid !== "number" || !Number.isInteger(raw.pid) || raw.pid <= 0) return undefined;
 		if (typeof raw.createdAt !== "string") return undefined;
+		if (raw.cwd !== undefined && typeof raw.cwd !== "string") return undefined;
 		return raw as HookContextBridgeDiscovery;
 	} catch {
 		return undefined;

@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { HarnessId, InstallChange, InstallerContext } from "./types.ts";
 
 export const MCP_SERVER_NAME = "agent-synctex";
@@ -11,12 +12,28 @@ export function agentIdForHarness(harness: string): string {
 	return `agent-synctex-${harness}`;
 }
 
+export function agentSynctexMcpLaunchConfig(harness: HarnessId, noHooks: boolean): { command: string; args: string[] } {
+	return {
+		command: process.execPath,
+		args: [agentSynctexCliScriptPath(), "mcp", "--harness", harness, ...(noHooks ? ["--no-hooks"] : [])],
+	};
+}
+
 export function mcpServerConfig(harness: HarnessId, noHooks: boolean, extra: Record<string, unknown> = {}): Record<string, unknown> {
 	return {
-		command: "agent-synctex",
-		args: ["mcp", "--harness", harness, ...(noHooks ? ["--no-hooks"] : [])],
+		...agentSynctexMcpLaunchConfig(harness, noHooks),
 		...extra,
 	};
+}
+
+function agentSynctexCliScriptPath(): string {
+	const moduleDir = dirname(fileURLToPath(import.meta.url));
+	const candidates = [
+		resolve(moduleDir, "../../../scripts/agent-synctex.js"),
+		resolve(moduleDir, "../../../dist/scripts/agent-synctex.js"),
+		resolve(moduleDir, "../../../scripts/agent-synctex.ts"),
+	];
+	return candidates.find((candidate) => existsSync(candidate)) ?? resolve(moduleDir, "../../../scripts/agent-synctex.js");
 }
 
 export function change(description: string, path?: string): InstallChange {
@@ -105,9 +122,10 @@ export function removeMcpServersJson(ctx: InstallerContext, path: string): Insta
 export function upsertOpencodeMcp(ctx: InstallerContext, path: string, harness: HarnessId, noHooks: boolean): InstallChange[] {
 	const config = parseJsoncObject(path);
 	const current = isRecord(config.mcp) ? { ...config.mcp } : {};
+	const launchConfig = agentSynctexMcpLaunchConfig(harness, noHooks);
 	current[MCP_SERVER_NAME] = {
 		type: "local",
-		command: ["agent-synctex", "mcp", "--harness", harness, ...(noHooks ? ["--no-hooks"] : [])],
+		command: [launchConfig.command, ...launchConfig.args],
 		enabled: true,
 	};
 	config.mcp = current;

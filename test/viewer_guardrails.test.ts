@@ -64,7 +64,7 @@ const FORBIDDEN_RUNTIME_LITERAL_MARKERS = new Map<string, string>([
 	["tex-actions-host-service", "legacy host-service runtime metadata should not be in active graph"],
 ]);
 
-const FORBIDDEN_RUNTIME_SCHEMA_FIELDS = new Set(["inline", "continuous", "callback_target_id"]);
+const FORBIDDEN_RUNTIME_SCHEMA_FIELDS = new Set(["inline", "callback_target_id"]);
 
 const FORBIDDEN_ACTIVE_HANDLER_STRING_FIELDS_BY_FILE = new Map<string, Map<string, string>>([
 	["host_service_mcp.ts", new Map([

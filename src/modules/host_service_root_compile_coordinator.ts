@@ -50,23 +50,22 @@ interface RootCompileQueue {
 }
 
 export class HostServiceRootCompileCoordinator {
-	private readonly queues = new Map<string, RootCompileQueue>();
+	private readonly queue: RootCompileQueue = { items: [], running: false };
 	private readonly lastCompileResults = new Map<string, HostServiceRootCompileCacheRecord<unknown>>();
 	private stoppedError: HostServiceCompileCoordinationError | undefined;
 
-	runExclusive<T>(rootKey: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+	runExclusive<T>(_rootKey: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
 		if (this.stoppedError !== undefined) {
 			return Promise.reject(this.stoppedError);
 		}
 		if (signal?.aborted) {
 			return Promise.reject(new HostServiceCompileCoordinationError(
-				"compile request cancelled before entering root compile queue",
+				"compile request cancelled before entering compile queue",
 				"compile_cancelled",
 			));
 		}
 
 		return new Promise<T>((resolve, reject) => {
-			const queue = this.queueFor(rootKey);
 			const item: RootCompileQueueItem = {
 				operation,
 				resolve: (value) => resolve(value as T),
@@ -80,17 +79,17 @@ export class HostServiceRootCompileCoordinator {
 					if (item.started) {
 						return;
 					}
-					this.removeQueuedItem(rootKey, queue, item);
+					this.removeQueuedItem(item);
 					item.reject(new HostServiceCompileCoordinationError(
-						"compile request cancelled while waiting behind an active same-root compile",
+						"compile request cancelled while waiting behind an active compile",
 						"compile_cancelled",
 					));
 				};
 				signal.addEventListener("abort", item.onAbort, { once: true });
 			}
 
-			queue.items.push(item);
-			this.pump(rootKey, queue);
+			this.queue.items.push(item);
+			this.pump();
 		});
 	}
 
@@ -121,77 +120,58 @@ export class HostServiceRootCompileCoordinator {
 	}
 
 	stop(error = new HostServiceCompileCoordinationError(
-		"MCP runtime stopped while compile request was waiting behind an active same-root compile",
+		"MCP runtime stopped while compile request was waiting behind an active compile",
 		"runtime_stopped",
 	)): void {
 		this.stoppedError = error;
 		this.lastCompileResults.clear();
-		for (const [rootKey, queue] of this.queues) {
-			const pending = queue.items.filter((item) => !item.started);
-			queue.items = queue.items.filter((item) => item.started);
-			for (const item of pending) {
-				this.detachAbort(item);
-				item.reject(error);
-			}
-			if (queue.items.length === 0) {
-				this.queues.delete(rootKey);
-			}
+		const pending = this.queue.items.filter((item) => !item.started);
+		this.queue.items = this.queue.items.filter((item) => item.started);
+		for (const item of pending) {
+			this.detachAbort(item);
+			item.reject(error);
 		}
 	}
 
 	activeRootCount(): number {
-		return this.queues.size;
+		return this.queue.items.length > 0 ? 1 : 0;
 	}
 
-	private queueFor(rootKey: string): RootCompileQueue {
-		const existing = this.queues.get(rootKey);
-		if (existing !== undefined) {
-			return existing;
-		}
-		const created: RootCompileQueue = { items: [], running: false };
-		this.queues.set(rootKey, created);
-		return created;
-	}
-
-	private pump(rootKey: string, queue: RootCompileQueue): void {
-		if (queue.running) {
+	private pump(): void {
+		if (this.queue.running) {
 			return;
 		}
-		const item = queue.items[0];
+		const item = this.queue.items[0];
 		if (item === undefined) {
-			this.queues.delete(rootKey);
 			return;
 		}
 		if (this.stoppedError !== undefined) {
-			queue.items.shift();
+			this.queue.items.shift();
 			this.detachAbort(item);
 			item.reject(this.stoppedError);
-			this.pump(rootKey, queue);
+			this.pump();
 			return;
 		}
 
-		queue.running = true;
+		this.queue.running = true;
 		item.started = true;
 		this.detachAbort(item);
 		void item.operation()
 			.then((value) => item.resolve(value))
 			.catch((error) => item.reject(error))
 			.finally(() => {
-				queue.items.shift();
-				queue.running = false;
-				this.pump(rootKey, queue);
+				this.queue.items.shift();
+				this.queue.running = false;
+				this.pump();
 			});
 	}
 
-	private removeQueuedItem(rootKey: string, queue: RootCompileQueue, item: RootCompileQueueItem): void {
-		const index = queue.items.indexOf(item);
+	private removeQueuedItem(item: RootCompileQueueItem): void {
+		const index = this.queue.items.indexOf(item);
 		if (index >= 0) {
-			queue.items.splice(index, 1);
+			this.queue.items.splice(index, 1);
 		}
 		this.detachAbort(item);
-		if (!queue.running && queue.items.length === 0) {
-			this.queues.delete(rootKey);
-		}
 	}
 
 	private detachAbort(item: RootCompileQueueItem): void {

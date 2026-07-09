@@ -203,6 +203,128 @@ body {
     z-index: 10;
 }
 
+.hostCompileButton::before {
+    content: none !important;
+    display: none !important;
+    -webkit-mask-image: none !important;
+    mask-image: none !important;
+}
+
+.hostCompileButton:disabled {
+    opacity: .45;
+    cursor: default;
+}
+
+.hostCompileButton span {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    vertical-align: middle;
+    background: currentColor;
+    -webkit-mask-position: center;
+    mask-position: center;
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    -webkit-mask-size: 16px 16px;
+    mask-size: 16px 16px;
+}
+
+.hostCompileOnceIcon {
+    color: rgb(34 197 94);
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 2.5v11l9-5.5z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 2.5v11l9-5.5z'/%3E%3C/svg%3E");
+}
+
+.hostCompileStopIcon {
+    color: rgb(96 165 250);
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='3' y='3' width='10' height='10' rx='1.5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='3' y='3' width='10' height='10' rx='1.5'/%3E%3C/svg%3E");
+}
+
+.hostCompileLoopIcon {
+    color: var(--toolbar-icon-color, currentColor);
+    width: 16px;
+    height: 16px;
+    transform-origin: 50% 50%;
+    will-change: transform;
+    -webkit-mask-size: 12px 12px;
+    mask-size: 12px 12px;
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%20874.9%20874.9%27%3E%3Cpath%20d%3D%27M95.4%20709.5c30%2037.5%2065.6%2069.7%20106%2095.601%2041.1%2026.399%2086%2045.6%20133.4%2057L374.6%20696.8C317.3%20683%20265.3%20649.9%20228.3%20603.4%20190.2%20555.601%20170%20498%20170%20436.7c0-58.6%2018.6-114.1%2053.7-160.7%201.9-2.5%203.9-5.1%205.9-7.5l97%20125.7L435.4%208.4%2029%208.5l95%20123.1c-12.9%2013.2-24.9%2027.3-36.1%2042.1-28%2037.1-49.7%2078.2-64.6%20122C7.9%20341%200%20388.5%200%20436.8c0%2050.4%208.5%2099.801%2025.3%20146.9%2016.3%2045.6%2039.8%2087.901%2070.1%20125.8zM779.5%20168.4c-30-37.5-65.6-69.7-106-95.6-41.1-26.4-86-45.6-133.4-57l-39.799%20165.3C557.6%20194.9%20609.6%20228%20646.6%20274.5c38.1%2047.8%2058.301%20105.4%2058.301%20166.7%200%2058.6-18.6%20114.1-53.701%20160.7-2%202.7-4.1%205.3-6.299%208l-99.6-129.2L436.5%20866.5l406.401-.1-92.4-119.7c13-13.3%2025.199-27.5%2036.5-42.5%2028-37.1%2049.699-78.2%2064.6-122%2015.4-45.3%2023.301-92.8%2023.301-141.1%200-50.4-8.5-99.801-25.301-146.9C833.301%20248.6%20809.801%20206.3%20779.5%20168.4z%27%2F%3E%3C%2Fsvg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%20874.9%20874.9%27%3E%3Cpath%20d%3D%27M95.4%20709.5c30%2037.5%2065.6%2069.7%20106%2095.601%2041.1%2026.399%2086%2045.6%20133.4%2057L374.6%20696.8C317.3%20683%20265.3%20649.9%20228.3%20603.4%20190.2%20555.601%20170%20498%20170%20436.7c0-58.6%2018.6-114.1%2053.7-160.7%201.9-2.5%203.9-5.1%205.9-7.5l97%20125.7L435.4%208.4%2029%208.5l95%20123.1c-12.9%2013.2-24.9%2027.3-36.1%2042.1-28%2037.1-49.7%2078.2-64.6%20122C7.9%20341%200%20388.5%200%20436.8c0%2050.4%208.5%2099.801%2025.3%20146.9%2016.3%2045.6%2039.8%2087.901%2070.1%20125.8zM779.5%20168.4c-30-37.5-65.6-69.7-106-95.6-41.1-26.4-86-45.6-133.4-57l-39.799%20165.3C557.6%20194.9%20609.6%20228%20646.6%20274.5c38.1%2047.8%2058.301%20105.4%2058.301%20166.7%200%2058.6-18.6%20114.1-53.701%20160.7-2%202.7-4.1%205.3-6.299%208l-99.6-129.2L436.5%20866.5l406.401-.1-92.4-119.7c13-13.3%2025.199-27.5%2036.5-42.5%2028-37.1%2049.699-78.2%2064.6-122%2015.4-45.3%2023.301-92.8%2023.301-141.1%200-50.4-8.5-99.801-25.301-146.9C833.301%20248.6%20809.801%20206.3%20779.5%20168.4z%27%2F%3E%3C%2Fsvg%3E");
+}
+
+#hostContinuousCompileButton.hostContinuousCompileActive {
+    background: rgb(37 99 235 / .35);
+    border-radius: 4px;
+}
+
+#hostContinuousCompileButton.hostContinuousCompileActive .hostCompileLoopIcon,
+body[data-host-lw-continuous-compile="true"] #hostContinuousCompileButton .hostCompileLoopIcon {
+    animation: hostCompileSpin 900ms linear infinite;
+}
+
+@media (max-width: 520px) {
+    #hostCompileButton,
+    #hostContinuousCompileButton {
+        display: none !important;
+    }
+}
+
+@keyframes hostCompileSpin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+#hostCompileDiagnosticBox {
+    position: fixed;
+    top: calc(var(--toolbar-height, 32px) + 6px);
+    left: 50%;
+    z-index: 100101;
+    display: grid;
+    gap: 8px;
+    width: min(760px, calc(100vw - 32px));
+    padding: 10px 12px;
+    border: 1px solid rgb(96 165 250 / .55);
+    border-radius: 8px;
+    background: rgb(31 41 55 / .96);
+    color: white;
+    box-shadow: 0 12px 32px rgb(0 0 0 / .28);
+    transform: translateX(-50%);
+}
+
+#hostCompileDiagnosticBox[data-severity="error"] {
+    border-color: rgb(248 113 113 / .7);
+}
+
+.hostCompileDiagnosticText {
+    max-height: 8em;
+    overflow: auto;
+    font: 12px/1.35 sans-serif;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.hostCompileDiagnosticActions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.hostCompileDiagnosticActions button {
+    border: 0;
+    border-radius: 5px;
+    padding: 4px 8px;
+    background: rgb(255 255 255 / .12);
+    color: white;
+    cursor: pointer;
+    font: 12px/1.2 sans-serif;
+}
+
+.hostCompileDiagnosticActions button:hover,
+.hostCompileDiagnosticActions button:focus-visible {
+    background: rgb(255 255 255 / .22);
+}
+
 #hostSynctexCapabilityBanner {
     position: fixed;
     top: calc(var(--toolbar-height, 32px) + 6px);

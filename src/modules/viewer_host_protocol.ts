@@ -1,5 +1,6 @@
-export const VIEWER_HOST_PROTOCOL_VERSION = 1 as const;
+export const VIEWER_HOST_PROTOCOL_VERSION = 2 as const;
 export const VIEWER_HOST_CONTROL_TOKEN_HEADER = "x-agent-synctex-viewer-host-token" as const;
+export const VIEWER_HOST_HEARTBEAT_TOKEN_HEADER = "x-agent-synctex-viewer-host-heartbeat-token" as const;
 
 export interface ViewerHostHelloMessage {
 	type: "hello";
@@ -63,6 +64,16 @@ export interface ViewerHostPdfMaybeUpdatedMessage {
 export interface ViewerHostClearPdfAnnotationsMessage {
 	type: "clear_pdf_annotations";
 	pdf_id: number;
+}
+
+export interface ViewerHostCompileStatusMessage {
+	type: "compile_status";
+	pdf_id: number;
+	running: boolean;
+	continuous: boolean;
+	severity?: "info" | "error";
+	message?: string;
+	inject_text?: string;
 }
 
 export type ViewerHostSynctexPrecision = "verified" | "text" | "line" | "raw";
@@ -143,6 +154,7 @@ export type McpToViewerHostMessage =
 	| ViewerHostSynctexForwardMessage
 	| ViewerHostPdfMaybeUpdatedMessage
 	| ViewerHostClearPdfAnnotationsMessage
+	| ViewerHostCompileStatusMessage
 	| ViewerHostReverseSynctexHoverResultMessage
 	| ViewerHostReverseSynctexForwardProbeResultMessage;
 
@@ -229,6 +241,13 @@ export interface ViewerHostReverseSynctexForwardProbeMessage {
 	textAfterSelection?: string;
 }
 
+export interface ViewerHostCompileActionMessage {
+	type: "compile_action";
+	pdf_id: number;
+	action: "compile" | "stop" | "continuous_on" | "continuous_off" | "status" | "inject_diagnostic";
+	inject_text?: string;
+}
+
 export type ViewerHostToMcpMessage =
 	| ViewerHostReadyMessage
 	| ViewerHostViewerLoadedMessage
@@ -238,7 +257,8 @@ export type ViewerHostToMcpMessage =
 	| ViewerHostPdfAnnotationDeletedMessage
 	| ViewerHostSelectionDebugMessage
 	| ViewerHostReverseSynctexHoverMessage
-	| ViewerHostReverseSynctexForwardProbeMessage;
+	| ViewerHostReverseSynctexForwardProbeMessage
+	| ViewerHostCompileActionMessage;
 
 export interface ViewerHostControlAcceptedResult {
 	type: McpToViewerHostMessage["type"];
@@ -355,6 +375,21 @@ function optionalNumber(value: unknown, field: string): number | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "number" || !Number.isFinite(value)) {
 		throw new Error(`${field} must be a finite number`);
+	}
+	return value;
+}
+
+function optionalCompileStatusSeverity(value: unknown, field: string): "info" | "error" | undefined {
+	if (value === undefined) return undefined;
+	if (value !== "info" && value !== "error") {
+		throw new Error(`${field} must be info or error`);
+	}
+	return value;
+}
+
+function requireCompileAction(value: unknown, field: string): ViewerHostCompileActionMessage["action"] {
+	if (value !== "compile" && value !== "stop" && value !== "continuous_on" && value !== "continuous_off" && value !== "status" && value !== "inject_diagnostic") {
+		throw new Error(`${field} must be a compile action`);
 	}
 	return value;
 }
@@ -512,6 +547,20 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
 		case "clear_pdf_annotations":
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };
+		case "compile_status": {
+			const severity = optionalCompileStatusSeverity(message.severity, "severity");
+			const text = optionalString(message.message, "message");
+			const injectText = optionalString(message.inject_text, "inject_text");
+			return {
+				type,
+				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
+				running: optionalBoolean(message.running, "running") ?? false,
+				continuous: optionalBoolean(message.continuous, "continuous") ?? false,
+				...(severity === undefined ? {} : { severity }),
+				...(text === undefined ? {} : { message: text }),
+				...(injectText === undefined ? {} : { inject_text: injectText }),
+			};
+		}
 		case "reverse_synctex_hover_result": {
 			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
 			const line = message.line === undefined ? undefined : requirePositiveInteger(message.line, "line");
@@ -675,6 +724,15 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				...(page === undefined ? {} : { page }),
 				text: optionalString(message.text, "text") ?? "",
 				details: requireRecord(message.details, "details"),
+			};
+		}
+		case "compile_action": {
+			const injectText = optionalString(message.inject_text, "inject_text");
+			return {
+				type,
+				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
+				action: requireCompileAction(message.action, "action"),
+				...(injectText === undefined ? {} : { inject_text: injectText }),
 			};
 		}
 		case "reverse_synctex_hover":

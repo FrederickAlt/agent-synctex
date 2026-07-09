@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
 import { BrowserViewerAppLauncher, createDefaultViewerHostClientFactory, FakeViewerHostClient, ViewerHostMcpService, type BrowserViewerLaunchTarget, type BrowserViewerLauncher, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
@@ -78,6 +80,25 @@ async function waitForPidExit(pid: number, timeoutMs = 2_000): Promise<void> {
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
 	throw new Error(`pid ${pid} was still running after ${timeoutMs}ms`);
+}
+
+async function runNodeScript(script: string, args: string[], env: NodeJS.ProcessEnv = {}): Promise<string> {
+	const child = spawn(process.execPath, ["--input-type=module", "-e", script, ...args], {
+		env: { ...process.env, ...env },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk: Buffer) => { stdout += String(chunk); });
+	child.stderr.on("data", (chunk: Buffer) => { stderr += String(chunk); });
+	await new Promise<void>((resolveWait, rejectWait) => {
+		child.once("error", rejectWait);
+		child.once("exit", (code, signal) => {
+			if (code === 0) resolveWait();
+			else rejectWait(new Error(`child exited ${signal ? `with signal ${signal}` : `with code ${code ?? "unknown"}`}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+		});
+	});
+	return stdout;
 }
 
 function callTool(id: number, name: string, args: Record<string, unknown>, service: ViewerHostMcpService) {
@@ -257,9 +278,10 @@ test("default Viewer Host client factory reuses agent runtime server origin", as
 	const launches: BrowserViewerLaunchTarget[] = [];
 	try {
 		await server.start();
-		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, updated_at: new Date().toISOString() }) + "\n");
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, heartbeat_token: "reuse-heartbeat-token", owner_id: "reuse-owner", updated_at: new Date().toISOString() }) + "\n");
 		const factory = createDefaultViewerHostClientFactory({
 			agentRuntimeDir: baseDir,
+			viewerHostOwnerId: "reuse-owner",
 			command: join(baseDir, "must-not-launch"),
 			browserOpenAckTimeoutMs: 20,
 			browserLauncher: { launchOrFocus: (target) => { launches.push(target); } },
@@ -283,7 +305,40 @@ test("default Viewer Host client factory reuses agent runtime server origin", as
 	}
 });
 
-test("ViewerHostMcpService.stop shuts down a persistent Viewer Host server", async () => {
+test("default Viewer Host client factory coalesces concurrent persistent startup", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-startup-in-progress-"));
+	const statePath = join(baseDir, "viewer-host.json");
+	const factory = createDefaultViewerHostClientFactory({
+		agentRuntimeDir: baseDir,
+		command: process.execPath,
+		args: [resolve(process.cwd(), "scripts", "viewer-host-server.ts")],
+		browserOpenAckTimeoutMs: 20,
+		heartbeatLeaseMs: 150,
+		heartbeatIntervalMs: 40,
+		browserLauncher: { launchOrFocus: () => undefined },
+	});
+	let clients: ViewerHostClient[] = [];
+	try {
+		clients = await Promise.all([factory(), factory()]);
+		assert.equal(clients[0], clients[1], "concurrent startup waiters should receive the same Viewer Host client");
+		assert.equal(clients[0]?.origin, clients[1]?.origin);
+		const state = JSON.parse(readFileSync(statePath, "utf8")) as { pid?: unknown; origin?: unknown };
+		assert.equal(state.origin, clients[0]?.origin);
+		assert.equal(typeof state.pid, "number");
+	} finally {
+		for (const client of new Set(clients)) await client.close?.();
+		try {
+			const state = JSON.parse(readFileSync(statePath, "utf8")) as { pid?: unknown };
+			if (typeof state.pid === "number") await waitForPidExit(state.pid);
+		} catch {
+			// Best-effort cleanup.
+		}
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("persistent Viewer Host exits when MCP heartbeat stops", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-persistent-stop-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	const statePath = join(baseDir, "viewer-host.json");
@@ -296,6 +351,8 @@ test("ViewerHostMcpService.stop shuts down a persistent Viewer Host server", asy
 			args: [resolve(process.cwd(), "scripts", "viewer-host-server.ts")],
 			browserOpenAckTimeoutMs: 20,
 			shutdownTimeoutMs: 2_000,
+			heartbeatLeaseMs: 150,
+			heartbeatIntervalMs: 40,
 			browserLauncher: { launchOrFocus: () => undefined },
 		}),
 		makePdfId: () => 347,
@@ -303,18 +360,20 @@ test("ViewerHostMcpService.stop shuts down a persistent Viewer Host server", asy
 	try {
 		const opened = await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 		assert.equal(opened.result?.details?.pdf_id, 347);
-		const state = JSON.parse(readFileSync(statePath, "utf8")) as { origin?: unknown; pid?: unknown; shutdown_token?: unknown; control_token?: unknown };
+		const state = JSON.parse(readFileSync(statePath, "utf8")) as { origin?: unknown; pid?: unknown; shutdown_token?: unknown; control_token?: unknown; heartbeat_token?: unknown; owner_id?: unknown };
 		assert.equal(typeof state.origin, "string");
 		assert.equal(typeof state.pid, "number");
-		assert.equal(typeof state.shutdown_token, "string");
+		assert.equal(state.shutdown_token, undefined);
 		assert.equal(typeof state.control_token, "string");
+		assert.equal(typeof state.heartbeat_token, "string");
+		assert.equal(typeof state.owner_id, "string");
 		pid = state.pid as number;
 		assert.equal(isPidRunning(pid), true);
 
 		await service.stop();
 
 		await waitForPidExit(pid);
-		assert.throws(() => readFileSync(statePath, "utf8"), /ENOENT/);
+		assert.equal(existsSync(statePath), true, "heartbeat exit leaves discovery state for next MCP startup to retire");
 	} finally {
 		try {
 			await service.stop();
@@ -332,6 +391,84 @@ test("ViewerHostMcpService.stop shuts down a persistent Viewer Host server", asy
 	}
 });
 
+test("reused persistent Viewer Host clients share browser open in-progress state", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-reuse-browser-in-progress-"));
+	const registry = new ViewerHostPdfRegistry();
+	const controlToken = "reuse-browser-progress-control-token";
+	const server = new ViewerHostServer({ registry, controlToken });
+	const launches: BrowserViewerLaunchTarget[] = [];
+	try {
+		await server.start();
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, heartbeat_token: "reuse-browser-progress-heartbeat-token", owner_id: "reuse-browser-progress-owner", updated_at: new Date().toISOString() }) + "\n");
+		const factory = createDefaultViewerHostClientFactory({
+			agentRuntimeDir: baseDir,
+			viewerHostOwnerId: "reuse-browser-progress-owner",
+			command: join(baseDir, "must-not-launch"),
+			browserOpenAckTimeoutMs: 20,
+			browserLauncher: { launchOrFocus: (target) => { launches.push(target); } },
+		});
+		const [firstClient, secondClient] = await Promise.all([factory(), factory()]);
+		const firstPdfPath = join(baseDir, "first.pdf");
+		const secondPdfPath = join(baseDir, "second.pdf");
+		writeFakePdf(firstPdfPath);
+		writeFakePdf(secondPdfPath);
+
+		const [first, second] = await Promise.all([
+			firstClient.send({ type: "open_pdf", pdf_id: 501, pdf_path: firstPdfPath, title: "first.pdf", workspace_cwd: baseDir }),
+			secondClient.send({ type: "open_pdf", pdf_id: 502, pdf_path: secondPdfPath, title: "second.pdf", workspace_cwd: baseDir }),
+		]);
+
+		assert.equal(first?.ok, true);
+		assert.equal(second?.ok, true);
+		assert.equal(launches.length, 1, "only one xdg-open/browser launch should run while the first launch is still in progress");
+		const attempts = [first, second].map((response) => response?.ok === true && "result" in response ? response.result.browser_open_attempted : undefined);
+		assert.deepEqual(attempts.sort(), [false, true]);
+		assert.equal(typeof JSON.parse(readFileSync(join(baseDir, "viewer-host.json"), "utf8")).browser_open_in_progress_at, "string");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("reused persistent Viewer Host clients share browser open in-progress state across processes", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-reuse-browser-process-lock-"));
+	const registry = new ViewerHostPdfRegistry();
+	const controlToken = "reuse-browser-process-control-token";
+	const server = new ViewerHostServer({ registry, controlToken });
+	const launchLog = join(baseDir, "browser-launches.log");
+	const opener = join(baseDir, "record-open");
+	try {
+		await server.start();
+		writeFileSync(opener, `#!/bin/sh\necho "$@" >> "$LAUNCH_LOG"\nsleep 0.2\nexit 0\n`);
+		chmodSync(opener, 0o700);
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, heartbeat_token: "reuse-browser-process-heartbeat-token", owner_id: "reuse-browser-process-owner", updated_at: new Date().toISOString() }) + "\n");
+		const firstPdfPath = join(baseDir, "first.pdf");
+		const secondPdfPath = join(baseDir, "second.pdf");
+		writeFakePdf(firstPdfPath);
+		writeFakePdf(secondPdfPath);
+		const clientModule = pathToFileURL(resolve(process.cwd(), "src/modules/viewer_host_client.ts")).href;
+		const childScript = `
+			import { createDefaultViewerHostClientFactory } from ${JSON.stringify(clientModule)};
+			const [agentRuntimeDir, ownerId, pdfPath, pdfId, cwd] = process.argv.slice(1);
+			const client = await createDefaultViewerHostClientFactory({ agentRuntimeDir, viewerHostOwnerId: ownerId, command: "must-not-launch", browserOpenAckTimeoutMs: 20 })();
+			const response = await client.send({ type: "open_pdf", pdf_id: Number(pdfId), pdf_path: pdfPath, title: pdfPath.split("/").at(-1), workspace_cwd: cwd });
+			if (response?.ok !== true) throw new Error(JSON.stringify(response));
+		`;
+
+		await Promise.all([
+			runNodeScript(childScript, [baseDir, "reuse-browser-process-owner", firstPdfPath, "601", baseDir], { AGENT_SYNCTEX_BROWSER_COMMAND: opener, LAUNCH_LOG: launchLog }),
+			runNodeScript(childScript, [baseDir, "reuse-browser-process-owner", secondPdfPath, "602", baseDir], { AGENT_SYNCTEX_BROWSER_COMMAND: opener, LAUNCH_LOG: launchLog }),
+		]);
+
+		const launches = existsSync(launchLog) ? readFileSync(launchLog, "utf8").trim().split(/\r?\n/).filter(Boolean) : [];
+		assert.equal(launches.length, 1, "cross-process browser open lock should allow only one xdg-open launch");
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 
 test("default Viewer Host client factory reopens an already-opened reused host when no active viewer is connected", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-reuse-opened-"));
@@ -341,9 +478,10 @@ test("default Viewer Host client factory reopens an already-opened reused host w
 	const launches: BrowserViewerLaunchTarget[] = [];
 	try {
 		await server.start();
-		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, updated_at: new Date().toISOString(), browser_opened_at: new Date().toISOString() }) + "\n");
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, heartbeat_token: "reuse-opened-heartbeat-token", owner_id: "reuse-opened-owner", updated_at: new Date().toISOString(), browser_opened_at: new Date().toISOString() }) + "\n");
 		const factory = createDefaultViewerHostClientFactory({
 			agentRuntimeDir: baseDir,
+			viewerHostOwnerId: "reuse-opened-owner",
 			command: join(baseDir, "must-not-launch"),
 			browserOpenAckTimeoutMs: 20,
 			browserLauncher: { launchOrFocus: (target) => { launches.push(target); } },

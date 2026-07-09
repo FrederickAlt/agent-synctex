@@ -1,5 +1,5 @@
 import type { DoctorFinding, HarnessAdapter, HarnessDetection, InstallChange, InstallerContext } from "../types.ts";
-import { MANAGED_MARKER, change, homePath, isRecord, managedCodexPreToolUseScript, managedCodexUserPromptSubmitScript, pathExists, projectPath, readJsonObject, readText, removeManagedFile, removeManagedTomlBlock, scopePath, upsertManagedTomlBlock, writeJsonObject, writeText } from "../config_edit.ts";
+import { MANAGED_MARKER, agentSynctexMcpLaunchConfig, change, homePath, isRecord, managedCodexPreToolUseScript, managedCodexUserPromptSubmitScript, pathExists, projectPath, readJsonObject, readText, removeManagedFile, removeManagedTomlBlock, scopePath, upsertManagedTomlBlock, writeJsonObject, writeText } from "../config_edit.ts";
 
 const MCP_BLOCK_ID = "mcp:codex";
 
@@ -64,11 +64,11 @@ export const codexAdapter: HarnessAdapter = {
 };
 
 function upsertCodexMcp(ctx: InstallerContext): InstallChange[] {
-	const args = `["mcp", "--harness", "codex"${ctx.noHooks ? ", \"--no-hooks\"" : ""}]`;
+	const launchConfig = agentSynctexMcpLaunchConfig("codex", ctx.noHooks);
 	const body = `
 [mcp_servers.agent-synctex]
-command = "agent-synctex"
-args = ${args}
+command = ${JSON.stringify(launchConfig.command)}
+args = ${JSON.stringify(launchConfig.args)}
 `;
 	return upsertManagedTomlBlock(ctx, mcpPath(ctx), MCP_BLOCK_ID, body);
 }

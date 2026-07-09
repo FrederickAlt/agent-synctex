@@ -6,7 +6,7 @@ import type { AddressInfo, Socket } from "node:net";
 import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath, URL } from "node:url";
-import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_CONTROL_TOKEN_HEADER, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
+import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_CONTROL_TOKEN_HEADER, VIEWER_HOST_HEARTBEAT_TOKEN_HEADER, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
 import { prewarmSynctexForPdf, reverseSynctexForwardProbeResult, reverseSynctexHoverResult } from "./synctex/synctex_resolution.ts";
 import { DEFAULT_VIEWER_HOST_ACCESS_POLICY, type ViewerHostAccessPolicy, type ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
@@ -102,6 +102,12 @@ export interface ViewerHostShutdownRequestHandler {
 	shutdown(reason: string): Promise<void> | void;
 }
 
+export interface ViewerHostHeartbeatRequestHandler {
+	token: string;
+	ownerId: string;
+	heartbeat(): Promise<void> | void;
+}
+
 export interface ViewerHostServerOptions {
 	registry: ViewerHostPdfRegistry;
 	port?: number;
@@ -112,6 +118,7 @@ export interface ViewerHostServerOptions {
 	pdfChangeDetection?: ViewerHostPdfChangeDetectionOptions;
 	accessPolicy?: ViewerHostAccessPolicy;
 	shutdownRequest?: ViewerHostShutdownRequestHandler;
+	heartbeatRequest?: ViewerHostHeartbeatRequestHandler;
 	controlToken?: string;
 }
 
@@ -127,6 +134,7 @@ export class ViewerHostServer {
 	private readonly nowMs: () => number;
 	private readonly accessPolicy: ViewerHostAccessPolicy;
 	private readonly shutdownRequest: ViewerHostShutdownRequestHandler | undefined;
+	private readonly heartbeatRequest: ViewerHostHeartbeatRequestHandler | undefined;
 	private readonly controlToken: string | undefined;
 	private controlReady = false;
 	private controlProtocolVersion: number | undefined;
@@ -159,6 +167,7 @@ export class ViewerHostServer {
 		this.nowMs = options.pdfChangeDetection?.nowMs ?? (() => Date.now());
 		this.accessPolicy = options.accessPolicy ?? DEFAULT_VIEWER_HOST_ACCESS_POLICY;
 		this.shutdownRequest = options.shutdownRequest;
+		this.heartbeatRequest = options.heartbeatRequest;
 		this.controlToken = options.controlToken;
 	}
 
@@ -306,6 +315,10 @@ export class ViewerHostServer {
 		}
 		if (requestUrl.pathname === "/shutdown") {
 			this.handleShutdownRequest(request, response);
+			return;
+		}
+		if (requestUrl.pathname === "/heartbeat") {
+			void this.handleHeartbeatRequest(request, response).catch((error) => jsonResponse(response, 500, { ok: false, error: { code: "internal_error", message: error instanceof Error ? error.message : String(error) } }));
 			return;
 		}
 		if (requestUrl.pathname === "/app-events") {
@@ -491,16 +504,16 @@ export class ViewerHostServer {
 			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "MCP event drain requires POST" } });
 			return;
 		}
-		const pdfIds = await this.readMcpEventsDrainPdfIds(request, response);
+		const filters = await this.readMcpEventsDrainFilters(request, response);
 		if (response.headersSent) return;
-		const events = this.drainMcpEventBacklog(pdfIds);
+		const events = this.drainMcpEventBacklog(filters);
 		this.broadcastAnnotationsCleared(new Set(events
 			.filter((event) => event.type === "pdf_annotation" || event.type === "pdf_annotation_deleted")
 			.map((event) => event.pdf_id)));
 		jsonResponse(response, 200, { ok: true, events });
 	}
 
-	private async readMcpEventsDrainPdfIds(request: IncomingMessage, response: ServerResponse): Promise<Set<number> | undefined> {
+	private async readMcpEventsDrainFilters(request: IncomingMessage, response: ServerResponse): Promise<{ pdfIds?: Set<number>; eventTypes?: Set<ViewerHostToMcpMessage["type"]> } | undefined> {
 		if (request.headers["content-type"] === undefined) return undefined;
 		let body = "";
 		try {
@@ -517,20 +530,34 @@ export class ViewerHostServer {
 			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "MCP event drain body must be valid JSON" } });
 			return undefined;
 		}
-		if (!isRecord(payload) || payload.pdf_ids === undefined) return undefined;
-		if (!Array.isArray(payload.pdf_ids) || !payload.pdf_ids.every((value) => Number.isInteger(value) && value > 0)) {
-			jsonResponse(response, 400, { ok: false, error: { code: "invalid_pdf_ids", message: "MCP event drain pdf_ids must be positive integers" } });
-			return undefined;
+		if (!isRecord(payload)) return undefined;
+		let pdfIds: Set<number> | undefined;
+		if (payload.pdf_ids !== undefined) {
+			if (!Array.isArray(payload.pdf_ids) || !payload.pdf_ids.every((value) => Number.isInteger(value) && value > 0)) {
+				jsonResponse(response, 400, { ok: false, error: { code: "invalid_pdf_ids", message: "MCP event drain pdf_ids must be positive integers" } });
+				return undefined;
+			}
+			pdfIds = new Set(payload.pdf_ids);
 		}
-		return new Set(payload.pdf_ids);
+		let eventTypes: Set<ViewerHostToMcpMessage["type"]> | undefined;
+		if (payload.event_types !== undefined) {
+			if (!Array.isArray(payload.event_types) || !payload.event_types.every((value) => typeof value === "string")) {
+				jsonResponse(response, 400, { ok: false, error: { code: "invalid_event_types", message: "MCP event drain event_types must be strings" } });
+				return undefined;
+			}
+			eventTypes = new Set(payload.event_types as ViewerHostToMcpMessage["type"][]);
+		}
+		return { ...(pdfIds === undefined ? {} : { pdfIds }), ...(eventTypes === undefined ? {} : { eventTypes }) };
 	}
 
-	private drainMcpEventBacklog(pdfIds: Set<number> | undefined): ViewerHostToMcpMessage[] {
-		if (pdfIds === undefined) return this.mcpEventBacklog.splice(0);
+	private drainMcpEventBacklog(filters: { pdfIds?: Set<number>; eventTypes?: Set<ViewerHostToMcpMessage["type"]> } | undefined): ViewerHostToMcpMessage[] {
+		if (filters?.pdfIds === undefined && filters?.eventTypes === undefined) return this.mcpEventBacklog.splice(0);
 		const drained: ViewerHostToMcpMessage[] = [];
 		const kept: ViewerHostToMcpMessage[] = [];
 		for (const event of this.mcpEventBacklog) {
-			if ("pdf_id" in event && pdfIds.has(event.pdf_id)) drained.push(event);
+			const matchesPdf = filters?.pdfIds === undefined || ("pdf_id" in event && filters.pdfIds.has(event.pdf_id));
+			const matchesType = filters?.eventTypes === undefined || filters.eventTypes.has(event.type);
+			if (matchesPdf && matchesType) drained.push(event);
 			else kept.push(event);
 		}
 		this.mcpEventBacklog.splice(0, this.mcpEventBacklog.length, ...kept);
@@ -664,6 +691,35 @@ export class ViewerHostServer {
 		jsonResponse(response, 200, { ok: true });
 	}
 
+	private async handleHeartbeatRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		if (request.method !== "POST") {
+			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "heartbeat requires POST" } });
+			return;
+		}
+		if (!this.heartbeatRequest) {
+			jsonResponse(response, 404, { ok: false, error: { code: "heartbeat_unavailable", message: "heartbeat endpoint is not enabled" } });
+			return;
+		}
+		if (request.headers[VIEWER_HOST_HEARTBEAT_TOKEN_HEADER] !== this.heartbeatRequest.token) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid heartbeat token" } });
+			return;
+		}
+		let payload: unknown = {};
+		try {
+			const raw = await readRequestBody(request);
+			payload = raw.trim() ? JSON.parse(raw) : {};
+		} catch {
+			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "heartbeat request body must be valid JSON" } });
+			return;
+		}
+		if (!isRecord(payload) || payload.owner_id !== this.heartbeatRequest.ownerId) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "heartbeat owner mismatch" } });
+			return;
+		}
+		await this.heartbeatRequest.heartbeat();
+		jsonResponse(response, 200, { ok: true, owner_id: this.heartbeatRequest.ownerId, active_viewer_clients: this.activeViewerClientCount() });
+	}
+
 	private isAuthorizedControlRequest(request: IncomingMessage): boolean {
 		return this.controlToken === undefined || request.headers[VIEWER_HOST_CONTROL_TOKEN_HEADER] === this.controlToken;
 	}
@@ -759,6 +815,11 @@ export class ViewerHostServer {
 				const record = this.registry.getPdf(message.pdf_id);
 				this.broadcastAnnotationsCleared([record.pdfId]);
 				return { ok: true, result: { type: "clear_pdf_annotations", pdf_id: record.pdfId } };
+			}
+			case "compile_status": {
+				const record = this.registry.getPdf(message.pdf_id);
+				this.broadcastViewerSocketMessage(record.pdfId, message);
+				return { ok: true, result: { type: "compile_status", pdf_id: record.pdfId } };
 			}
 			case "reverse_synctex_hover_result": {
 				const record = this.registry.getPdf(message.pdf_id);
@@ -857,7 +918,7 @@ export class ViewerHostServer {
 		let payload: unknown;
 		try {
 			payload = JSON.parse(text);
-			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "pdf_annotation" && payload.type !== "pdf_annotation_deleted" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover" && payload.type !== "reverse_synctex_forward_probe")) return;
+			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "pdf_annotation" && payload.type !== "pdf_annotation_deleted" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover" && payload.type !== "reverse_synctex_forward_probe" && payload.type !== "compile_action")) return;
 			if (payload.pdf_id !== undefined && payload.pdf_id !== connection.pdfId) {
 				throw new Error(`${String(payload.type)} pdf_id=${String(payload.pdf_id)} does not match viewer socket pdf_id=${connection.pdfId}`);
 			}

@@ -18,6 +18,7 @@ import type {
 import type { HostServiceMcpPdfOperations } from "./host_service_mcp.ts";
 import {
 	VIEWER_HOST_CONTROL_TOKEN_HEADER,
+	VIEWER_HOST_HEARTBEAT_TOKEN_HEADER,
 	VIEWER_HOST_PROTOCOL_VERSION,
 	validateMcpToViewerHostMessage,
 	validateViewerHostToMcpMessage,
@@ -43,6 +44,17 @@ const DEFAULT_VIEWER_HOST_READY_TIMEOUT_MS = 10_000;
 const DEFAULT_VIEWER_HOST_SHUTDOWN_TIMEOUT_MS = 1_000;
 const DEFAULT_BROWSER_OPEN_ACK_TIMEOUT_MS = 2_000;
 const BROWSER_OPEN_ACK_POLL_INTERVAL_MS = 100;
+const DEFAULT_VIEWER_HOST_HEARTBEAT_LEASE_MS = 5_000;
+const DEFAULT_VIEWER_HOST_HEARTBEAT_INTERVAL_MS = 1_000;
+const BROWSER_OPEN_IN_PROGRESS_TTL_MS = 30_000;
+const DEFAULT_VIEWER_HOST_OWNER_ID = `mcp-${process.pid}-${randomBytes(16).toString("base64url")}`;
+
+interface BrowserOpenState {
+	inProgressUntilMs?: number;
+}
+
+const browserOpenStateByOrigin = new Map<string, BrowserOpenState>();
+const viewerHostStartupByRuntimeDir = new Map<string, Promise<ViewerHostClient>>();
 
 interface TrackedViewerHostPdf {
 	pdfId: number;
@@ -55,10 +67,13 @@ interface TrackedViewerHostPdf {
 	fileSnapshot?: { size: number; mtimeMs: number };
 }
 
+type ViewerCompileAction = Extract<ViewerHostToMcpMessage, { type: "compile_action" }>;
+type ViewerCompileActionHandler = (message: ViewerCompileAction, record: TrackedViewerHostPdf) => Promise<void> | void;
+
 export interface ViewerHostClient {
 	readonly origin: string;
 	send(message: McpToViewerHostMessage): Promise<void | ViewerHostControlResponse>;
-	drainEvents?(pdfIds?: readonly number[]): Promise<ViewerHostToMcpMessage[]>;
+	drainEvents?(pdfIds?: readonly number[], eventTypes?: readonly ViewerHostToMcpMessage["type"][]): Promise<ViewerHostToMcpMessage[]>;
 	close?(): Promise<void> | void;
 	shutdownHost?(): Promise<void> | void;
 }
@@ -142,6 +157,9 @@ export interface ViewerHostProcessLauncherOptions {
 	readyTimeoutMs?: number;
 	shutdownTimeoutMs?: number;
 	browserOpenAckTimeoutMs?: number;
+	heartbeatLeaseMs?: number;
+	heartbeatIntervalMs?: number;
+	viewerHostOwnerId?: string;
 	browserLauncher?: BrowserViewerLauncher;
 	agentRuntimeDir?: string;
 }
@@ -158,8 +176,24 @@ interface PersistentViewerHostState {
 	pid?: number;
 	shutdown_token?: string;
 	control_token?: string;
+	heartbeat_token?: string;
+	owner_id?: string;
+	heartbeat_lease_ms?: number;
 	updated_at: string;
 	browser_opened_at?: string;
+	browser_open_in_progress_at?: string;
+	browser_open_attempted_at?: string;
+}
+
+interface BrowserOpenCoordinator {
+	begin(): boolean;
+	confirmed(): void;
+}
+
+interface ViewerHostHeartbeatOptions {
+	ownerId: string;
+	token: string;
+	intervalMs: number;
 }
 
 class HttpViewerHostProcessClient implements ViewerHostClient {
@@ -171,12 +205,15 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 	private readonly controlToken: string | undefined;
 	private readonly closeHost: (() => Promise<void>) | undefined;
 	private readonly shutdownHostHandler: (() => Promise<void>) | undefined;
-	private readonly afterBrowserLaunch: (() => void) | undefined;
+	private readonly browserOpenCoordinator: BrowserOpenCoordinator;
+	private readonly heartbeat: ViewerHostHeartbeatOptions | undefined;
+	private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	private heartbeatInFlight = false;
 	private launchBrowserOnNextOpen: boolean;
 	private closed = false;
 	private hostShutdownStarted = false;
 
-	constructor(options: { origin: string; appUrl: string; browserLauncher: BrowserViewerLauncher; controlToken?: string; closeHost?: () => Promise<void>; shutdownHost?: () => Promise<void>; launchBrowserOnNextOpen?: boolean; afterBrowserLaunch?: () => void; browserOpenAckTimeoutMs?: number }) {
+	constructor(options: { origin: string; appUrl: string; browserLauncher: BrowserViewerLauncher; controlToken?: string; closeHost?: () => Promise<void>; shutdownHost?: () => Promise<void>; launchBrowserOnNextOpen?: boolean; browserOpenCoordinator?: BrowserOpenCoordinator; browserOpenAckTimeoutMs?: number; heartbeat?: ViewerHostHeartbeatOptions }) {
 		this.origin = options.origin.replace(/\/$/, "");
 		this.appUrl = options.appUrl;
 		this.browserLauncher = options.browserLauncher;
@@ -186,7 +223,9 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 		this.closeHost = options.closeHost;
 		this.shutdownHostHandler = options.shutdownHost;
 		this.launchBrowserOnNextOpen = options.launchBrowserOnNextOpen ?? true;
-		this.afterBrowserLaunch = options.afterBrowserLaunch;
+		this.browserOpenCoordinator = options.browserOpenCoordinator ?? createMemoryBrowserOpenCoordinator(this.origin);
+		this.heartbeat = options.heartbeat;
+		this.startHeartbeat();
 	}
 
 	async send(message: McpToViewerHostMessage): Promise<ViewerHostControlResponse> {
@@ -207,7 +246,9 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 		}
 
 		let browserOpenError: string | undefined;
-		if (this.launchBrowserOnNextOpen) {
+		let browserOpenAttempted = false;
+		if (this.launchBrowserOnNextOpen && this.browserOpenCoordinator.begin()) {
+			browserOpenAttempted = true;
 			try {
 				await this.browserLauncher.launchOrFocus({ origin: this.origin, appUrl: `${this.origin}/viewer-lw` });
 			} catch (error) {
@@ -216,13 +257,15 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 		}
 		const activeCount = await this.waitForActiveViewerClient(this.browserOpenAckTimeoutMs);
 		const confirmed = activeCount > 0;
-		this.launchBrowserOnNextOpen = !confirmed;
-		if (confirmed) this.afterBrowserLaunch?.();
+		if (confirmed) {
+			this.launchBrowserOnNextOpen = false;
+			this.browserOpenCoordinator.confirmed();
+		}
 		return {
 			...response,
 			result: {
 				...response.result,
-				browser_open_attempted: true,
+				browser_open_attempted: browserOpenAttempted,
 				browser_open_confirmed: confirmed,
 				active_viewer_clients: activeCount,
 				...(browserOpenError === undefined ? {} : { browser_open_error: browserOpenError }),
@@ -252,12 +295,48 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 		return 0;
 	}
 
-	async drainEvents(pdfIds?: readonly number[]): Promise<ViewerHostToMcpMessage[]> {
+	private startHeartbeat(): void {
+		if (this.heartbeat === undefined) return;
+		void this.sendHeartbeat();
+		this.heartbeatTimer = setInterval(() => {
+			void this.sendHeartbeat();
+		}, Math.max(50, this.heartbeat.intervalMs));
+		this.heartbeatTimer.unref?.();
+	}
+
+	private stopHeartbeat(): void {
+		if (this.heartbeatTimer === undefined) return;
+		clearInterval(this.heartbeatTimer);
+		this.heartbeatTimer = undefined;
+	}
+
+	private async sendHeartbeat(): Promise<void> {
+		if (this.closed || this.heartbeat === undefined || this.heartbeatInFlight) return;
+		this.heartbeatInFlight = true;
+		try {
+			await fetch(`${this.origin}/heartbeat`, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					[VIEWER_HOST_HEARTBEAT_TOKEN_HEADER]: this.heartbeat.token,
+				},
+				body: JSON.stringify({ owner_id: this.heartbeat.ownerId }),
+				signal: AbortSignal.timeout(Math.max(50, Math.min(this.heartbeat.intervalMs, 1_000))),
+			});
+		} catch {
+			// The lease monitor handles missed heartbeats; individual failures are non-fatal.
+		} finally {
+			this.heartbeatInFlight = false;
+		}
+	}
+
+	async drainEvents(pdfIds?: readonly number[], eventTypes?: readonly ViewerHostToMcpMessage["type"][]): Promise<ViewerHostToMcpMessage[]> {
 		if (this.closed) return [];
+		const body = pdfIds === undefined && eventTypes === undefined ? undefined : JSON.stringify({ ...(pdfIds === undefined ? {} : { pdf_ids: pdfIds }), ...(eventTypes === undefined ? {} : { event_types: eventTypes }) });
 		const response = await fetch(`${this.origin}/mcp-events/drain`, {
 			method: "POST",
-			headers: { ...this.controlHeaders(), ...(pdfIds === undefined ? {} : { "content-type": "application/json" }) },
-			...(pdfIds === undefined ? {} : { body: JSON.stringify({ pdf_ids: pdfIds }) }),
+			headers: { ...this.controlHeaders(), ...(body === undefined ? {} : { "content-type": "application/json" }) },
+			...(body === undefined ? {} : { body }),
 		});
 		const payload = await response.json() as { ok?: unknown; events?: unknown; error?: { message?: unknown } };
 		if (!response.ok || payload.ok !== true || !Array.isArray(payload.events)) {
@@ -273,6 +352,7 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
+		this.stopHeartbeat();
 		if (this.closeHost) {
 			this.hostShutdownStarted = true;
 			await this.closeHost();
@@ -283,6 +363,7 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 		if (this.hostShutdownStarted) return;
 		this.hostShutdownStarted = true;
 		this.closed = true;
+		this.stopHeartbeat();
 		if (this.shutdownHostHandler) {
 			await this.shutdownHostHandler();
 			return;
@@ -309,7 +390,8 @@ class LocalViewerHostProcessClient extends HttpViewerHostProcessClient {
 }
 
 export function createDefaultViewerHostClientFactory(options: ViewerHostProcessLauncherOptions = {}): ViewerHostClientFactory {
-	return async () => launchLocalViewerHostProcess(options);
+	const viewerHostOwnerId = options.viewerHostOwnerId ?? DEFAULT_VIEWER_HOST_OWNER_ID;
+	return async () => launchLocalViewerHostProcess({ ...options, viewerHostOwnerId });
 }
 
 function defaultBrowserViewerLauncher(_shutdownTimeoutMs: number): BrowserViewerLauncher {
@@ -317,56 +399,90 @@ function defaultBrowserViewerLauncher(_shutdownTimeoutMs: number): BrowserViewer
 }
 
 async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOptions): Promise<ViewerHostClient> {
-	const command = options.command ?? process.execPath;
-	const args = options.args ?? [fileURLToPath(new URL("../../scripts/viewer-host-server.ts", import.meta.url))];
-	const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_VIEWER_HOST_READY_TIMEOUT_MS;
-	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_VIEWER_HOST_SHUTDOWN_TIMEOUT_MS;
-	const browserOpenAckTimeoutMs = options.browserOpenAckTimeoutMs ?? DEFAULT_BROWSER_OPEN_ACK_TIMEOUT_MS;
-	const browserLauncher = options.browserLauncher ?? defaultBrowserViewerLauncher(shutdownTimeoutMs);
-	const reusableClient = options.agentRuntimeDir === undefined ? undefined : await reusableViewerHostClient(options.agentRuntimeDir, browserLauncher, browserOpenAckTimeoutMs, shutdownTimeoutMs);
-	if (reusableClient) return reusableClient;
-	const persistent = options.agentRuntimeDir !== undefined;
-	const shutdownToken = persistent ? randomBytes(32).toString("base64url") : undefined;
-	const controlToken = randomBytes(32).toString("base64url");
-	const child = spawn(command, args, {
-		stdio: ["pipe", "pipe", "pipe"],
-		detached: persistent,
-		env: {
-			...process.env,
-			...(persistent ? { AGENT_SYNCTEX_PERSISTENT_VIEWER_HOST: "1" } : {}),
-			...(shutdownToken === undefined ? {} : { AGENT_SYNCTEX_VIEWER_HOST_SHUTDOWN_TOKEN: shutdownToken }),
-			AGENT_SYNCTEX_VIEWER_HOST_CONTROL_TOKEN: controlToken,
-		},
-	});
-	let stderr = "";
-	child.stderr.on("data", (chunk: Buffer) => {
-		stderr += String(chunk);
-		if (stderr.length > 8_192) stderr = stderr.slice(-8_192);
-	});
-	try {
-		const ready = await readViewerHostReadyLine(child, readyTimeoutMs, () => stderr);
-		if (!persistent || options.agentRuntimeDir === undefined) {
-			return new LocalViewerHostProcessClient(child, ready, shutdownTimeoutMs, browserLauncher, browserOpenAckTimeoutMs, controlToken);
-		}
-		const state: PersistentViewerHostState = { origin: ready.origin, app_url: ready.app_url, pid: child.pid, ...(shutdownToken === undefined ? {} : { shutdown_token: shutdownToken }), control_token: controlToken, updated_at: new Date().toISOString() };
-		writePersistentViewerHostState(options.agentRuntimeDir, state);
-		child.stdin.end();
-		child.stdout.destroy();
-		child.stderr.destroy();
-		child.unref();
-		return new HttpViewerHostProcessClient({
-			origin: ready.origin,
-			appUrl: ready.app_url,
-			browserLauncher,
-			browserOpenAckTimeoutMs,
-			controlToken,
-			shutdownHost: () => shutdownPersistentViewerHost({ agentRuntimeDir: options.agentRuntimeDir!, state, shutdownTimeoutMs, browserLauncher }),
-			afterBrowserLaunch: () => writePersistentViewerHostState(options.agentRuntimeDir!, { ...state, browser_opened_at: new Date().toISOString(), updated_at: new Date().toISOString() }),
+	const start = async (): Promise<ViewerHostClient> => {
+		const command = options.command ?? process.execPath;
+		const args = options.args ?? [fileURLToPath(new URL("../../scripts/viewer-host-server.ts", import.meta.url))];
+		const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_VIEWER_HOST_READY_TIMEOUT_MS;
+		const shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_VIEWER_HOST_SHUTDOWN_TIMEOUT_MS;
+		const browserOpenAckTimeoutMs = options.browserOpenAckTimeoutMs ?? DEFAULT_BROWSER_OPEN_ACK_TIMEOUT_MS;
+		const heartbeatLeaseMs = options.heartbeatLeaseMs ?? DEFAULT_VIEWER_HOST_HEARTBEAT_LEASE_MS;
+		const heartbeatIntervalMs = options.heartbeatIntervalMs ?? Math.min(DEFAULT_VIEWER_HOST_HEARTBEAT_INTERVAL_MS, Math.max(50, Math.floor(heartbeatLeaseMs / 3)));
+		const viewerHostOwnerId = options.viewerHostOwnerId ?? DEFAULT_VIEWER_HOST_OWNER_ID;
+		const browserLauncher = options.browserLauncher ?? defaultBrowserViewerLauncher(shutdownTimeoutMs);
+		const reusableClient = options.agentRuntimeDir === undefined ? undefined : await reusableViewerHostClient(options.agentRuntimeDir, browserLauncher, browserOpenAckTimeoutMs, shutdownTimeoutMs, viewerHostOwnerId, heartbeatIntervalMs);
+		if (reusableClient) return reusableClient;
+		const persistent = options.agentRuntimeDir !== undefined;
+		const controlToken = randomBytes(32).toString("base64url");
+		const heartbeatToken = persistent ? randomBytes(32).toString("base64url") : undefined;
+		const child = spawn(command, args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			detached: persistent,
+			env: {
+				...process.env,
+				...(persistent ? {
+					AGENT_SYNCTEX_PERSISTENT_VIEWER_HOST: "1",
+					AGENT_SYNCTEX_VIEWER_HOST_OWNER_ID: viewerHostOwnerId,
+					...(heartbeatToken === undefined ? {} : { AGENT_SYNCTEX_VIEWER_HOST_HEARTBEAT_TOKEN: heartbeatToken }),
+					AGENT_SYNCTEX_VIEWER_HOST_HEARTBEAT_LEASE_MS: String(heartbeatLeaseMs),
+				} : {}),
+				AGENT_SYNCTEX_VIEWER_HOST_CONTROL_TOKEN: controlToken,
+			},
 		});
-	} catch (error) {
-		child.kill("SIGKILL");
-		throw error;
+		let stderr = "";
+		child.stderr.on("data", (chunk: Buffer) => {
+			stderr += String(chunk);
+			if (stderr.length > 8_192) stderr = stderr.slice(-8_192);
+		});
+		try {
+			const ready = await readViewerHostReadyLine(child, readyTimeoutMs, () => stderr);
+			if (!persistent || options.agentRuntimeDir === undefined) {
+				return new LocalViewerHostProcessClient(child, ready, shutdownTimeoutMs, browserLauncher, browserOpenAckTimeoutMs, controlToken);
+			}
+			const state: PersistentViewerHostState = {
+				origin: ready.origin,
+				app_url: ready.app_url,
+				pid: child.pid,
+				control_token: controlToken,
+				...(heartbeatToken === undefined ? {} : { heartbeat_token: heartbeatToken }),
+				owner_id: viewerHostOwnerId,
+				heartbeat_lease_ms: heartbeatLeaseMs,
+				updated_at: new Date().toISOString(),
+			};
+			writePersistentViewerHostState(options.agentRuntimeDir, state);
+			child.stdin.end();
+			child.stdout.destroy();
+			child.stderr.destroy();
+			child.unref();
+			return new HttpViewerHostProcessClient({
+				origin: ready.origin,
+				appUrl: ready.app_url,
+				browserLauncher,
+				browserOpenAckTimeoutMs,
+				controlToken,
+				browserOpenCoordinator: createPersistentBrowserOpenCoordinator(options.agentRuntimeDir!, ready.origin),
+				...(heartbeatToken === undefined ? {} : { heartbeat: { ownerId: viewerHostOwnerId, token: heartbeatToken, intervalMs: heartbeatIntervalMs } }),
+			});
+		} catch (error) {
+			child.kill("SIGKILL");
+			throw error;
+		}
+	};
+
+	const startupKey = options.agentRuntimeDir === undefined ? undefined : resolve(options.agentRuntimeDir);
+	if (startupKey !== undefined) {
+		const existingStartup = viewerHostStartupByRuntimeDir.get(startupKey);
+		if (existingStartup) return await existingStartup;
+		const startup = start();
+		viewerHostStartupByRuntimeDir.set(startupKey, startup);
+		try {
+			return await startup;
+		} finally {
+			if (viewerHostStartupByRuntimeDir.get(startupKey) === startup) {
+				viewerHostStartupByRuntimeDir.delete(startupKey);
+			}
+		}
 	}
+	return await start();
 }
 
 function persistentViewerHostStatePath(agentRuntimeDir: string): string {
@@ -383,8 +499,13 @@ function readPersistentViewerHostState(agentRuntimeDir: string): PersistentViewe
 			...(typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0 ? { pid: parsed.pid } : {}),
 			...(typeof parsed.shutdown_token === "string" && parsed.shutdown_token.length > 0 ? { shutdown_token: parsed.shutdown_token } : {}),
 			...(typeof parsed.control_token === "string" && parsed.control_token.length > 0 ? { control_token: parsed.control_token } : {}),
+			...(typeof parsed.heartbeat_token === "string" && parsed.heartbeat_token.length > 0 ? { heartbeat_token: parsed.heartbeat_token } : {}),
+			...(typeof parsed.owner_id === "string" && parsed.owner_id.length > 0 ? { owner_id: parsed.owner_id } : {}),
+			...(typeof parsed.heartbeat_lease_ms === "number" && Number.isInteger(parsed.heartbeat_lease_ms) && parsed.heartbeat_lease_ms > 0 ? { heartbeat_lease_ms: parsed.heartbeat_lease_ms } : {}),
 			updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : "",
 			...(typeof parsed.browser_opened_at === "string" ? { browser_opened_at: parsed.browser_opened_at } : {}),
+			...(typeof parsed.browser_open_in_progress_at === "string" ? { browser_open_in_progress_at: parsed.browser_open_in_progress_at } : {}),
+			...(typeof parsed.browser_open_attempted_at === "string" ? { browser_open_attempted_at: parsed.browser_open_attempted_at } : {}),
 		};
 	} catch {
 		return undefined;
@@ -397,9 +518,94 @@ function writePersistentViewerHostState(agentRuntimeDir: string, state: Persiste
 	writeFileSync(persistentViewerHostStatePath(agentRuntimeDir), JSON.stringify(state) + "\n", { mode: 0o600 });
 }
 
-async function reusableViewerHostClient(agentRuntimeDir: string, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number, shutdownTimeoutMs: number): Promise<ViewerHostClient | undefined> {
+function updatePersistentViewerHostState(agentRuntimeDir: string, update: (state: PersistentViewerHostState) => PersistentViewerHostState): void {
+	const current = readPersistentViewerHostState(agentRuntimeDir);
+	if (!current) return;
+	writePersistentViewerHostState(agentRuntimeDir, update(current));
+}
+
+function createMemoryBrowserOpenCoordinator(origin: string): BrowserOpenCoordinator {
+	const key = origin.replace(/\/$/, "");
+	return {
+		begin(): boolean {
+			const now = Date.now();
+			const current = browserOpenStateByOrigin.get(key);
+			if (current?.inProgressUntilMs !== undefined && current.inProgressUntilMs > now) return false;
+			browserOpenStateByOrigin.set(key, { inProgressUntilMs: now + BROWSER_OPEN_IN_PROGRESS_TTL_MS });
+			return true;
+		},
+		confirmed(): void {
+			browserOpenStateByOrigin.delete(key);
+		},
+	};
+}
+
+function createPersistentBrowserOpenCoordinator(agentRuntimeDir: string, origin: string): BrowserOpenCoordinator {
+	const memory = createMemoryBrowserOpenCoordinator(origin);
+	return {
+		begin(): boolean {
+			if (!tryAcquireBrowserOpenLock(agentRuntimeDir, origin)) return false;
+			if (!memory.begin()) {
+				releaseBrowserOpenLock(agentRuntimeDir);
+				return false;
+			}
+			const now = new Date().toISOString();
+			updatePersistentViewerHostState(agentRuntimeDir, (current) => ({
+				...current,
+				browser_open_in_progress_at: now,
+				browser_open_attempted_at: now,
+				updated_at: now,
+			}));
+			return true;
+		},
+		confirmed(): void {
+			memory.confirmed();
+			releaseBrowserOpenLock(agentRuntimeDir);
+			const now = new Date().toISOString();
+			updatePersistentViewerHostState(agentRuntimeDir, (current) => {
+				const { browser_open_in_progress_at: _browserOpenInProgressAt, ...rest } = current;
+				return { ...rest, browser_opened_at: now, updated_at: now };
+			});
+		},
+	};
+}
+
+function browserOpenLockPath(agentRuntimeDir: string): string {
+	return join(agentRuntimeDir, "viewer-host-browser-open.lock");
+}
+
+function tryAcquireBrowserOpenLock(agentRuntimeDir: string, origin: string): boolean {
+	const lockPath = browserOpenLockPath(agentRuntimeDir);
+	try {
+		const status = statSync(lockPath);
+		if (Date.now() - status.mtimeMs < BROWSER_OPEN_IN_PROGRESS_TTL_MS) return false;
+		rmSync(lockPath, { force: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+	}
+	try {
+		writeFileSync(lockPath, `${JSON.stringify({ origin: origin.replace(/\/$/, ""), created_at: new Date().toISOString() })}\n`, { flag: "wx", mode: 0o600 });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function releaseBrowserOpenLock(agentRuntimeDir: string): void {
+	try {
+		rmSync(browserOpenLockPath(agentRuntimeDir), { force: true });
+	} catch {
+		// Best-effort cleanup only.
+	}
+}
+
+async function reusableViewerHostClient(agentRuntimeDir: string, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number, shutdownTimeoutMs: number, viewerHostOwnerId: string, heartbeatIntervalMs: number): Promise<ViewerHostClient | undefined> {
 	const state = readPersistentViewerHostState(agentRuntimeDir);
 	if (!state?.control_token) return undefined;
+	if (state.owner_id !== viewerHostOwnerId || state.heartbeat_token === undefined) {
+		await retirePersistentViewerHost({ agentRuntimeDir, state, shutdownTimeoutMs, browserLauncher });
+		return undefined;
+	}
 	try {
 		const response = await new ViewerHostControlClient({ origin: state.origin, controlToken: state.control_token }).send({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION });
 		if (response.ok === true) {
@@ -411,33 +617,42 @@ async function reusableViewerHostClient(agentRuntimeDir: string, browserLauncher
 				browserOpenAckTimeoutMs,
 				controlToken: state.control_token,
 				launchBrowserOnNextOpen: activeViewerClients <= 0,
-				shutdownHost: () => shutdownPersistentViewerHost({ agentRuntimeDir, state, shutdownTimeoutMs, browserLauncher }),
-				afterBrowserLaunch: () => writePersistentViewerHostState(agentRuntimeDir, { ...state, browser_opened_at: new Date().toISOString(), updated_at: new Date().toISOString() }),
+				browserOpenCoordinator: createPersistentBrowserOpenCoordinator(agentRuntimeDir, state.origin),
+				heartbeat: { ownerId: viewerHostOwnerId, token: state.heartbeat_token, intervalMs: heartbeatIntervalMs },
 			});
 		}
+		await retirePersistentViewerHost({ agentRuntimeDir, state, shutdownTimeoutMs, browserLauncher });
 	} catch {
+		removePersistentViewerHostState(agentRuntimeDir, state);
 		return undefined;
 	}
 	return undefined;
 }
 
-interface PersistentViewerHostShutdownOptions {
+interface PersistentViewerHostRetireOptions {
 	agentRuntimeDir: string;
 	state: PersistentViewerHostState;
 	shutdownTimeoutMs: number;
 	browserLauncher: BrowserViewerLauncher;
 }
 
-async function shutdownPersistentViewerHost(options: PersistentViewerHostShutdownOptions): Promise<void> {
+async function retirePersistentViewerHost(options: PersistentViewerHostRetireOptions): Promise<void> {
+	if (!await viewerHostControlResponds(options.state.origin, options.state.control_token)) {
+		removePersistentViewerHostState(options.agentRuntimeDir, options.state);
+		return;
+	}
 	try {
 		await options.browserLauncher.close?.();
 	} catch {
-		// Browser cleanup must not prevent Host shutdown.
+		// Browser cleanup must not prevent Host retirement.
 	}
 	const endpointStopped = options.state.shutdown_token === undefined
 		? false
 		: await requestPersistentViewerHostShutdown(options.state.origin, options.state.shutdown_token, options.shutdownTimeoutMs, options.state.control_token);
-	if (endpointStopped) removePersistentViewerHostState(options.agentRuntimeDir, options.state);
+	const signalStopped = endpointStopped ? true : await signalPersistentViewerHost(options.state, options.shutdownTimeoutMs);
+	if (signalStopped || !await viewerHostControlResponds(options.state.origin, options.state.control_token)) {
+		removePersistentViewerHostState(options.agentRuntimeDir, options.state);
+	}
 }
 
 async function requestPersistentViewerHostShutdown(origin: string, token: string, timeoutMs: number, controlToken: string | undefined): Promise<boolean> {
@@ -458,13 +673,23 @@ async function waitForViewerHostUnavailable(origin: string, timeoutMs: number, c
 	const deadline = Date.now() + Math.max(0, timeoutMs);
 	while (true) {
 		const remainingMs = deadline - Date.now();
-		if (!await viewerHostHelloSucceeds(origin, Math.min(100, Math.max(1, remainingMs)), controlToken)) return true;
+		if (!await viewerHostControlResponds(origin, controlToken, Math.min(100, Math.max(1, remainingMs)))) return true;
 		if (remainingMs <= 0) return false;
 		await sleep(Math.min(50, Math.max(1, remainingMs)));
 	}
 }
 
-async function viewerHostHelloSucceeds(origin: string, timeoutMs: number, controlToken: string | undefined): Promise<boolean> {
+async function signalPersistentViewerHost(state: PersistentViewerHostState, timeoutMs: number): Promise<boolean> {
+	if (state.pid === undefined) return false;
+	try {
+		process.kill(state.pid, "SIGTERM");
+	} catch {
+		return false;
+	}
+	return await waitForViewerHostUnavailable(state.origin, timeoutMs, state.control_token);
+}
+
+async function viewerHostControlResponds(origin: string, controlToken: string | undefined, timeoutMs = 250): Promise<boolean> {
 	try {
 		const response = await fetch(`${origin}/control`, {
 			method: "POST",
@@ -472,8 +697,8 @@ async function viewerHostHelloSucceeds(origin: string, timeoutMs: number, contro
 			body: JSON.stringify({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION }),
 			signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
 		});
-		const payload = await response.json() as { ok?: unknown };
-		return response.ok && payload.ok === true;
+		await response.arrayBuffer();
+		return response.status >= 200 && response.status < 500;
 	} catch {
 		return false;
 	}
@@ -603,6 +828,9 @@ export class ViewerHostMcpService {
 	private readonly reverseSynctexMapper: ReverseSynctexMapper;
 	private readonly recordsById = new Map<number, TrackedViewerHostPdf>();
 	private readonly recordsByPath = new Map<string, TrackedViewerHostPdf>();
+	private compileActionHandler: ViewerCompileActionHandler | undefined;
+	private eventDrainTimer: ReturnType<typeof setInterval> | undefined;
+	private eventDrainInFlight = false;
 	readonly pdfOperations: HostServiceMcpPdfOperations;
 
 	constructor(options: ViewerHostMcpServiceOptions = {}) {
@@ -626,6 +854,15 @@ export class ViewerHostMcpService {
 			fetchPdfContext: (request) => this.fetchPdfContext(request),
 			markTrackedPdfUpdated: (pdfPath) => this.markTrackedPdfUpdated(pdfPath),
 		};
+	}
+
+	setCompileActionHandler(handler: ViewerCompileActionHandler | undefined): void {
+		this.compileActionHandler = handler;
+		if (handler !== undefined) this.ensureEventDrainPolling();
+	}
+
+	async sendCompileStatus(message: Omit<Extract<McpToViewerHostMessage, { type: "compile_status" }>, "type">): Promise<void> {
+		await this.sendWithReconnect({ type: "compile_status", ...message }, { reregisterBeforeSend: true });
 	}
 
 	async openPdf(request: HostServiceOpenRequest): Promise<HostServiceOpenResponseEnvelope> {
@@ -828,19 +1065,54 @@ export class ViewerHostMcpService {
 				text: parsed.text,
 				details: parsed.details,
 			});
+		} else if (parsed.type === "compile_action") {
+			const record = this.recordsById.get(parsed.pdf_id);
+			if (!record) return;
+			if (parsed.action === "inject_diagnostic" && parsed.inject_text?.trim()) {
+				this.eventStore.appendPdfAnnotationEvent({
+					type: "pdf_annotation",
+					pdf_id: parsed.pdf_id,
+					annotation_id: `compile-diagnostic-${Date.now()}`,
+					timestamp: new Date().toISOString(),
+					source_file: inferDefaultSourceFileForPdf(record.pdfPath) ?? record.pdfPath,
+					line: 1,
+					page: 1,
+					x: 0,
+					y: 0,
+					comment: parsed.inject_text,
+				});
+				return;
+			}
+			void Promise.resolve(this.compileActionHandler?.(parsed, record)).catch(() => undefined);
 		}
 	}
 
-	private async drainHostEvents(): Promise<void> {
+	private async drainHostEvents(eventTypes?: readonly ViewerHostToMcpMessage["type"][]): Promise<void> {
 		const pdfIds = [...this.recordsById.keys()];
 		if (pdfIds.length === 0) return;
-		const events = await this.activeSession?.client.drainEvents?.(pdfIds) ?? [];
+		const events = await this.activeSession?.client.drainEvents?.(pdfIds, eventTypes) ?? [];
 		for (const event of events) {
 			this.handleHostMessage(event);
 		}
 	}
 
+	private ensureEventDrainPolling(): void {
+		if (this.eventDrainTimer !== undefined) return;
+		this.eventDrainTimer = setInterval(() => {
+			if (this.eventDrainInFlight) return;
+			this.eventDrainInFlight = true;
+			void this.drainHostEvents(["compile_action"]).catch(() => undefined).finally(() => {
+				this.eventDrainInFlight = false;
+			});
+		}, 500);
+		this.eventDrainTimer.unref?.();
+	}
+
 	async stop(): Promise<void> {
+		if (this.eventDrainTimer !== undefined) {
+			clearInterval(this.eventDrainTimer);
+			this.eventDrainTimer = undefined;
+		}
 		await this.enqueueLifecycle(async () => {
 			const client = this.activeSession?.client;
 			this.activeSession = undefined;

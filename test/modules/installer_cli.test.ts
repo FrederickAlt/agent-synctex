@@ -42,6 +42,29 @@ async function withInstallerHome<T>(home: string, fn: () => Promise<T>): Promise
 	}
 }
 
+function assertMcpServerLaunch(server: { command?: unknown; args?: unknown }, harness: string, extraArgs: string[] = []): void {
+	assert.equal(server.command, process.execPath);
+	assert.ok(Array.isArray(server.args));
+	assert.match(String(server.args[0]), /agent-synctex\.(?:js|ts)$/);
+	assert.deepEqual(server.args.slice(1), ["mcp", "--harness", harness, ...extraArgs]);
+}
+
+function assertOpencodeMcpCommand(command: unknown, harness: string): void {
+	assert.ok(Array.isArray(command));
+	assert.equal(command[0], process.execPath);
+	assert.match(String(command[1]), /agent-synctex\.(?:js|ts)$/);
+	assert.deepEqual(command.slice(2), ["mcp", "--harness", harness]);
+}
+
+function assertCodexMcpConfigLaunch(config: string, harness: string): void {
+	assert.match(config, new RegExp(`command = ${escapeRegExp(JSON.stringify(process.execPath))}`));
+	assert.match(config, new RegExp(`args = \\[[^\\n]*agent-synctex\\.(?:js|ts)","mcp","--harness","${escapeRegExp(harness)}"`));
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 test("default all installer writes user/global MCP config and hooks for detected harness directories", async () => {
 	const cwd = tempProject("agent-synctex-global-cwd-{}");
 	const home = tempProject("agent-synctex-global-home-{}");
@@ -56,11 +79,11 @@ test("default all installer writes user/global MCP config and hooks for detected
 			assert.equal(result.code, 0, result.stderr);
 
 			const claudeMcp = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8"));
-			assert.deepEqual(claudeMcp.mcpServers["agent-synctex"].args, ["mcp", "--harness", "claude"]);
+			assertMcpServerLaunch(claudeMcp.mcpServers["agent-synctex"], "claude");
 			assert.match(readFileSync(join(home, ".claude", "hooks", "agent-synctex-fetch-info.sh"), "utf8"), /agent-synctex fetch-info --harness 'claude'/);
 
 			const codexConfig = readFileSync(join(home, ".codex", "config.toml"), "utf8");
-			assert.match(codexConfig, /command = "agent-synctex"\nargs = \["mcp", "--harness", "codex"\]/);
+			assertCodexMcpConfigLaunch(codexConfig, "codex");
 			const codexHooks = JSON.parse(readFileSync(join(home, ".codex", "hooks.json"), "utf8"));
 			assert.equal(codexHooks.hooks.UserPromptSubmit[0].hooks[0].command, join(home, ".codex", "hooks", "agent-synctex-user-prompt-submit.mjs"));
 			assert.equal(codexHooks.hooks.PreToolUse[0].matcher, "mcp__agent[-_]synctex__.*");
@@ -69,11 +92,11 @@ test("default all installer writes user/global MCP config and hooks for detected
 			assert.match(readFileSync(join(home, ".codex", "hooks", "agent-synctex-pre-tool-use.mjs"), "utf8"), /updatedInput/);
 
 			const clineMcp = JSON.parse(readFileSync(join(home, ".cline", "data", "settings", "cline_mcp_settings.json"), "utf8"));
-			assert.deepEqual(clineMcp.mcpServers["agent-synctex"].args, ["mcp", "--harness", "cline"]);
+			assertMcpServerLaunch(clineMcp.mcpServers["agent-synctex"], "cline");
 			assert.match(readFileSync(join(home, "Documents", "Cline", "Hooks", "UserPromptSubmit"), "utf8"), /agent-synctex fetch-info --harness 'cline'/);
 
 			const piMcp = JSON.parse(readFileSync(join(home, ".pi", "agent", "mcp.json"), "utf8"));
-			assert.deepEqual(piMcp.mcpServers["agent-synctex"].args, ["mcp", "--harness", "pi"]);
+			assertMcpServerLaunch(piMcp.mcpServers["agent-synctex"], "pi");
 			assert.equal(piMcp.mcpServers["agent-synctex"].lifecycle, "keep-alive");
 			const piExtension = readFileSync(join(home, ".pi", "agent", "extensions", "agent-synctex-post-user.ts"), "utf8");
 			assert.match(piExtension, /spawnSync\("agent-synctex", args/);
@@ -85,7 +108,7 @@ test("default all installer writes user/global MCP config and hooks for detected
 			assert.match(piExtension, /args\.push\("--agent-id", sessionId\)/);
 
 			const opencode = JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8"));
-			assert.deepEqual(opencode.mcp["agent-synctex"].command, ["agent-synctex", "mcp", "--harness", "opencode"]);
+			assertOpencodeMcpCommand(opencode.mcp["agent-synctex"].command, "opencode");
 			assert.match(readFileSync(join(home, ".config", "opencode", "plugins", "agent-synctex-post-user.ts"), "utf8"), /spawnSync\("agent-synctex", \["fetch-info", "--harness", "opencode"\]/);
 		});
 	} finally {
@@ -124,7 +147,7 @@ test("combined local install writes MCP config and hooks without user/global pat
 			const result = await runCli(cwd, ["install", "--harness", "claude", "--local"]);
 			assert.equal(result.code, 0, result.stderr);
 			const mcp = JSON.parse(readFileSync(join(cwd, ".mcp.json"), "utf8"));
-			assert.deepEqual(mcp.mcpServers["agent-synctex"].args, ["mcp", "--harness", "claude"]);
+			assertMcpServerLaunch(mcp.mcpServers["agent-synctex"], "claude");
 			assert.equal(existsSync(join(cwd, ".claude", "hooks", "agent-synctex-fetch-info.sh")), true);
 			assert.equal(existsSync(join(home, ".claude.json")), false);
 		});
@@ -141,7 +164,7 @@ test("combined local install with --no-hooks writes manual MCP config only", asy
 		const result = await runCli(cwd, ["install", "--harness", "claude", "--local", "--no-hooks"]);
 		assert.equal(result.code, 0, result.stderr);
 		const mcp = JSON.parse(readFileSync(join(cwd, ".mcp.json"), "utf8"));
-		assert.deepEqual(mcp.mcpServers["agent-synctex"].args, ["mcp", "--harness", "claude", "--no-hooks"]);
+		assertMcpServerLaunch(mcp.mcpServers["agent-synctex"], "claude", ["--no-hooks"]);
 		assert.equal(existsSync(join(cwd, ".claude", "hooks", "agent-synctex-fetch-info.sh")), false);
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
@@ -154,11 +177,11 @@ test("Claude installer stages MCP config, hook config, and atomic uninstall", as
 	try {
 		assert.equal((await runCli(cwd, ["install", "mcp", "--harness", "claude", "--local"])).code, 0);
 		const mcpOnly = JSON.parse(readFileSync(join(cwd, ".mcp.json"), "utf8"));
-		assert.deepEqual(mcpOnly.mcpServers["agent-synctex"].args, ["mcp", "--harness", "claude"]);
+		assertMcpServerLaunch(mcpOnly.mcpServers["agent-synctex"], "claude");
 
 		assert.equal((await runCli(cwd, ["install", "hooks", "--harness", "claude", "--local"])).code, 0);
 		const mcpWithHooks = JSON.parse(readFileSync(join(cwd, ".mcp.json"), "utf8"));
-		assert.deepEqual(mcpWithHooks.mcpServers["agent-synctex"].args, ["mcp", "--harness", "claude"]);
+		assertMcpServerLaunch(mcpWithHooks.mcpServers["agent-synctex"], "claude");
 		const settings = JSON.parse(readFileSync(join(cwd, ".claude", "settings.json"), "utf8"));
 		assert.equal(settings.hooks.UserPromptSubmit.length, 1);
 		assert.match(readFileSync(join(cwd, ".claude", "hooks", "agent-synctex-fetch-info.sh"), "utf8"), /Managed by agent-synctex/);
@@ -182,7 +205,7 @@ test("OpenCode installer writes chat.message plugin wrapper", async () => {
 		assert.equal((await runCli(cwd, ["install", "hooks", "--harness", "opencode", "--local"])).code, 0);
 		assert.equal((await runCli(cwd, ["install", "mcp", "--harness", "opencode", "--local"])).code, 0);
 		const config = JSON.parse(readFileSync(join(cwd, "opencode.json"), "utf8"));
-		assert.deepEqual(config.mcp["agent-synctex"].command, ["agent-synctex", "mcp", "--harness", "opencode"]);
+		assertOpencodeMcpCommand(config.mcp["agent-synctex"].command, "opencode");
 		const plugin = readFileSync(join(cwd, ".opencode", "plugins", "agent-synctex-post-user.ts"), "utf8");
 		assert.match(plugin, /"chat\.message"/);
 		assert.match(plugin, /output\.parts/);
@@ -201,7 +224,7 @@ test("Pi installer combined install reports MCP config once and writes standalon
 		rmSync(join(cwd, ".pi"), { recursive: true, force: true });
 		assert.equal((await runCli(cwd, ["install", "mcp", "--harness", "pi", "--local"])).code, 0);
 		const mcp = JSON.parse(readFileSync(join(cwd, ".pi", "mcp.json"), "utf8"));
-		assert.deepEqual(mcp.mcpServers["agent-synctex"].args, ["mcp", "--harness", "pi"]);
+		assertMcpServerLaunch(mcp.mcpServers["agent-synctex"], "pi");
 		assert.equal(mcp.mcpServers["agent-synctex"].lifecycle, "keep-alive");
 		assert.equal((await runCli(cwd, ["install", "hooks", "--harness", "pi", "--local"])).code, 0);
 		const extension = readFileSync(join(cwd, ".pi", "extensions", "agent-synctex-post-user.ts"), "utf8");
@@ -225,7 +248,7 @@ test("Codex and Cline installers write new single-CLI MCP and hook commands", as
 	const cwd = tempProject("agent-synctex-codex-cline-{}");
 	try {
 		assert.equal((await runCli(cwd, ["install", "mcp", "--harness", "codex", "--local"])).code, 0);
-		assert.match(readFileSync(join(cwd, ".codex", "config.toml"), "utf8"), /command = "agent-synctex"\nargs = \["mcp", "--harness", "codex"\]/);
+		assertCodexMcpConfigLaunch(readFileSync(join(cwd, ".codex", "config.toml"), "utf8"), "codex");
 		mkdirSync(join(cwd, ".codex"), { recursive: true });
 		writeFileSync(join(cwd, ".codex", "hooks.json"), JSON.stringify({ hooks: { UserPromptSubmit: [{ type: "command", command: "./.codex/hooks/agent-synctex-fetch-info.sh" }] } }) + "\n");
 		assert.equal((await runCli(cwd, ["install", "hooks", "--harness", "codex", "--local"])).code, 0);
@@ -240,11 +263,11 @@ test("Codex and Cline installers write new single-CLI MCP and hook commands", as
 
 		assert.equal((await runCli(cwd, ["install", "mcp", "--harness", "cline", "--no-hooks", "--local"])).code, 0);
 		const clineMcp = JSON.parse(readFileSync(join(cwd, ".cline_mcp_settings.json"), "utf8"));
-		assert.deepEqual(clineMcp.mcpServers["agent-synctex"].args, ["mcp", "--harness", "cline", "--no-hooks"]);
+		assertMcpServerLaunch(clineMcp.mcpServers["agent-synctex"], "cline", ["--no-hooks"]);
 		assert.equal((await runCli(cwd, ["install", "hooks", "--harness", "cline", "--local"])).code, 0);
 		assert.match(readFileSync(join(cwd, ".clinerules", "hooks", "UserPromptSubmit"), "utf8"), /agent-synctex fetch-info --harness 'cline'/);
 		const clineMcpAfterHooks = JSON.parse(readFileSync(join(cwd, ".cline_mcp_settings.json"), "utf8"));
-		assert.deepEqual(clineMcpAfterHooks.mcpServers["agent-synctex"].args, ["mcp", "--harness", "cline"]);
+		assertMcpServerLaunch(clineMcpAfterHooks.mcpServers["agent-synctex"], "cline");
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
 	}

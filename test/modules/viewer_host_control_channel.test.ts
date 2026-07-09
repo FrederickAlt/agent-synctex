@@ -45,10 +45,10 @@ test("Viewer Host control channel accepts hello and records protocol readiness",
 		await server.start();
 		const client = new ViewerHostControlClient({ origin: server.origin });
 
-		const response = await client.send({ type: "hello", protocol_version: 1 });
+		const response = await client.send({ type: "hello", protocol_version: 2 });
 
-		assert.deepEqual(response, { ok: true, message: { type: "ready", protocol_version: 1, origin: server.origin, active_viewer_clients: 0 } });
-		assert.deepEqual(server.controlStatus, { ready: true, protocolVersion: 1 });
+		assert.deepEqual(response, { ok: true, message: { type: "ready", protocol_version: 2, origin: server.origin, active_viewer_clients: 0 } });
+		assert.deepEqual(server.controlStatus, { ready: true, protocolVersion: 2 });
 	} finally {
 		await server.stop();
 	}
@@ -59,13 +59,13 @@ test("Viewer Host MCP endpoints require the configured owner token", async () =>
 	const server = new ViewerHostServer({ registry, controlToken: "owner-token" });
 	try {
 		await server.start();
-		const unauthorized = await fetch(`${server.origin}/control`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "hello", protocol_version: 1 }) });
+		const unauthorized = await fetch(`${server.origin}/control`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "hello", protocol_version: 2 }) });
 		assert.equal(unauthorized.status, 403);
 		const unauthorizedDrain = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
 		assert.equal(unauthorizedDrain.status, 403);
 
 		const client = new ViewerHostControlClient({ origin: server.origin, controlToken: "owner-token" });
-		assert.equal((await client.send({ type: "hello", protocol_version: 1 })).ok, true);
+		assert.equal((await client.send({ type: "hello", protocol_version: 2 })).ok, true);
 		const authorizedDrain = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST", headers: { [VIEWER_HOST_CONTROL_TOKEN_HEADER]: "owner-token" } });
 		assert.equal(authorizedDrain.status, 200);
 	} finally {
@@ -209,7 +209,7 @@ test("Viewer Host control channel returns deterministic errors for malformed mes
 
 		assert.deepEqual(await client.send({ type: "bogus", pdf_id: 1 }), { ok: false, error: { code: "invalid_message", message: "unknown message type: bogus" } });
 		assert.deepEqual(await client.send({ type: "open_pdf", pdf_id: 0, pdf_path: "/tmp/paper.pdf" }), { ok: false, error: { code: "invalid_message", message: "pdf_id must be a positive integer" } });
-		assert.deepEqual(await client.send({ type: "hello", protocol_version: 2 }), { ok: false, error: { code: "unsupported_protocol_version", message: "unsupported protocol_version=2" } });
+		assert.deepEqual(await client.send({ type: "hello", protocol_version: 1 }), { ok: false, error: { code: "unsupported_protocol_version", message: "unsupported protocol_version=1" } });
 		assert.deepEqual(await client.send({ type: "open_pdf", pdf_id: 1, pdf_path: "/tmp/definitely-missing-viewer-host.pdf" }), { ok: false, error: { code: "control_dispatch_failed", message: "registered PDF is not readable" } });
 		const nonFileDir = mkdtempSync(join(tmpdir(), "viewer-host-control-non-file-"));
 		mkdirSync(join(nonFileDir, "not-a-pdf.pdf"));

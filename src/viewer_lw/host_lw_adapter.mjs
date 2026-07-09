@@ -69,7 +69,11 @@ const hostState = {
   hoverEnabled: true,
   debugSynctexEnabled: false,
   lastPdfLoadSource: "url",
+  compileRunning: false,
+  continuousCompile: false,
+  compileDiagnostic: undefined,
 };
+const compileStateByPdfId = new Map();
 let activeRefreshLoadingTask;
 let activeSocket;
 let reconnectTimer;
@@ -398,7 +402,6 @@ function sanitizeSelectionDebugDetails(details = {}) {
 }
 
 function sendSelectionDebug(phase, page, details = {}) {
-  if (!hostState.debugSynctexEnabled) return;
   const safeDetails = sanitizeSelectionDebugDetails(details);
   const selectedText = window.getSelection()?.toString() ?? "";
   const text = truncateSelectionDebugText(conciseRawMouseDiagnosticText(phase, safeDetails) ?? selectedText);
@@ -450,6 +453,162 @@ function updateHostDataset() {
   document.body.dataset.hostLwSynctexIssue = hostState.synctexCapabilityIssue?.code ?? "";
   document.body.dataset.hostLwHoverEnabled = hostState.hoverEnabled ? "true" : "false";
   document.body.dataset.hostLwDebugSynctexEnabled = hostState.debugSynctexEnabled ? "true" : "false";
+  document.body.dataset.hostLwCompileRunning = hostState.compileRunning ? "true" : "false";
+  document.body.dataset.hostLwContinuousCompile = hostState.continuousCompile ? "true" : "false";
+}
+
+function sendCompileAction(action, extra = {}) {
+  const pdfId = activePdfId();
+  if (!pdfId) return false;
+  return sendViewerSocketPayload({ type: "compile_action", pdf_id: pdfId, action, ...extra });
+}
+
+function compileStateForPdfId(pdfId) {
+  return compileStateByPdfId.get(Number(pdfId)) ?? { running: false, continuous: false, diagnostic: undefined };
+}
+
+function setCompileStateForPdfId(pdfId, nextState) {
+  const key = Number(pdfId);
+  if (!Number.isInteger(key) || key <= 0) return;
+  const current = compileStateForPdfId(key);
+  compileStateByPdfId.set(key, { ...current, ...nextState });
+  if (key === activePdfId()) {
+    const state = compileStateByPdfId.get(key);
+    hostState.compileRunning = state.running === true;
+    hostState.continuousCompile = state.continuous === true;
+    hostState.compileDiagnostic = state.diagnostic;
+  }
+}
+
+function applyCompileStateForActivePdf() {
+  const state = compileStateForPdfId(activePdfId());
+  hostState.compileRunning = state.running === true;
+  hostState.continuousCompile = state.continuous === true;
+  hostState.compileDiagnostic = state.diagnostic;
+  updateHostDataset();
+  updateCompileToolbarButtons();
+  renderCompileDiagnostic();
+}
+
+function updateCompileToolbarButtons() {
+  const compileButton = document.getElementById("hostCompileButton");
+  const continuousButton = document.getElementById("hostContinuousCompileButton");
+  if (compileButton) {
+    const disabledByContinuous = hostState.continuousCompile && !hostState.compileRunning;
+    compileButton.classList.toggle("hostCompileRunning", hostState.compileRunning);
+    compileButton.disabled = disabledByContinuous;
+    compileButton.title = hostState.compileRunning ? "Stop compilation" : disabledByContinuous ? "Compile once is disabled while continuous compilation is enabled" : "Compile once";
+    compileButton.setAttribute("aria-label", compileButton.title);
+    const icon = compileButton.querySelector("span");
+    icon.textContent = "";
+    icon.className = hostState.compileRunning ? "hostCompileStopIcon" : "hostCompileOnceIcon";
+  }
+  if (continuousButton) {
+    continuousButton.classList.toggle("hostContinuousCompileActive", hostState.continuousCompile);
+    continuousButton.title = hostState.continuousCompile ? "Disable continuous compilation" : "Enable continuous compilation";
+    continuousButton.setAttribute("aria-label", continuousButton.title);
+  }
+}
+
+function renderCompileDiagnostic() {
+  let box = document.getElementById("hostCompileDiagnosticBox");
+  const diagnostic = hostState.compileDiagnostic;
+  if (!diagnostic) {
+    box?.remove();
+    return;
+  }
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "hostCompileDiagnosticBox";
+    box.setAttribute("role", "status");
+    box.setAttribute("aria-live", "polite");
+    const text = document.createElement("div");
+    text.className = "hostCompileDiagnosticText";
+    const actions = document.createElement("div");
+    actions.className = "hostCompileDiagnosticActions";
+    const inject = document.createElement("button");
+    inject.type = "button";
+    inject.textContent = "Inject on next prompt";
+    inject.addEventListener("click", () => sendCompileAction("inject_diagnostic", { inject_text: hostState.compileDiagnostic?.injectText ?? hostState.compileDiagnostic?.message ?? "" }));
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.textContent = "Dismiss";
+    dismiss.addEventListener("click", () => {
+      setCompileStateForPdfId(activePdfId(), { diagnostic: undefined });
+      hostState.compileDiagnostic = undefined;
+      renderCompileDiagnostic();
+    });
+    actions.append(inject, dismiss);
+    box.append(text, actions);
+    document.body.appendChild(box);
+  }
+  box.dataset.severity = diagnostic.severity || "info";
+  box.querySelector(".hostCompileDiagnosticText").textContent = diagnostic.message;
+}
+
+function setCompileStatus(message) {
+  const diagnostic = typeof message.message === "string" && message.message.length > 0
+    ? { severity: message.severity || "info", message: message.message, injectText: message.inject_text }
+    : undefined;
+  setCompileStateForPdfId(message.pdf_id, { running: message.running === true, continuous: message.continuous === true, diagnostic });
+  if (Number(message.pdf_id) === activePdfId()) {
+    updateHostDataset();
+    updateCompileToolbarButtons();
+    renderCompileDiagnostic();
+  }
+}
+
+function installCompileToolbarButtons() {
+  if (document.getElementById("hostCompileButton")) return;
+  const compileButton = document.createElement("button");
+  compileButton.id = "hostCompileButton";
+  compileButton.className = "toolbarButton hostCompileButton";
+  compileButton.type = "button";
+  compileButton.tabIndex = 0;
+  const compileLabel = document.createElement("span");
+  compileLabel.setAttribute("aria-hidden", "true");
+  compileButton.appendChild(compileLabel);
+  compileButton.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (hostState.compileRunning) {
+      setCompileStateForPdfId(activePdfId(), { running: false, continuous: false });
+      updateHostDataset();
+      updateCompileToolbarButtons();
+      sendCompileAction("stop");
+      return;
+    }
+    if (hostState.continuousCompile) return;
+    sendCompileAction("compile");
+  });
+  const continuousButton = document.createElement("button");
+  continuousButton.id = "hostContinuousCompileButton";
+  continuousButton.className = "toolbarButton hostCompileButton";
+  continuousButton.type = "button";
+  continuousButton.tabIndex = 0;
+  const continuousLabel = document.createElement("span");
+  continuousLabel.className = "hostCompileLoopIcon";
+  continuousLabel.setAttribute("aria-hidden", "true");
+  continuousButton.appendChild(continuousLabel);
+  continuousButton.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const enabling = !hostState.continuousCompile;
+    setCompileStateForPdfId(activePdfId(), { continuous: enabling, running: false, diagnostic: undefined });
+    updateHostDataset();
+    updateCompileToolbarButtons();
+    renderCompileDiagnostic();
+    if (!sendCompileAction(enabling ? "continuous_on" : "continuous_off")) {
+      setCompileStateForPdfId(activePdfId(), { continuous: false, running: false, diagnostic: { severity: "error", message: "Could not contact the server to change continuous compilation." } });
+      updateHostDataset();
+      updateCompileToolbarButtons();
+      renderCompileDiagnostic();
+    }
+  });
+  const anchor = document.getElementById("hostSynctexHoverButton") ?? document.getElementById("toolbarViewerRight")?.firstElementChild ?? document.getElementById("toolbarViewerRight");
+  anchor?.parentNode?.insertBefore(compileButton, anchor);
+  anchor?.parentNode?.insertBefore(continuousButton, anchor);
+  updateCompileToolbarButtons();
 }
 
 function renderSynctexCapabilityIssue() {
@@ -1595,12 +1754,10 @@ function sendSelectionPayload(pageNumber) {
   const payload = selectionPayload(pageNumber, context);
   sendSelectionDebug("send", pageNumber, { signature, generation: selectionGeneration, selectedPayloadText: payload.selectedText, selectedPayloadTextLength: payload.selectedText.length, selectionStartX: payload.selectionStartX, selectionStartY: payload.selectionStartY, selectionEndX: payload.selectionEndX, selectionEndY: payload.selectionEndY });
   const sent = sendViewerSocketPayload(payload);
-  if (hostState.debugSynctexEnabled) {
-    setTimeout(() => {
-      const currentText = window.getSelection()?.toString() ?? "";
-      sendSelectionDebug("post_send_audit", pageNumber, { sentText: payload.selectedText, sentTextLength: payload.selectedText.length, currentText, currentTextLength: currentText.length, changed: currentText !== payload.selectedText });
-    }, 300);
-  }
+  setTimeout(() => {
+    const currentText = window.getSelection()?.toString() ?? "";
+    sendSelectionDebug("post_send_audit", pageNumber, { sentText: payload.selectedText, sentTextLength: payload.selectedText.length, currentText, currentTextLength: currentText.length, changed: currentText !== payload.selectedText });
+  }, 300);
   return sent;
 }
 
@@ -1634,7 +1791,6 @@ function scheduleSelectionPayload(pageNumber) {
 
 document.addEventListener("selectionchange", () => {
   selectionGeneration += 1;
-  if (!hostState.debugSynctexEnabled) return;
   const signature = currentSelectionSignature();
   sendSelectionDebug("selectionchange", undefined, { observedSignature: signature, generation: selectionGeneration });
 });
@@ -2171,6 +2327,7 @@ async function switchDirectViewerTab(pdfId, viewerUrl) {
     hostState.config = config;
     hostState.visibleRevision = Number(config.revision);
     hostState.latestRevision = Number(config.revision);
+    applyCompileStateForActivePdf();
     document.title = tabDisplayTitle(tab || config, pdfId) || document.title;
     await refreshToConfig(config, { preserveView: false });
     restoreAnnotationsForActivePdf();
@@ -2241,6 +2398,7 @@ function closeDirectViewerTab(pdfId) {
       hostState.latestRevision = 0;
       hostState.lastError = undefined;
       hostState.debugSynctexEnabled = false;
+      applyCompileStateForActivePdf();
       clearSynctexCapabilityIssue();
       document.title = "PDF Viewer";
       void app()?.close?.();
@@ -2598,6 +2756,10 @@ function handleHostMessage(message) {
     clearAnnotationsFromHostMessage(message);
     return;
   }
+  if (message.type === "compile_status") {
+    setCompileStatus(message);
+    return;
+  }
   if (Number(message.pdf_id) !== activePdfId()) return;
   if (message.type === "pdf_refresh") {
     const nextRevision = Number(message.revision);
@@ -2684,6 +2846,7 @@ function connectViewerSocket() {
     sendLoadedStateDiagnostic("lw_loaded_state", { trigger: "socket_open" });
     sendToolsHitTargetDiagnostic("socket_open");
     sendPendingProbe();
+    sendCompileAction("status");
   });
   socket.addEventListener("message", (event) => {
     if (activeSocket !== socket) return;
@@ -2731,6 +2894,7 @@ installToolbarTabsContainer();
 installHostTabMessageListener();
 installPdfThemeButton();
 installHoverToolbarButton();
+installCompileToolbarButtons();
 setDebugSynctexEnabled(initialConfig.debug_synctex === true);
 installToolsHitboxFallback();
 installPageEventHandlers();

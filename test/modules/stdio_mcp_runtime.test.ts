@@ -720,6 +720,62 @@ test("stdio runtime routes hook-injected session ids to separate runtime workspa
 	}
 });
 
+test("stdio runtime serializes concurrent tool calls", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-tool-queue-"));
+	const launchCwd = join(baseDir, "project");
+	const runtimeRoot = join(baseDir, "runtime");
+	mkdirSync(launchCwd, { recursive: true });
+	const order: string[] = [];
+	let active = 0;
+	let maxActive = 0;
+	await withRuntimeEnv(runtimeRoot, async () => {
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const runtime = new TexActionsStdioMcpRuntime({
+			stdin,
+			stdout,
+			stderr: new PassThrough(),
+			launchCwd,
+			pdfOperations: {
+				compileService: {
+					async compileLatexFileRequest(request: HostServiceCompileRequest): Promise<HostServiceCompileResponseEnvelope> {
+						const source = request.details.latex_file_path;
+						order.push(`start:${source}`);
+						active += 1;
+						maxActive = Math.max(maxActive, active);
+						await new Promise((resolve) => setTimeout(resolve, 40));
+						active -= 1;
+						order.push(`end:${source}`);
+						return {
+							protocol_version: 1,
+							request_id: request.request_id,
+							operation: "compile_latex_file",
+							status: "ok",
+							generated_at_ns: 1,
+							status_details: { protocol_version: 1, supported: true, service_available: true, workspace_context: request.workspace_context, request_id: request.request_id, operation: "compile_latex_file", source, pdf: join(request.workspace_context.cwd, `${source}.pdf`), log: join(request.workspace_context.cwd, `${source}.log`), artifact_paths: [], clean: false, cleaned_artifacts: [], compile_status: "ok", warning_count: 0 },
+						};
+					},
+				} as never,
+			},
+		});
+		try {
+			runtime.start();
+			const output = collectMcpFrames(stdout, 2);
+			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "compile_latex_file", arguments: { latex_file_path: "first.tex" } } }));
+			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "compile_latex_file", arguments: { latex_file_path: "second.tex" } } }));
+			await output;
+		} finally {
+			runtime.close();
+		}
+	});
+	try {
+		assert.equal(maxActive, 1);
+		assert.deepEqual(order, ["start:first.tex", "end:first.tex", "start:second.tex", "end:second.tex"]);
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("stdio runtime injects launch-cwd workspace context into compile_latex_file calls", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-compile-cwd-"));
 	const launchCwd = join(baseDir, "project");

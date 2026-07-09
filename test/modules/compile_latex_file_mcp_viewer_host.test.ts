@@ -81,8 +81,8 @@ test("compile_latex_file performs one fake one-shot compile and returns source/p
 	}
 });
 
-test("compile_latex_file compile-only calls invoke the compiler every time instead of reusing cached one-shot results", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "compile-file-mcp-no-cache-"));
+test("compile_latex_file compile-only calls reuse fresh one-shot results until a dependency changes", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "compile-file-mcp-cache-"));
 	const stateDir = join(baseDir, "state");
 	writeFakeLatexmk(join(baseDir, "bin"), stateDir);
 	const sourcePath = join(baseDir, "paper.tex");
@@ -92,6 +92,11 @@ test("compile_latex_file compile-only calls invoke the compiler every time inste
 	try {
 		await withPath(`${join(baseDir, "bin")}:${process.env.PATH ?? ""}`, async () => {
 			await callCompile({ latex_file_path: "paper.tex", workspace_context: { cwd: baseDir } }, service);
+			await callCompile({ latex_file_path: "paper.tex", workspace_context: { cwd: baseDir } }, service);
+			assert.equal(readFileSync(join(stateDir, "count.txt"), "utf8"), "1");
+
+			writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}Changed\\end{document}\n");
+			utimesSync(sourcePath, 3, 3);
 			await callCompile({ latex_file_path: "paper.tex", workspace_context: { cwd: baseDir } }, service);
 			assert.equal(readFileSync(join(stateDir, "count.txt"), "utf8"), "2");
 		});
@@ -144,7 +149,7 @@ test("compile_latex_file open_pdf uses Viewer Host and reuses an already tracked
 			const second = await callCompile({ latex_file_path: "paper.tex", open_pdf: true, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 			assert.equal(second.result?.details?.pdf_id, 42);
 			assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "focus_pdf"]);
-			assert.equal(readFileSync(join(stateDir, "count.txt"), "utf8"), "2");
+			assert.equal(readFileSync(join(stateDir, "count.txt"), "utf8"), "1");
 		});
 	} finally {
 		await service.stop();

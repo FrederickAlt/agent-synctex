@@ -14,13 +14,14 @@ function assertValidationError(fn: () => unknown, pattern: RegExp): void {
 
 test("Viewer Host protocol validates representative MCP to Host messages", () => {
 	const messages: McpToViewerHostMessage[] = [
-		{ type: "hello", protocol_version: 1 },
+		{ type: "hello", protocol_version: 2 },
 		{ type: "open_pdf", pdf_id: 123, pdf_path: "/tmp/main.pdf", title: "main.pdf", workspace_cwd: "/tmp" },
 		{ type: "focus_pdf", pdf_id: 123 },
 		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, width: 250, height: 12, source_file: "/tmp/main.tex", line: 42, source_line: "hello" },
 		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, indicator: true, source_file: "/tmp/main.tex", line: 42 },
 		{ type: "synctex_forward", pdf_id: 123, page: 2, x: 100, y: 500, ranges: [{ page: 2, h: 10, v: 20, W: 30, H: 4 }, { page: 2, h: 30, v: 40, W: 10, H: 3 }], source_file: "/tmp/main.tex", line: 42 },
 		{ type: "pdf_maybe_updated", pdf_id: 123 },
+		{ type: "compile_status", pdf_id: 123, running: false, continuous: true, severity: "error", message: "compile failed", inject_text: "compile failed" },
 		{ type: "reverse_synctex_hover_result", pdf_id: 123, request_id: 7, page: 2, x: 100, y: 500, source_file: "/tmp/main.tex", line: 42, column: 0, source_line: "hello", rect: { left: 10, top: 20, right: 30, bottom: 40 }, precision: "verified", selected_score: 4, nearest_candidate: { source_file: "/tmp/main.tex", line: 78, column: 0, source_line: "\\end{document}", score: 1000, structural: true, distance: 0 }, repaired: { source_file: "/tmp/main.tex", line: 42, column: 0, source_line: "hello", precision: "verified", score: 4 }, candidates: [{ source_file: "/tmp/main.tex", line: 78, column: 0, source_line: "\\end{document}", score: 1000, structural: true, distance: 0 }, { source_file: "/tmp/main.tex", line: 42, column: 0, source_line: "hello", score: 4, structural: false, distance: 4 }], forward: { attempted: true, contains_click: true, boxes_considered: 2, boxes_filtered: 1, chosen_box: { page: 2, h: 10, v: 20, W: 30, H: 4 } } },
 		{ type: "reverse_synctex_hover_result", pdf_id: 123, request_id: 8, page: 2, x: 100, y: 500, error: "no result" },
 		{ type: "reverse_synctex_forward_probe_result", pdf_id: 123, request_id: 9, click_page: 2, click_x: 100, click_y: 500, reverse_source_file: "/tmp/main.tex", reverse_line: 42, reverse_column: 0, reverse_source_line: "hello", source_span: { source_file: "/tmp/main.tex", start_line: 40, end_line: 42 }, page: 2, x: 90, y: 480, ranges: [{ page: 2, h: 10, v: 20, W: 30, H: 4 }], source_file: "/tmp/main.tex", line: 42, source_line: "hello" },
@@ -34,7 +35,7 @@ test("Viewer Host protocol validates representative MCP to Host messages", () =>
 
 test("Viewer Host protocol validates representative Host to MCP messages", () => {
 	const messages: ViewerHostToMcpMessage[] = [
-		{ type: "ready", protocol_version: 1, origin: "http://127.0.0.1:43125" },
+		{ type: "ready", protocol_version: 2, origin: "http://127.0.0.1:43125" },
 		{ type: "viewer_loaded", pdf_id: 123 },
 		{ type: "viewer_tab_closed", pdf_id: 123 },
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500 },
@@ -43,6 +44,7 @@ test("Viewer Host protocol validates representative Host to MCP messages", () =>
 		{ type: "pdf_annotation", pdf_id: 123, annotation_id: "a1", page: 2, x: 100, y: 500, source_file: "/tmp/main.tex", line: 42, source_line: "hello", source_span: { source_file: "/tmp/main.tex", start_line: 40, end_line: 42 }, comment: "please check" },
 		{ type: "pdf_annotation_deleted", pdf_id: 123, annotation_id: "a1" },
 		{ type: "selection_debug", pdf_id: 123, phase: "send", page: 2, text: "chosen", details: { phase: "send", selectionTextLength: 6 } },
+		{ type: "compile_action", pdf_id: 123, action: "inject_diagnostic", inject_text: "compile failed" },
 		{ type: "reverse_synctex_hover", pdf_id: 123, request_id: 7, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
 		{ type: "reverse_synctex_forward_probe", pdf_id: 123, request_id: 8, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
 	];
@@ -78,6 +80,7 @@ test("Viewer Host protocol validation rejects malformed boundary messages", () =
 		[{ type: "reverse_synctex_forward_probe_result", pdf_id: 1, request_id: 1, click_page: 1, click_x: 1, click_y: 1 }, /requires reverse source/],
 		[{ type: "reverse_synctex_forward_probe_result", pdf_id: 1, request_id: 1, click_page: 1, click_x: -1, click_y: 1, error: "bad" }, /click_x/],
 		[{ type: "reverse_synctex_forward_probe_result", pdf_id: 1, request_id: 1, click_page: 1, click_x: 1, click_y: 1, reverse_source_file: "/tmp/main.tex", reverse_line: 1, reverse_column: 0, page: 1, x: 1, y: 1, source_file: "/tmp/main.tex", line: 1, source_span: { source_file: "/tmp/main.tex", start_line: 3, end_line: 2 } }, /source_span\.end_line/],
+		[{ type: "compile_status", pdf_id: 1, running: false, continuous: false, severity: "warning" }, /severity/],
 	];
 
 	for (const [message, pattern] of invalidMcpMessages) {
@@ -102,6 +105,7 @@ test("Viewer Host protocol validation rejects malformed boundary messages", () =
 		[{ type: "reverse_synctex_hover", pdf_id: 1, request_id: 0, page: 1, x: 1, y: 1 }, /request_id/],
 		[{ type: "reverse_synctex_hover", pdf_id: 1, request_id: 1, page: 1, x: -1, y: 1 }, /x/],
 		[{ type: "reverse_synctex_forward_probe", pdf_id: 1, request_id: 0, page: 1, x: 1, y: 1 }, /request_id/],
+		[{ type: "compile_action", pdf_id: 1, action: "restart" }, /compile action/],
 	];
 
 	for (const [message, pattern] of invalidHostMessages) {

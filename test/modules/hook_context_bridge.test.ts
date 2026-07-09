@@ -124,6 +124,44 @@ test("hook context discovery uses this process namespace and does not scan harne
 	}
 });
 
+test("hook context discovery falls back to cwd-matched bridge when session identity is unavailable", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "hook-context-cwd-fallback-"));
+	const runtimeRoot = join(baseDir, "runtime");
+	const projectCwd = join(baseDir, "project");
+	mkdirSync(projectCwd, { recursive: true });
+	const bridge = startHookContextBridge({
+		runtimeDir: join(runtimeRoot, "agents", "runtime-without-session-id"),
+		cwd: projectCwd,
+		fetchContext: async () => ({ text: "cwd matched marks", pdfIds: [3], eventCount: 1, cleared: true, events: [] }),
+	});
+	try {
+		await bridge.ready;
+		assert.equal(await fetchHookContext({ runtimeRoot, cwd: projectCwd, prompt: "next prompt" }), "cwd matched marks");
+	} finally {
+		await bridge.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("hook context discovery falls back to cwd-matched bridge when explicit session id misses", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "hook-context-agentid-cwd-fallback-"));
+	const runtimeRoot = join(baseDir, "runtime");
+	const projectCwd = join(baseDir, "project");
+	mkdirSync(projectCwd, { recursive: true });
+	const bridge = startHookContextBridge({
+		runtimeDir: join(runtimeRoot, "agents", "lineage-owned-runtime"),
+		cwd: projectCwd,
+		fetchContext: async () => ({ text: "cwd matched despite session mismatch", pdfIds: [4], eventCount: 1, cleared: true, events: [] }),
+	});
+	try {
+		await bridge.ready;
+		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "pi-session-id", cwd: projectCwd, prompt: "next prompt" }), "cwd matched despite session mismatch");
+	} finally {
+		await bridge.close();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("hook context discovery returns empty instead of scanning unrelated bridges", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "hook-context-no-scan-"));
 	const runtimeRoot = join(baseDir, "runtime");

@@ -6,7 +6,7 @@ import { basename, join } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
-import { ViewerHostMcpService, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import { createDefaultViewerHostClientFactory, ViewerHostMcpService, type BrowserViewerLauncher, type BrowserViewerLaunchTarget, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
 import type { McpToViewerHostMessage, ViewerHostControlResponse } from "../../src/modules/viewer_host_protocol.ts";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
@@ -159,9 +159,38 @@ class HttpViewerHostClient implements ViewerHostClient {
 	}
 }
 
+class RecordingBrowserLauncher implements BrowserViewerLauncher {
+	readonly targets: BrowserViewerLaunchTarget[] = [];
+
+	async launchOrFocus(target: BrowserViewerLaunchTarget): Promise<void> {
+		this.targets.push(target);
+	}
+}
+
 function callTool(id: number, name: string, args: Record<string, unknown>, service: ViewerHostMcpService) {
 	return handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }), service.pdfOperations);
 }
+
+test("Viewer Host browser open is attempted once per service session even without browser ack", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-single-browser-open-"));
+	const runtimeDir = join(baseDir, "runtime");
+	const firstPdf = join(baseDir, "first.pdf");
+	const secondPdf = join(baseDir, "second.pdf");
+	writeFakePdf(firstPdf, "first");
+	writeFakePdf(secondPdf, "second");
+	const launcher = new RecordingBrowserLauncher();
+	const service = new ViewerHostMcpService({ clientFactory: createDefaultViewerHostClientFactory({ agentRuntimeDir: runtimeDir, browserLauncher: launcher, browserOpenAckTimeoutMs: 25 }) });
+	try {
+		const first = await service.pdfOperations.openPdf!({ protocol_version: 1, request_id: "first", operation: "open_pdf", created_at_ns: 1, workspace_context: { cwd: baseDir }, details: { pdf_path: firstPdf } });
+		const second = await service.pdfOperations.openPdf!({ protocol_version: 1, request_id: "second", operation: "open_pdf", created_at_ns: 2, workspace_context: { cwd: baseDir }, details: { pdf_path: secondPdf } });
+		assert.equal(first.status, "ok");
+		assert.equal(second.status, "ok");
+		assert.equal(launcher.targets.length, 1);
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
 
 test("viewer sockets accept registered pdf_id clients and reject unknown pdf_id clients cleanly", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-register-"));
@@ -231,6 +260,70 @@ test("synctex_forward and pdf_refresh messages are delivered only to viewer sock
 		firstSocket?.close();
 		firstPeerSocket?.close();
 		secondSocket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("compile status broadcasts to viewer sockets and compile actions drain to MCP", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-compile-action-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 23, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath) });
+		await server.start();
+		socket = await openViewerSocket(server.origin, 23, await getViewerSocketToken(server.origin, 23));
+		const control = new ViewerHostControlClient({ origin: server.origin });
+
+		const statusMessage = nextJsonMessage(socket);
+		assert.deepEqual(await control.send({ type: "compile_status", pdf_id: 23, running: false, continuous: true, severity: "error", message: "compile failed", inject_text: "compile failed" }), { ok: true, result: { type: "compile_status", pdf_id: 23 } });
+		assert.deepEqual(await statusMessage, { type: "compile_status", pdf_id: 23, running: false, continuous: true, severity: "error", message: "compile failed", inject_text: "compile failed" });
+
+		socket.send(JSON.stringify({ type: "compile_action", action: "continuous_on" }));
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		const response = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
+		const payload = await response.json() as { ok?: boolean; events?: unknown[] };
+		assert.equal(payload.ok, true);
+		assert.deepEqual(payload.events, [{ type: "compile_action", pdf_id: 23, action: "continuous_on" }]);
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("compile action polling does not drain or clear PDF annotations", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-filtered-drain-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 31, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath) });
+		await server.start();
+		socket = await openViewerSocket(server.origin, 31, await getViewerSocketToken(server.origin, 31));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, comment: "keep me" }));
+		socket.send(JSON.stringify({ type: "compile_action", action: "status" }));
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		const filteredResponse = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pdf_ids: [31], event_types: ["compile_action"] }) });
+		const filteredPayload = await filteredResponse.json() as { ok?: boolean; events?: unknown[] };
+		assert.equal(filteredPayload.ok, true);
+		assert.deepEqual(filteredPayload.events, [{ type: "compile_action", pdf_id: 31, action: "status" }]);
+		await assertNoMessage(socket);
+
+		const clearMessage = nextJsonMessage(socket);
+		const allResponse = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
+		const allPayload = await allResponse.json() as { ok?: boolean; events?: unknown[] };
+		assert.equal(allPayload.ok, true);
+		assert.deepEqual(allPayload.events, [{ type: "pdf_annotation", pdf_id: 31, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, comment: "keep me" }]);
+		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 31, pdf_ids: [31] });
+	} finally {
+		socket?.close();
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
 	}

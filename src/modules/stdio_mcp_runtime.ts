@@ -1,4 +1,7 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, extname, resolve } from "node:path";
 import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
 import type { Readable, Writable } from "node:stream";
 import { MCP_ERROR_PARSE_ERROR, buildMcpErrorResponse, handleMcpRequest } from "./host_service_mcp.ts";
@@ -8,6 +11,7 @@ import { HostServiceCompileService } from "./host_service_compile.ts";
 import { ViewerHostMcpService } from "./viewer_host_client.ts";
 import { startHookContextBridge, type HookContextBridgeHandle } from "./hook_context_bridge.ts";
 import { areHarnessHooksInstalled } from "./installer/hook_install_state.ts";
+import { LATEXMK_CONTINUOUS_EVENT_PREFIX, latexmkContinuousArgs } from "./latex/latex_file_compiler.ts";
 import type { HarnessId } from "./installer/types.ts";
 import {
 	frameClientPayload,
@@ -115,8 +119,10 @@ export class TexActionsStdioMcpRuntime {
 	private readonly pdfServicesByAgentId = new Map<string, ViewerHostMcpService>();
 	private readonly compileServicesByAgentId = new Map<string, HostServiceCompileService>();
 	private readonly pdfOperationsByAgentId = new Map<string, StdioMcpPdfOperations>();
+	private readonly compileActionHandlesByAgentId = new Map<string, ViewerCompileActionsHandle>();
 	private readonly hookContextBridgesByAgentId = new Map<string, HookContextBridgeHandle>();
 	private firstToolCallWarning: string | undefined;
+	private toolCallQueue: Promise<void> = Promise.resolve();
 	private closed = false;
 
 	constructor(options: TexActionsStdioMcpRuntimeOptions = {}) {
@@ -152,6 +158,8 @@ export class TexActionsStdioMcpRuntime {
 		this.frameLoop.close();
 		for (const bridge of this.hookContextBridgesByAgentId.values()) void bridge.close();
 		this.hookContextBridgesByAgentId.clear();
+		for (const handle of this.compileActionHandlesByAgentId.values()) handle.stop();
+		this.compileActionHandlesByAgentId.clear();
 		for (const service of this.compileServicesByAgentId.values()) service.stop();
 		this.compileServicesByAgentId.clear();
 		for (const service of this.pdfServicesByAgentId.values()) void service.stop();
@@ -191,6 +199,8 @@ export class TexActionsStdioMcpRuntime {
 		});
 		compileService.start();
 		this.compileServicesByAgentId.set(agentId, compileService);
+		const compileActions = installViewerCompileActions(service, compileService);
+		this.compileActionHandlesByAgentId.set(agentId, compileActions);
 		const operations: StdioMcpPdfOperations = { ...service.pdfOperations, compileService };
 		this.pdfOperationsByAgentId.set(agentId, operations);
 		return operations;
@@ -204,6 +214,7 @@ export class TexActionsStdioMcpRuntime {
 		if (!runtimeDir) return;
 		const bridge = startHookContextBridge({
 			runtimeDir,
+			cwd: workspaceContext.cwd,
 			fetchContext: async (request) => {
 				if (!pdfOperations.fetchPdfContext) return { text: "", pdfIds: [], eventCount: 0, cleared: false, events: [] };
 				return pdfOperations.fetchPdfContext({ ...request, cwd: workspaceContext.cwd });
@@ -214,7 +225,21 @@ export class TexActionsStdioMcpRuntime {
 	}
 
 	private async handleFrame(payload: string, protocol: McpClientFrameProtocol): Promise<void> {
+		if (!isToolCallPayload(payload)) {
+			await this.handleFrameNow(payload, protocol);
+			return;
+		}
+		const queued = this.toolCallQueue.then(() => this.handleFrameNow(payload, protocol));
+		this.toolCallQueue = queued.catch(() => undefined);
+		await queued;
+	}
+
+	private async handleFrameNow(payload: string, protocol: McpClientFrameProtocol): Promise<void> {
 		const routedRequest = this.rewriteRequestPayload(payload);
+		if (routedRequest.continuousCompileActive && isNamedToolCallPayload(routedRequest.payload, "compile_latex_file")) {
+			await this.writePayload(JSON.stringify(buildContinuousCompileActiveToolResponse(routedRequest.payload)), protocol);
+			return;
+		}
 		const response = await handleMcpRequest(routedRequest.payload, routedRequest.pdfOperations, {
 			exposeFetchPdfContext: this.exposeFetchPdfContext(),
 			emitViewerUrlFallback: (url) => this.writeViewerUrlFallback(url),
@@ -236,21 +261,21 @@ export class TexActionsStdioMcpRuntime {
 		return appendTextToToolResult(response, warning);
 	}
 
-	private rewriteRequestPayload(payload: string): { payload: string; pdfOperations: StdioMcpPdfOperations } {
+	private rewriteRequestPayload(payload: string): { payload: string; pdfOperations: StdioMcpPdfOperations; continuousCompileActive: boolean } {
 		try {
 			const parsed: unknown = JSON.parse(payload);
 			if (!isRecord(parsed) || parsed.method !== "tools/call" || !isRecord(parsed.params) || typeof parsed.params.name !== "string") {
 				const workspaceContext = this.workspaceContext();
-				return { payload, pdfOperations: this.pdfOperationsForWorkspace(workspaceContext) };
+				return this.routePayloadForWorkspace(payload, workspaceContext);
 			}
 			if (!STDIO_AGENT_SCOPED_TOOL_NAMES.has(parsed.params.name)) {
 				const workspaceContext = this.workspaceContext();
-				return { payload, pdfOperations: this.pdfOperationsForWorkspace(workspaceContext) };
+				return this.routePayloadForWorkspace(payload, workspaceContext);
 			}
 			const rawArguments = parsed.params.arguments;
 			if (parsed.params.name === "fetch_pdf_context" && rawArguments !== undefined && !isRecord(rawArguments)) {
 				const workspaceContext = this.workspaceContext();
-				return { payload, pdfOperations: this.pdfOperationsForWorkspace(workspaceContext) };
+				return this.routePayloadForWorkspace(payload, workspaceContext);
 			}
 			const currentArguments = isRecord(rawArguments)
 				? rawArguments
@@ -259,6 +284,7 @@ export class TexActionsStdioMcpRuntime {
 					: {};
 			const metadata = sessionMetadataFromArguments(currentArguments);
 			const workspaceContext = this.seedRuntimePreamble(this.workspaceContext(metadata));
+			const agentId = workspaceContext.session_id ?? "default";
 			const pdfOperations = this.pdfOperationsForWorkspace(workspaceContext);
 			this.ensureHookContextBridge(workspaceContext, pdfOperations);
 			const nextArguments = stripAgentSynctexSessionMetadata(currentArguments);
@@ -275,11 +301,25 @@ export class TexActionsStdioMcpRuntime {
 					},
 				}),
 				pdfOperations,
+				continuousCompileActive: this.continuousCompileActiveForToolCall(agentId, parsed.params.name, rewrittenArguments, workspaceContext),
 			};
 		} catch {
 			const workspaceContext = this.workspaceContext();
-			return { payload, pdfOperations: this.pdfOperationsForWorkspace(workspaceContext) };
+			return this.routePayloadForWorkspace(payload, workspaceContext);
 		}
+	}
+
+	private routePayloadForWorkspace(payload: string, workspaceContext: HostServiceWorkspaceContext): { payload: string; pdfOperations: StdioMcpPdfOperations; continuousCompileActive: boolean } {
+		return {
+			payload,
+			pdfOperations: this.pdfOperationsForWorkspace(workspaceContext),
+			continuousCompileActive: false,
+		};
+	}
+
+	private continuousCompileActiveForToolCall(agentId: string, toolName: string, args: Record<string, unknown>, workspaceContext: HostServiceWorkspaceContext): boolean {
+		if (toolName !== "compile_latex_file" || typeof args.latex_file_path !== "string") return false;
+		return this.compileActionHandlesByAgentId.get(agentId)?.hasContinuousCompileForSource(args.latex_file_path, workspaceContext.cwd) === true;
 	}
 
 	private async writePayload(payload: string, protocol: McpClientFrameProtocol): Promise<void> {
@@ -289,6 +329,252 @@ export class TexActionsStdioMcpRuntime {
 	private writeViewerUrlFallback(url: string): void {
 		this.viewerUrlFallbackWriter(`Agent SyncTeX: no browser viewer was detected after launch; pass this Viewer URL to the user: ${url}\n`);
 	}
+}
+
+interface ViewerCompileActionsHandle {
+	stop(): void;
+	hasContinuousCompileForSource(sourcePath: string, cwd: string): boolean;
+}
+
+type ViewerCompileRecord = { pdfId: number; pdfPath: string; workspaceCwd: string };
+
+interface ContinuousLatexmkProcess {
+	child: ChildProcessWithoutNullStreams;
+	record: ViewerCompileRecord;
+	sourcePath: string;
+	buffer: string;
+	outputTail: string;
+	stopping: boolean;
+}
+
+class ViewerContinuousLatexmkController {
+	private readonly service: ViewerHostMcpService;
+	private readonly processes = new Map<number, ContinuousLatexmkProcess>();
+
+	constructor(service: ViewerHostMcpService) {
+		this.service = service;
+	}
+
+	has(pdfId: number): boolean {
+		return this.processes.has(pdfId);
+	}
+
+	hasSource(sourcePath: string, cwd: string): boolean {
+		const normalized = normalizeContinuousSourcePath(sourcePath, cwd);
+		return [...this.processes.values()].some((state) => normalizeContinuousSourcePath(state.sourcePath, dirname(state.sourcePath)) === normalized);
+	}
+
+	async start(record: ViewerCompileRecord): Promise<void> {
+		if (this.processes.has(record.pdfId)) {
+			await this.sendStatus(record, true, { continuous: true });
+			return;
+		}
+		const sourcePath = sourcePathForCompiledPdf(record.pdfPath);
+		await this.sendStatus(record, true, { continuous: true });
+		let child: ChildProcessWithoutNullStreams;
+		try {
+			child = spawn("latexmk", latexmkContinuousArgs(sourcePath, undefined), {
+				cwd: dirname(sourcePath),
+				env: {
+					...process.env,
+					HOME: process.env.HOME || homedir(),
+					PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+				},
+			});
+		} catch (error) {
+			const detail = continuousCompileErrorText(sourcePath, error);
+			await this.sendStatus(record, false, { continuous: false, severity: "error", message: detail, injectText: detail });
+			return;
+		}
+		const state: ContinuousLatexmkProcess = { child, record, sourcePath, buffer: "", outputTail: "", stopping: false };
+		this.processes.set(record.pdfId, state);
+		child.stdout.on("data", (chunk) => void this.handleOutput(state, chunk));
+		child.stderr.on("data", (chunk) => void this.handleOutput(state, chunk));
+		child.on("error", (error) => {
+			if (state.stopping) return;
+			state.stopping = true;
+			this.processes.delete(record.pdfId);
+			const detail = continuousCompileErrorText(sourcePath, error);
+			void this.sendStatus(record, false, { continuous: false, severity: "error", message: detail, injectText: detail });
+		});
+		child.on("close", (code, signal) => {
+			this.processes.delete(record.pdfId);
+			if (state.stopping) return;
+			const detail = continuousCompileErrorText(sourcePath, `continuous latexmk exited (${code ?? signal ?? "unknown"})`, state.outputTail);
+			void this.sendStatus(record, false, { continuous: false, severity: "error", message: detail, injectText: detail });
+		});
+	}
+
+	async stop(pdfId: number, notice?: string): Promise<boolean> {
+		const state = this.processes.get(pdfId);
+		if (state === undefined) return false;
+		state.stopping = true;
+		this.processes.delete(pdfId);
+		state.child.kill("SIGTERM");
+		const killTimer = setTimeout(() => state.child.kill("SIGKILL"), 2_000);
+		killTimer.unref?.();
+		await this.sendStatus(state.record, false, { continuous: false, ...(notice === undefined ? {} : { severity: "info", message: notice }) });
+		return true;
+	}
+
+	stopAll(): void {
+		for (const pdfId of [...this.processes.keys()]) void this.stop(pdfId);
+	}
+
+	private async handleOutput(state: ContinuousLatexmkProcess, chunk: Buffer | string): Promise<void> {
+		const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+		state.outputTail = `${state.outputTail}${text}`.slice(-12_000);
+		state.buffer += text;
+		const lines = state.buffer.split(/\r?\n/);
+		state.buffer = lines.pop() ?? "";
+		for (const line of lines) {
+			const event = line.startsWith(LATEXMK_CONTINUOUS_EVENT_PREFIX) ? line.slice(LATEXMK_CONTINUOUS_EVENT_PREFIX.length).trim() : undefined;
+			if (event === "compiling") {
+				await this.sendStatus(state.record, true, { continuous: true });
+			} else if (event === "success" || event === "warning") {
+				await this.service.pdfOperations.markTrackedPdfUpdated?.(state.record.pdfPath);
+				await this.sendStatus(state.record, false, { continuous: true });
+			} else if (event === "failure") {
+				const detail = continuousCompileErrorText(state.sourcePath, "compile failed", state.outputTail);
+				await this.sendStatus(state.record, false, { continuous: true, severity: "error", message: detail, injectText: detail });
+			}
+		}
+	}
+
+	private async sendStatus(record: ViewerCompileRecord, running: boolean, options: { continuous: boolean; severity?: "info" | "error"; message?: string; injectText?: string }): Promise<void> {
+		await this.service.sendCompileStatus({
+			pdf_id: record.pdfId,
+			running,
+			continuous: options.continuous,
+			...(options.severity === undefined ? {} : { severity: options.severity }),
+			...(options.message === undefined ? {} : { message: options.message }),
+			...(options.injectText === undefined ? {} : { inject_text: options.injectText }),
+		});
+	}
+}
+
+function installViewerCompileActions(service: ViewerHostMcpService, compileService: HostServiceCompileService): ViewerCompileActionsHandle {
+	const active = new Map<number, AbortController>();
+	const continuous = new ViewerContinuousLatexmkController(service);
+	const runCompile = async (record: ViewerCompileRecord) => {
+		if (active.has(record.pdfId) || continuous.has(record.pdfId)) return;
+		const sourcePath = sourcePathForCompiledPdf(record.pdfPath);
+		const sendStatus = async (running: boolean, options: { severity?: "info" | "error"; message?: string; injectText?: string } = {}) => {
+			await service.sendCompileStatus({
+				pdf_id: record.pdfId,
+				running,
+				continuous: false,
+				...(options.severity === undefined ? {} : { severity: options.severity }),
+				...(options.message === undefined ? {} : { message: options.message }),
+				...(options.injectText === undefined ? {} : { inject_text: options.injectText }),
+			});
+		};
+		const controller = new AbortController();
+		active.set(record.pdfId, controller);
+		await sendStatus(true);
+		try {
+			const response = await compileService.compileLatexFileRequest({
+				protocol_version: 1,
+				request_id: `viewer-compile-${Date.now()}`,
+				operation: "compile_latex_file",
+				created_at_ns: Date.now() * 1_000_000,
+				workspace_context: { cwd: record.workspaceCwd },
+				details: { latex_file_path: sourcePath, open_pdf: true, reuse_existing: true },
+			}, controller.signal);
+			active.delete(record.pdfId);
+			if (response.status === "error") {
+				const detail = viewerCompileErrorText(response.error ?? "compile failed", response.status_details as unknown as Record<string, unknown>);
+				await sendStatus(false, { severity: "error", message: detail, injectText: detail });
+			} else {
+				await sendStatus(false);
+			}
+		} catch (error) {
+			active.delete(record.pdfId);
+			if (!controller.signal.aborted) {
+				const detail = error instanceof Error ? error.message : String(error);
+				await sendStatus(false, { severity: "error", message: detail, injectText: detail });
+			}
+		}
+	};
+	service.setCompileActionHandler(async (message, record) => {
+		if (message.action === "status") {
+			await service.sendCompileStatus({ pdf_id: record.pdfId, running: active.has(record.pdfId), continuous: continuous.has(record.pdfId) });
+			return;
+		}
+		const sendStopped = async (notice?: string) => {
+			await service.sendCompileStatus({ pdf_id: record.pdfId, running: false, continuous: false, ...(notice === undefined ? {} : { severity: "info", message: notice }) });
+		};
+		if (message.action === "stop") {
+			active.get(record.pdfId)?.abort(new Error("compile stopped by viewer"));
+			compileService.cancelActiveFileCompiles("compile stopped by viewer");
+			active.delete(record.pdfId);
+			if (!await continuous.stop(record.pdfId, "Continuous compilation deactivated.")) await sendStopped("Continuous compilation deactivated.");
+			return;
+		}
+		if (message.action === "continuous_off") {
+			if (!await continuous.stop(record.pdfId)) await service.sendCompileStatus({ pdf_id: record.pdfId, running: active.has(record.pdfId), continuous: false });
+			return;
+		}
+		if (message.action === "continuous_on") {
+			active.get(record.pdfId)?.abort(new Error("compile superseded by continuous compilation"));
+			compileService.cancelActiveFileCompiles("compile superseded by continuous compilation");
+			active.delete(record.pdfId);
+			await continuous.start(record);
+			return;
+		}
+		await runCompile(record);
+	});
+	return {
+		stop: () => continuous.stopAll(),
+		hasContinuousCompileForSource: (sourcePath, cwd) => continuous.hasSource(sourcePath, cwd),
+	};
+}
+
+function sourcePathForCompiledPdf(pdfPath: string): string {
+	const extension = extname(pdfPath);
+	return extension.toLowerCase() === ".pdf" ? `${pdfPath.slice(0, -extension.length)}.tex` : `${pdfPath}.tex`;
+}
+
+function normalizeContinuousSourcePath(sourcePath: string, cwd: string): string {
+	return resolve(cwd, sourcePath.trim());
+}
+
+function viewerCompileErrorText(error: string, details: Record<string, unknown>): string {
+	const source = typeof details.source === "string" ? basename(details.source) : "LaTeX source";
+	const summary = typeof details.error_summary === "string" && details.error_summary.trim() ? `\n${details.error_summary.trim()}` : "";
+	const log = typeof details.log === "string" && details.log.trim() ? `\nLog: ${details.log}` : "";
+	return `${source}: ${error}${summary}${log}`.trim();
+}
+
+function continuousCompileErrorText(sourcePath: string, error: unknown, outputTail = ""): string {
+	const message = error instanceof Error ? error.message : String(error);
+	const tail = outputTail.trim() ? `\n${outputTail.trim().split(/\r?\n/).slice(-8).join("\n")}` : "";
+	return `${basename(sourcePath)}: continuous compilation failed: ${message}${tail}`.trim();
+}
+
+function isNamedToolCallPayload(payload: string, name: string): boolean {
+	try {
+		const parsed: unknown = JSON.parse(payload);
+		return isRecord(parsed) && parsed.method === "tools/call" && isRecord(parsed.params) && parsed.params.name === name;
+	} catch {
+		return false;
+	}
+}
+
+function buildContinuousCompileActiveToolResponse(payload: string): unknown {
+	let id: unknown = null;
+	try {
+		const parsed: unknown = JSON.parse(payload);
+		if (isRecord(parsed) && (typeof parsed.id === "string" || typeof parsed.id === "number" || parsed.id === null)) id = parsed.id;
+	} catch {}
+	return {
+		jsonrpc: "2.0",
+		id,
+		result: {
+			content: [{ type: "text", text: "Continuous compilation is enabled by the user. Do not start or stop a separate compile; let the existing continuous latexmk process continue updating the viewer/PDF." }],
+			details: { continuous_compile_active: true },
+		},
+	};
 }
 
 function writeViewerUrlFallbackToUser(message: string, stderr: Writable): void {
