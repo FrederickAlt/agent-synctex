@@ -6,17 +6,21 @@ import type { AddressInfo, Socket } from "node:net";
 import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath, URL } from "node:url";
-import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_CONTROL_TOKEN_HEADER, VIEWER_HOST_HEARTBEAT_TOKEN_HEADER, VIEWER_HOST_PROTOCOL_VERSION, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
+import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_CONTROL_TOKEN_HEADER, VIEWER_HOST_HEARTBEAT_TOKEN_HEADER, VIEWER_HOST_PROTOCOL_VERSION, VIEWER_HOST_SHUTDOWN_TOKEN_HEADER, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
 import { prewarmSynctexForPdf, reverseSynctexForwardProbeResult, reverseSynctexHoverResult } from "./synctex/synctex_resolution.ts";
 import { DEFAULT_VIEWER_HOST_ACCESS_POLICY, type ViewerHostAccessPolicy, type ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
+import { PendingPdfMarkStore, type AcknowledgedPdfMark } from "./pending_pdf_marks.ts";
+import { inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
+import { ViewerHostEventBacklog, type ViewerHostEventFilters } from "./viewer_host_event_backlog.ts";
+import { ViewerFailureReporter } from "./viewer_failure_reporter.ts";
 export type { ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
 
 const LOCAL_HOST = "127.0.0.1";
 const DEFAULT_PORT = 0;
 const MAX_VIEWER_SOCKET_MESSAGE_BYTES = 64 * 1024;
+const DEFAULT_MAX_MCP_EVENT_BACKLOG = 500;
 const LW_VIEWER_ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "viewer_lw");
-const VIEWER_CLIENT_ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "viewer_client");
 const LW_PDFJS_BUILD_ASSETS = new Map<string, { path: string; polyfillModernPromiseHelpers?: boolean }>([
 	["/viewer-lw/build/pdf.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.mjs"), polyfillModernPromiseHelpers: true }],
 	["/viewer-lw/build/pdf.worker.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.worker.mjs"), polyfillModernPromiseHelpers: true }],
@@ -69,16 +73,17 @@ export interface ViewerHostPdfRefreshDiagnostic {
 	message: string;
 }
 
-interface ViewerClientTabEvent {
+interface ViewerTabEvent {
 	type: "open_pdf" | "focus_pdf";
 	pdf_id: number;
 	title: string;
 	revision: number;
 	viewer_url: string;
 	visible_tab_token: string;
+	active: boolean;
 }
 
-interface AppTabPayload {
+interface ViewerTabPayload {
 	pdf_id: number;
 	revision: number;
 	viewer_url: string;
@@ -114,12 +119,14 @@ export interface ViewerHostServerOptions {
 	fileSystem?: ViewerHostFileSystem;
 	viewerDispatch?: ViewerHostViewerDispatch;
 	verifyPdfMaybeUpdated?: (record: ViewerHostPdfRecord) => Promise<void> | void;
-	mcpEventSink?: (message: ViewerHostToMcpMessage) => Promise<void> | void;
 	pdfChangeDetection?: ViewerHostPdfChangeDetectionOptions;
 	accessPolicy?: ViewerHostAccessPolicy;
 	shutdownRequest?: ViewerHostShutdownRequestHandler;
 	heartbeatRequest?: ViewerHostHeartbeatRequestHandler;
 	controlToken?: string;
+	pendingPdfMarks?: PendingPdfMarkStore;
+	instanceId?: string;
+	maxMcpEventBacklog?: number;
 }
 
 export class ViewerHostServer {
@@ -128,7 +135,6 @@ export class ViewerHostServer {
 	private readonly fileSystem: ViewerHostFileSystem;
 	private readonly viewerDispatch: ViewerHostViewerDispatch;
 	private readonly verifyPdfMaybeUpdated: (record: ViewerHostPdfRecord) => Promise<void> | void;
-	private readonly mcpEventSink: (message: ViewerHostToMcpMessage) => Promise<void> | void;
 	private readonly pdfChangeDebounceMs: number;
 	private readonly pdfChangePollIntervalMs: number;
 	private readonly nowMs: () => number;
@@ -136,16 +142,19 @@ export class ViewerHostServer {
 	private readonly shutdownRequest: ViewerHostShutdownRequestHandler | undefined;
 	private readonly heartbeatRequest: ViewerHostHeartbeatRequestHandler | undefined;
 	private readonly controlToken: string | undefined;
+	private readonly pendingPdfMarks: PendingPdfMarkStore;
+	private readonly instanceIdValue: string;
+	private readonly failureReporter: ViewerFailureReporter;
 	private controlReady = false;
 	private controlProtocolVersion: number | undefined;
 	private server: Server | undefined;
 	private activeSockets = new Set<Socket>();
-	private appEventClients = new Set<ServerResponse>();
-	private readonly mcpEventBacklog: ViewerHostToMcpMessage[] = [];
+	private viewerEventClients = new Set<ServerResponse>();
+	private readonly mcpEvents: ViewerHostEventBacklog;
 	private viewerSocketClientsByPdfId = new Map<number, Set<ViewerSocketConnection>>();
 	private viewerSocketTokensByPdfId = new Map<number, string>();
-	private visibleViewerClientTabs = new Map<number, ViewerClientTabEvent>();
-	private activeVisibleViewerClientPdfId: number | undefined;
+	private visibleViewerTabs = new Map<number, ViewerTabEvent>();
+	private activeVisiblePdfId: number | undefined;
 	private debugSynctexByPdfId = new Map<number, boolean>();
 	private pendingPdfRefreshSnapshots = new Map<number, PendingPdfRefreshSnapshot>();
 	private pdfRefreshDiagnostics = new Map<number, ViewerHostPdfRefreshDiagnostic>();
@@ -161,7 +170,6 @@ export class ViewerHostServer {
 		this.fileSystem = options.fileSystem ?? { stat: statFile, createReadStream };
 		this.viewerDispatch = options.viewerDispatch ?? NOOP_VIEWER_DISPATCH;
 		this.verifyPdfMaybeUpdated = options.verifyPdfMaybeUpdated ?? (() => undefined);
-		this.mcpEventSink = options.mcpEventSink ?? (() => undefined);
 		this.pdfChangeDebounceMs = nonNegativeNumber(options.pdfChangeDetection?.debounceMs, 250);
 		this.pdfChangePollIntervalMs = nonNegativeNumber(options.pdfChangeDetection?.pollIntervalMs, 1_000);
 		this.nowMs = options.pdfChangeDetection?.nowMs ?? (() => Date.now());
@@ -169,6 +177,17 @@ export class ViewerHostServer {
 		this.shutdownRequest = options.shutdownRequest;
 		this.heartbeatRequest = options.heartbeatRequest;
 		this.controlToken = options.controlToken;
+		this.pendingPdfMarks = options.pendingPdfMarks ?? new PendingPdfMarkStore();
+		this.instanceIdValue = options.instanceId?.trim() || randomBytes(24).toString("base64url");
+		this.mcpEvents = new ViewerHostEventBacklog(options.maxMcpEventBacklog ?? DEFAULT_MAX_MCP_EVENT_BACKLOG);
+		this.failureReporter = new ViewerFailureReporter((message) => {
+			if (message.pdf_id === undefined) {
+				this.broadcastAllViewerSocketMessages(message);
+				return;
+			}
+			this.registry.getPdf(message.pdf_id);
+			this.broadcastViewerSocketMessage(message.pdf_id, message);
+		});
 	}
 
 	get origin(): string {
@@ -181,8 +200,12 @@ export class ViewerHostServer {
 		return this.addressValue;
 	}
 
-	get appUrl(): string {
-		return this.accessPolicy.appUrl(this.origin);
+	get viewerRootUrl(): string {
+		return this.accessPolicy.viewerRootUrl(this.origin);
+	}
+
+	get instanceId(): string {
+		return this.instanceIdValue;
 	}
 
 	get controlStatus(): ViewerHostControlStatus {
@@ -206,7 +229,7 @@ export class ViewerHostServer {
 	}
 
 	private activeViewerClientCount(): number {
-		let count = this.appEventClients.size;
+		let count = this.viewerEventClients.size;
 		for (const clients of this.viewerSocketClientsByPdfId.values()) {
 			for (const client of clients) {
 				if (!client.closed) count += 1;
@@ -288,9 +311,10 @@ export class ViewerHostServer {
 		this.addressValue = undefined;
 		this.controlReady = false;
 		this.controlProtocolVersion = undefined;
-		this.visibleViewerClientTabs.clear();
+		this.visibleViewerTabs.clear();
 		this.debugSynctexByPdfId.clear();
-		this.mcpEventBacklog.splice(0);
+		this.mcpEvents.clear();
+		this.pendingPdfMarks.clear();
 		this.pendingPdfRefreshSnapshots.clear();
 		this.pdfRefreshDiagnostics.clear();
 		this.stopPdfChangePolling();
@@ -299,8 +323,8 @@ export class ViewerHostServer {
 		for (const socket of this.activeSockets) {
 			socket.destroy();
 		}
-		this.appEventClients.clear();
-		this.activeVisibleViewerClientPdfId = undefined;
+		this.viewerEventClients.clear();
+		this.activeVisiblePdfId = undefined;
 		if (!server) return;
 		await new Promise<void>((resolve, reject) => {
 			server.close((error) => error ? reject(error) : resolve());
@@ -321,35 +345,45 @@ export class ViewerHostServer {
 			void this.handleHeartbeatRequest(request, response).catch((error) => jsonResponse(response, 500, { ok: false, error: { code: "internal_error", message: error instanceof Error ? error.message : String(error) } }));
 			return;
 		}
-		if (requestUrl.pathname === "/app-events") {
-			this.handleAppEventsRequest(request, response);
+		if (requestUrl.pathname === "/viewer-events") {
+			this.handleViewerEventsRequest(request, response);
 			return;
 		}
-		if (requestUrl.pathname === "/app-tab-closed") {
-			await this.handleAppTabClosedRequest(request, response);
+		if (requestUrl.pathname === "/viewer-tab-closed") {
+			await this.handleViewerTabClosedRequest(request, response);
 			return;
 		}
-		if (requestUrl.pathname === "/app-tab-selected") {
-			await this.handleAppTabSelectedRequest(request, response);
+		if (requestUrl.pathname === "/viewer-tab-selected") {
+			await this.handleViewerTabSelectedRequest(request, response);
 			return;
 		}
 		if (requestUrl.pathname === "/mcp-events/drain") {
 			await this.handleMcpEventsDrainRequest(request, response);
 			return;
 		}
-
+		if (requestUrl.pathname === "/marks/claim") {
+			await this.handleMarksClaimRequest(request, response);
+			return;
+		}
+		if (requestUrl.pathname === "/marks/ack") {
+			await this.handleMarksAckRequest(request, response);
+			return;
+		}
+		if (requestUrl.pathname === "/marks/release") {
+			await this.handleMarksReleaseRequest(request, response);
+			return;
+		}
+		if (requestUrl.pathname === "/synctex/probe") {
+			await this.handleSynctexProbeRequest(request, response);
+			return;
+		}
 		if (request.method !== "GET" && request.method !== "HEAD") {
 			textResponse(response, 405, "text/plain; charset=utf-8", "method not allowed", false);
 			return;
 		}
 
-		if (requestUrl.pathname === "/app") {
-			this.serveAppShell(response, request.method === "HEAD");
-			return;
-		}
-
 		if (requestUrl.pathname === "/viewer-lw" || requestUrl.pathname === "/viewer-lw/") {
-			const activeTab = this.lastVisibleViewerClientTab();
+			const activeTab = this.lastVisibleViewerTab();
 			if (!activeTab) {
 				this.serveLaTeXWorkshopEmptyViewerShell(response, request.method === "HEAD");
 				return;
@@ -394,12 +428,6 @@ export class ViewerHostServer {
 			return;
 		}
 
-		if (requestUrl.pathname === "/assets/viewer-client-tabs.js") {
-			this.serveViewerClientAsset(response, "viewer-client-tabs.js", request.method === "HEAD");
-			return;
-		}
-
-
 		if (requestUrl.pathname.startsWith("/viewer-lw/")) {
 			this.serveLaTeXWorkshopViewerAsset(response, requestUrl.pathname, request.method === "HEAD");
 			return;
@@ -424,9 +452,9 @@ export class ViewerHostServer {
 		textResponse(response, 404, "text/plain; charset=utf-8", "not found", request.method === "HEAD");
 	}
 
-	private handleAppEventsRequest(request: IncomingMessage, response: ServerResponse): void {
+	private handleViewerEventsRequest(request: IncomingMessage, response: ServerResponse): void {
 		if (request.method !== "GET") {
-			textResponse(response, 405, "text/plain; charset=utf-8", "app event stream requires GET", false);
+			textResponse(response, 405, "text/plain; charset=utf-8", "viewer event stream requires GET", false);
 			return;
 		}
 		response.writeHead(200, {
@@ -434,29 +462,30 @@ export class ViewerHostServer {
 			"cache-control": "no-store",
 			connection: "keep-alive",
 		});
-		this.appEventClients.add(response);
-		writeAppEvent(response, { type: "ready" });
-		for (const event of this.visibleViewerClientTabs.values()) {
-			writeAppEvent(response, event);
+		this.viewerEventClients.add(response);
+		writeViewerEvent(response, { type: "ready" });
+		for (const event of this.visibleViewerTabs.values()) {
+			writeViewerEvent(response, { ...event, active: event.pdf_id === this.activeVisiblePdfId });
 		}
-		request.once("close", () => this.appEventClients.delete(response));
+		request.once("close", () => this.viewerEventClients.delete(response));
 	}
 
-	private async handleAppTabClosedRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
-		const payload = await this.readAppTabPayload(request, response, "invalid_close_payload");
+	private async handleViewerTabClosedRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		const payload = await this.readViewerTabPayload(request, response, "invalid_close_payload");
 		if (!payload) return;
-		const current = this.visibleViewerClientTabs.get(payload.pdf_id);
+		const current = this.visibleViewerTabs.get(payload.pdf_id);
 		if (current?.revision === payload.revision && current.viewer_url === payload.viewer_url && current.visible_tab_token === payload.visible_tab_token) {
-			this.visibleViewerClientTabs.delete(payload.pdf_id);
-			if (this.activeVisibleViewerClientPdfId === payload.pdf_id) this.activeVisibleViewerClientPdfId = this.lastVisibleViewerClientTab()?.pdf_id;
+			this.visibleViewerTabs.delete(payload.pdf_id);
+			if (this.activeVisiblePdfId === payload.pdf_id) this.activeVisiblePdfId = this.lastVisibleViewerTab()?.pdf_id;
 			this.discardMcpEventsForPdfId(payload.pdf_id);
+			this.pendingPdfMarks.clearPdf(payload.pdf_id);
 			this.broadcastAnnotationsCleared([payload.pdf_id]);
-			void Promise.resolve(this.mcpEventSink({ type: "viewer_tab_closed", pdf_id: payload.pdf_id })).catch(() => undefined);
+			this.queueMcpEvent({ type: "viewer_tab_closed", pdf_id: payload.pdf_id });
 		}
 		textResponse(response, 200, "application/json; charset=utf-8", JSON.stringify({ ok: true }), false);
 	}
 
-	private async handleAppTabSelectedRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+	private async handleViewerTabSelectedRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
 		if (request.method !== "POST") {
 			textResponse(response, 405, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "method_not_allowed" }), false);
 			return;
@@ -468,15 +497,19 @@ export class ViewerHostServer {
 			textResponse(response, 400, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "malformed_json" }), false);
 			return;
 		}
-		if (!isAppTabSelectedPayload(payload)) {
+		if (!isViewerTabSelectedPayload(payload)) {
 			textResponse(response, 400, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "invalid_select_payload" }), false);
 			return;
 		}
-		if (this.visibleViewerClientTabs.has(payload.pdf_id)) this.activeVisibleViewerClientPdfId = payload.pdf_id;
+		const selected = this.visibleViewerTabs.get(payload.pdf_id);
+		if (selected) {
+			this.activeVisiblePdfId = payload.pdf_id;
+			this.broadcastViewerEvent({ ...selected, type: "focus_pdf", active: true });
+		}
 		textResponse(response, 200, "application/json; charset=utf-8", JSON.stringify({ ok: true }), false);
 	}
 
-	private async readAppTabPayload(request: IncomingMessage, response: ServerResponse, invalidPayloadError: string): Promise<AppTabPayload | undefined> {
+	private async readViewerTabPayload(request: IncomingMessage, response: ServerResponse, invalidPayloadError: string): Promise<ViewerTabPayload | undefined> {
 		if (request.method !== "POST") {
 			textResponse(response, 405, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "method_not_allowed" }), false);
 			return;
@@ -488,7 +521,7 @@ export class ViewerHostServer {
 			textResponse(response, 400, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: "malformed_json" }), false);
 			return;
 		}
-		if (!isAppTabPayload(payload)) {
+		if (!isViewerTabPayload(payload)) {
 			textResponse(response, 400, "application/json; charset=utf-8", JSON.stringify({ ok: false, error: invalidPayloadError }), false);
 			return;
 		}
@@ -506,14 +539,167 @@ export class ViewerHostServer {
 		}
 		const filters = await this.readMcpEventsDrainFilters(request, response);
 		if (response.headersSent) return;
-		const events = this.drainMcpEventBacklog(filters);
-		this.broadcastAnnotationsCleared(new Set(events
-			.filter((event) => event.type === "pdf_annotation" || event.type === "pdf_annotation_deleted")
-			.map((event) => event.pdf_id)));
+		const events = this.mcpEvents.drain(filters);
 		jsonResponse(response, 200, { ok: true, events });
 	}
 
-	private async readMcpEventsDrainFilters(request: IncomingMessage, response: ServerResponse): Promise<{ pdfIds?: Set<number>; eventTypes?: Set<ViewerHostToMcpMessage["type"]> } | undefined> {
+	private async handleMarksClaimRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		if (!this.isAuthorizedControlRequest(request)) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid Viewer Host control token" } });
+			return;
+		}
+		if (request.method !== "POST") {
+			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "mark claim requires POST" } });
+			return;
+		}
+		let payload: unknown = {};
+		try {
+			const body = await readRequestBody(request);
+			if (body.trim()) payload = JSON.parse(body);
+		} catch {
+			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "mark claim body must be valid JSON" } });
+			return;
+		}
+		if (!isRecord(payload)) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_request", message: "mark claim body must be an object" } });
+			return;
+		}
+		if (payload.pdf_ids !== undefined && (!Array.isArray(payload.pdf_ids) || !payload.pdf_ids.every((value) => Number.isInteger(value) && value > 0))) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_pdf_ids", message: "mark claim pdf_ids must be positive integers" } });
+			return;
+		}
+		if (payload.max_marks !== undefined && (!Number.isInteger(payload.max_marks) || Number(payload.max_marks) <= 0)) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_max_marks", message: "mark claim max_marks must be a positive integer" } });
+			return;
+		}
+		const claim = this.pendingPdfMarks.claim({
+			...(payload.pdf_ids === undefined ? {} : { pdfIds: new Set(payload.pdf_ids as number[]) }),
+			...(payload.max_marks === undefined ? {} : { maxMarks: Number(payload.max_marks) }),
+		});
+		jsonResponse(response, 200, {
+			ok: true,
+			marks: claim.marks,
+			...(claim.claimId === undefined ? {} : { claim_id: claim.claimId }),
+			...(claim.expiresAtMs === undefined ? {} : { lease_expires_at_ms: claim.expiresAtMs }),
+		});
+	}
+
+	private async handleMarksAckRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		if (!this.isAuthorizedControlRequest(request)) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid Viewer Host control token" } });
+			return;
+		}
+		if (request.method !== "POST") {
+			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "mark acknowledgement requires POST" } });
+			return;
+		}
+		let payload: unknown;
+		try {
+			payload = JSON.parse(await readRequestBody(request));
+		} catch {
+			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "mark acknowledgement body must be valid JSON" } });
+			return;
+		}
+		if (!isRecord(payload) || typeof payload.claim_id !== "string" || !payload.claim_id.trim() || payload.claim_id.length > 256) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_claim_id", message: "mark acknowledgement claim_id must be a non-empty string" } });
+			return;
+		}
+		if (!Array.isArray(payload.consumed) || !payload.consumed.every((entry) => isRecord(entry)
+			&& Number.isInteger(entry.pdf_id) && Number(entry.pdf_id) > 0
+			&& typeof entry.annotation_id === "string" && entry.annotation_id.length > 0)) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_consumed_marks", message: "mark acknowledgement consumed must list PDF and annotation IDs" } });
+			return;
+		}
+		const acknowledged = this.pendingPdfMarks.acknowledge(payload.claim_id, payload.consumed as AcknowledgedPdfMark[]);
+		this.broadcastAcknowledgedMarks(acknowledged);
+		jsonResponse(response, 200, { ok: true, acknowledged });
+	}
+
+	private async handleMarksReleaseRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		if (!this.isAuthorizedControlRequest(request)) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid Viewer Host control token" } });
+			return;
+		}
+		if (request.method !== "POST") {
+			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "mark release requires POST" } });
+			return;
+		}
+		let payload: unknown;
+		try {
+			payload = JSON.parse(await readRequestBody(request));
+		} catch {
+			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "mark release body must be valid JSON" } });
+			return;
+		}
+		if (!isRecord(payload) || typeof payload.claim_id !== "string" || !payload.claim_id.trim() || payload.claim_id.length > 256) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_claim_id", message: "mark release claim_id must be a non-empty string" } });
+			return;
+		}
+		if (payload.error !== undefined && (typeof payload.error !== "string" || !payload.error.trim() || payload.error.length > 2_000)) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_error", message: "mark release error must be a non-empty string of at most 2000 characters" } });
+			return;
+		}
+		const released = this.pendingPdfMarks.release(payload.claim_id);
+		if (typeof payload.error === "string") {
+			for (const pdfId of new Set(released.map((mark) => mark.pdf_id))) {
+				await this.failureReporter.report(payload.error, {
+					pdfId,
+					code: "mark_delivery_failed",
+					title: "Could not deliver PDF marks",
+					detail: payload.error,
+					injectText: `PDF mark delivery failed: ${payload.error}`,
+				});
+			}
+		}
+		jsonResponse(response, 200, { ok: true, released });
+	}
+
+	private async handleSynctexProbeRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		if (request.method !== "POST") {
+			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "SyncTeX probe requires POST" } });
+			return;
+		}
+		let payload: unknown;
+		try {
+			payload = JSON.parse(await readRequestBody(request));
+		} catch {
+			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "SyncTeX probe body must be valid JSON" } });
+			return;
+		}
+		if (!isRecord(payload)) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_request", message: "SyncTeX probe body must be an object" } });
+			return;
+		}
+		const pdfId = parsePositiveInteger(typeof payload.pdf_id === "number" ? String(payload.pdf_id) : undefined);
+		if (pdfId === undefined || !this.hasRegisteredPdf(pdfId)) {
+			jsonResponse(response, 404, { ok: false, error: { code: "unknown_pdf", message: "unknown pdf_id" } });
+			return;
+		}
+		if (request.headers["x-agent-synctex-viewer-token"] !== this.viewerSocketTokenForPdf(pdfId)) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid viewer token" } });
+			return;
+		}
+		let message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_forward_probe" }>;
+		try {
+			const validated = validateViewerHostToMcpMessage({ ...payload, type: "reverse_synctex_forward_probe", pdf_id: pdfId });
+			if (validated.type !== "reverse_synctex_forward_probe") throw new Error("invalid SyncTeX probe message");
+			message = validated;
+		} catch (error) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_probe", message: errorMessage(error) } });
+			return;
+		}
+		try {
+			const record = this.registry.getPdf(pdfId);
+			jsonResponse(response, 200, { ok: true, result: reverseSynctexForwardProbeResult({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } }) });
+		} catch (error) {
+			jsonResponse(response, 200, {
+				ok: true,
+				result: { type: "reverse_synctex_forward_probe_result", pdf_id: pdfId, request_id: message.request_id, click_page: message.page, click_x: message.x, click_y: message.y, error: errorMessage(error) },
+			});
+		}
+	}
+
+	private async readMcpEventsDrainFilters(request: IncomingMessage, response: ServerResponse): Promise<ViewerHostEventFilters | undefined> {
 		if (request.headers["content-type"] === undefined) return undefined;
 		let body = "";
 		try {
@@ -548,28 +734,6 @@ export class ViewerHostServer {
 			eventTypes = new Set(payload.event_types as ViewerHostToMcpMessage["type"][]);
 		}
 		return { ...(pdfIds === undefined ? {} : { pdfIds }), ...(eventTypes === undefined ? {} : { eventTypes }) };
-	}
-
-	private drainMcpEventBacklog(filters: { pdfIds?: Set<number>; eventTypes?: Set<ViewerHostToMcpMessage["type"]> } | undefined): ViewerHostToMcpMessage[] {
-		if (filters?.pdfIds === undefined && filters?.eventTypes === undefined) return this.mcpEventBacklog.splice(0);
-		const drained: ViewerHostToMcpMessage[] = [];
-		const kept: ViewerHostToMcpMessage[] = [];
-		for (const event of this.mcpEventBacklog) {
-			const matchesPdf = filters?.pdfIds === undefined || ("pdf_id" in event && filters.pdfIds.has(event.pdf_id));
-			const matchesType = filters?.eventTypes === undefined || filters.eventTypes.has(event.type);
-			if (matchesPdf && matchesType) drained.push(event);
-			else kept.push(event);
-		}
-		this.mcpEventBacklog.splice(0, this.mcpEventBacklog.length, ...kept);
-		return drained;
-	}
-
-	private serveAppShell(response: ServerResponse, headOnly: boolean): void {
-		this.serveViewerClientAsset(response, "app.html", headOnly);
-	}
-
-	private serveViewerClientAsset(response: ServerResponse, relativeAssetPath: string, headOnly: boolean): void {
-		this.serveStaticFile(response, VIEWER_CLIENT_ASSET_ROOT, relativeAssetPath, headOnly);
 	}
 
 	private serveLaTeXWorkshopViewerShell(response: ServerResponse, pdfId: number, headOnly: boolean): void {
@@ -678,7 +842,7 @@ export class ViewerHostServer {
 			jsonResponse(response, 404, { ok: false, error: { code: "shutdown_unavailable", message: "shutdown endpoint is not enabled" } });
 			return;
 		}
-		if (request.headers["x-agent-synctex-shutdown-token"] !== this.shutdownRequest.token) {
+		if (request.headers[VIEWER_HOST_SHUTDOWN_TOKEN_HEADER] !== this.shutdownRequest.token) {
 			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid shutdown token" } });
 			return;
 		}
@@ -688,7 +852,7 @@ export class ViewerHostServer {
 				void Promise.resolve(shutdownRequest.shutdown("http_shutdown")).catch(() => undefined);
 			});
 		});
-		jsonResponse(response, 200, { ok: true });
+		jsonResponse(response, 200, { ok: true, instance_id: this.instanceIdValue });
 	}
 
 	private async handleHeartbeatRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -767,7 +931,7 @@ export class ViewerHostServer {
 				}
 				this.controlReady = true;
 				this.controlProtocolVersion = message.protocol_version;
-				return { ok: true, message: { type: "ready", protocol_version: VIEWER_HOST_PROTOCOL_VERSION, origin: this.origin, active_viewer_clients: this.activeViewerClientCount() } };
+				return { ok: true, message: { type: "ready", protocol_version: VIEWER_HOST_PROTOCOL_VERSION, origin: this.origin, instance_id: this.instanceIdValue, active_viewer_clients: this.activeViewerClientCount() } };
 			case "open_pdf": {
 				const snapshot = await snapshotRegisteredPdf(this.fileSystem, message.pdf_path);
 				const revision = this.nextRegistrationRevision(message.pdf_id, message.pdf_path, snapshot);
@@ -783,14 +947,14 @@ export class ViewerHostServer {
 				this.pdfRefreshDiagnostics.delete(record.pdfId);
 				this.debugSynctexByPdfId.set(record.pdfId, message.debug_synctex === true);
 				await this.viewerDispatch.openPdf(record);
-				this.broadcastViewerClientTabEvent("open_pdf", record);
+					this.broadcastViewerTabEvent("open_pdf", record);
 				this.scheduleSynctexPrewarm(record);
 				return { ok: true, result: { type: "open_pdf", pdf_id: record.pdfId, revision: record.revision } };
 			}
 			case "focus_pdf": {
 				const record = this.registry.getPdf(message.pdf_id);
 				await this.viewerDispatch.focusPdf(record);
-				this.broadcastViewerClientTabEvent("focus_pdf", record);
+					this.broadcastViewerTabEvent("focus_pdf", record);
 				return { ok: true, result: { type: "focus_pdf", pdf_id: record.pdfId } };
 			}
 			case "set_debug_synctex": {
@@ -813,6 +977,7 @@ export class ViewerHostServer {
 			}
 			case "clear_pdf_annotations": {
 				const record = this.registry.getPdf(message.pdf_id);
+				this.pendingPdfMarks.clearPdf(record.pdfId);
 				this.broadcastAnnotationsCleared([record.pdfId]);
 				return { ok: true, result: { type: "clear_pdf_annotations", pdf_id: record.pdfId } };
 			}
@@ -821,15 +986,21 @@ export class ViewerHostServer {
 				this.broadcastViewerSocketMessage(record.pdfId, message);
 				return { ok: true, result: { type: "compile_status", pdf_id: record.pdfId } };
 			}
+			case "report_error": {
+				if (message.pdf_id !== undefined) this.registry.getPdf(message.pdf_id);
+				await this.failureReporter.report(message.detail, {
+					code: message.code,
+					title: message.title,
+					...(message.pdf_id === undefined ? {} : { pdfId: message.pdf_id }),
+					detail: message.detail,
+					...(message.inject_text === undefined ? {} : { injectText: message.inject_text }),
+				});
+				return { ok: true, result: { type: "report_error", ...(message.pdf_id === undefined ? {} : { pdf_id: message.pdf_id }) } };
+			}
 			case "reverse_synctex_hover_result": {
 				const record = this.registry.getPdf(message.pdf_id);
 				this.broadcastViewerSocketMessage(record.pdfId, message);
 				return { ok: true, result: { type: "reverse_synctex_hover_result", pdf_id: record.pdfId } };
-			}
-			case "reverse_synctex_forward_probe_result": {
-				const record = this.registry.getPdf(message.pdf_id);
-				this.broadcastViewerSocketMessage(record.pdfId, message);
-				return { ok: true, result: { type: "reverse_synctex_forward_probe_result", pdf_id: record.pdfId } };
 			}
 		}
 	}
@@ -918,52 +1089,67 @@ export class ViewerHostServer {
 		let payload: unknown;
 		try {
 			payload = JSON.parse(text);
-			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "pdf_annotation" && payload.type !== "pdf_annotation_deleted" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover" && payload.type !== "reverse_synctex_forward_probe" && payload.type !== "compile_action")) return;
+			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "pdf_annotation" && payload.type !== "pdf_annotation_deleted" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover" && payload.type !== "compile_action")) return;
 			if (payload.pdf_id !== undefined && payload.pdf_id !== connection.pdfId) {
 				throw new Error(`${String(payload.type)} pdf_id=${String(payload.pdf_id)} does not match viewer socket pdf_id=${connection.pdfId}`);
 			}
 			const message = validateViewerHostToMcpMessage({ ...payload, pdf_id: connection.pdfId });
+			if (message.type === "pdf_annotation") {
+				this.pendingPdfMarks.upsert(message);
+				return;
+			}
+			if (message.type === "pdf_annotation_deleted") {
+				this.pendingPdfMarks.delete(message.pdf_id, message.annotation_id);
+				return;
+			}
+			if (message.type === "compile_action" && message.action === "inject_diagnostic" && message.inject_text?.trim()) {
+				const record = this.registry.getPdf(message.pdf_id);
+				this.pendingPdfMarks.upsert({
+					type: "pdf_annotation",
+					pdf_id: record.pdfId,
+					annotation_id: `compile-diagnostic-${Date.now()}-${randomBytes(6).toString("hex")}`,
+					page: 1,
+					x: 0,
+					y: 0,
+					source_file: inferDefaultSourceFileForPdf(record.pdfPath) ?? record.pdfPath,
+					line: 1,
+					comment: message.inject_text,
+				});
+				return;
+			}
 			if (message.type === "reverse_synctex_hover") {
 				this.handleReverseSynctexHoverMessage(connection, message);
 				return;
 			}
-			if (message.type === "reverse_synctex_forward_probe") {
-				this.handleReverseSynctexForwardProbeMessage(connection, message);
-				return;
-			}
 			this.queueMcpEvent(message);
-			void Promise.resolve(this.mcpEventSink(message)).catch((error: unknown) => {
-				if (!connection.closed && message.type === "reverse_synctex") sendViewerSocketJson(connection, { type: "error", code: "reverse_synctex_failed", message: errorMessage(error) });
-			});
 		} catch (error) {
 			sendViewerSocketJson(connection, { type: "error", code: "invalid_viewer_message", message: errorMessage(error) });
 		}
 	}
 
 	private discardMcpEventsForPdfId(pdfId: number): void {
-		const kept = this.mcpEventBacklog.filter((event) => !("pdf_id" in event) || event.pdf_id !== pdfId);
-		this.mcpEventBacklog.splice(0, this.mcpEventBacklog.length, ...kept);
+		this.mcpEvents.discardPdf(pdfId);
 	}
 
 	private queueMcpEvent(message: ViewerHostToMcpMessage): void {
-		if (message.type === "pdf_annotation_deleted") {
-			const existingIndex = this.mcpEventBacklog.findIndex((event) => event.type === "pdf_annotation" && event.pdf_id === message.pdf_id && event.annotation_id === message.annotation_id);
-			if (existingIndex >= 0) this.mcpEventBacklog.splice(existingIndex, 1);
-			return;
-		}
-		if (message.type === "pdf_annotation") {
-			const existingIndex = this.mcpEventBacklog.findIndex((event) => event.type === "pdf_annotation" && event.pdf_id === message.pdf_id && event.annotation_id === message.annotation_id);
-			if (existingIndex >= 0) {
-				this.mcpEventBacklog[existingIndex] = message;
-				return;
-			}
-		}
-		this.mcpEventBacklog.push(message);
+		this.mcpEvents.enqueue(message);
 	}
 
 	private broadcastAnnotationsCleared(pdfIds: Iterable<number>): void {
 		for (const pdfId of pdfIds) {
 			this.broadcastAllViewerSocketMessages({ type: "annotations_cleared", pdf_id: pdfId, pdf_ids: [pdfId] });
+		}
+	}
+
+	private broadcastAcknowledgedMarks(acknowledged: readonly AcknowledgedPdfMark[]): void {
+		const annotationIdsByPdfId = new Map<number, string[]>();
+		for (const mark of acknowledged) {
+			const annotationIds = annotationIdsByPdfId.get(mark.pdf_id) ?? [];
+			annotationIds.push(mark.annotation_id);
+			annotationIdsByPdfId.set(mark.pdf_id, annotationIds);
+		}
+		for (const [pdfId, annotationIds] of annotationIdsByPdfId) {
+			this.broadcastAllViewerSocketMessages({ type: "annotations_cleared", pdf_id: pdfId, pdf_ids: [pdfId], annotation_ids: annotationIds });
 		}
 	}
 
@@ -977,15 +1163,6 @@ export class ViewerHostServer {
 			}
 		}
 		return delivered;
-	}
-
-	private handleReverseSynctexForwardProbeMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_forward_probe" }>): void {
-		try {
-			const record = this.registry.getPdf(connection.pdfId);
-			sendViewerSocketJson(connection, reverseSynctexForwardProbeResult({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } }));
-		} catch (error) {
-			sendViewerSocketJson(connection, { type: "reverse_synctex_forward_probe_result", pdf_id: connection.pdfId, request_id: message.request_id, click_page: message.page, click_x: message.x, click_y: message.y, error: errorMessage(error) });
-		}
 	}
 
 	private handleReverseSynctexHoverMessage(connection: ViewerSocketConnection, message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_hover" }>): void {
@@ -1033,22 +1210,19 @@ export class ViewerHostServer {
 		return token;
 	}
 
-	private broadcastViewerClientTabEvent(type: ViewerClientTabEvent["type"], record: ViewerHostPdfRecord): void {
-		const event: ViewerClientTabEvent = {
+	private broadcastViewerTabEvent(type: ViewerTabEvent["type"], record: ViewerHostPdfRecord): void {
+		const event: ViewerTabEvent = {
 			type,
 			pdf_id: record.pdfId,
 			title: record.title,
 			revision: record.revision,
 			viewer_url: this.accessPolicy.viewerUrl(record.pdfId, record.revision),
 			visible_tab_token: this.createVisibleTabToken(),
+			active: true,
 		};
-		if (this.visibleViewerClientTabs.has(record.pdfId)) {
-			this.visibleViewerClientTabs.set(record.pdfId, event);
-		} else {
-			this.visibleViewerClientTabs.set(record.pdfId, event);
-		}
-		this.activeVisibleViewerClientPdfId = record.pdfId;
-		this.broadcastAppEvent(event);
+		this.visibleViewerTabs.set(record.pdfId, event);
+		this.activeVisiblePdfId = record.pdfId;
+		this.broadcastViewerEvent(event);
 	}
 
 	private createVisibleTabToken(): string {
@@ -1057,19 +1231,19 @@ export class ViewerHostServer {
 		return token;
 	}
 
-	private lastVisibleViewerClientTab(): ViewerClientTabEvent | undefined {
-		if (this.activeVisibleViewerClientPdfId !== undefined) {
-			const active = this.visibleViewerClientTabs.get(this.activeVisibleViewerClientPdfId);
+	private lastVisibleViewerTab(): ViewerTabEvent | undefined {
+		if (this.activeVisiblePdfId !== undefined) {
+			const active = this.visibleViewerTabs.get(this.activeVisiblePdfId);
 			if (active) return active;
 		}
-		let last: ViewerClientTabEvent | undefined;
-		for (const event of this.visibleViewerClientTabs.values()) last = event;
+		let last: ViewerTabEvent | undefined;
+		for (const event of this.visibleViewerTabs.values()) last = event;
 		return last;
 	}
 
-	private broadcastAppEvent(event: ViewerClientTabEvent | { type: "ready" }): void {
-		for (const client of this.appEventClients) {
-			writeAppEvent(client, event);
+	private broadcastViewerEvent(event: ViewerTabEvent | { type: "ready" }): void {
+		for (const client of this.viewerEventClients) {
+			writeViewerEvent(client, event);
 		}
 	}
 
@@ -1127,13 +1301,7 @@ export class ViewerHostServer {
 		if (now - pending.observedAtMs < this.pdfChangeDebounceMs) return;
 
 		this.pendingPdfRefreshSnapshots.delete(record.pdfId);
-		const updated = this.registry.registerPdf({
-			pdfId: record.pdfId,
-			pdfPath: record.pdfPath,
-			title: record.title,
-			revision: record.revision + 1,
-			fileSnapshot: snapshot,
-		});
+		const updated = this.registry.recordPdfFileChange(record.pdfId, snapshot);
 		this.scheduleSynctexPrewarm(updated);
 		this.sendPdfRefresh(record.pdfId);
 	}
@@ -1340,11 +1508,11 @@ async function waitForReadablePdfOpen(stream: Readable): Promise<void> {
 	});
 }
 
-function writeAppEvent(response: ServerResponse, event: ViewerClientTabEvent | { type: "ready" }): void {
+function writeViewerEvent(response: ServerResponse, event: ViewerTabEvent | { type: "ready" }): void {
 	response.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function isAppTabPayload(payload: unknown): payload is AppTabPayload {
+function isViewerTabPayload(payload: unknown): payload is ViewerTabPayload {
 	return typeof payload === "object"
 		&& payload !== null
 		&& Number.isInteger((payload as { pdf_id?: unknown }).pdf_id)
@@ -1357,7 +1525,7 @@ function isAppTabPayload(payload: unknown): payload is AppTabPayload {
 		&& !!(payload as { visible_tab_token: string }).visible_tab_token;
 }
 
-function isAppTabSelectedPayload(payload: unknown): payload is { pdf_id: number } {
+function isViewerTabSelectedPayload(payload: unknown): payload is { pdf_id: number } {
 	return typeof payload === "object"
 		&& payload !== null
 		&& Number.isInteger((payload as { pdf_id?: unknown }).pdf_id)

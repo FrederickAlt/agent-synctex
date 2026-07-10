@@ -22,16 +22,7 @@ export function viewerUrlForAgentWhenNoLiveViewer(details: ViewerUrlAgentNoticeD
 export function viewerUrlAgentNotice(details: ViewerUrlAgentNoticeDetails): string | undefined {
 	const url = viewerUrlForAgentWhenNoLiveViewer(details);
 	if (url === undefined) return undefined;
-	const browserLaunch = isRecord(details.browser_launch) ? details.browser_launch : undefined;
-	const openerError = typeof browserLaunch?.error === "string" && browserLaunch.error.trim()
-		? ` (browser opener failed: ${compactOneLine(browserLaunch.error)})`
-		: "";
-	return `No browser viewer was detected after launch${openerError}; pass this Viewer URL to the user: ${url}`;
-}
-
-function compactOneLine(value: string): string {
-	const compacted = value.replace(/\s+/g, " ").trim();
-	return compacted.length > 240 ? `${compacted.slice(0, 239)}…` : compacted;
+	return `Pass this Viewer URL to the user: ${url}`;
 }
 
 export function appendViewerUrlAgentNotice(text: string, details: ViewerUrlAgentNoticeDetails): string {

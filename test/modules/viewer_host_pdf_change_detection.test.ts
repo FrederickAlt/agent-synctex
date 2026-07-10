@@ -110,7 +110,7 @@ test("Viewer Host increments revision and broadcasts pdf_refresh after a stable 
 	const server = new ViewerHostServer({ registry, pdfChangeDetection: { debounceMs: 75, pollIntervalMs: 0, nowMs: () => nowMs } });
 	let socket: TestWebSocket | undefined;
 	try {
-		registry.registerPdf({ pdfId: 2, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath) });
+		registry.registerPdf({ pdfId: 2, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
 		await server.start();
 		socket = await openViewerSocket(server.origin, 2, await getViewerSocketToken(server.origin, 2));
 
@@ -126,6 +126,7 @@ test("Viewer Host increments revision and broadcasts pdf_refresh after a stable 
 
 		assert.equal(registry.getPdf(2).revision, 2);
 		assert.deepEqual(registry.getPdf(2).fileSnapshot, changedSnapshot);
+		assert.equal(registry.getPdf(2).workspaceCwd, baseDir, "file refresh must preserve workspace identity used by reverse SyncTeX");
 		assert.deepEqual(await refresh, { type: "pdf_refresh", pdf_id: 2, revision: 2, pdf_url: `${server.origin}/pdf/2?revision=2` });
 	} finally {
 		socket?.close();

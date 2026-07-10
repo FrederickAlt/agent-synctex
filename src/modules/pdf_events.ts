@@ -99,7 +99,12 @@ export interface GetPdfEventsRequest {
 export class PdfEventStore {
 	private readonly events: PdfEvent[] = [];
 	private readonly readSequences = new Set<number>();
+	private readonly maxEvents: number;
 	private nextSequence = 1;
+
+	constructor(options: { maxEvents?: number } = {}) {
+		this.maxEvents = typeof options.maxEvents === "number" && Number.isInteger(options.maxEvents) && options.maxEvents > 0 ? options.maxEvents : 500;
+	}
 
 	appendReverseSynctexEvent(input: ReverseSynctexPdfEventInput): ReverseSynctexPdfEvent {
 		const event: ReverseSynctexPdfEvent = {
@@ -107,7 +112,7 @@ export class PdfEventStore {
 			sequence: this.nextSequence,
 		};
 		this.nextSequence += 1;
-		this.events.push(event);
+		this.append(event);
 		return event;
 	}
 
@@ -117,7 +122,7 @@ export class PdfEventStore {
 			sequence: this.nextSequence,
 		};
 		this.nextSequence += 1;
-		this.events.push(event);
+		this.append(event);
 		return event;
 	}
 
@@ -127,7 +132,7 @@ export class PdfEventStore {
 			sequence: this.nextSequence,
 		};
 		this.nextSequence += 1;
-		this.events.push(event);
+		this.append(event);
 		return event;
 	}
 
@@ -149,6 +154,15 @@ export class PdfEventStore {
 		return returned;
 	}
 
+	getPdfAnnotationEvents(request: Pick<GetPdfEventsRequest, "pdf_id" | "max_events">): PdfAnnotationEvent[] {
+		const filtered = this.events.filter((event): event is PdfAnnotationEvent => event.type === "pdf_annotation"
+			&& (request.pdf_id === undefined || event.pdf_id === request.pdf_id));
+		const unread = filtered.filter((event) => !this.readSequences.has(event.sequence));
+		const returned = unread.slice(0, request.max_events);
+		for (const event of returned) this.readSequences.add(event.sequence);
+		return returned;
+	}
+
 	clearPdfEvents(pdfId: number): void {
 		for (let index = this.events.length - 1; index >= 0; index -= 1) {
 			const event = this.events[index];
@@ -162,5 +176,13 @@ export class PdfEventStore {
 		this.events.length = 0;
 		this.readSequences.clear();
 		this.nextSequence = 1;
+	}
+
+	private append(event: PdfEvent): void {
+		this.events.push(event);
+		while (this.events.length > this.maxEvents) {
+			const removed = this.events.shift();
+			if (removed) this.readSequences.delete(removed.sequence);
+		}
 	}
 }

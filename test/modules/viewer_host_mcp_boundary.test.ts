@@ -7,8 +7,8 @@ import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
-import { BrowserViewerAppLauncher, createDefaultViewerHostClientFactory, FakeViewerHostClient, ViewerHostMcpService, type BrowserViewerLaunchTarget, type BrowserViewerLauncher, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
-import type { McpToViewerHostMessage, ViewerHostControlResponse, ViewerHostToMcpMessage } from "../../src/modules/viewer_host_protocol.ts";
+import { SystemBrowserViewerLauncher, createDefaultViewerHostClientFactory, FakeViewerHostClient, ViewerHostMcpService, type BrowserViewerLaunchTarget, type BrowserViewerLauncher, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
+import type { McpToViewerHostMessage, ViewerHostControlResponse } from "../../src/modules/viewer_host_protocol.ts";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
 
@@ -217,9 +217,9 @@ test("Browser viewer launcher reports immediate opener failures", async () => {
 		const opener = join(baseDir, "fail-open");
 		writeFileSync(opener, `#!/bin/sh\necho opener failed >&2\nexit 7\n`);
 		chmodSync(opener, 0o700);
-		const launcher = new BrowserViewerAppLauncher({ command: opener });
+		const launcher = new SystemBrowserViewerLauncher({ command: opener });
 		await assert.rejects(
-			() => launcher.launchOrFocus({ origin: "http://127.0.0.1:1", appUrl: "http://127.0.0.1:1/viewer-lw" }),
+			() => launcher.launchOrFocus({ origin: "http://127.0.0.1:1", viewerUrl: "http://127.0.0.1:1/viewer-lw" }),
 			/opener .*exited with code 7: opener failed/,
 		);
 	} finally {
@@ -227,28 +227,26 @@ test("Browser viewer launcher reports immediate opener failures", async () => {
 	}
 });
 
-test("reverse-forward probe is handled by ViewerHostServer without mcpEventSink or PDF events", async () => {
+test("HTTP reverse-forward probe is handled by ViewerHostServer without entering the MCP event queue", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-probe-boundary-"));
 	const { pdfPath, sourcePath } = writeForwardSynctexFixture(baseDir);
 	const registry = new ViewerHostPdfRegistry();
 	let service: ViewerHostMcpService | undefined;
-	const sinkMessages: ViewerHostToMcpMessage[] = [];
-	const server = new ViewerHostServer({
-		registry,
-		mcpEventSink: (message) => {
-			sinkMessages.push(message);
-			return service?.handleHostMessage(message);
-		},
-	});
-	let socket: TestWebSocket | undefined;
+	const server = new ViewerHostServer({ registry });
 	try {
 		await server.start();
 		service = new ViewerHostMcpService({ client: new HttpViewerHostClient(server.origin), makePdfId: () => 812 });
 		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
-		socket = await openViewerSocket(server.origin, 812);
-
-		socket.send(JSON.stringify({ type: "reverse_synctex_forward_probe", request_id: 1, page: 1, x: 144, y: 155 }));
-		const result = await nextJsonMessage(socket);
+		const config = await (await fetch(`${server.origin}/config/812.json`)).json() as { viewer_socket_token: string };
+		const response = await fetch(`${server.origin}/synctex/probe`, {
+			method: "POST",
+			headers: { "content-type": "application/json", "x-agent-synctex-viewer-token": config.viewer_socket_token },
+			body: JSON.stringify({ pdf_id: 812, request_id: 1, page: 1, x: 144, y: 155 }),
+		});
+		assert.equal(response.status, 200);
+		const body = await response.json() as { ok: boolean; result: Record<string, unknown> };
+		assert.equal(body.ok, true);
+		const result = body.result;
 
 		assert.equal(result.type, "reverse_synctex_forward_probe_result");
 		assert.equal(result.pdf_id, 812);
@@ -258,12 +256,9 @@ test("reverse-forward probe is handled by ViewerHostServer without mcpEventSink 
 		assert.equal(result.source_file, sourcePath);
 		assert.equal(result.line, 3);
 		assert.equal(result.page, 1);
-		assert.equal(sinkMessages.length, 0, "debug probe must not be routed through mcpEventSink");
-
 		const events = await service.getPdfEvents({ pdf_id: 812, max_events: 10, stale: true, debug: true });
 		assert.equal(events.length, 0, "debug probe must not be appended to the MCP event store");
 	} finally {
-		socket?.close();
 		await service?.stop();
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -278,7 +273,7 @@ test("default Viewer Host client factory reuses agent runtime server origin", as
 	const launches: BrowserViewerLaunchTarget[] = [];
 	try {
 		await server.start();
-		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, heartbeat_token: "reuse-heartbeat-token", owner_id: "reuse-owner", updated_at: new Date().toISOString() }) + "\n");
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, viewer_url: server.viewerRootUrl, pid: 12345, instance_id: server.instanceId, shutdown_token: "reuse-shutdown-token", control_token: controlToken, heartbeat_token: "reuse-heartbeat-token", owner_id: "reuse-owner", updated_at: new Date().toISOString() }) + "\n");
 		const factory = createDefaultViewerHostClientFactory({
 			agentRuntimeDir: baseDir,
 			viewerHostOwnerId: "reuse-owner",
@@ -301,6 +296,49 @@ test("default Viewer Host client factory reuses agent runtime server origin", as
 		assert.equal((await fetch(`${server.origin}/config/345.json`)).status, 200, "reused server should not be shut down when client closes");
 	} finally {
 		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("stale Viewer Host identity never signals a reused discovery PID", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-stale-pid-"));
+	const registry = new ViewerHostPdfRegistry();
+	const controlToken = "stale-identity-control-token";
+	const unrelatedServer = new ViewerHostServer({ registry, controlToken, instanceId: "actual-instance" });
+	const sentinel = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+	let client: ViewerHostClient | undefined;
+	let browserCloseCalls = 0;
+	try {
+		assert.equal(typeof sentinel.pid, "number");
+		await unrelatedServer.start();
+		writeFileSync(join(baseDir, "viewer-host.json"), `${JSON.stringify({
+			origin: unrelatedServer.origin,
+			viewer_url: unrelatedServer.viewerRootUrl,
+			pid: sentinel.pid,
+			instance_id: "stale-instance",
+			shutdown_token: "stale-shutdown-token",
+			control_token: controlToken,
+			heartbeat_token: "stale-heartbeat-token",
+			owner_id: "old-owner",
+			updated_at: new Date().toISOString(),
+		})}\n`);
+		client = await createDefaultViewerHostClientFactory({
+			agentRuntimeDir: baseDir,
+			viewerHostOwnerId: "new-owner",
+			command: process.execPath,
+			args: [resolve(process.cwd(), "scripts", "viewer-host-server.ts")],
+			browserOpenAckTimeoutMs: 20,
+			heartbeatLeaseMs: 200,
+			heartbeatIntervalMs: 50,
+			browserLauncher: { launchOrFocus: () => undefined, close: () => { browserCloseCalls += 1; } },
+		})();
+
+		assert.equal(isPidRunning(sentinel.pid!), true, "stale discovery PID must be diagnostic only");
+		assert.equal(browserCloseCalls, 0, "identity mismatch must not close an unrelated browser session");
+	} finally {
+		await client?.shutdownHost?.();
+		await unrelatedServer.stop();
+		sentinel.kill("SIGKILL");
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });
@@ -338,7 +376,7 @@ test("default Viewer Host client factory coalesces concurrent persistent startup
 });
 
 
-test("persistent Viewer Host exits when MCP heartbeat stops", async () => {
+test("persistent Viewer Host records authenticated identity and shuts down with its MCP service", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-persistent-stop-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	const statePath = join(baseDir, "viewer-host.json");
@@ -360,10 +398,11 @@ test("persistent Viewer Host exits when MCP heartbeat stops", async () => {
 	try {
 		const opened = await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 		assert.equal(opened.result?.details?.pdf_id, 347);
-		const state = JSON.parse(readFileSync(statePath, "utf8")) as { origin?: unknown; pid?: unknown; shutdown_token?: unknown; control_token?: unknown; heartbeat_token?: unknown; owner_id?: unknown };
+		const state = JSON.parse(readFileSync(statePath, "utf8")) as { origin?: unknown; pid?: unknown; instance_id?: unknown; shutdown_token?: unknown; control_token?: unknown; heartbeat_token?: unknown; owner_id?: unknown };
 		assert.equal(typeof state.origin, "string");
 		assert.equal(typeof state.pid, "number");
-		assert.equal(state.shutdown_token, undefined);
+		assert.equal(typeof state.instance_id, "string");
+		assert.equal(typeof state.shutdown_token, "string");
 		assert.equal(typeof state.control_token, "string");
 		assert.equal(typeof state.heartbeat_token, "string");
 		assert.equal(typeof state.owner_id, "string");
@@ -373,7 +412,7 @@ test("persistent Viewer Host exits when MCP heartbeat stops", async () => {
 		await service.stop();
 
 		await waitForPidExit(pid);
-		assert.equal(existsSync(statePath), true, "heartbeat exit leaves discovery state for next MCP startup to retire");
+		assert.equal(existsSync(statePath), false, "authenticated shutdown removes discovery for the stopped instance");
 	} finally {
 		try {
 			await service.stop();
@@ -399,7 +438,7 @@ test("reused persistent Viewer Host clients share browser open in-progress state
 	const launches: BrowserViewerLaunchTarget[] = [];
 	try {
 		await server.start();
-		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, heartbeat_token: "reuse-browser-progress-heartbeat-token", owner_id: "reuse-browser-progress-owner", updated_at: new Date().toISOString() }) + "\n");
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, viewer_url: server.viewerRootUrl, pid: 12345, instance_id: server.instanceId, shutdown_token: "reuse-browser-progress-shutdown-token", control_token: controlToken, heartbeat_token: "reuse-browser-progress-heartbeat-token", owner_id: "reuse-browser-progress-owner", updated_at: new Date().toISOString() }) + "\n");
 		const factory = createDefaultViewerHostClientFactory({
 			agentRuntimeDir: baseDir,
 			viewerHostOwnerId: "reuse-browser-progress-owner",
@@ -442,7 +481,7 @@ test("reused persistent Viewer Host clients share browser open in-progress state
 		await server.start();
 		writeFileSync(opener, `#!/bin/sh\necho "$@" >> "$LAUNCH_LOG"\nsleep 0.2\nexit 0\n`);
 		chmodSync(opener, 0o700);
-		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, heartbeat_token: "reuse-browser-process-heartbeat-token", owner_id: "reuse-browser-process-owner", updated_at: new Date().toISOString() }) + "\n");
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, viewer_url: server.viewerRootUrl, pid: 12345, instance_id: server.instanceId, shutdown_token: "reuse-browser-process-shutdown-token", control_token: controlToken, heartbeat_token: "reuse-browser-process-heartbeat-token", owner_id: "reuse-browser-process-owner", updated_at: new Date().toISOString() }) + "\n");
 		const firstPdfPath = join(baseDir, "first.pdf");
 		const secondPdfPath = join(baseDir, "second.pdf");
 		writeFakePdf(firstPdfPath);
@@ -478,7 +517,7 @@ test("default Viewer Host client factory reopens an already-opened reused host w
 	const launches: BrowserViewerLaunchTarget[] = [];
 	try {
 		await server.start();
-		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, app_url: server.appUrl, pid: 12345, control_token: controlToken, heartbeat_token: "reuse-opened-heartbeat-token", owner_id: "reuse-opened-owner", updated_at: new Date().toISOString(), browser_opened_at: new Date().toISOString() }) + "\n");
+		writeFileSync(join(baseDir, "viewer-host.json"), JSON.stringify({ origin: server.origin, viewer_url: server.viewerRootUrl, pid: 12345, instance_id: server.instanceId, shutdown_token: "reuse-opened-shutdown-token", control_token: controlToken, heartbeat_token: "reuse-opened-heartbeat-token", owner_id: "reuse-opened-owner", updated_at: new Date().toISOString(), browser_opened_at: new Date().toISOString() }) + "\n");
 		const factory = createDefaultViewerHostClientFactory({
 			agentRuntimeDir: baseDir,
 			viewerHostOwnerId: "reuse-opened-owner",
@@ -521,8 +560,8 @@ test("default Viewer Host client factory opens the stable browser viewer before 
 		assert.equal(first.result?.details?.pdf_id, 91);
 		assert.equal(second.result?.details?.pdf_id, 91);
 		assert.equal(browserLauncher.calls.length, 1, "open/focus operations should only open the stable browser viewer once per host session");
-		assert.deepEqual(browserLauncher.calls.map((call) => call.appUrl), browserLauncher.calls.map((call) => `${call.origin}/viewer-lw`));
-		assert.match(browserLauncher.calls[0]?.appUrl ?? "", /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw$/);
+		assert.deepEqual(browserLauncher.calls.map((call) => call.viewerUrl), browserLauncher.calls.map((call) => `${call.origin}/viewer-lw`));
+		assert.match(browserLauncher.calls[0]?.viewerUrl ?? "", /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw$/);
 		const config = await fetch(`${browserLauncher.calls[0].origin}/config/91.json`);
 		assert.equal(config.status, 200, "returned viewer/config URL must remain reachable while the Host is alive");
 	} finally {
@@ -669,6 +708,93 @@ test("jump_pdf exposes JS fallback diagnostics after native SyncTeX failure", as
 			indicator: true,
 		});
 	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("jump_pdf reports failures for tracked PDFs through the general viewer failure path", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-jump-reported-failure-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const client = new FakeViewerHostClient({ origin: "http://127.0.0.1:43125" });
+	const service = new ViewerHostMcpService({ client, makePdfId: () => 7 });
+	try {
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+		const response = await callTool(2, "jump_pdf", {
+			pdf_id: 7,
+			line: 3,
+			source_file: join(baseDir, "missing.tex"),
+			workspace_context: { cwd: baseDir },
+		}, service) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+
+		assert.equal(response.result?.isError, true);
+		assert.match(response.result?.content?.[0]?.text ?? "", /missing\.tex/);
+		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "report_error"]);
+		const report = client.messages[1] as Extract<McpToViewerHostMessage, { type: "report_error" }>;
+		assert.equal(report.pdf_id, 7);
+		assert.equal(report.code, "synctex_jump_failed");
+		assert.equal(report.title, "Could not jump to the LaTeX source");
+		assert.match(report.detail, /missing\.tex/);
+		assert.equal(report.inject_text, `PDF source jump failed: ${report.detail}`);
+	} finally {
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("unexpected viewer action failures are reported instead of being swallowed", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-action-reported-failure-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const client = new FakeViewerHostClient({ origin: "http://127.0.0.1:43125" });
+	const service = new ViewerHostMcpService({ client, makePdfId: () => 8 });
+	try {
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+		service.setCompileActionHandler(async () => { throw new Error("simulated compile action failure"); });
+		service.handleHostMessage({ type: "compile_action", pdf_id: 8, action: "compile" });
+		const deadline = Date.now() + 2_000;
+		while (client.messages.length < 2 && Date.now() < deadline) await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+
+		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "report_error"]);
+		assert.deepEqual(client.messages[1], {
+			type: "report_error",
+			pdf_id: 8,
+			code: "viewer_action_failed",
+			title: "Could not handle the viewer action",
+			detail: "simulated compile action failure",
+			inject_text: "Viewer action compile failed: simulated compile action failure",
+		});
+	} finally {
+		await service.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("tracked PDF refresh failures use ViewerFailureReporter before propagating", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-refresh-reported-failure-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const messages: McpToViewerHostMessage[] = [];
+	let refreshFailuresRemaining = 2;
+	const client: ViewerHostClient = {
+		origin: "http://127.0.0.1:43125",
+		async send(message) {
+			messages.push(message);
+			if (message.type === "pdf_maybe_updated" && refreshFailuresRemaining-- > 0) throw new Error("simulated PDF refresh failure");
+		},
+	};
+	const service = new ViewerHostMcpService({ client, makePdfId: () => 9 });
+	try {
+		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
+		await assert.rejects(() => service.markTrackedPdfUpdated(pdfPath), /simulated PDF refresh failure/);
+
+		const report = messages.find((message): message is Extract<McpToViewerHostMessage, { type: "report_error" }> => message.type === "report_error");
+		assert.equal(report?.pdf_id, 9);
+		assert.equal(report?.code, "pdf_refresh_failed");
+		assert.equal(report?.title, "Could not refresh the PDF");
+		assert.match(report?.detail ?? "", /simulated PDF refresh failure/);
+		assert.equal(report?.inject_text, `Could not refresh the PDF: ${report?.detail}`);
+	} finally {
+		await service.stop();
 		rmSync(baseDir, { recursive: true, force: true });
 	}
 });

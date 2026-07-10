@@ -47,12 +47,14 @@ function opencodePluginSource(): string {
 	return `import { spawnSync } from "node:child_process";
 
 // Managed by agent-synctex.
-function fetchPdfContext(prompt: string): string {
+function fetchPdfContext(prompt: string): { text: string; error?: string } {
 	const result = spawnSync("agent-synctex", ["fetch-info", "--harness", "opencode"], {
 		input: prompt,
 		encoding: "utf8",
 	});
-	return result.status === 0 ? (result.stdout ?? "").trim() : "";
+	if (result.status === 0) return { text: (result.stdout ?? "").trim() };
+	const detail = (result.stderr ?? "").trim() || result.error?.message || "agent-synctex fetch-info exited with status " + (result.status ?? "unknown");
+	return { text: "", error: detail };
 }
 
 export const AgentSynctexPostUser = async () => ({
@@ -61,16 +63,16 @@ export const AgentSynctexPostUser = async () => ({
 		const prompt = parts
 			.filter((part: any) => part?.type === "text")
 			.map((part: any) => String(part.text ?? ""))
-			.join("\n");
+			.join("\\n");
 		const context = fetchPdfContext(prompt);
-		if (!context) return;
+		if (!context.text && !context.error) return;
 		const now = Date.now();
 		parts.push({
 			id: \`agent-synctex-pdf-context-\${now}\`,
 			messageID: input.messageID ?? output.message?.id,
 			sessionID: input.sessionID,
 			type: "text",
-			text: \`\n\n\${context}\`,
+			text: context.error ? \`\\n\\nAgent SyncTeX hook failed: \${context.error}\` : \`\\n\\n\${context.text}\`,
 			time: { start: now, end: now },
 		});
 		output.parts = parts;

@@ -35,6 +35,7 @@ const persistent = process.env.AGENT_SYNCTEX_PERSISTENT_VIEWER_HOST === "1";
 const idleTimeoutMs = parseIdleTimeoutMs(process.env.AGENT_SYNCTEX_VIEWER_HOST_IDLE_MS);
 const shutdownToken = process.env.AGENT_SYNCTEX_VIEWER_HOST_SHUTDOWN_TOKEN;
 const controlToken = process.env.AGENT_SYNCTEX_VIEWER_HOST_CONTROL_TOKEN;
+const instanceId = process.env.AGENT_SYNCTEX_VIEWER_HOST_INSTANCE_ID;
 const heartbeatToken = process.env.AGENT_SYNCTEX_VIEWER_HOST_HEARTBEAT_TOKEN;
 const heartbeatOwnerId = process.env.AGENT_SYNCTEX_VIEWER_HOST_OWNER_ID;
 const heartbeatLeaseMs = parseHeartbeatLeaseMs(process.env.AGENT_SYNCTEX_VIEWER_HOST_HEARTBEAT_LEASE_MS);
@@ -47,6 +48,7 @@ const server = new ViewerHostServer({
 	...(shutdownToken === undefined ? {} : { shutdownRequest: { token: shutdownToken, shutdown: (reason: string) => shutdown(reason) } }),
 	...(heartbeatToken === undefined || heartbeatOwnerId === undefined ? {} : { heartbeatRequest: { token: heartbeatToken, ownerId: heartbeatOwnerId, heartbeat: () => { lastHeartbeatAt = Date.now(); } } }),
 	...(controlToken === undefined ? {} : { controlToken }),
+	...(instanceId === undefined ? {} : { instanceId }),
 });
 await server.start();
 
@@ -57,7 +59,7 @@ async function shutdown(reason: string): Promise<void> {
 	if (!persistent) stdout.write(JSON.stringify({ type: "stopped", reason }) + "\n");
 }
 
-stdout.write(JSON.stringify({ type: "ready", origin: server.origin, app_url: server.appUrl, address: server.address }) + "\n");
+stdout.write(JSON.stringify({ type: "ready", origin: server.origin, viewer_url: server.viewerRootUrl, instance_id: server.instanceId, address: server.address }) + "\n");
 
 if (persistent && heartbeatToken !== undefined && heartbeatOwnerId !== undefined) {
 	setInterval(() => {

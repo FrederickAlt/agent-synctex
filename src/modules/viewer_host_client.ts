@@ -1,13 +1,14 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes, randomInt } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertReadablePdfFile, assertReadableSourceFile, inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
 import { mapReverseSynctex } from "./synctex/forward_synctex.ts";
 import { resolveForwardSynctexJump, reverseSynctexHoverResult, reverseSynctexPdfEventFromViewerMessage, type ReverseSynctexMapper } from "./synctex/synctex_resolution.ts";
 import { PdfEventStore, type GetPdfEventsRequest, type PdfEvent } from "./pdf_events.ts";
-import { collectPostUserPdfContextFromEvents, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
+import { collectPostUserPdfContextFromEvents, pdfAnnotationEventsFromViewerMarks, type FetchPdfContextRequest, type PostUserPdfContextResult } from "./post_user_pdf_context.ts";
+import type { AcknowledgedPdfMark, PendingPdfMarkClaim } from "./pending_pdf_marks.ts";
 import type {
 	HostServiceJumpRequest,
 	HostServiceJumpResponseEnvelope,
@@ -20,6 +21,7 @@ import {
 	VIEWER_HOST_CONTROL_TOKEN_HEADER,
 	VIEWER_HOST_HEARTBEAT_TOKEN_HEADER,
 	VIEWER_HOST_PROTOCOL_VERSION,
+	VIEWER_HOST_SHUTDOWN_TOKEN_HEADER,
 	validateMcpToViewerHostMessage,
 	validateViewerHostToMcpMessage,
 	type McpToViewerHostMessage,
@@ -29,8 +31,13 @@ import {
 	type ViewerHostToMcpMessage,
 } from "./viewer_host_protocol.ts";
 import { ViewerHostControlClient } from "./viewer_host_control_client.ts";
+import { ViewerHostMarksClient } from "./viewer_host_marks_client.ts";
+import { persistentViewerHostStatePath, readPersistentViewerHostState, updatePersistentViewerHostState, writePersistentViewerHostState, type PersistentViewerHostState } from "./viewer_host_discovery.ts";
+import { ViewerFailureReporter, type ViewerFailureContext } from "./viewer_failure_reporter.ts";
+import { createLogger } from "./logging.ts";
 
 const VIEWER_HOST_BACKEND_NAME = "viewer-host-client";
+const logger = createLogger("viewer-host.mcp-service");
 const VIEWER_HOST_CAPABILITIES = {
 	open: true,
 	close: false,
@@ -74,6 +81,8 @@ export interface ViewerHostClient {
 	readonly origin: string;
 	send(message: McpToViewerHostMessage): Promise<void | ViewerHostControlResponse>;
 	drainEvents?(pdfIds?: readonly number[], eventTypes?: readonly ViewerHostToMcpMessage["type"][]): Promise<ViewerHostToMcpMessage[]>;
+	claimPdfMarks?(pdfIds?: readonly number[], maxMarks?: number): Promise<PendingPdfMarkClaim>;
+	acknowledgePdfMarks?(claimId: string, consumed: readonly AcknowledgedPdfMark[]): Promise<AcknowledgedPdfMark[]>;
 	close?(): Promise<void> | void;
 	shutdownHost?(): Promise<void> | void;
 }
@@ -82,7 +91,7 @@ export type ViewerHostClientFactory = () => ViewerHostClient | Promise<ViewerHos
 
 export interface BrowserViewerLaunchTarget {
 	origin: string;
-	appUrl: string;
+	viewerUrl: string;
 }
 
 export interface BrowserViewerLauncher {
@@ -90,27 +99,27 @@ export interface BrowserViewerLauncher {
 	close?(): Promise<void> | void;
 }
 
-export interface BrowserViewerAppLauncherOptions {
+export interface SystemBrowserViewerLauncherOptions {
 	command?: string;
 	args?: string[];
 }
 
-export class BrowserViewerAppLauncher implements BrowserViewerLauncher {
-	private readonly options: BrowserViewerAppLauncherOptions;
+export class SystemBrowserViewerLauncher implements BrowserViewerLauncher {
+	private readonly options: SystemBrowserViewerLauncherOptions;
 
-	constructor(options: BrowserViewerAppLauncherOptions = {}) {
+	constructor(options: SystemBrowserViewerLauncherOptions = {}) {
 		this.options = options;
 	}
 
 	async launchOrFocus(target: BrowserViewerLaunchTarget): Promise<void> {
-		const config = this.resolveConfig(target.appUrl);
+		const config = this.resolveConfig(target.viewerUrl);
 		const child = spawn(config.command, config.args, { stdio: ["ignore", "ignore", "pipe"], detached: true });
 		let stderr = "";
 		child.stderr?.on("data", (chunk: Buffer) => {
 			stderr += String(chunk);
 			if (stderr.length > 2_048) stderr = stderr.slice(-2_048);
 		});
-		await waitForSpawn(child, `failed to open browser viewer ${target.appUrl}`);
+		await waitForSpawn(child, `failed to open browser viewer ${target.viewerUrl}`);
 		const earlyExit = await waitForEarlyProcessExit(child, 750);
 		if (earlyExit && earlyExit.code !== 0) {
 			throw new Error(`browser opener ${config.command} exited ${earlyExit.signal ? `with signal ${earlyExit.signal}` : `with code ${earlyExit.code}`}${stderr.trim() ? `: ${stderr.trim()}` : ""}`);
@@ -119,12 +128,12 @@ export class BrowserViewerAppLauncher implements BrowserViewerLauncher {
 		child.unref();
 	}
 
-	private resolveConfig(appUrl: string): { command: string; args: string[] } {
-		if (this.options.command !== undefined) return { command: this.options.command, args: [...(this.options.args ?? []), appUrl] };
-		if (process.env.AGENT_SYNCTEX_BROWSER_COMMAND?.trim()) return { command: process.env.AGENT_SYNCTEX_BROWSER_COMMAND, args: [appUrl] };
-		if (process.platform === "darwin") return { command: "open", args: [appUrl] };
-		if (process.platform === "win32") return { command: "cmd", args: ["/c", "start", "", appUrl] };
-		return { command: "xdg-open", args: [appUrl] };
+	private resolveConfig(viewerUrl: string): { command: string; args: string[] } {
+		if (this.options.command !== undefined) return { command: this.options.command, args: [...(this.options.args ?? []), viewerUrl] };
+		if (process.env.AGENT_SYNCTEX_BROWSER_COMMAND?.trim()) return { command: process.env.AGENT_SYNCTEX_BROWSER_COMMAND, args: [viewerUrl] };
+		if (process.platform === "darwin") return { command: "open", args: [viewerUrl] };
+		if (process.platform === "win32") return { command: "cmd", args: ["/c", "start", "", viewerUrl] };
+		return { command: "xdg-open", args: [viewerUrl] };
 	}
 }
 
@@ -136,6 +145,11 @@ interface ActiveViewerHostSession {
 interface ViewerHostSendResult {
 	session: ActiveViewerHostSession;
 	response?: ViewerHostControlResponse;
+}
+
+interface ClaimedHostPdfMarks {
+	claim: PendingPdfMarkClaim;
+	client: Required<Pick<ViewerHostClient, "acknowledgePdfMarks">>;
 }
 
 export class FakeViewerHostClient implements ViewerHostClient {
@@ -162,27 +176,15 @@ export interface ViewerHostProcessLauncherOptions {
 	viewerHostOwnerId?: string;
 	browserLauncher?: BrowserViewerLauncher;
 	agentRuntimeDir?: string;
+	workspaceCwd?: string;
+	requestTimeoutMs?: number;
 }
 
 interface ViewerHostReadyLine {
 	type: "ready";
 	origin: string;
-	app_url: string;
-}
-
-interface PersistentViewerHostState {
-	origin: string;
-	app_url: string;
-	pid?: number;
-	shutdown_token?: string;
-	control_token?: string;
-	heartbeat_token?: string;
-	owner_id?: string;
-	heartbeat_lease_ms?: number;
-	updated_at: string;
-	browser_opened_at?: string;
-	browser_open_in_progress_at?: string;
-	browser_open_attempted_at?: string;
+	viewer_url: string;
+	instance_id: string;
 }
 
 interface BrowserOpenCoordinator {
@@ -198,33 +200,37 @@ interface ViewerHostHeartbeatOptions {
 
 class HttpViewerHostProcessClient implements ViewerHostClient {
 	readonly origin: string;
-	private readonly appUrl: string;
+	private readonly viewerUrl: string;
 	private readonly browserLauncher: BrowserViewerLauncher;
 	private readonly browserOpenAckTimeoutMs: number;
 	private readonly controlClient: ViewerHostControlClient;
+	private readonly marksClient: ViewerHostMarksClient;
 	private readonly controlToken: string | undefined;
 	private readonly closeHost: (() => Promise<void>) | undefined;
 	private readonly shutdownHostHandler: (() => Promise<void>) | undefined;
 	private readonly browserOpenCoordinator: BrowserOpenCoordinator;
 	private readonly heartbeat: ViewerHostHeartbeatOptions | undefined;
+	private readonly requestTimeoutMs: number;
 	private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	private heartbeatInFlight = false;
 	private launchBrowserOnNextOpen: boolean;
 	private closed = false;
 	private hostShutdownStarted = false;
 
-	constructor(options: { origin: string; appUrl: string; browserLauncher: BrowserViewerLauncher; controlToken?: string; closeHost?: () => Promise<void>; shutdownHost?: () => Promise<void>; launchBrowserOnNextOpen?: boolean; browserOpenCoordinator?: BrowserOpenCoordinator; browserOpenAckTimeoutMs?: number; heartbeat?: ViewerHostHeartbeatOptions }) {
+	constructor(options: { origin: string; viewerUrl: string; browserLauncher: BrowserViewerLauncher; controlToken?: string; closeHost?: () => Promise<void>; shutdownHost?: () => Promise<void>; launchBrowserOnNextOpen?: boolean; browserOpenCoordinator?: BrowserOpenCoordinator; browserOpenAckTimeoutMs?: number; heartbeat?: ViewerHostHeartbeatOptions; requestTimeoutMs?: number }) {
 		this.origin = options.origin.replace(/\/$/, "");
-		this.appUrl = options.appUrl;
+		this.viewerUrl = options.viewerUrl;
 		this.browserLauncher = options.browserLauncher;
 		this.browserOpenAckTimeoutMs = options.browserOpenAckTimeoutMs ?? DEFAULT_BROWSER_OPEN_ACK_TIMEOUT_MS;
 		this.controlToken = options.controlToken;
-		this.controlClient = new ViewerHostControlClient({ origin: this.origin, controlToken: this.controlToken });
+		this.controlClient = new ViewerHostControlClient({ origin: this.origin, controlToken: this.controlToken, requestTimeoutMs: options.requestTimeoutMs });
+		this.marksClient = new ViewerHostMarksClient({ origin: this.origin, controlToken: this.controlToken, requestTimeoutMs: options.requestTimeoutMs });
 		this.closeHost = options.closeHost;
 		this.shutdownHostHandler = options.shutdownHost;
 		this.launchBrowserOnNextOpen = options.launchBrowserOnNextOpen ?? true;
 		this.browserOpenCoordinator = options.browserOpenCoordinator ?? createMemoryBrowserOpenCoordinator(this.origin);
 		this.heartbeat = options.heartbeat;
+		this.requestTimeoutMs = options.requestTimeoutMs ?? 2_000;
 		this.startHeartbeat();
 	}
 
@@ -250,7 +256,7 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 		if (this.launchBrowserOnNextOpen && this.browserOpenCoordinator.begin()) {
 			browserOpenAttempted = true;
 			try {
-				await this.browserLauncher.launchOrFocus({ origin: this.origin, appUrl: `${this.origin}/viewer-lw` });
+				await this.browserLauncher.launchOrFocus({ origin: this.origin, viewerUrl: this.viewerUrl });
 			} catch (error) {
 				browserOpenError = error instanceof Error ? error.message : String(error);
 			}
@@ -337,12 +343,21 @@ class HttpViewerHostProcessClient implements ViewerHostClient {
 			method: "POST",
 			headers: { ...this.controlHeaders(), ...(body === undefined ? {} : { "content-type": "application/json" }) },
 			...(body === undefined ? {} : { body }),
+			signal: AbortSignal.timeout(Math.max(1, this.requestTimeoutMs)),
 		});
 		const payload = await response.json() as { ok?: unknown; events?: unknown; error?: { message?: unknown } };
 		if (!response.ok || payload.ok !== true || !Array.isArray(payload.events)) {
 			throw new Error(typeof payload.error?.message === "string" ? payload.error.message : "failed to drain Viewer Host MCP events");
 		}
 		return payload.events.map((event) => validateViewerHostToMcpMessage(event));
+	}
+
+	async claimPdfMarks(pdfIds?: readonly number[], maxMarks?: number): Promise<PendingPdfMarkClaim> {
+		return this.closed ? { marks: [] } : await this.marksClient.claimPdfMarks(pdfIds, maxMarks);
+	}
+
+	async acknowledgePdfMarks(claimId: string, consumed: readonly AcknowledgedPdfMark[]): Promise<AcknowledgedPdfMark[]> {
+		return this.closed ? [] : await this.marksClient.acknowledgePdfMarks(claimId, consumed);
 	}
 
 	private controlHeaders(): Record<string, string> {
@@ -376,7 +391,7 @@ class LocalViewerHostProcessClient extends HttpViewerHostProcessClient {
 	constructor(child: ChildProcessWithoutNullStreams, ready: ViewerHostReadyLine, shutdownTimeoutMs: number, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number, controlToken: string) {
 		super({
 			origin: ready.origin,
-			appUrl: ready.app_url,
+			viewerUrl: ready.viewer_url,
 			browserLauncher,
 			browserOpenAckTimeoutMs,
 			controlToken,
@@ -395,7 +410,7 @@ export function createDefaultViewerHostClientFactory(options: ViewerHostProcessL
 }
 
 function defaultBrowserViewerLauncher(_shutdownTimeoutMs: number): BrowserViewerLauncher {
-	return new BrowserViewerAppLauncher();
+	return new SystemBrowserViewerLauncher();
 }
 
 async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOptions): Promise<ViewerHostClient> {
@@ -407,13 +422,16 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 		const browserOpenAckTimeoutMs = options.browserOpenAckTimeoutMs ?? DEFAULT_BROWSER_OPEN_ACK_TIMEOUT_MS;
 		const heartbeatLeaseMs = options.heartbeatLeaseMs ?? DEFAULT_VIEWER_HOST_HEARTBEAT_LEASE_MS;
 		const heartbeatIntervalMs = options.heartbeatIntervalMs ?? Math.min(DEFAULT_VIEWER_HOST_HEARTBEAT_INTERVAL_MS, Math.max(50, Math.floor(heartbeatLeaseMs / 3)));
+		const requestTimeoutMs = options.requestTimeoutMs ?? 2_000;
 		const viewerHostOwnerId = options.viewerHostOwnerId ?? DEFAULT_VIEWER_HOST_OWNER_ID;
 		const browserLauncher = options.browserLauncher ?? defaultBrowserViewerLauncher(shutdownTimeoutMs);
-		const reusableClient = options.agentRuntimeDir === undefined ? undefined : await reusableViewerHostClient(options.agentRuntimeDir, browserLauncher, browserOpenAckTimeoutMs, shutdownTimeoutMs, viewerHostOwnerId, heartbeatIntervalMs);
+		const reusableClient = options.agentRuntimeDir === undefined ? undefined : await reusableViewerHostClient(options.agentRuntimeDir, browserLauncher, browserOpenAckTimeoutMs, shutdownTimeoutMs, viewerHostOwnerId, heartbeatIntervalMs, requestTimeoutMs);
 		if (reusableClient) return reusableClient;
 		const persistent = options.agentRuntimeDir !== undefined;
 		const controlToken = randomBytes(32).toString("base64url");
 		const heartbeatToken = persistent ? randomBytes(32).toString("base64url") : undefined;
+		const shutdownToken = persistent ? randomBytes(32).toString("base64url") : undefined;
+		const instanceId = randomBytes(24).toString("base64url");
 		const child = spawn(command, args, {
 			stdio: ["pipe", "pipe", "pipe"],
 			detached: persistent,
@@ -423,9 +441,11 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 					AGENT_SYNCTEX_PERSISTENT_VIEWER_HOST: "1",
 					AGENT_SYNCTEX_VIEWER_HOST_OWNER_ID: viewerHostOwnerId,
 					...(heartbeatToken === undefined ? {} : { AGENT_SYNCTEX_VIEWER_HOST_HEARTBEAT_TOKEN: heartbeatToken }),
+					...(shutdownToken === undefined ? {} : { AGENT_SYNCTEX_VIEWER_HOST_SHUTDOWN_TOKEN: shutdownToken }),
 					AGENT_SYNCTEX_VIEWER_HOST_HEARTBEAT_LEASE_MS: String(heartbeatLeaseMs),
 				} : {}),
 				AGENT_SYNCTEX_VIEWER_HOST_CONTROL_TOKEN: controlToken,
+				AGENT_SYNCTEX_VIEWER_HOST_INSTANCE_ID: instanceId,
 			},
 		});
 		let stderr = "";
@@ -435,17 +455,21 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 		});
 		try {
 			const ready = await readViewerHostReadyLine(child, readyTimeoutMs, () => stderr);
+			if (ready.instance_id !== instanceId) throw new Error("Viewer Host Server reported an unexpected instance_id");
 			if (!persistent || options.agentRuntimeDir === undefined) {
 				return new LocalViewerHostProcessClient(child, ready, shutdownTimeoutMs, browserLauncher, browserOpenAckTimeoutMs, controlToken);
 			}
 			const state: PersistentViewerHostState = {
 				origin: ready.origin,
-				app_url: ready.app_url,
+				viewer_url: ready.viewer_url,
 				pid: child.pid,
+				instance_id: instanceId,
+				...(shutdownToken === undefined ? {} : { shutdown_token: shutdownToken }),
 				control_token: controlToken,
 				...(heartbeatToken === undefined ? {} : { heartbeat_token: heartbeatToken }),
 				owner_id: viewerHostOwnerId,
 				heartbeat_lease_ms: heartbeatLeaseMs,
+				...(options.workspaceCwd === undefined ? {} : { cwd: resolve(options.workspaceCwd) }),
 				updated_at: new Date().toISOString(),
 			};
 			writePersistentViewerHostState(options.agentRuntimeDir, state);
@@ -455,11 +479,13 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 			child.unref();
 			return new HttpViewerHostProcessClient({
 				origin: ready.origin,
-				appUrl: ready.app_url,
+				viewerUrl: ready.viewer_url,
 				browserLauncher,
 				browserOpenAckTimeoutMs,
 				controlToken,
+				requestTimeoutMs,
 				browserOpenCoordinator: createPersistentBrowserOpenCoordinator(options.agentRuntimeDir!, ready.origin),
+				shutdownHost: () => shutdownDiscoveredViewerHost(options.agentRuntimeDir!, state, browserLauncher, shutdownTimeoutMs),
 				...(heartbeatToken === undefined ? {} : { heartbeat: { ownerId: viewerHostOwnerId, token: heartbeatToken, intervalMs: heartbeatIntervalMs } }),
 			});
 		} catch (error) {
@@ -483,45 +509,6 @@ async function launchLocalViewerHostProcess(options: ViewerHostProcessLauncherOp
 		}
 	}
 	return await start();
-}
-
-function persistentViewerHostStatePath(agentRuntimeDir: string): string {
-	return join(agentRuntimeDir, "viewer-host.json");
-}
-
-function readPersistentViewerHostState(agentRuntimeDir: string): PersistentViewerHostState | undefined {
-	try {
-		const parsed = JSON.parse(readFileSync(persistentViewerHostStatePath(agentRuntimeDir), "utf8")) as Partial<PersistentViewerHostState>;
-		if (typeof parsed.origin !== "string" || typeof parsed.app_url !== "string") return undefined;
-		return {
-			origin: parsed.origin.replace(/\/$/, ""),
-			app_url: parsed.app_url,
-			...(typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0 ? { pid: parsed.pid } : {}),
-			...(typeof parsed.shutdown_token === "string" && parsed.shutdown_token.length > 0 ? { shutdown_token: parsed.shutdown_token } : {}),
-			...(typeof parsed.control_token === "string" && parsed.control_token.length > 0 ? { control_token: parsed.control_token } : {}),
-			...(typeof parsed.heartbeat_token === "string" && parsed.heartbeat_token.length > 0 ? { heartbeat_token: parsed.heartbeat_token } : {}),
-			...(typeof parsed.owner_id === "string" && parsed.owner_id.length > 0 ? { owner_id: parsed.owner_id } : {}),
-			...(typeof parsed.heartbeat_lease_ms === "number" && Number.isInteger(parsed.heartbeat_lease_ms) && parsed.heartbeat_lease_ms > 0 ? { heartbeat_lease_ms: parsed.heartbeat_lease_ms } : {}),
-			updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : "",
-			...(typeof parsed.browser_opened_at === "string" ? { browser_opened_at: parsed.browser_opened_at } : {}),
-			...(typeof parsed.browser_open_in_progress_at === "string" ? { browser_open_in_progress_at: parsed.browser_open_in_progress_at } : {}),
-			...(typeof parsed.browser_open_attempted_at === "string" ? { browser_open_attempted_at: parsed.browser_open_attempted_at } : {}),
-		};
-	} catch {
-		return undefined;
-	}
-}
-
-function writePersistentViewerHostState(agentRuntimeDir: string, state: PersistentViewerHostState): void {
-	mkdirSync(agentRuntimeDir, { recursive: true, mode: 0o700 });
-	chmodSync(agentRuntimeDir, 0o700);
-	writeFileSync(persistentViewerHostStatePath(agentRuntimeDir), JSON.stringify(state) + "\n", { mode: 0o600 });
-}
-
-function updatePersistentViewerHostState(agentRuntimeDir: string, update: (state: PersistentViewerHostState) => PersistentViewerHostState): void {
-	const current = readPersistentViewerHostState(agentRuntimeDir);
-	if (!current) return;
-	writePersistentViewerHostState(agentRuntimeDir, update(current));
 }
 
 function createMemoryBrowserOpenCoordinator(origin: string): BrowserOpenCoordinator {
@@ -599,29 +586,35 @@ function releaseBrowserOpenLock(agentRuntimeDir: string): void {
 	}
 }
 
-async function reusableViewerHostClient(agentRuntimeDir: string, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number, shutdownTimeoutMs: number, viewerHostOwnerId: string, heartbeatIntervalMs: number): Promise<ViewerHostClient | undefined> {
+async function reusableViewerHostClient(agentRuntimeDir: string, browserLauncher: BrowserViewerLauncher, browserOpenAckTimeoutMs: number, shutdownTimeoutMs: number, viewerHostOwnerId: string, heartbeatIntervalMs: number, requestTimeoutMs: number): Promise<ViewerHostClient | undefined> {
 	const state = readPersistentViewerHostState(agentRuntimeDir);
-	if (!state?.control_token) return undefined;
-	if (state.owner_id !== viewerHostOwnerId || state.heartbeat_token === undefined) {
+	if (!state) return undefined;
+	if (state.control_token === undefined || state.instance_id === undefined || state.shutdown_token === undefined || state.heartbeat_token === undefined) {
+		removePersistentViewerHostState(agentRuntimeDir, state);
+		return undefined;
+	}
+	if (state.owner_id !== viewerHostOwnerId) {
 		await retirePersistentViewerHost({ agentRuntimeDir, state, shutdownTimeoutMs, browserLauncher });
 		return undefined;
 	}
 	try {
-		const response = await new ViewerHostControlClient({ origin: state.origin, controlToken: state.control_token }).send({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION });
-		if (response.ok === true) {
-			const activeViewerClients = "message" in response && typeof response.message.active_viewer_clients === "number" ? response.message.active_viewer_clients : 0;
+		const response = await new ViewerHostControlClient({ origin: state.origin, controlToken: state.control_token, requestTimeoutMs }).send({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION });
+		if (response.ok === true && "message" in response && response.message.instance_id === state.instance_id && response.message.origin === state.origin) {
+			const activeViewerClients = typeof response.message.active_viewer_clients === "number" ? response.message.active_viewer_clients : 0;
 			return new HttpViewerHostProcessClient({
 				origin: state.origin,
-				appUrl: state.app_url,
+				viewerUrl: state.viewer_url,
 				browserLauncher,
 				browserOpenAckTimeoutMs,
 				controlToken: state.control_token,
+				requestTimeoutMs,
 				launchBrowserOnNextOpen: activeViewerClients <= 0,
 				browserOpenCoordinator: createPersistentBrowserOpenCoordinator(agentRuntimeDir, state.origin),
 				heartbeat: { ownerId: viewerHostOwnerId, token: state.heartbeat_token, intervalMs: heartbeatIntervalMs },
+				shutdownHost: () => shutdownDiscoveredViewerHost(agentRuntimeDir, state, browserLauncher, shutdownTimeoutMs),
 			});
 		}
-		await retirePersistentViewerHost({ agentRuntimeDir, state, shutdownTimeoutMs, browserLauncher });
+		removePersistentViewerHostState(agentRuntimeDir, state);
 	} catch {
 		removePersistentViewerHostState(agentRuntimeDir, state);
 		return undefined;
@@ -637,7 +630,8 @@ interface PersistentViewerHostRetireOptions {
 }
 
 async function retirePersistentViewerHost(options: PersistentViewerHostRetireOptions): Promise<void> {
-	if (!await viewerHostControlResponds(options.state.origin, options.state.control_token)) {
+	if (options.state.control_token === undefined || options.state.instance_id === undefined || options.state.shutdown_token === undefined
+		|| !await viewerHostIdentityMatches(options.state)) {
 		removePersistentViewerHostState(options.agentRuntimeDir, options.state);
 		return;
 	}
@@ -646,59 +640,50 @@ async function retirePersistentViewerHost(options: PersistentViewerHostRetireOpt
 	} catch {
 		// Browser cleanup must not prevent Host retirement.
 	}
-	const endpointStopped = options.state.shutdown_token === undefined
-		? false
-		: await requestPersistentViewerHostShutdown(options.state.origin, options.state.shutdown_token, options.shutdownTimeoutMs, options.state.control_token);
-	const signalStopped = endpointStopped ? true : await signalPersistentViewerHost(options.state, options.shutdownTimeoutMs);
-	if (signalStopped || !await viewerHostControlResponds(options.state.origin, options.state.control_token)) {
-		removePersistentViewerHostState(options.agentRuntimeDir, options.state);
-	}
+	await requestPersistentViewerHostShutdown(options.state, options.shutdownTimeoutMs);
+	removePersistentViewerHostState(options.agentRuntimeDir, options.state);
 }
 
-async function requestPersistentViewerHostShutdown(origin: string, token: string, timeoutMs: number, controlToken: string | undefined): Promise<boolean> {
+async function shutdownDiscoveredViewerHost(agentRuntimeDir: string, state: PersistentViewerHostState, browserLauncher: BrowserViewerLauncher, timeoutMs: number): Promise<void> {
+	await retirePersistentViewerHost({ agentRuntimeDir, state, browserLauncher, shutdownTimeoutMs: timeoutMs });
+}
+
+async function requestPersistentViewerHostShutdown(state: PersistentViewerHostState & { shutdown_token?: string; control_token?: string; instance_id?: string }, timeoutMs: number): Promise<boolean> {
+	if (state.shutdown_token === undefined || state.control_token === undefined || state.instance_id === undefined) return false;
 	try {
-		const response = await fetch(`${origin}/shutdown`, {
+		const response = await fetch(`${state.origin}/shutdown`, {
 			method: "POST",
-			headers: { "x-agent-synctex-shutdown-token": token },
+			headers: { [VIEWER_HOST_SHUTDOWN_TOKEN_HEADER]: state.shutdown_token, [VIEWER_HOST_CONTROL_TOKEN_HEADER]: state.control_token },
 			signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
 		});
 		if (!response.ok) return false;
+		const payload = await response.json() as { ok?: unknown; instance_id?: unknown };
+		if (payload.ok !== true || payload.instance_id !== state.instance_id) return false;
 	} catch {
 		return false;
 	}
-	return await waitForViewerHostUnavailable(origin, timeoutMs, controlToken);
+	return await waitForViewerHostInstanceUnavailable(state, timeoutMs);
 }
 
-async function waitForViewerHostUnavailable(origin: string, timeoutMs: number, controlToken: string | undefined): Promise<boolean> {
+async function waitForViewerHostInstanceUnavailable(state: PersistentViewerHostState, timeoutMs: number): Promise<boolean> {
 	const deadline = Date.now() + Math.max(0, timeoutMs);
 	while (true) {
 		const remainingMs = deadline - Date.now();
-		if (!await viewerHostControlResponds(origin, controlToken, Math.min(100, Math.max(1, remainingMs)))) return true;
+		if (!await viewerHostIdentityMatches(state, Math.min(100, Math.max(1, remainingMs)))) return true;
 		if (remainingMs <= 0) return false;
 		await sleep(Math.min(50, Math.max(1, remainingMs)));
 	}
 }
 
-async function signalPersistentViewerHost(state: PersistentViewerHostState, timeoutMs: number): Promise<boolean> {
-	if (state.pid === undefined) return false;
+async function viewerHostIdentityMatches(state: PersistentViewerHostState, timeoutMs = 250): Promise<boolean> {
+	if (state.control_token === undefined || state.instance_id === undefined) return false;
 	try {
-		process.kill(state.pid, "SIGTERM");
-	} catch {
-		return false;
-	}
-	return await waitForViewerHostUnavailable(state.origin, timeoutMs, state.control_token);
-}
-
-async function viewerHostControlResponds(origin: string, controlToken: string | undefined, timeoutMs = 250): Promise<boolean> {
-	try {
-		const response = await fetch(`${origin}/control`, {
-			method: "POST",
-			headers: { "content-type": "application/json", ...(controlToken === undefined ? {} : { [VIEWER_HOST_CONTROL_TOKEN_HEADER]: controlToken }) },
-			body: JSON.stringify({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION }),
-			signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
-		});
-		await response.arrayBuffer();
-		return response.status >= 200 && response.status < 500;
+		const response = await new ViewerHostControlClient({ origin: state.origin, controlToken: state.control_token, requestTimeoutMs: timeoutMs })
+			.send({ type: "hello", protocol_version: VIEWER_HOST_PROTOCOL_VERSION });
+		return response.ok === true && "message" in response
+			&& response.message.origin === state.origin
+			&& response.message.instance_id === state.instance_id
+			&& response.message.protocol_version === VIEWER_HOST_PROTOCOL_VERSION;
 	} catch {
 		return false;
 	}
@@ -708,7 +693,12 @@ function removePersistentViewerHostState(agentRuntimeDir: string, expected: Pers
 	const current = readPersistentViewerHostState(agentRuntimeDir);
 	if (!current) return;
 	if (current.origin !== expected.origin.replace(/\/$/, "")) return;
-	if (expected.pid !== undefined && current.pid !== expected.pid) return;
+	if (expected.instance_id !== undefined) {
+		if (current.instance_id !== expected.instance_id) return;
+	} else {
+		if (current.instance_id !== undefined) return;
+		if (expected.pid !== undefined && current.pid !== expected.pid) return;
+	}
 	try {
 		rmSync(persistentViewerHostStatePath(agentRuntimeDir), { force: true });
 	} catch {
@@ -744,10 +734,10 @@ async function readViewerHostReadyLine(child: ChildProcessWithoutNullStreams, ti
 			const line = buffer.slice(0, newline).trim();
 			try {
 				const parsed = JSON.parse(line) as Partial<ViewerHostReadyLine>;
-				if (parsed.type !== "ready" || typeof parsed.origin !== "string" || typeof parsed.app_url !== "string") {
-					throw new Error("expected ready message with origin and app_url");
+				if (parsed.type !== "ready" || typeof parsed.origin !== "string" || typeof parsed.viewer_url !== "string" || typeof parsed.instance_id !== "string" || !parsed.instance_id) {
+					throw new Error("expected ready message with origin, viewer_url, and instance_id");
 				}
-				resolveOnce({ type: "ready", origin: parsed.origin, app_url: parsed.app_url });
+				resolveOnce({ type: "ready", origin: parsed.origin, viewer_url: parsed.viewer_url, instance_id: parsed.instance_id });
 			} catch (error) {
 				rejectOnce(new Error(`invalid Viewer Host Server startup message: ${error instanceof Error ? error.message : String(error)}`));
 			}
@@ -813,6 +803,7 @@ export interface ViewerHostMcpServiceOptions {
 	nowNs?: () => number;
 	reverseSynctexMapper?: ReverseSynctexMapper;
 	agentRuntimeDir?: string;
+	workspaceCwd?: string;
 }
 
 export class ViewerHostMcpService {
@@ -826,6 +817,7 @@ export class ViewerHostMcpService {
 	private readonly makePdfId: () => number;
 	private readonly nowNs: () => number;
 	private readonly reverseSynctexMapper: ReverseSynctexMapper;
+	private readonly failureReporter: ViewerFailureReporter;
 	private readonly recordsById = new Map<number, TrackedViewerHostPdf>();
 	private readonly recordsByPath = new Map<string, TrackedViewerHostPdf>();
 	private compileActionHandler: ViewerCompileActionHandler | undefined;
@@ -841,12 +833,22 @@ export class ViewerHostMcpService {
 			this.activeSession = { client: options.client, generation: this.allocateGeneration() };
 			this.clientFactory = async () => options.client!;
 		} else {
-			this.clientFactory = options.clientFactory ?? createDefaultViewerHostClientFactory({ agentRuntimeDir: options.agentRuntimeDir });
+			this.clientFactory = options.clientFactory ?? createDefaultViewerHostClientFactory({ agentRuntimeDir: options.agentRuntimeDir, workspaceCwd: options.workspaceCwd });
 		}
 		this.eventStore = options.eventStore ?? new PdfEventStore();
 		this.makePdfId = options.makePdfId ?? (() => randomInt(MIN_PDF_ID, MAX_PDF_ID + 1));
 		this.nowNs = options.nowNs ?? (() => Date.now() * 1_000_000);
 		this.reverseSynctexMapper = options.reverseSynctexMapper ?? mapReverseSynctex;
+		this.failureReporter = new ViewerFailureReporter(async (message) => {
+			await this.sendWithReconnect({
+				type: "report_error",
+				...(message.pdf_id === undefined ? {} : { pdf_id: message.pdf_id }),
+				code: message.code,
+				title: message.title,
+				detail: message.detail,
+				...(message.inject_text === undefined ? {} : { inject_text: message.inject_text }),
+			}, { reregisterBeforeSend: message.pdf_id !== undefined });
+		});
 		this.pdfOperations = {
 			openPdf: (request) => this.openPdf(request),
 			jumpPdf: (request) => this.jumpPdf(request),
@@ -863,6 +865,10 @@ export class ViewerHostMcpService {
 
 	async sendCompileStatus(message: Omit<Extract<McpToViewerHostMessage, { type: "compile_status" }>, "type">): Promise<void> {
 		await this.sendWithReconnect({ type: "compile_status", ...message }, { reregisterBeforeSend: true });
+	}
+
+	async reportViewerFailure(error: unknown, context: ViewerFailureContext): Promise<void> {
+		await this.failureReporter.report(error, context);
 	}
 
 	async openPdf(request: HostServiceOpenRequest): Promise<HostServiceOpenResponseEnvelope> {
@@ -969,7 +975,25 @@ export class ViewerHostMcpService {
 				},
 			};
 		} catch (error) {
-			const reason = error instanceof Error ? error.message : String(error);
+			let surfacedError = error;
+			const originalReason = error instanceof Error ? error.message : String(error);
+			if (record !== undefined) {
+				try {
+					await this.reportViewerFailure(error, {
+						pdfId: record.pdfId,
+						code: "synctex_jump_failed",
+						title: "Could not jump to the LaTeX source",
+						detail: originalReason,
+						injectText: `PDF source jump failed: ${originalReason}`,
+					});
+				} catch (reportingError) {
+					surfacedError = new AggregateError(
+						[error instanceof Error ? error : new Error(String(error)), reportingError instanceof Error ? reportingError : new Error(String(reportingError))],
+						`${originalReason}; additionally failed to report the failure to the viewer: ${reportingError instanceof Error ? reportingError.message : String(reportingError)}`,
+					);
+				}
+			}
+			const reason = surfacedError instanceof Error ? surfacedError.message : String(surfacedError);
 			return {
 				protocol_version: request.protocol_version,
 				request_id: request.request_id,
@@ -1006,17 +1030,28 @@ export class ViewerHostMcpService {
 	}
 
 	async fetchPdfContext(request: FetchPdfContextRequest): Promise<PostUserPdfContextResult> {
-		const events = await this.getPdfEvents({
+		await this.drainHostEvents(["pdf_annotation", "pdf_annotation_deleted"]);
+		const maxEvents = Math.min(request.max_events ?? 20, 20);
+		const localEvents = this.eventStore.getPdfAnnotationEvents({
 			...(request.pdf_id === undefined ? {} : { pdf_id: request.pdf_id }),
-			max_events: request.max_events ?? 20,
+			max_events: maxEvents,
 		});
-		const result = collectPostUserPdfContextFromEvents(events, {
+		const claimed = await this.claimHostPdfMarks(request, maxEvents - localEvents.length);
+		const hostEvents = claimed === undefined ? [] : pdfAnnotationEventsFromViewerMarks(claimed.claim.marks)
+			.map((event, index) => ({ ...event, sequence: localEvents.length + index + 1 }));
+		const result = collectPostUserPdfContextFromEvents([...localEvents, ...hostEvents], {
 			...(request.pdf_id === undefined ? {} : { pdfId: request.pdf_id }),
-			maxEvents: request.max_events,
+			maxEvents,
 			clearViewer: true,
 			cwd: request.cwd,
 		});
-		if (result.cleared) {
+		if (claimed?.claim.claimId !== undefined) {
+			const claimedKeys = new Set(claimed.claim.marks.map((mark) => `${mark.pdf_id}\0${mark.annotation_id}`));
+			const consumed = result.events
+				.filter((event) => claimedKeys.has(`${event.pdf_id}\0${event.annotation_id}`))
+				.map((event) => ({ pdf_id: event.pdf_id, annotation_id: event.annotation_id }));
+			await claimed.client.acknowledgePdfMarks(claimed.claim.claimId, consumed);
+		} else if (claimed === undefined && result.cleared) {
 			for (const pdfId of result.pdfIds) {
 				await this.sendWithReconnect({ type: "clear_pdf_annotations", pdf_id: pdfId }, { reregisterBeforeSend: true });
 			}
@@ -1024,11 +1059,32 @@ export class ViewerHostMcpService {
 		return result;
 	}
 
+	private async claimHostPdfMarks(request: FetchPdfContextRequest, maxMarks: number): Promise<ClaimedHostPdfMarks | undefined> {
+		if (this.recordsById.size === 0) return undefined;
+		return await this.enqueueLifecycle(async () => {
+			const session = await this.ensureSession();
+			if (session.client.claimPdfMarks === undefined || session.client.acknowledgePdfMarks === undefined) return undefined;
+			await this.reregisterKnownPdfs(session);
+			const pdfIds = request.pdf_id === undefined ? Array.from(this.recordsById.keys()) : [request.pdf_id];
+			const claim = maxMarks <= 0 ? { marks: [] } : await session.client.claimPdfMarks(pdfIds, maxMarks);
+			return {
+				claim,
+				client: session.client as ViewerHostClient & Required<Pick<ViewerHostClient, "acknowledgePdfMarks">>,
+			};
+		});
+	}
+
 	async markTrackedPdfUpdated(pdfPath: string): Promise<{ tracked: boolean; pdfId?: number }> {
 		const record = this.recordsByPath.get(resolve(pdfPath));
 		if (!record) return { tracked: false };
-		await this.sendWithReconnect({ type: "pdf_maybe_updated", pdf_id: record.pdfId }, { reregisterBeforeSend: true });
-		return { tracked: true, pdfId: record.pdfId };
+		return await this.failureReporter.capture({
+			pdfId: record.pdfId,
+			code: "pdf_refresh_failed",
+			title: "Could not refresh the PDF",
+		}, async () => {
+			await this.sendWithReconnect({ type: "pdf_maybe_updated", pdf_id: record.pdfId }, { reregisterBeforeSend: true });
+			return { tracked: true, pdfId: record.pdfId };
+		});
 	}
 
 	handleHostMessage(message: ViewerHostToMcpMessage): void {
@@ -1068,23 +1124,24 @@ export class ViewerHostMcpService {
 		} else if (parsed.type === "compile_action") {
 			const record = this.recordsById.get(parsed.pdf_id);
 			if (!record) return;
-			if (parsed.action === "inject_diagnostic" && parsed.inject_text?.trim()) {
-				this.eventStore.appendPdfAnnotationEvent({
-					type: "pdf_annotation",
-					pdf_id: parsed.pdf_id,
-					annotation_id: `compile-diagnostic-${Date.now()}`,
-					timestamp: new Date().toISOString(),
-					source_file: inferDefaultSourceFileForPdf(record.pdfPath) ?? record.pdfPath,
-					line: 1,
-					page: 1,
-					x: 0,
-					y: 0,
-					comment: parsed.inject_text,
+			void (async () => {
+				await this.compileActionHandler?.(parsed, record);
+			})().catch((error) => {
+				this.reportBackgroundFailure(error, {
+					pdfId: record.pdfId,
+					code: "viewer_action_failed",
+					title: "Could not handle the viewer action",
+					detail: error instanceof Error ? error.message : String(error),
+					injectText: `Viewer action ${parsed.action} failed: ${error instanceof Error ? error.message : String(error)}`,
 				});
-				return;
-			}
-			void Promise.resolve(this.compileActionHandler?.(parsed, record)).catch(() => undefined);
+			});
 		}
+	}
+
+	private reportBackgroundFailure(error: unknown, context: ViewerFailureContext): void {
+		void this.reportViewerFailure(error, context).catch((reportingError) => {
+			logger.error("viewer_failure_delivery_failed", { code: context.code, pdf_id: context.pdfId, error, reportingError });
+		});
 	}
 
 	private async drainHostEvents(eventTypes?: readonly ViewerHostToMcpMessage["type"][]): Promise<void> {

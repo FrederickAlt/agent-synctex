@@ -63,15 +63,17 @@ export class ViewerHostPdfRegistry {
 		return record;
 	}
 
-	getPdf(pdfId: number): ViewerHostPdfRecord {
-		if (!Number.isInteger(pdfId) || pdfId <= 0) {
-			throw new Error(`Invalid pdf_id=${String(pdfId)}`);
-		}
-		const record = this.records.get(pdfId);
-		if (!record) {
-			throw new Error(`Unknown pdf_id=${pdfId}: no Viewer Host PDF registration found`);
-		}
+	recordPdfFileChange(pdfId: number, fileSnapshot: ViewerHostFileSnapshot): ViewerHostPdfRecord {
+		const record = this.requirePdf(pdfId);
+		validateFileSnapshot(fileSnapshot);
+		record.revision += 1;
+		record.fileSnapshot = { ...fileSnapshot };
+		record.updatedAtNs = this.nowNs();
 		return copyRecord(record);
+	}
+
+	getPdf(pdfId: number): ViewerHostPdfRecord {
+		return copyRecord(this.requirePdf(pdfId));
 	}
 
 	listPdfs(): ViewerHostPdfRecord[] {
@@ -80,6 +82,17 @@ export class ViewerHostPdfRegistry {
 
 	clear(): void {
 		this.records.clear();
+	}
+
+	private requirePdf(pdfId: number): ViewerHostPdfRecord {
+		if (!Number.isInteger(pdfId) || pdfId <= 0) {
+			throw new Error(`Invalid pdf_id=${String(pdfId)}`);
+		}
+		const record = this.records.get(pdfId);
+		if (!record) {
+			throw new Error(`Unknown pdf_id=${pdfId}: no Viewer Host PDF registration found`);
+		}
+		return record;
 	}
 }
 
@@ -103,13 +116,17 @@ function validateRegistration(input: ViewerHostPdfRegistration): void {
 	if (input.workspaceCwd !== undefined && (typeof input.workspaceCwd !== "string" || !input.workspaceCwd.trim())) {
 		throw new Error("workspaceCwd must be a non-empty string when provided");
 	}
-	if (!input.fileSnapshot || typeof input.fileSnapshot !== "object") {
+	validateFileSnapshot(input.fileSnapshot);
+}
+
+function validateFileSnapshot(fileSnapshot: ViewerHostFileSnapshot): void {
+	if (!fileSnapshot || typeof fileSnapshot !== "object") {
 		throw new Error("fileSnapshot is required");
 	}
-	if (typeof input.fileSnapshot.size !== "number" || !Number.isFinite(input.fileSnapshot.size) || input.fileSnapshot.size < 0) {
+	if (typeof fileSnapshot.size !== "number" || !Number.isFinite(fileSnapshot.size) || fileSnapshot.size < 0) {
 		throw new Error("fileSnapshot.size must be a finite non-negative number");
 	}
-	if (typeof input.fileSnapshot.mtimeMs !== "number" || !Number.isFinite(input.fileSnapshot.mtimeMs) || input.fileSnapshot.mtimeMs < 0) {
+	if (typeof fileSnapshot.mtimeMs !== "number" || !Number.isFinite(fileSnapshot.mtimeMs) || fileSnapshot.mtimeMs < 0) {
 		throw new Error("fileSnapshot.mtimeMs must be a finite non-negative number");
 	}
 }

@@ -29,7 +29,6 @@ const MCP_RUNTIME_PROTOCOL_VERSION = 1;
 const MCP_RUNTIME_REQUEST_PREFIX = "mcp-runtime";
 const MCP_DEFAULT_WORKSPACE_CONTEXT: HostServiceWorkspaceContext = { cwd: "/" };
 const mcpCompileServicesByPdfOperations = new WeakMap<HostServiceMcpPdfOperations, HostServiceCompileService>();
-const mcpToolCallQueuesByPdfOperations = new WeakMap<HostServiceMcpPdfOperations, Promise<void>>();
 let mcpRuntimeRequestCounter = 0;
 
 export interface HostServiceMcpPdfOperations {
@@ -411,6 +410,7 @@ function agentFacingDetails<T extends Record<string, unknown>>(details: T): T {
 	delete filtered.managed_record;
 	delete filtered.handle;
 	delete filtered.viewer_url;
+	delete filtered.browser_launch;
 	return filtered as T;
 }
 
@@ -897,13 +897,6 @@ export function mcpFramedResponse(payload: McpResponsePayload): string {
 	return encodeResponse(payload);
 }
 
-async function enqueueMcpToolCall<T>(pdfOperations: HostServiceMcpPdfOperations, operation: () => Promise<T>): Promise<T> {
-	const previous = mcpToolCallQueuesByPdfOperations.get(pdfOperations) ?? Promise.resolve();
-	const queued = previous.then(operation, operation);
-	mcpToolCallQueuesByPdfOperations.set(pdfOperations, queued.then(() => undefined, () => undefined));
-	return await queued;
-}
-
 async function handleMcpToolCall(request: McpParsedRequest, pdfOperations: HostServiceMcpPdfOperations, options: HostServiceMcpOptions): Promise<McpResponsePayload> {
 	let call: { name: string; args: Record<string, unknown> };
 	try {
@@ -985,7 +978,7 @@ export async function handleMcpRequest(
 				tools: mcpToolDescriptions(options),
 			});
 		case "tools/call":
-			return await enqueueMcpToolCall(pdfOperations, () => handleMcpToolCall(request, pdfOperations, options));
+			return await handleMcpToolCall(request, pdfOperations, options);
 		default:
 			return buildMcpErrorResponse(request.id, MCP_ERROR_METHOD_NOT_FOUND, `method not found: ${request.method}`);
 	}

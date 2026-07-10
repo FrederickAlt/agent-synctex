@@ -3,10 +3,10 @@ export interface ViewerHostServerAddress {
 	port: number;
 }
 
-export interface ViewerHostAccessPolicy {
+	export interface ViewerHostAccessPolicy {
 	readonly bindHost: string;
 	originForAddress(address: ViewerHostServerAddress): string;
-	appUrl(origin: string): string;
+	viewerRootUrl(origin: string): string;
 	viewerUrl(pdfId: number, revision?: number): string;
 	pdfUrl(origin: string, pdfId: number, revision: number): string;
 	viewerSocketUrl(origin: string, pdfId: number, token: string): string;
@@ -20,8 +20,8 @@ export class LocalLoopbackViewerHostAccessPolicy implements ViewerHostAccessPoli
 		return `http://${this.bindHost}:${address.port}`;
 	}
 
-	appUrl(origin: string): string {
-		return `${origin}/app`;
+	viewerRootUrl(origin: string): string {
+		return `${origin}/viewer-lw`;
 	}
 
 	viewerUrl(pdfId: number, revision?: number): string {

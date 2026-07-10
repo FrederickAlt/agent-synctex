@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
 import { createDefaultViewerHostClientFactory, ViewerHostMcpService, type BrowserViewerLauncher, type BrowserViewerLaunchTarget, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
-import type { McpToViewerHostMessage, ViewerHostControlResponse } from "../../src/modules/viewer_host_protocol.ts";
+import type { McpToViewerHostMessage, ViewerHostControlResponse, ViewerHostToMcpMessage } from "../../src/modules/viewer_host_protocol.ts";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
 
@@ -61,6 +61,33 @@ async function openViewerSocket(origin: string, pdfId: number, token: string): P
 		socket.addEventListener("error", () => { clearTimeout(timer); reject(new Error(`viewer socket errored before open for pdf_id=${pdfId}`)); }, { once: true });
 	});
 	return socket;
+}
+
+interface TestMarkClaim {
+	claim_id?: string;
+	marks: Array<{ pdf_id: number; annotation_id: string; [key: string]: unknown }>;
+}
+
+async function claimMarks(origin: string, options: { pdf_ids?: number[]; max_marks?: number } = {}): Promise<TestMarkClaim> {
+	const response = await fetch(`${origin}/marks/claim`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(options),
+	});
+	assert.equal(response.status, 200);
+	return await response.json() as TestMarkClaim;
+}
+
+async function acknowledgeMarks(origin: string, claim: TestMarkClaim, consumed = claim.marks): Promise<Array<{ pdf_id: number; annotation_id: string }>> {
+	assert.equal(typeof claim.claim_id, "string");
+	const response = await fetch(`${origin}/marks/ack`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ claim_id: claim.claim_id, consumed: consumed.map((mark) => ({ pdf_id: mark.pdf_id, annotation_id: mark.annotation_id })) }),
+	});
+	assert.equal(response.status, 200);
+	const payload = await response.json() as { acknowledged?: Array<{ pdf_id: number; annotation_id: string }> };
+	return payload.acknowledged ?? [];
 }
 
 async function expectSocketRejected(origin: string, pdfId: number, token?: string): Promise<void> {
@@ -156,6 +183,16 @@ class HttpViewerHostClient implements ViewerHostClient {
 	async send(message: McpToViewerHostMessage): Promise<void> {
 		const response: ViewerHostControlResponse = await this.client.send(message);
 		if (!response.ok) throw new Error(response.error.message);
+	}
+
+	async drainEvents(pdfIds?: readonly number[], eventTypes?: readonly ViewerHostToMcpMessage["type"][]): Promise<ViewerHostToMcpMessage[]> {
+		const response = await fetch(`${this.origin}/mcp-events/drain`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ ...(pdfIds === undefined ? {} : { pdf_ids: pdfIds }), ...(eventTypes === undefined ? {} : { event_types: eventTypes }) }),
+		});
+		const payload = await response.json() as { events?: ViewerHostToMcpMessage[] };
+		return payload.events ?? [];
 	}
 }
 
@@ -295,7 +332,82 @@ test("compile status broadcasts to viewer sockets and compile actions drain to M
 	}
 });
 
-test("compile action polling does not drain or clear PDF annotations", async () => {
+test("reported failures reach the target viewer with optional agent-forwarding text", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-reported-failure-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 25, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath) });
+		await server.start();
+		socket = await openViewerSocket(server.origin, 25, await getViewerSocketToken(server.origin, 25));
+		const control = new ViewerHostControlClient({ origin: server.origin });
+
+		const viewerFailure = nextJsonMessage(socket);
+		assert.deepEqual(await control.send({
+			type: "report_error",
+			pdf_id: 25,
+			code: "mark_fetch_failed",
+			title: "Could not fetch PDF marks",
+			detail: "The Viewer Host rejected the mark claim.",
+			inject_text: "PDF mark delivery failed: claim rejected",
+		}), { ok: true, result: { type: "report_error", pdf_id: 25 } });
+		assert.deepEqual(await viewerFailure, {
+			type: "viewer_error",
+			pdf_id: 25,
+			code: "mark_fetch_failed",
+			title: "Could not fetch PDF marks",
+			detail: "The Viewer Host rejected the mark claim.",
+			inject_text: "PDF mark delivery failed: claim rejected",
+		});
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host bounds its transient MCP event backlog", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-bounded-events-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFakePdf(pdfPath);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry, maxMcpEventBacklog: 2 });
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 24, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath) });
+		await server.start();
+		socket = await openViewerSocket(server.origin, 24, await getViewerSocketToken(server.origin, 24));
+		socket.send(JSON.stringify({ type: "compile_action", action: "compile" }));
+		socket.send(JSON.stringify({ type: "compile_action", action: "stop" }));
+		socket.send(JSON.stringify({ type: "compile_action", action: "continuous_on" }));
+		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+		const payload = await (await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" })).json() as { events?: unknown[] };
+		assert.deepEqual(payload.events, [
+			{ type: "compile_action", pdf_id: 24, action: "stop" },
+			{ type: "compile_action", pdf_id: 24, action: "continuous_on" },
+		]);
+
+		socket.send(JSON.stringify({ type: "compile_action", action: "status" }));
+		socket.send(JSON.stringify({ type: "selection_debug", phase: "one", text: "", details: {} }));
+		socket.send(JSON.stringify({ type: "selection_debug", phase: "two", text: "", details: {} }));
+		socket.send(JSON.stringify({ type: "selection_debug", phase: "three", text: "", details: {} }));
+		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+		const afterDiagnostics = await (await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" })).json() as { events?: unknown[] };
+		assert.deepEqual(afterDiagnostics.events, [
+			{ type: "compile_action", pdf_id: 24, action: "status" },
+			{ type: "selection_debug", pdf_id: 24, phase: "three", text: "", details: {} },
+		]);
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("generic event drains do not consume or clear pending PDF marks", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-filtered-drain-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFakePdf(pdfPath);
@@ -316,12 +428,13 @@ test("compile action polling does not drain or clear PDF annotations", async () 
 		assert.deepEqual(filteredPayload.events, [{ type: "compile_action", pdf_id: 31, action: "status" }]);
 		await assertNoMessage(socket);
 
-		const clearMessage = nextJsonMessage(socket);
 		const allResponse = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
 		const allPayload = await allResponse.json() as { ok?: boolean; events?: unknown[] };
 		assert.equal(allPayload.ok, true);
-		assert.deepEqual(allPayload.events, [{ type: "pdf_annotation", pdf_id: 31, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, comment: "keep me" }]);
-		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 31, pdf_ids: [31] });
+		assert.deepEqual(allPayload.events, []);
+		const claim = await claimMarks(server.origin, { pdf_ids: [31] });
+		assert.deepEqual(claim.marks, [{ type: "pdf_annotation", pdf_id: 31, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, comment: "keep me" }]);
+		await assertNoMessage(socket);
 	} finally {
 		socket?.close();
 		await server.stop();
@@ -329,7 +442,7 @@ test("compile action polling does not drain or clear PDF annotations", async () 
 	}
 });
 
-test("PDF annotation socket payloads are coalesced for MCP drain and clear viewer annotations", async () => {
+test("PDF annotation socket payloads are coalesced for mark claims and targeted acknowledgement", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-annotation-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFakePdf(pdfPath);
@@ -348,12 +461,10 @@ test("PDF annotation socket payloads are coalesced for MCP drain and clear viewe
 		await new Promise((resolve) => setTimeout(resolve, 50));
 
 		const clearMessage = nextJsonMessage(socket);
-		const response = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
-		assert.equal(response.status, 200);
-		const payload = await response.json() as { ok?: boolean; events?: unknown[] };
-		assert.equal(payload.ok, true);
-		assert.deepEqual(payload.events, [{ type: "pdf_annotation", pdf_id: 33, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, source_line: "new", comment: "new" }]);
-		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 33, pdf_ids: [33] });
+		const claim = await claimMarks(server.origin);
+		assert.deepEqual(claim.marks, [{ type: "pdf_annotation", pdf_id: 33, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, source_line: "new", comment: "new" }]);
+		assert.deepEqual(await acknowledgeMarks(server.origin, claim), [{ pdf_id: 33, annotation_id: "a1" }]);
+		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 33, pdf_ids: [33], annotation_ids: ["a1"] });
 	} finally {
 		socket?.close();
 		await server.stop();
@@ -361,7 +472,7 @@ test("PDF annotation socket payloads are coalesced for MCP drain and clear viewe
 	}
 });
 
-test("MCP event drain can be scoped to owned pdf_ids without consuming other events", async () => {
+test("mark claims can be scoped to owned pdf_ids without consuming other marks", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-drain-owned-"));
 	const firstPdf = join(baseDir, "first.pdf");
 	const secondPdf = join(baseDir, "second.pdf");
@@ -382,16 +493,16 @@ test("MCP event drain can be scoped to owned pdf_ids without consuming other eve
 		await new Promise((resolve) => setTimeout(resolve, 50));
 
 		const firstClearMessage = nextJsonMessage(firstSocket);
-		const scopedResponse = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pdf_ids: [41] }) });
-		assert.equal(scopedResponse.status, 200);
-		const scopedPayload = await scopedResponse.json() as { events?: Array<{ pdf_id?: number }> };
-		assert.deepEqual(scopedPayload.events?.map((event) => event.pdf_id), [41]);
-		assert.deepEqual(await firstClearMessage, { type: "annotations_cleared", pdf_id: 41, pdf_ids: [41] });
+		const scopedClaim = await claimMarks(server.origin, { pdf_ids: [41] });
+		assert.deepEqual(scopedClaim.marks.map((mark) => mark.pdf_id), [41]);
+		await acknowledgeMarks(server.origin, scopedClaim);
+		assert.deepEqual(await firstClearMessage, { type: "annotations_cleared", pdf_id: 41, pdf_ids: [41], annotation_ids: ["a1"] });
 
 		const secondClearMessage = nextJsonMessage(secondSocket);
-		const remainingPayload = await (await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" })).json() as { events?: Array<{ pdf_id?: number }> };
-		assert.deepEqual(remainingPayload.events?.map((event) => event.pdf_id), [42]);
-		assert.deepEqual(await secondClearMessage, { type: "annotations_cleared", pdf_id: 42, pdf_ids: [42] });
+		const remainingClaim = await claimMarks(server.origin);
+		assert.deepEqual(remainingClaim.marks.map((mark) => mark.pdf_id), [42]);
+		await acknowledgeMarks(server.origin, remainingClaim);
+		assert.deepEqual(await secondClearMessage, { type: "annotations_cleared", pdf_id: 42, pdf_ids: [42], annotation_ids: ["a2"] });
 	} finally {
 		firstSocket?.close();
 		secondSocket?.close();
@@ -418,7 +529,7 @@ test("closing a visible viewer tab discards queued marks and clears viewer annot
 		await new Promise((resolve) => setTimeout(resolve, 50));
 
 		const clearMessage = nextJsonMessage(socket);
-		const closeResponse = await fetch(`${server.origin}/app-tab-closed`, {
+		const closeResponse = await fetch(`${server.origin}/viewer-tab-closed`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ pdf_id: 33, revision: 1, viewer_url: "/viewer-lw/33?revision=1", visible_tab_token: "visible-tab-1" }),
@@ -426,9 +537,7 @@ test("closing a visible viewer tab discards queued marks and clears viewer annot
 
 		assert.equal(closeResponse.status, 200);
 		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 33, pdf_ids: [33] });
-		const drain = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
-		const payload = await drain.json() as { events?: unknown[] };
-		assert.deepEqual(payload.events, []);
+		assert.deepEqual((await claimMarks(server.origin)).marks, []);
 	} finally {
 		socket?.close();
 		await server.stop();
@@ -467,10 +576,7 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 	const { pdfPath, sourcePath } = writeSynctexFixture(baseDir);
 	const registry = new ViewerHostPdfRegistry();
 	let service: ViewerHostMcpService | undefined;
-	const server = new ViewerHostServer({
-		registry,
-		mcpEventSink: (message) => service?.handleHostMessage(message),
-	});
+	const server = new ViewerHostServer({ registry });
 	let socket: TestWebSocket | undefined;
 	try {
 		await server.start();

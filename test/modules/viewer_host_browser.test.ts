@@ -4,7 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { chromium, type Browser, type Page, type Request, type Response } from "playwright";
+import { chromium, type Browser, type Page, type Request, type Response, type Route } from "playwright";
 import { handleMcpRequest } from "../../src/modules/host_service_mcp.ts";
 import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
 import { ViewerHostMcpService, type ViewerHostClient } from "../../src/modules/viewer_host_client.ts";
@@ -226,6 +226,7 @@ test("LaTeX Workshop viewer Tools button is clickable across its hitbox", async 
 	try {
 		registry.registerPdf({ pdfId: 260, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
 		await server.start();
+		await new ViewerHostControlClient({ origin: server.origin }).send({ type: "set_debug_synctex", pdf_id: 260, enabled: true });
 		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
 		const page = await browser.newPage({ viewport: { width: 420, height: 220 } });
 		await page.goto(`${server.origin}/viewer-lw/260`, { waitUntil: "domcontentloaded" });
@@ -282,13 +283,12 @@ test("LaTeX Workshop viewer Tools button is clickable across its hitbox", async 
 			assert.equal(hit.interceptingElement, undefined, `Tools hit target at ${hit.name} should not report an intercepting element: ${JSON.stringify(hit)}`);
 		}
 		await page.waitForFunction(() => (window as unknown as { __hostLwLoadedState?: () => { socketStatus?: string } }).__hostLwLoadedState?.().socketStatus === "connected");
-		const drained = await (await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" })).json() as { events: Array<{ type: string; phase?: string; details?: { points?: unknown[]; elements?: unknown; scrollbarGutter?: unknown; appShell?: unknown } }> };
+		const drained = await (await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" })).json() as { events: Array<{ type: string; phase?: string; details?: { points?: unknown[]; elements?: unknown; scrollbarGutter?: unknown } }> };
 		const hitTargetEvent = drained.events.find((event) => event.type === "selection_debug" && event.phase === "lw_tools_hit_target");
 		assert.ok(hitTargetEvent, `Tools hit-target diagnostics should be retrievable through MCP events: ${JSON.stringify(drained.events.map((event) => event.phase))}`);
 		assert.ok(Array.isArray(hitTargetEvent.details?.points) && hitTargetEvent.details.points.length >= 3, "event diagnostics should include left/center/right elementFromPoint results");
 		assert.ok(hitTargetEvent.details?.elements, "event diagnostics should include relevant element rect/style details");
 		assert.ok(hitTargetEvent.details?.scrollbarGutter, "event diagnostics should include scrollbar/gutter details");
-		assert.ok(hitTargetEvent.details?.appShell, "event diagnostics should include parent app-shell details");
 
 		const clickAndAssertOpen = async (xFraction: number) => {
 			await page.locator("#secondaryToolbarToggleButton").evaluate((button) => {
@@ -372,6 +372,7 @@ test("LaTeX Workshop viewer keeps toolbar-integrated navigation history", async 
 	try {
 		registry.registerPdf({ pdfId: 261, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
 		await server.start();
+		await new ViewerHostControlClient({ origin: server.origin }).send({ type: "set_debug_synctex", pdf_id: 261, enabled: true });
 		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
 		const page = await browser.newPage({ viewport: { width: 360, height: 180 } });
 		await page.goto(`${server.origin}/viewer-lw/261`, { waitUntil: "domcontentloaded" });
@@ -498,180 +499,6 @@ test("LaTeX Workshop viewer keeps toolbar-integrated navigation history", async 
 	}
 });
 
-test("LaTeX Workshop app shell forwards parent-level history shortcuts to the active iframe", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-app-shortcuts-"));
-	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
-	const registry = new ViewerHostPdfRegistry();
-	const server = new ViewerHostServer({ registry });
-	let browser: Browser | undefined;
-	try {
-		registry.registerPdf({ pdfId: 263, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
-		await server.start();
-		const control = new ViewerHostControlClient({ origin: server.origin });
-		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
-		const page = await browser.newPage({ viewport: { width: 420, height: 220 } });
-		await page.goto(`${server.origin}/app`, { waitUntil: "domcontentloaded" });
-		assert.equal((await control.send({ type: "open_pdf", pdf_id: 263, pdf_path: pdfPath, title: "paper.pdf" })).ok, true);
-		await page.waitForSelector("iframe[data-pdf-id='263']");
-		const frame = page.frameLocator("iframe[data-pdf-id='263']");
-		await frame.locator("#viewerContainer").waitFor({ state: "attached", timeout: 10_000 });
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const loaded = (iframe?.contentWindow as unknown as { __hostLwLoadedState?: () => { renderedCanvasCount?: number } } | undefined)?.__hostLwLoadedState?.();
-			return (loaded?.renderedCanvasCount ?? 0) > 0;
-		}, undefined, { timeout: 10_000 });
-		await page.evaluate(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const app = (iframe?.contentWindow as unknown as { PDFViewerApplication?: { pdfViewer?: { currentScaleValue: string } } } | undefined)?.PDFViewerApplication;
-			if (app?.pdfViewer) app.pdfViewer.currentScaleValue = "2";
-		});
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const container = iframe?.contentDocument?.getElementById("viewerContainer");
-			return !!container && container.scrollHeight - container.clientHeight > 100;
-		});
-		await frame.locator("#secondaryToolbarToggleButton").waitFor({ state: "attached", timeout: 10_000 });
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const tools = iframe?.contentDocument?.getElementById("secondaryToolbarToggleButton") as HTMLElement | null;
-			const rect = tools?.getBoundingClientRect();
-			const hit = rect ? iframe?.contentDocument?.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) : undefined;
-			return hit === tools;
-		}, undefined, { timeout: 10_000 });
-		const appLayout = await page.evaluate(() => {
-			const scrolling = document.scrollingElement ?? document.documentElement;
-			const app = document.getElementById("viewer-client-app") as HTMLElement | null;
-			const panels = document.getElementById("viewer-panels") as HTMLElement | null;
-			const panel = document.querySelector("[role='tabpanel'][data-pdf-id='263']") as HTMLElement | null;
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const iframeRect = iframe?.getBoundingClientRect();
-			const tools = iframe?.contentDocument?.getElementById("secondaryToolbarToggleButton") as HTMLElement | null;
-			const toolsRect = tools?.getBoundingClientRect();
-			const parentToolsPoint = iframeRect && toolsRect ? { x: iframeRect.left + toolsRect.left + toolsRect.width / 2, y: iframeRect.top + toolsRect.top + toolsRect.height / 2 } : undefined;
-			const parentHit = parentToolsPoint ? document.elementFromPoint(parentToolsPoint.x, parentToolsPoint.y) : undefined;
-			const iframeHit = toolsRect ? iframe?.contentDocument?.elementsFromPoint(toolsRect.left + toolsRect.width / 2, toolsRect.top + toolsRect.height / 2)?.[0] : undefined;
-			return {
-				viewport: { width: innerWidth, height: innerHeight },
-				scrollHeight: scrolling.scrollHeight,
-				clientHeight: scrolling.clientHeight,
-				scrollWidth: scrolling.scrollWidth,
-				clientWidth: scrolling.clientWidth,
-				bodyOverflow: getComputedStyle(document.body).overflow,
-				documentOverflow: getComputedStyle(document.documentElement).overflow,
-				appOverflow: app ? getComputedStyle(app).overflow : "missing",
-				panelsOverflow: panels ? getComputedStyle(panels).overflow : "missing",
-				panelOverflow: panel ? getComputedStyle(panel).overflow : "missing",
-				iframeDisplay: iframe ? getComputedStyle(iframe).display : "missing",
-				iframeRect: iframeRect ? { left: iframeRect.left, top: iframeRect.top, right: iframeRect.right, bottom: iframeRect.bottom, width: iframeRect.width, height: iframeRect.height } : undefined,
-				toolsExists: !!tools,
-				toolsRect: toolsRect ? { left: toolsRect.left, top: toolsRect.top, right: toolsRect.right, bottom: toolsRect.bottom, width: toolsRect.width, height: toolsRect.height } : undefined,
-				parentHitTag: parentHit instanceof Element ? parentHit.tagName : undefined,
-				parentHitPdfId: parentHit instanceof HTMLElement ? parentHit.dataset.pdfId : undefined,
-				iframeHitId: iframeHit instanceof Element ? iframeHit.id : undefined,
-				iframeHitTag: iframeHit instanceof Element ? iframeHit.tagName : undefined,
-				iframeHitClass: iframeHit instanceof Element ? String(iframeHit.className) : undefined,
-			};
-		});
-		assert.ok(appLayout.scrollHeight <= appLayout.clientHeight, `app shell should not have an outer vertical scrollbar: ${JSON.stringify(appLayout)}`);
-		assert.ok(appLayout.scrollWidth <= appLayout.clientWidth, `app shell should not have an outer horizontal scrollbar: ${JSON.stringify(appLayout)}`);
-		assert.equal(appLayout.bodyOverflow, "hidden");
-		assert.equal(appLayout.documentOverflow, "hidden");
-		assert.equal(appLayout.appOverflow, "hidden");
-		assert.equal(appLayout.panelsOverflow, "hidden");
-		assert.equal(appLayout.panelOverflow, "hidden");
-		assert.equal(appLayout.iframeDisplay, "block");
-		assert.ok(appLayout.iframeRect, "active iframe should have a parent-frame rect");
-		assert.ok((appLayout.iframeRect?.bottom ?? Infinity) <= appLayout.viewport.height, `iframe should fit inside the app viewport: ${JSON.stringify(appLayout)}`);
-		assert.equal(appLayout.parentHitTag, "IFRAME", `parent hit test at Tools center should hit the active iframe, not an outer scrollbar/overlay: ${JSON.stringify(appLayout)}`);
-		assert.equal(appLayout.parentHitPdfId, "263");
-		const iframeToolsHit = await frame.locator("#secondaryToolbarToggleButton").evaluate((button) => {
-			const rect = button.getBoundingClientRect();
-			return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === button;
-		});
-		assert.equal(iframeToolsHit, true, `iframe hit test at Tools center should hit Tools: ${JSON.stringify(appLayout)}`);
-		await page.evaluate(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const container = iframe?.contentDocument?.getElementById("viewerContainer");
-			if (!container) throw new Error("missing viewerContainer");
-			container.scrollTop = 90;
-		});
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { state(): { back: unknown[] }; capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
-			return (debug?.state().back.length ?? 0) === 1 && (debug?.capture().scrollTop ?? 0) > 50;
-		});
-		const dispatchParentKey = async (key: "o" | "i") => page.evaluate((eventKey) => {
-			const event = new KeyboardEvent("keydown", { key: eventKey, ctrlKey: true, bubbles: true, cancelable: true });
-			return !document.dispatchEvent(event);
-		}, key);
-		const dispatchParentSideButton = async (init: { button: number; buttons?: number; which?: number }) => page.evaluate((mouseInit) => ["pointerdown", "pointerup", "mousedown", "mouseup", "auxclick"].map((type) => {
-			const event = type.startsWith("pointer") && typeof PointerEvent !== "undefined"
-				? new PointerEvent(type, { button: mouseInit.button, buttons: mouseInit.buttons, bubbles: true, cancelable: true, pointerType: "mouse" })
-				: new MouseEvent(type, { button: mouseInit.button, buttons: mouseInit.buttons, bubbles: true, cancelable: true });
-			if (mouseInit.which !== undefined) Object.defineProperty(event, "which", { value: mouseInit.which });
-			return !document.dispatchEvent(event);
-		}), init);
-		assert.equal(await dispatchParentKey("o"), true, "parent Ctrl+O should suppress browser file-open default");
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
-			return (debug?.capture().scrollTop ?? 999) < 2;
-		});
-		assert.equal(await dispatchParentKey("i"), true, "parent Ctrl+I should suppress browser default");
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
-			return (debug?.capture().scrollTop ?? 0) > 50;
-		});
-		assert.deepEqual(await dispatchParentSideButton({ button: 3 }), [true, true, true, true, true], "parent MSB4 sequence should suppress browser navigation");
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
-			return (debug?.capture().scrollTop ?? 999) < 2;
-		});
-		assert.deepEqual(await dispatchParentSideButton({ button: 4 }), [true, true, true, true, true], "parent MSB5 sequence should suppress browser navigation");
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
-			return (debug?.capture().scrollTop ?? 0) > 50;
-		});
-		assert.deepEqual(await dispatchParentSideButton({ button: 0, buttons: 8 }), [true, true, true, true, true], "parent alternative MSB4 buttons=8 sequence should suppress browser navigation");
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
-			return (debug?.capture().scrollTop ?? 999) < 2;
-		});
-		assert.deepEqual(await dispatchParentSideButton({ button: 0, buttons: 16 }), [true, true, true, true, true], "parent alternative MSB5 buttons=16 sequence should suppress browser navigation");
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
-			return (debug?.capture().scrollTop ?? 0) > 50;
-		});
-		assert.deepEqual(await dispatchParentSideButton({ button: 0, buttons: 0, which: 4 }), [true, true, true, true, true], "parent WebKit MSB4 which=4 sequence should suppress browser navigation");
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
-			return (debug?.capture().scrollTop ?? 999) < 2;
-		});
-		assert.deepEqual(await dispatchParentSideButton({ button: 0, buttons: 0, which: 5 }), [true, true, true, true, true], "parent WebKit MSB5 which=5 sequence should suppress browser navigation");
-		await page.waitForFunction(() => {
-			const iframe = document.querySelector("iframe[data-pdf-id='263']") as HTMLIFrameElement | null;
-			const debug = (iframe?.contentWindow as unknown as { __hostLwNavigationHistoryDebug?: { capture(): { scrollTop: number } } } | undefined)?.__hostLwNavigationHistoryDebug;
-			return (debug?.capture().scrollTop ?? 0) > 50;
-		});
-		const parentRawMouseDrain = await (await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" })).json() as { events: Array<{ type: string; phase?: string; text?: string; details?: { type?: string; button?: number; buttons?: number; which?: number; target?: unknown; defaultPrevented?: boolean; handledDirection?: string } }> };
-		const appShellRawMouseEvents = parentRawMouseDrain.events.filter((event) => event.type === "selection_debug" && event.phase === "lw_app_shell_raw_mouse_event");
-		assert.ok(appShellRawMouseEvents.some((event) => event.details?.which === 4 && event.details.handledDirection === "back"), "MCP debug events should expose raw app-shell MSB4 which=4 diagnostics");
-		assert.ok(appShellRawMouseEvents.some((event) => event.details?.which === 5 && event.details.handledDirection === "forward"), "MCP debug events should expose raw app-shell MSB5 which=5 diagnostics");
-		assert.ok(appShellRawMouseEvents.every((event) => typeof event.details?.type === "string" && typeof event.details.defaultPrevented === "boolean" && event.details.target), "raw app-shell mouse diagnostics should include event type, target and defaultPrevented");
-		assert.ok(appShellRawMouseEvents.some((event) => /type=.*button=.*buttons=.*which=.*handled=back/.test(event.text ?? "")), "raw app-shell mouse diagnostics should expose a concise MCP-visible text summary");
-	} finally {
-		await browser?.close();
-		await server.stop();
-		rmSync(baseDir, { recursive: true, force: true });
-	}
-});
-
 test("side-by-side LaTeX Workshop viewer route renders PDF with stock toolbar UI", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-browser-"));
 	const pdfPath = join(baseDir, "paper.pdf");
@@ -765,8 +592,8 @@ test("LaTeX Workshop viewer applies initial named destination hash for label-bac
 	}
 });
 
-test("Viewer Client app iframe loads LaTeX Workshop PDF pages and emits loaded-state diagnostics", async () => {
-	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-app-iframe-"));
+test("direct LaTeX Workshop viewer loads PDF pages and emits loaded-state diagnostics", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-direct-diagnostics-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFileSync(pdfPath, makeOnePagePdf());
 	const registry = new ViewerHostPdfRegistry();
@@ -778,7 +605,7 @@ test("Viewer Client app iframe loads LaTeX Workshop PDF pages and emits loaded-s
 	try {
 		await server.start();
 		const client = new ViewerHostControlClient({ origin: server.origin });
-		assert.equal((await client.send({ type: "open_pdf", pdf_id: 144, pdf_path: pdfPath, title: "App iframe PDF" })).ok, true);
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 144, pdf_path: pdfPath, title: "Direct viewer PDF", debug_synctex: true })).ok, true);
 
 		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
 		const page = await browser.newPage();
@@ -789,11 +616,8 @@ test("Viewer Client app iframe loads LaTeX Workshop PDF pages and emits loaded-s
 			if (response.status() >= 400) failedRequests.push(`${response.status()} ${response.url()}`);
 		});
 
-		await page.goto(`${server.origin}/app`, { waitUntil: "domcontentloaded" });
-		await page.waitForFunction(() => document.querySelector("iframe[data-pdf-id='144']")?.getAttribute("src") === "/viewer-lw/144?revision=1", undefined, { timeout: 5_000 });
-		const frame = await page.waitForEvent("framenavigated", { predicate: (candidate) => candidate.url().includes("/viewer-lw/144"), timeout: 10_000 }).catch(() => page.frames().find((candidate) => candidate.url().includes("/viewer-lw/144")));
-		assert.ok(frame, `LW iframe should navigate\n${summarizeFailures(consoleMessages, pageErrors, failedRequests)}`);
-		await frame.waitForFunction(() => {
+		await page.goto(`${server.origin}/viewer-lw/144`, { waitUntil: "domcontentloaded" });
+		await page.waitForFunction(() => {
 			const diagnostic = (window as unknown as { __hostLwLoadedState?: () => { pdfDocumentLoaded?: boolean; numPages?: number; pagesCount?: number; renderedPageCount?: number; canvasCount?: number; currentPageInput?: string; currentPageLabel?: string } }).__hostLwLoadedState?.();
 			return diagnostic?.pdfDocumentLoaded === true
 				&& diagnostic.numPages === 1
@@ -921,7 +745,142 @@ test("LaTeX Workshop viewer refreshes from Host socket while preserving page and
 });
 
 
-test("LaTeX Workshop viewer reconnects Host socket and receives later refreshes", async () => {
+test("reopening the active PDF never rolls back when an older prefetch finishes late", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-active-reopen-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFileSync(pdfPath, makeTwoPagePdfWithToken("REVONE"));
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	let releaseRevisionTwo = () => {};
+	try {
+		await server.start();
+		const client = new ViewerHostControlClient({ origin: server.origin });
+		const firstOpen = await client.send({ type: "open_pdf", pdf_id: 146, pdf_path: pdfPath, title: "paper.pdf" });
+		assert.deepEqual(firstOpen, { ok: true, result: { type: "open_pdf", pdf_id: 146, revision: 1 } });
+
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		await page.goto(`${server.origin}/viewer-lw/146`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		assert.equal((await drainHostMcpEvents(server.origin)).some((event) => event.type === "selection_debug"), false, "normal viewer mode must not enqueue hidden diagnostics");
+		let markRevisionTwoRequested: (() => void) | undefined;
+		const revisionTwoRequested = new Promise<void>((resolveRequest) => { markRevisionTwoRequested = resolveRequest; });
+		const revisionTwoGate = new Promise<void>((resolveGate) => { releaseRevisionTwo = resolveGate; });
+		await page.route(`${server.origin}/pdf/146?revision=2`, async (route) => {
+			markRevisionTwoRequested?.();
+			await revisionTwoGate;
+			await route.continue();
+		});
+
+		writeFileSync(pdfPath, makeTwoPagePdfWithToken("REVTWO"));
+		const secondOpen = await client.send({ type: "open_pdf", pdf_id: 146, pdf_path: pdfPath, title: "paper.pdf" });
+		assert.deepEqual(secondOpen, { ok: true, result: { type: "open_pdf", pdf_id: 146, revision: 2 } });
+		await revisionTwoRequested;
+
+		writeFileSync(pdfPath, makeTwoPagePdfWithToken("REVTHREE"));
+		const thirdOpen = await client.send({ type: "open_pdf", pdf_id: 146, pdf_path: pdfPath, title: "paper.pdf" });
+		assert.deepEqual(thirdOpen, { ok: true, result: { type: "open_pdf", pdf_id: 146, revision: 3 } });
+		await page.waitForFunction(() => document.body.dataset.hostLwVisibleRevision === "3", undefined, { timeout: 10_000 });
+		releaseRevisionTwo();
+		await page.waitForTimeout(150);
+		assert.deepEqual(await page.evaluate(() => ({ visible: document.body.dataset.hostLwVisibleRevision, latest: document.body.dataset.hostLwLatestRevision })), { visible: "3", latest: "3" });
+	} finally {
+		releaseRevisionTwo();
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("direct viewer honors active replay and the latest rapid tab selection", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-tab-switch-race-"));
+	const slowPdfPath = join(baseDir, "slow.pdf");
+	const latestPdfPath = join(baseDir, "latest.pdf");
+	const activePdfPath = join(baseDir, "active.pdf");
+	writeFileSync(slowPdfPath, makeTwoPagePdfWithToken("SLOW"));
+	writeFileSync(latestPdfPath, makeTwoPagePdfWithToken("LATEST"));
+	writeFileSync(activePdfPath, makeTwoPagePdfWithToken("ACTIVE"));
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	const releaseOutstandingGates = new Set<() => void>();
+	try {
+		await server.start();
+		const client = new ViewerHostControlClient({ origin: server.origin });
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 270, pdf_path: slowPdfPath, title: "Slow" })).ok, true);
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 271, pdf_path: latestPdfPath, title: "Latest" })).ok, true);
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 272, pdf_path: activePdfPath, title: "Active" })).ok, true);
+
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		const slowConfigUrl = `${server.origin}/config/270.json`;
+		const gateSlowConfig = async () => {
+			let release = () => {};
+			const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+			releaseOutstandingGates.add(release);
+			const handler = async (route: Route) => {
+				await gate;
+				await route.continue();
+			};
+			await page.route(slowConfigUrl, handler);
+			return async () => {
+				release();
+				releaseOutstandingGates.delete(release);
+				await page.waitForTimeout(100);
+				await page.unroute(slowConfigUrl, handler);
+			};
+		};
+		const releaseInitialReplay = await gateSlowConfig();
+		await page.goto(`${server.origin}/viewer-lw`, { waitUntil: "domcontentloaded" });
+		await page.waitForFunction(() => {
+			const loaded = (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number; renderedCanvasCount?: number } }).__hostLwLoadedState?.();
+			return loaded?.activePdfId === 272 && (loaded.renderedCanvasCount ?? 0) > 0
+				&& document.querySelectorAll("#hostPdfTabsContainer .hostPdfTab").length === 3;
+		}, undefined, { timeout: 15_000 });
+		await releaseInitialReplay();
+		assert.equal(await page.evaluate(() => (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number } }).__hostLwLoadedState?.().activePdfId), 272, "active replay must supersede an earlier slow inactive tab");
+
+		const releaseFocusedAway = await gateSlowConfig();
+		await page.locator("#hostPdfTabsContainer .hostPdfTabButton[data-pdf-id='270']").click();
+		await page.waitForFunction(() => (window as unknown as { __hostLwLoadedState?: () => { pendingDirectViewerPdfId?: number } }).__hostLwLoadedState?.().pendingDirectViewerPdfId === 270);
+		assert.equal((await client.send({ type: "focus_pdf", pdf_id: 272 })).ok, true);
+		await page.waitForFunction(() => (window as unknown as { __hostLwLoadedState?: () => { pendingDirectViewerPdfId?: number } }).__hostLwLoadedState?.().pendingDirectViewerPdfId === undefined);
+		await releaseFocusedAway();
+		assert.equal(await page.evaluate(() => (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number } }).__hostLwLoadedState?.().activePdfId), 272, "newer Host focus must cancel a pending user switch");
+
+		const releaseRapidSwitch = await gateSlowConfig();
+		await page.locator("#hostPdfTabsContainer .hostPdfTabButton[data-pdf-id='270']").click();
+		await page.waitForFunction(() => (window as unknown as { __hostLwLoadedState?: () => { pendingDirectViewerPdfId?: number } }).__hostLwLoadedState?.().pendingDirectViewerPdfId === 270);
+		await page.locator("#hostPdfTabsContainer .hostPdfTabButton[data-pdf-id='271']").click();
+		await page.waitForFunction(() => {
+			const loaded = (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number; renderedCanvasCount?: number; socketStatus?: string } }).__hostLwLoadedState?.();
+			return loaded?.activePdfId === 271 && loaded.socketStatus === "connected" && (loaded.renderedCanvasCount ?? 0) > 0;
+		}, undefined, { timeout: 15_000 });
+		await releaseRapidSwitch();
+		assert.equal(await page.evaluate(() => (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number } }).__hostLwLoadedState?.().activePdfId), 271);
+		assert.equal(server.getConnectedViewerCount(271), 1);
+		assert.equal(server.getConnectedViewerCount(270), 0);
+
+		const releaseClosedSwitch = await gateSlowConfig();
+		await page.locator("#hostPdfTabsContainer .hostPdfTabButton[data-pdf-id='270']").click();
+		await page.waitForFunction(() => (window as unknown as { __hostLwLoadedState?: () => { pendingDirectViewerPdfId?: number } }).__hostLwLoadedState?.().pendingDirectViewerPdfId === 270);
+		await page.locator("#hostPdfTabsContainer .hostPdfTabClose[data-close-pdf-id='270']").click();
+		await page.waitForFunction(() => (window as unknown as { __hostLwLoadedState?: () => { pendingDirectViewerPdfId?: number } }).__hostLwLoadedState?.().pendingDirectViewerPdfId === undefined
+			&& document.querySelector("#hostPdfTabsContainer .hostPdfTab[data-pdf-id='270']") === null);
+		await releaseClosedSwitch();
+		assert.equal(await page.evaluate(() => (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number } }).__hostLwLoadedState?.().activePdfId), 271, "a closed pending tab must never become active");
+	} finally {
+		for (const release of releaseOutstandingGates) release();
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("LaTeX Workshop viewer reconciles a PDF refresh missed while its Host socket was disconnected", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-reconnect-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFileSync(pdfPath, makeTwoPagePdfWithToken("REVONE"));
@@ -941,12 +900,12 @@ test("LaTeX Workshop viewer reconnects Host socket and receives later refreshes"
 		assert.equal(server.getConnectedViewerCount(145), 1);
 
 		assert.equal(disconnectViewerSocketsForTest(server, 145), 1);
-		await page.waitForFunction(() => document.body.dataset.hostLwSocket === "connected", undefined, { timeout: 5_000 });
-		assert.equal(server.getConnectedViewerCount(145), 1);
-
 		writeFileSync(pdfPath, makeTwoPagePdfWithToken("REVTWO"));
 		registry.registerPdf({ pdfId: 145, pdfPath, title: "paper.pdf", revision: 2, fileSnapshot: snapshotPdf(pdfPath) });
-		assert.equal(server.sendPdfRefresh(145), 1);
+		assert.equal(server.sendPdfRefresh(145), 0, "the revision notification is intentionally missed while disconnected");
+
+		await page.waitForFunction(() => document.body.dataset.hostLwSocket === "connected", undefined, { timeout: 5_000 });
+		assert.equal(server.getConnectedViewerCount(145), 1);
 		await page.waitForFunction(() => document.body.dataset.hostLwVisibleRevision === "2", undefined, { timeout: 10_000 });
 	} finally {
 		await browser?.close();
@@ -1130,6 +1089,95 @@ test("LaTeX Workshop viewer renders Host forward SyncTeX marker and range overla
 	}
 });
 
+test("LaTeX Workshop viewer shows pending mark feedback and clears it on a reported SyncTeX failure", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-probe-failure-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFileSync(pdfPath, makeTwoPagePdfWithToken("NO-SYNCTEX"));
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 147, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 500, height: 360 } });
+		await page.goto(`${server.origin}/viewer-lw/147`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+
+		const pendingState = await page.locator(".page[data-page-number='1'] canvas").evaluate((canvas) => {
+			const rect = canvas.getBoundingClientRect();
+			canvas.dispatchEvent(new MouseEvent("click", {
+				bubbles: true,
+				cancelable: true,
+				button: 0,
+				clientX: rect.left + rect.width / 2,
+				clientY: rect.top + rect.height / 2,
+			}));
+			return {
+				visible: document.querySelector("[data-reverse-synctex-forward-probe]") !== null,
+				status: document.querySelector("[data-pdf-mark-status]")?.textContent,
+			};
+		});
+		assert.deepEqual(pendingState, { visible: true, status: "Resolving PDF mark…" }, "a click must explain its pending state synchronously");
+		await page.waitForFunction(() => document.querySelector("#hostSynctexCapabilityBanner")?.getAttribute("data-issue-code") === "synctex_missing");
+		assert.equal(await page.locator("[data-reverse-synctex-forward-probe]").count(), 0, "a real mapping failure must clear provisional feedback");
+		assert.equal(await page.locator("[data-pdf-mark-status]").count(), 0, "a real mapping failure must clear pending status text");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("LaTeX Workshop viewer reports unexpected failures in the general popup and can forward them to the agent", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-reported-failure-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	writeFileSync(pdfPath, makeOnePagePdf());
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 154, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		await page.goto(`${server.origin}/viewer-lw/154`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+
+		const control = new ViewerHostControlClient({ origin: server.origin });
+		assert.deepEqual(await control.send({
+			type: "report_error",
+			pdf_id: 154,
+			code: "mark_fetch_failed",
+			title: "Could not fetch PDF marks",
+			detail: "The Viewer Host rejected the mark claim.",
+			inject_text: "PDF mark delivery failed: claim rejected",
+		}), { ok: true, result: { type: "report_error", pdf_id: 154 } });
+
+		await page.waitForSelector("#hostViewerNotificationBox[data-severity='error']", { state: "attached", timeout: 2_000 });
+		const popup = await page.locator("#hostViewerNotificationBox").evaluate((element) => ({
+			role: element.getAttribute("role"),
+			text: element.querySelector(".hostViewerNotificationText")?.textContent,
+		}));
+		assert.deepEqual(popup, {
+			role: "alert",
+			text: "Could not fetch PDF marks\nThe Viewer Host rejected the mark claim.",
+		});
+		assert.equal(await page.locator("#hostSynctexCapabilityBanner").count(), 0, "unexpected failures must use the prominent general popup");
+
+		await page.getByRole("button", { name: "Forward to agent" }).click();
+		await page.waitForTimeout(50);
+		const claimResponse = await fetch(`${server.origin}/marks/claim`, { method: "POST" });
+		assert.equal(claimResponse.status, 200);
+		const claim = await claimResponse.json() as { marks?: Array<{ comment?: string }> };
+		assert.equal(claim.marks?.[0]?.comment, "PDF mark delivery failed: claim rejected");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("LaTeX Workshop viewer Ctrl-click and Cmd-click send Host reverse SyncTeX PDF coordinates", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-reverse-"));
 	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
@@ -1176,6 +1224,7 @@ test("LaTeX Workshop viewer selection reverse SyncTeX payload preserves selected
 	try {
 		registry.registerPdf({ pdfId: 148, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
 		await server.start();
+		await new ViewerHostControlClient({ origin: server.origin }).send({ type: "set_debug_synctex", pdf_id: 148, enabled: true });
 		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
 		const page = await browser.newPage();
 		await page.goto(`${server.origin}/viewer-lw/148`, { waitUntil: "domcontentloaded" });
@@ -1551,6 +1600,95 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 		const eventsAfterEditableClick = await drainHostMcpEvents(server.origin);
 		assert.equal(eventsAfterEditableClick.some((event) => event.type === "pdf_annotation"), false, "editable click should not emit a PDF annotation update");
 
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
+test("deselecting then editing a comment bubble preserves its DOM and never probes the PDF", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-deselected-comment-"));
+	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 156, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		await page.goto(`${server.origin}/viewer-lw/156`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		await page.waitForFunction(() => document.body.dataset.hostLwSocket === "connected", undefined, { timeout: 5_000 });
+
+		await page.evaluate((source) => {
+			(globalThis as typeof globalThis & { __hostLwSynctexDebug?: { showSynctexMarker: (message: unknown, options?: unknown) => boolean } }).__hostLwSynctexDebug?.showSynctexMarker({
+				type: "synctex_forward",
+				pdf_id: 156,
+				page: 1,
+				x: 120,
+				y: 70,
+				width: 24,
+				height: 14,
+				source_file: source,
+				line: 3,
+				source_line: "First paragraph text that should wrap a little and create boxes.",
+			}, { scroll: false });
+		}, sourcePath);
+		await page.locator("[data-synctex-marker]").first().click();
+		await page.locator("[data-pdf-annotation-box]").first().click();
+		await page.locator("button[title='Add comment']").click();
+		const textarea = page.locator("[data-pdf-annotation-bubble] textarea");
+		await textarea.fill("Existing comment.");
+
+		await page.evaluate(() => {
+			(globalThis as typeof globalThis & { __hostLwSynctexDebug?: { setHoverEnabled: (enabled: boolean) => void } }).__hostLwSynctexDebug?.setHoverEnabled(false);
+		});
+		await page.locator("#viewer .page[data-page-number='1']").click({ position: { x: 4, y: 4 } });
+		await page.waitForFunction(() => document.querySelector("[data-pdf-annotation]")?.getAttribute("data-pdf-annotation-selected") === "false");
+		await page.evaluate(() => {
+			(globalThis as typeof globalThis & { __hostLwSynctexDebug?: { setHoverEnabled: (enabled: boolean) => void } }).__hostLwSynctexDebug?.setHoverEnabled(true);
+			type TestWindow = Window & { __hostLwCommentTextarea?: HTMLTextAreaElement; __hostLwSentSocketMessages?: unknown[] };
+			const testWindow = window as TestWindow;
+			const originalTextarea = document.querySelector("[data-pdf-annotation-bubble] textarea");
+			if (!(originalTextarea instanceof HTMLTextAreaElement)) throw new Error("missing comment textarea");
+			testWindow.__hostLwCommentTextarea = originalTextarea;
+			testWindow.__hostLwSentSocketMessages = [];
+			const websocketPrototype = WebSocket.prototype as unknown as { send: (this: WebSocket, data: unknown) => void };
+			const nativeSend = websocketPrototype.send;
+			websocketPrototype.send = function(this: WebSocket, data: unknown): void {
+				if (typeof data === "string") {
+					try { testWindow.__hostLwSentSocketMessages?.push(JSON.parse(data)); } catch {}
+				}
+				nativeSend.call(this, data);
+			};
+		});
+
+		await textarea.click();
+		await page.waitForTimeout(150);
+		const outcome = await page.evaluate(() => {
+			type TestWindow = Window & { __hostLwCommentTextarea?: HTMLTextAreaElement; __hostLwSentSocketMessages?: Array<{ type?: string }> };
+			const testWindow = window as TestWindow;
+			const currentTextarea = document.querySelector("[data-pdf-annotation-bubble] textarea");
+			return {
+				sameTextarea: currentTextarea === testWindow.__hostLwCommentTextarea,
+				focused: document.activeElement === testWindow.__hostLwCommentTextarea,
+				selected: document.querySelector("[data-pdf-annotation]")?.getAttribute("data-pdf-annotation-selected"),
+				annotationCount: document.querySelectorAll("[data-pdf-annotation]").length,
+				probeTypes: (testWindow.__hostLwSentSocketMessages ?? []).map((message) => message.type).filter((type) => type === "reverse_synctex" || type === "reverse_synctex_forward_probe"),
+			};
+		});
+		assert.deepEqual(outcome, {
+			sameTextarea: true,
+			focused: true,
+			selected: "true",
+			annotationCount: 1,
+			probeTypes: [],
+		});
+		await textarea.fill("Edited after deselection.");
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1);
 	} finally {
 		await browser?.close();
 		await server.stop();

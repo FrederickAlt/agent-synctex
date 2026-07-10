@@ -1,6 +1,6 @@
 import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
 import { resolve } from "node:path";
-import { fetchHookContext } from "../hook_context_bridge.ts";
+import { fetchHookContext } from "../hook_context.ts";
 import { startTexActionsStdioMcpRuntime } from "../stdio_mcp_runtime.ts";
 import { selectHarnessAdapters, selectInstallHarnessAdapters, isHarnessId } from "./detect_harnesses.ts";
 import { recordManifest, removeManifestHarness } from "./manifest.ts";
@@ -62,11 +62,16 @@ export async function runAgentSynctexCli(argv: string[], io: { stdin?: NodeJS.Re
 		return runMcp(parsed, stderr);
 	}
 	if (parsed.command === "fetch-info") {
-		const prompt = await readStdin(io.stdin ?? processStdin).catch(() => "");
 		if (!isHarnessId(parsed.harness)) return 0;
-		const context = await fetchHookContext({ prompt, agentId: parsed.agentId, cwd: parsed.cwd }).catch(() => "");
-		if (context) stdout.write(context);
-		return 0;
+		try {
+			const prompt = await readStdin(io.stdin ?? processStdin);
+			const context = await fetchHookContext({ prompt, agentId: parsed.agentId, cwd: parsed.cwd });
+			if (context) stdout.write(context);
+			return 0;
+		} catch (error) {
+			stderr.write(`Agent SyncTeX mark fetch failed: ${error instanceof Error ? error.message : String(error)}\n`);
+			return 1;
+		}
 	}
 
 	const ctx: InstallerContext = {

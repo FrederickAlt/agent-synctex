@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough, type Readable } from "node:stream";
 import { test } from "node:test";
-import { TexActionsStdioMcpRuntime } from "../../src/modules/stdio_mcp_runtime.ts";
+import { LATEXMK_CONTINUOUS_EVENT_PREFIX } from "../../src/modules/latex/latex_file_compiler.ts";
+import { TexActionsStdioMcpRuntime, ViewerContinuousLatexmkController } from "../../src/modules/stdio_mcp_runtime.ts";
+import type { ViewerHostMcpService } from "../../src/modules/viewer_host_client.ts";
 import type { HostServiceCompileRequest, HostServiceCompileResponseEnvelope, HostServiceCompileSnippetRequest, HostServiceCompileSnippetResponseEnvelope, HostServiceOpenRequest, HostServiceOpenResponseEnvelope } from "../../src/modules/host_service_protocol.ts";
 import { collectMcpFrames, encodeMcpFrame } from "../helpers/mcp_frames.ts";
 
@@ -61,10 +64,10 @@ function writeFakeBrowserLauncher(baseDir: string): { command: string; logPath: 
 	const logPath = join(baseDir, "browser-launches.jsonl");
 	writeFileSync(command, `#!/usr/bin/env node
 const fs = require("node:fs");
-const appUrl = process.argv[2];
+const viewerUrl = process.argv[2];
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({
-  appUrl,
-  origin: appUrl ? new URL(appUrl).origin : undefined,
+  viewerUrl,
+  origin: viewerUrl ? new URL(viewerUrl).origin : undefined,
   argv: process.argv.slice(2)
 }) + "\\n");
 `);
@@ -76,14 +79,6 @@ async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
 	const started = Date.now();
 	while (!existsSync(path)) {
 		if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-		await new Promise((resolve) => setTimeout(resolve, 25));
-	}
-}
-
-async function waitForMissingFile(path: string, timeoutMs = 2_000): Promise<void> {
-	const started = Date.now();
-	while (existsSync(path)) {
-		if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${path} to be removed`);
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 }
@@ -140,7 +135,114 @@ async function withHome<T>(home: string, fn: () => Promise<T>): Promise<T> {
 	}
 }
 
-test("stdio runtime closes hook bridge when stdio closes", async () => {
+test("continuous compiler stop waits out in-flight output and suppresses queued stale side effects", async () => {
+	const child = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+	const childStdout = new PassThrough();
+	Object.assign(child, {
+		stdin: new PassThrough(),
+		stdout: childStdout,
+		stderr: new PassThrough(),
+		kill: () => true,
+	});
+	const statuses: Array<{ running: boolean; continuous: boolean }> = [];
+	const updatedPaths: string[] = [];
+	let statusCallCount = 0;
+	let markCompilingStatusStarted: (() => void) | undefined;
+	const compilingStatusStarted = new Promise<void>((resolveStarted) => { markCompilingStatusStarted = resolveStarted; });
+	let releaseCompilingStatus: (() => void) | undefined;
+	const compilingStatusGate = new Promise<void>((resolveGate) => { releaseCompilingStatus = resolveGate; });
+	const service = {
+		pdfOperations: {
+			markTrackedPdfUpdated: async (path: string) => { updatedPaths.push(path); },
+		},
+		async sendCompileStatus(message: { running: boolean; continuous: boolean }) {
+			statuses.push({ running: message.running, continuous: message.continuous });
+			statusCallCount += 1;
+			if (statusCallCount === 2) {
+				markCompilingStatusStarted?.();
+				await compilingStatusGate;
+			}
+		},
+	} as unknown as ViewerHostMcpService;
+	const controller = new ViewerContinuousLatexmkController(service, { spawnProcess: (() => child) as unknown as typeof spawn });
+
+	await controller.start({ pdfId: 7, pdfPath: "/tmp/paper.pdf", workspaceCwd: "/tmp" });
+	childStdout.write(`${LATEXMK_CONTINUOUS_EVENT_PREFIX}compiling\n${LATEXMK_CONTINUOUS_EVENT_PREFIX}success\n`);
+	await compilingStatusStarted;
+	const stop = controller.stop(7);
+	releaseCompilingStatus?.();
+	assert.equal(await stop, true);
+
+	assert.deepEqual(updatedPaths, [], "queued success output must not refresh after stop");
+	assert.deepEqual(statuses.at(-1), { running: false, continuous: false }, "the final status after stop must remain stopped");
+});
+
+test("continuous compiler teardown waits for output without emitting a reconnecting stop status", async () => {
+	const child = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+	const childStdout = new PassThrough();
+	Object.assign(child, { stdin: new PassThrough(), stdout: childStdout, stderr: new PassThrough(), kill: () => true });
+	const statuses: Array<{ running: boolean; continuous: boolean }> = [];
+	let statusCallCount = 0;
+	let markOutputInFlight: (() => void) | undefined;
+	const outputInFlight = new Promise<void>((resolveStarted) => { markOutputInFlight = resolveStarted; });
+	let releaseOutput: (() => void) | undefined;
+	const outputGate = new Promise<void>((resolveGate) => { releaseOutput = resolveGate; });
+	const service = {
+		pdfOperations: {},
+		async sendCompileStatus(message: { running: boolean; continuous: boolean }) {
+			statuses.push({ running: message.running, continuous: message.continuous });
+			statusCallCount += 1;
+			if (statusCallCount === 2) {
+				markOutputInFlight?.();
+				await outputGate;
+			}
+		},
+	} as unknown as ViewerHostMcpService;
+	const controller = new ViewerContinuousLatexmkController(service, { spawnProcess: (() => child) as unknown as typeof spawn });
+
+	await controller.start({ pdfId: 8, pdfPath: "/tmp/teardown.pdf", workspaceCwd: "/tmp" });
+	childStdout.write(`${LATEXMK_CONTINUOUS_EVENT_PREFIX}compiling\n`);
+	await outputInFlight;
+	const cleanup = controller.stopAll({ emitStatus: false });
+	releaseOutput?.();
+	await cleanup;
+
+	assert.deepEqual(statuses, [
+		{ running: true, continuous: true },
+		{ running: true, continuous: true },
+	], "runtime teardown must not send a late stopped status through a closed Viewer Host service");
+});
+
+test("continuous compiler teardown prevents an in-flight start from spawning after shutdown", async () => {
+	let spawnCount = 0;
+	let markInitialStatusStarted: (() => void) | undefined;
+	const initialStatusStarted = new Promise<void>((resolveStarted) => { markInitialStatusStarted = resolveStarted; });
+	let releaseInitialStatus: (() => void) | undefined;
+	const initialStatusGate = new Promise<void>((resolveGate) => { releaseInitialStatus = resolveGate; });
+	const service = {
+		pdfOperations: {},
+		async sendCompileStatus() {
+			markInitialStatusStarted?.();
+			await initialStatusGate;
+		},
+	} as unknown as ViewerHostMcpService;
+	const controller = new ViewerContinuousLatexmkController(service, {
+		spawnProcess: (() => {
+			spawnCount += 1;
+			throw new Error("spawn must not run after shutdown");
+		}) as unknown as typeof spawn,
+	});
+
+	const start = controller.start({ pdfId: 9, pdfPath: "/tmp/start-race.pdf", workspaceCwd: "/tmp" });
+	await initialStatusStarted;
+	await controller.stopAll({ emitStatus: false });
+	releaseInitialStatus?.();
+	await start;
+
+	assert.equal(spawnCount, 0);
+});
+
+test("stdio hook mode does not start a second hook bridge server", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-stdio-close-"));
 	const launchCwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
@@ -149,12 +251,11 @@ test("stdio runtime closes hook bridge when stdio closes", async () => {
 		await withRuntimeEnv(runtimeRoot, async () => {
 			const stdin = new PassThrough();
 			const runtime = new TexActionsStdioMcpRuntime({ stdin, stdout: new PassThrough(), stderr: new PassThrough(), launchCwd, hookMode: { kind: "hook-capable", harness: "codex" }, pdfOperations: {} });
-			runtime.start();
 			const discoveryPath = join(runtimeRoot, "agents", "stdio-test-agent", "hook-context-bridge.json");
 			try {
-				await waitForFile(discoveryPath);
+				runtime.start();
+				assert.equal(existsSync(discoveryPath), false);
 				stdin.end();
-				await waitForMissingFile(discoveryPath);
 			} finally {
 				runtime.close();
 			}
@@ -203,9 +304,10 @@ test("stdio runtime prints viewer URL to the agent when no live browser viewer i
 		const output = collectMcpFrames(stdout, 1);
 		stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "open_pdf", arguments: { pdf_file_path: "/tmp/paper.pdf" } } }));
 		const [toolResult] = await output as Array<{ result?: { content?: Array<{ text?: string }>; details?: Record<string, unknown> } }>;
-		assert.equal(toolResult.result?.content?.[0]?.text, "open_pdf ok: pdf_id=9\nNo browser viewer was detected after launch; pass this Viewer URL to the user: http://127.0.0.1:44417/viewer-lw/9");
+		assert.equal(toolResult.result?.content?.[0]?.text, "open_pdf ok: pdf_id=9\nPass this Viewer URL to the user: http://127.0.0.1:44417/viewer-lw/9");
 		assert.doesNotMatch(JSON.stringify(toolResult.result?.details), /127\.0\.0\.1|viewer_url/);
-		assert.deepEqual(userMessages, ["Agent SyncTeX: no browser viewer was detected after launch; pass this Viewer URL to the user: http://127.0.0.1:44417/viewer-lw/9\n"]);
+		assert.doesNotMatch(JSON.stringify(toolResult.result?.details), /browser_launch|browser opener|xdg-open/i);
+		assert.deepEqual(userMessages, ["Agent SyncTeX viewer: http://127.0.0.1:44417/viewer-lw/9\n"]);
 	} finally {
 		runtime.close();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -288,7 +390,6 @@ test("actual agent-synctex mcp --harness codex exits when stdio closes", async (
 	});
 
 	try {
-		await waitForFile(join(runtimeRoot, "agents", "entrypoint-codex-close-agent", "hook-context-bridge.json"));
 		child.stdin.end();
 		const exitCode = await Promise.race([
 			exitPromise,
@@ -425,14 +526,14 @@ test("actual agent-synctex mcp entrypoint routes open_pdf to the Viewer Host bou
 		assert.equal(openResponse.result?._meta?.["agent-synctex/viewer_url"], undefined);
 		assert.equal(typeof pdfId, "number");
 		await waitForFile(fakeBrowser.logPath);
-		const appLaunches = readFileSync(fakeBrowser.logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { appUrl?: unknown; origin?: unknown });
-		const origin = appLaunches[0]?.origin as string;
+		const viewerLaunches = readFileSync(fakeBrowser.logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { viewerUrl?: unknown; origin?: unknown });
+		const origin = viewerLaunches[0]?.origin as string;
 		const viewerUrl = `${origin}/viewer-lw/${pdfId}`;
 		assert.match(viewerUrl, /^http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/\d+$/);
-		assert.equal(openResponse.result?.content?.[0]?.text, `open_pdf ok: pdf_id=${pdfId}\nNo browser viewer was detected after launch; pass this Viewer URL to the user: ${viewerUrl}`);
+		assert.equal(openResponse.result?.content?.[0]?.text, `open_pdf ok: pdf_id=${pdfId}\nPass this Viewer URL to the user: ${viewerUrl}`);
 		assert.doesNotMatch(JSON.stringify(openResponse.result?.details), /127\.0\.0\.1|viewer_url/);
 		assert.equal(viewerUrl.includes(pdfPath), false, "viewer URL must not expose raw PDF paths");
-		assert.match(stderr, /Agent SyncTeX: no browser viewer was detected after launch; pass this Viewer URL to the user: http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/\d+/);
+		assert.match(stderr, /Agent SyncTeX viewer: http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/\d+/);
 		const viewer = await fetch(viewerUrl);
 		assert.equal(viewer.status, 200, "returned viewer URL should remain reachable while the Host is alive");
 		const config = await fetch(`${origin}/config/${pdfId}.json`);
@@ -440,8 +541,8 @@ test("actual agent-synctex mcp entrypoint routes open_pdf to the Viewer Host bou
 		const configBody = await config.json() as { pdf_id?: unknown; pdf_url?: unknown };
 		assert.equal(configBody.pdf_id, pdfId);
 		assert.equal(typeof configBody.pdf_url, "string");
-		assert.equal(appLaunches[0]?.origin, origin);
-		assert.equal(appLaunches[0]?.appUrl, `${origin}/viewer-lw`, "default stdio runtime must launch/focus the stable direct browser viewer URL");
+		assert.equal(viewerLaunches[0]?.origin, origin);
+		assert.equal(viewerLaunches[0]?.viewerUrl, `${origin}/viewer-lw`, "default stdio runtime must launch/focus the stable direct browser viewer URL");
 		assert.equal(child.exitCode, null, "MCP process must remain alive after routing open_pdf through the Viewer Host boundary");
 	} finally {
 		child.kill("SIGTERM");
@@ -488,7 +589,7 @@ test("actual agent-synctex mcp entrypoint bridges reverse SyncTeX events from th
 		await waitForFile(fakeBrowser.logPath);
 		const appLaunches = readFileSync(fakeBrowser.logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { origin?: unknown });
 		const origin = appLaunches[0]?.origin as string;
-		assert.equal(openFrame.result?.content?.[0]?.text, `open_pdf ok: pdf_id=${pdfId}\nNo browser viewer was detected after launch; pass this Viewer URL to the user: ${origin}/viewer-lw/${pdfId}`);
+		assert.equal(openFrame.result?.content?.[0]?.text, `open_pdf ok: pdf_id=${pdfId}\nPass this Viewer URL to the user: ${origin}/viewer-lw/${pdfId}`);
 		assert.doesNotMatch(JSON.stringify(openFrame.result?.details), /127\.0\.0\.1|viewer_url/);
 		const configResponse = await fetch(`${origin}/config/${pdfId}.json`);
 		assert.equal(configResponse.status, 200);
@@ -667,7 +768,7 @@ test("stdio runtime resolves relative PDF paths from the MCP launch cwd", async 
 	}
 });
 
-test("stdio runtime routes hook-injected session ids to separate runtime workspaces", async () => {
+test("stdio runtime binds one agent identity and rejects later session switching", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "stdio-mcp-session-metadata-"));
 	const launchCwd = join(baseDir, "project");
 	const runtimeRoot = join(baseDir, "runtime");
@@ -703,9 +804,12 @@ test("stdio runtime routes hook-injected session ids to separate runtime workspa
 			const output = collectMcpFrames(stdout, 2);
 			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 40, method: "tools/call", params: { name: "show_latex", arguments: { source: "\\[a\\]", workspace_context: { cwd: launchCwd, session_id: "model-supplied-wrong-session" }, _agent_synctex: { session_id: "pi-session-one", cwd: launchCwd } } } }));
 			stdin.write(encodeMcpFrame({ jsonrpc: "2.0", id: 41, method: "tools/call", params: { name: "show_latex", arguments: { source: "\\[b\\]", _pi: { session_id: "pi-session-two" } } } }));
-			await output;
-			await waitForFile(join(runtimeRoot, "agents", "pi-session-one", "hook-context-bridge.json"));
-			await waitForFile(join(runtimeRoot, "agents", "pi-session-two", "hook-context-bridge.json"));
+			const frames = await output as Array<{ id?: unknown; error?: { code?: unknown; message?: unknown } }>;
+			assert.equal(frames[0]?.error, undefined);
+			assert.equal(frames[1]?.error?.code, -32602);
+			assert.match(String(frames[1]?.error?.message), /bound to agent pi-session-one.*pi-session-two/);
+			assert.equal(existsSync(join(runtimeRoot, "agents", "pi-session-one", "hook-context-bridge.json")), false);
+			assert.equal(existsSync(join(runtimeRoot, "agents", "pi-session-two")), false);
 		} finally {
 			runtime.close();
 		}
@@ -713,7 +817,6 @@ test("stdio runtime routes hook-injected session ids to separate runtime workspa
 	try {
 		assert.deepEqual(observed, [
 			{ sessionId: "pi-session-one", workspaceRoot: join(runtimeRoot, "agents", "pi-session-one") },
-			{ sessionId: "pi-session-two", workspaceRoot: join(runtimeRoot, "agents", "pi-session-two") },
 		]);
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });

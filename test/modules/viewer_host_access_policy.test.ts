@@ -8,7 +8,7 @@ test("local loopback Viewer Host access policy owns generated app, PDF, and sock
 
 	assert.equal(policy.bindHost, "127.0.0.1");
 	assert.equal(origin, "http://127.0.0.1:43125");
-	assert.equal(policy.appUrl(origin), "http://127.0.0.1:43125/app");
+	assert.equal(policy.viewerRootUrl(origin), "http://127.0.0.1:43125/viewer-lw");
 	assert.equal(policy.viewerUrl(7, 3), "/viewer-lw/7?revision=3");
 	assert.equal(policy.pdfUrl(origin, 7, 3), "http://127.0.0.1:43125/pdf/7?revision=3");
 	assert.equal(policy.viewerSocketUrl(origin, 7, "a token"), "ws://127.0.0.1:43125/viewer-socket?pdf_id=7&token=a%20token");

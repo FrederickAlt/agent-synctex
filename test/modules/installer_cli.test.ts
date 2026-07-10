@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { runAgentSynctexCli } from "../../src/modules/installer/cli.ts";
 
 function tempProject(prefix: string): string {
@@ -64,6 +66,125 @@ function assertCodexMcpConfigLaunch(config: string, harness: string): void {
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+function installFailingCli(cwd: string): string {
+	const binDir = join(cwd, "bin");
+	mkdirSync(binDir, { recursive: true });
+	const fakeCli = join(binDir, "agent-synctex");
+	writeFileSync(fakeCli, "#!/usr/bin/env node\nprocess.stderr.write('simulated fetch-info failure\\n');\nprocess.exit(23);\n");
+	chmodSync(fakeCli, 0o755);
+	return binDir;
+}
+
+async function runInstalledHook(path: string, binDir: string, input = "prompt"): Promise<{ code: number | null; stdout: string; stderr: string }> {
+	const child = spawn(path, [], {
+		env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+	child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+	child.stdin.end(input);
+	const code = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+	return { code, stdout, stderr };
+}
+
+test("installed Codex hook emits a visible warning when mark fetching fails", async () => {
+	const cwd = tempProject("agent-synctex-codex-hook-failure-{}");
+	try {
+		const install = await runCli(cwd, ["install", "hooks", "--harness", "codex", "--local"]);
+		assert.equal(install.code, 0, install.stderr);
+		const binDir = join(cwd, "bin");
+		mkdirSync(binDir, { recursive: true });
+		const fakeCli = join(binDir, "agent-synctex");
+		writeFileSync(fakeCli, "#!/usr/bin/env node\nprocess.stderr.write('simulated fetch-info failure\\n');\nprocess.exit(23);\n");
+		chmodSync(fakeCli, 0o755);
+
+		const hookPath = join(cwd, ".codex", "hooks", "agent-synctex-user-prompt-submit.mjs");
+		const child = spawn(process.execPath, [hookPath], {
+			env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+		child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+		child.stdin.end(JSON.stringify({
+			hook_event_name: "UserPromptSubmit",
+			session_id: "codex-hook-session",
+			turn_id: "codex-hook-turn",
+			prompt: "Read my PDF marks",
+			cwd,
+		}));
+		const code = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+
+		assert.equal(code, 0, stderr);
+		assert.notEqual(stdout.trim(), "", "a failed mark fetch must not become successful empty hook output");
+		const output = JSON.parse(stdout) as { systemMessage?: unknown };
+		assert.match(String(output.systemMessage), /Agent SyncTeX hook failed: simulated fetch-info failure/);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("installed Claude and Cline hooks fail noisily when mark fetching fails", async () => {
+	const cwd = tempProject("agent-synctex-shell-hook-failure-{}");
+	try {
+		for (const harness of ["claude", "cline"] as const) {
+			const install = await runCli(cwd, ["install", "hooks", "--harness", harness, "--local"]);
+			assert.equal(install.code, 0, install.stderr);
+		}
+		const binDir = installFailingCli(cwd);
+		for (const hookPath of [
+			join(cwd, ".claude", "hooks", "agent-synctex-fetch-info.sh"),
+			join(cwd, ".clinerules", "hooks", "UserPromptSubmit"),
+		]) {
+			const result = await runInstalledHook(hookPath, binDir);
+			assert.notEqual(result.code, 0, `${hookPath} must not turn a failed fetch into successful empty output`);
+			assert.equal(result.stdout, "");
+			assert.match(result.stderr, /simulated fetch-info failure/);
+			assert.match(result.stderr, /Agent SyncTeX hook failed while fetching PDF marks/);
+		}
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("installed Pi and OpenCode integrations surface mark-fetch failures", async () => {
+	const cwd = tempProject("agent-synctex-plugin-hook-failure-{}");
+	const previousPath = process.env.PATH;
+	try {
+		for (const harness of ["pi", "opencode"] as const) {
+			const install = await runCli(cwd, ["install", "hooks", "--harness", harness, "--local"]);
+			assert.equal(install.code, 0, install.stderr);
+		}
+		const binDir = installFailingCli(cwd);
+		process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+
+		const piHandlers = new Map<string, (event: unknown, context: unknown) => Promise<unknown>>();
+		const piModule = await import(`${pathToFileURL(join(cwd, ".pi", "extensions", "agent-synctex-post-user.ts")).href}?failure=${Date.now()}`);
+		piModule.default({ on(name: string, handler: (event: unknown, context: unknown) => Promise<unknown>) { piHandlers.set(name, handler); } });
+		const notifications: Array<{ message: string; level: string }> = [];
+		const piResult = await piHandlers.get("before_agent_start")?.({ prompt: "Read marks", cwd }, {
+			cwd,
+			sessionManager: { getSessionId: () => "pi-failure-session" },
+			ui: { notify(message: string, level: string) { notifications.push({ message, level }); } },
+		});
+		assert.equal(piResult, undefined);
+		assert.deepEqual(notifications, [{ message: "Agent SyncTeX hook failed: simulated fetch-info failure", level: "warning" }]);
+
+		const openCodeModule = await import(`${pathToFileURL(join(cwd, ".opencode", "plugins", "agent-synctex-post-user.ts")).href}?failure=${Date.now()}`);
+		const openCodeHooks = await openCodeModule.AgentSynctexPostUser();
+		const output = { parts: [{ type: "text", text: "Read marks" }] };
+		await openCodeHooks["chat.message"]({ messageID: "message-1", sessionID: "session-1" }, output);
+		assert.match(String(output.parts.at(-1)?.text), /Agent SyncTeX hook failed: simulated fetch-info failure/);
+	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
 
 test("default all installer writes user/global MCP config and hooks for detected harness directories", async () => {
 	const cwd = tempProject("agent-synctex-global-cwd-{}");

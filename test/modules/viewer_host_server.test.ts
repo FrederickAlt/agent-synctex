@@ -94,7 +94,7 @@ test("Viewer Host Server binds to 127.0.0.1 only and serves registered PDF bytes
 	}
 });
 
-test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer config, and PDF.js assets", async () => {
+test("Viewer Host Server removes the legacy app shell and serves the direct viewer, config, and PDF.js assets", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-client-routes-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFakePdf(pdfPath);
@@ -105,23 +105,10 @@ test("Viewer Host Server serves Host-loaded Viewer Client shell, per-PDF viewer 
 		await server.start();
 
 		const app = await readHttp(`${server.origin}/app`);
-		assert.equal(app.status, 200);
-		assert.match(app.contentType, /text\/html/);
-		const appHtml = app.body.toString("utf8");
-		assert.match(appHtml, /Viewer Client/i);
-		assert.match(appHtml, /id="tab-list"/);
-		assert.match(appHtml, /id="viewer-panels"/);
-		assert.match(appHtml, /\/assets\/viewer-client-tabs\.js/);
-		assertHostLoadedWebCode("Viewer Client shell", appHtml);
+		assert.equal(app.status, 404);
 
 		const tabShellScript = await readHttp(`${server.origin}/assets/viewer-client-tabs.js`);
-		assert.equal(tabShellScript.status, 200);
-		assert.match(tabShellScript.contentType, /javascript/);
-		const tabShellScriptBody = tabShellScript.body.toString("utf8");
-		assert.match(tabShellScriptBody, /EventSource\("\/app-events"\)/);
-		assert.match(tabShellScriptBody, /\/viewer-lw\//);
-		assert.match(tabShellScriptBody, /data-close-pdf-id/);
-		assertHostLoadedWebCode("tab shell script", tabShellScriptBody);
+		assert.equal(tabShellScript.status, 404);
 
 		const legacyViewer = await readHttp(`${server.origin}/viewer/109?revision=2`, { redirect: "manual" });
 		assert.equal(legacyViewer.status, 302);
@@ -353,6 +340,7 @@ test("Viewer Host Server HTTP shutdown endpoint requires its local token", async
 	const shutdownRequested = new Promise<void>((resolve) => { resolveShutdown = resolve; });
 	const server = new ViewerHostServer({
 		registry,
+		instanceId: "shutdown-instance",
 		shutdownRequest: {
 			token: "test-token",
 			shutdown: (reason) => {
@@ -368,6 +356,7 @@ test("Viewer Host Server HTTP shutdown endpoint requires its local token", async
 
 		const accepted = await readHttp(`${server.origin}/shutdown`, { method: "POST", headers: { "x-agent-synctex-shutdown-token": "test-token" } });
 		assert.equal(accepted.status, 200);
+		assert.deepEqual(JSON.parse(accepted.body.toString("utf8")), { ok: true, instance_id: "shutdown-instance" });
 		await Promise.race([
 			shutdownRequested,
 			new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timed out waiting for shutdown handler")), 1_000)),

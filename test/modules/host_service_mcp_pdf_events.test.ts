@@ -54,6 +54,32 @@ test("fetch_pdf_context formats PDF annotation comments as concise source-cited 
 	assert.doesNotMatch(text, /selection_debug|page=3/);
 });
 
+test("PDF mark context preserves long user comments without truncation or omission", () => {
+	const comment = [
+		"What we actually should prove is that (\\mathfrak z^{(t)}_s) exists and is deterministic.",
+		"The middle of this comment is intentionally long: " + "boundary-law-detail ".repeat(600),
+		"UNMISTAKABLE COMMENT REMAINDER: use it to define the boundary laws.",
+	].join("\n");
+	const result = collectPostUserPdfContextFromEvents([{
+		type: "pdf_annotation",
+		sequence: 1,
+		pdf_id: 77,
+		annotation_id: "long-comment",
+		timestamp: "2026-07-10T12:00:00.000Z",
+		source_file: "/tmp/paper/main.tex",
+		line: 9,
+		source_line: "A marked equation.",
+		page: 1,
+		x: 10,
+		y: 20,
+		comment,
+	}], { maxEvents: 1, clearViewer: true });
+
+	assert.equal(result.eventCount, 1, "a long comment must not cause the entire mark to be omitted");
+	assert.ok(result.text.includes(comment), "the exact comment, including its remainder and line breaks, must reach the hook context");
+	assert.match(result.text, /UNMISTAKABLE COMMENT REMAINDER/);
+});
+
 test("PDF mark context keeps absolute source paths outside cwd", () => {
 	const result = collectPostUserPdfContextFromEvents([{
 		type: "pdf_annotation",
@@ -89,6 +115,28 @@ test("PDF mark context formats source spans instead of only the clicked line", (
 	}], { cwd: "/tmp/workspace", clearViewer: true });
 
 	assert.equal(result.text, "## PDF marks from the User\n\n- `main.tex:135-156` — `}`");
+});
+
+test("PDF mark context delivers every selected event without a hidden output budget", () => {
+	const events: PdfEvent[] = Array.from({ length: 20 }, (_, index) => ({
+		type: "pdf_annotation" as const,
+		sequence: index + 1,
+		pdf_id: 1,
+		annotation_id: `mark-${index}`,
+		timestamp: "2026-06-29T12:00:00.000Z",
+		source_file: "/tmp/workspace/main.tex",
+		line: index + 1,
+		source_line: `line ${index + 1}`,
+		page: 1,
+		x: 1,
+		y: 1,
+		comment: "x".repeat(500),
+	}));
+	const result = collectPostUserPdfContextFromEvents(events, { cwd: "/tmp/workspace", maxEvents: 20 });
+	assert.equal(result.eventCount, events.length);
+	assert.equal(result.events.length, result.eventCount);
+	assert.match(result.text, /main\.tex:20/);
+	assert.ok(result.text.length > 8_000, "the old implicit output budget must not truncate comments or omit marks");
 });
 
 function eventInput(pdfId: number, line: number): ReverseSynctexPdfEventInput {
@@ -296,6 +344,15 @@ test("PdfEventStore max_events returns oldest unread page and leaves overflow un
 
 	assert.deepEqual(store.getEvents({ max_events: 2 }), [first, second]);
 	assert.deepEqual(store.getEvents({ max_events: 2 }), [third]);
+});
+
+test("PdfEventStore bounds retained history and forgets read state for evicted events", () => {
+	const store = new PdfEventStore({ maxEvents: 2 });
+	store.appendReverseSynctexEvent(eventInput(1, 1));
+	store.appendReverseSynctexEvent(eventInput(1, 2));
+	store.appendReverseSynctexEvent(eventInput(1, 3));
+	assert.deepEqual(store.getEvents({ max_events: 10, stale: true }).map((event) => event.sequence), [2, 3]);
+	assert.deepEqual(store.getEvents({ max_events: 10 }).map((event) => event.sequence), [2, 3]);
 });
 
 test("fetch_pdf_context schema is advertised while raw get_pdf_events remains hidden", async () => {

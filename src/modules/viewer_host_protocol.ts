@@ -1,6 +1,7 @@
-export const VIEWER_HOST_PROTOCOL_VERSION = 2 as const;
+export const VIEWER_HOST_PROTOCOL_VERSION = 3 as const;
 export const VIEWER_HOST_CONTROL_TOKEN_HEADER = "x-agent-synctex-viewer-host-token" as const;
 export const VIEWER_HOST_HEARTBEAT_TOKEN_HEADER = "x-agent-synctex-viewer-host-heartbeat-token" as const;
+export const VIEWER_HOST_SHUTDOWN_TOKEN_HEADER = "x-agent-synctex-shutdown-token" as const;
 
 export interface ViewerHostHelloMessage {
 	type: "hello";
@@ -73,6 +74,24 @@ export interface ViewerHostCompileStatusMessage {
 	continuous: boolean;
 	severity?: "info" | "error";
 	message?: string;
+	inject_text?: string;
+}
+
+export interface ViewerHostReportErrorMessage {
+	type: "report_error";
+	pdf_id?: number;
+	code: string;
+	title: string;
+	detail: string;
+	inject_text?: string;
+}
+
+export interface ViewerHostErrorMessage {
+	type: "viewer_error";
+	pdf_id?: number;
+	code: string;
+	title: string;
+	detail: string;
 	inject_text?: string;
 }
 
@@ -155,13 +174,14 @@ export type McpToViewerHostMessage =
 	| ViewerHostPdfMaybeUpdatedMessage
 	| ViewerHostClearPdfAnnotationsMessage
 	| ViewerHostCompileStatusMessage
-	| ViewerHostReverseSynctexHoverResultMessage
-	| ViewerHostReverseSynctexForwardProbeResultMessage;
+	| ViewerHostReportErrorMessage
+	| ViewerHostReverseSynctexHoverResultMessage;
 
 export interface ViewerHostReadyMessage {
 	type: "ready";
 	protocol_version: number;
 	origin: string;
+	instance_id: string;
 	active_viewer_clients?: number;
 }
 
@@ -275,6 +295,36 @@ export type ViewerHostControlResponse =
 	| { ok: true; result: ViewerHostControlAcceptedResult }
 	| { ok: false; error: { code: string; message: string } };
 
+export function validateViewerHostControlResponse(value: unknown): ViewerHostControlResponse {
+	if (!isRecord(value) || typeof value.ok !== "boolean") throw new Error("Viewer Host control response must include boolean ok");
+	if (value.ok === false) {
+		if (!isRecord(value.error)) throw new Error("Viewer Host control error response requires error details");
+		return {
+			ok: false,
+			error: {
+				code: requireNonEmptyString(value.error.code, "error.code"),
+				message: requireNonEmptyString(value.error.message, "error.message"),
+			},
+		};
+	}
+	if (value.message !== undefined) {
+		const parsed = validateViewerHostToMcpMessage(value.message);
+		if (parsed.type !== "ready") throw new Error("Viewer Host control message response must be ready");
+		return { ok: true, message: parsed };
+	}
+	if (!isRecord(value.result)) throw new Error("Viewer Host successful control response requires message or result");
+	const result: ViewerHostControlAcceptedResult = {
+		type: requireNonEmptyString(value.result.type, "result.type") as ViewerHostControlAcceptedResult["type"],
+		...(value.result.pdf_id === undefined ? {} : { pdf_id: requirePositiveInteger(value.result.pdf_id, "result.pdf_id") }),
+		...(value.result.revision === undefined ? {} : { revision: requirePositiveInteger(value.result.revision, "result.revision") }),
+		...(value.result.browser_open_attempted === undefined ? {} : { browser_open_attempted: optionalBoolean(value.result.browser_open_attempted, "result.browser_open_attempted") }),
+		...(value.result.browser_open_confirmed === undefined ? {} : { browser_open_confirmed: optionalBoolean(value.result.browser_open_confirmed, "result.browser_open_confirmed") }),
+		...(value.result.browser_open_error === undefined ? {} : { browser_open_error: requireNonEmptyString(value.result.browser_open_error, "result.browser_open_error") }),
+		...(value.result.active_viewer_clients === undefined ? {} : { active_viewer_clients: requireNonNegativeInteger(value.result.active_viewer_clients, "result.active_viewer_clients") }),
+	};
+	return { ok: true, result };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
@@ -289,6 +339,13 @@ function requireStringType(value: Record<string, unknown>): string {
 function requirePositiveInteger(value: unknown, field: string): number {
 	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
 		throw new Error(`${field} must be a positive integer`);
+	}
+	return value;
+}
+
+function requireNonNegativeInteger(value: unknown, field: string): number {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+		throw new Error(`${field} must be a non-negative integer`);
 	}
 	return value;
 }
@@ -561,6 +618,18 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				...(injectText === undefined ? {} : { inject_text: injectText }),
 			};
 		}
+		case "report_error": {
+			const pdfId = message.pdf_id === undefined ? undefined : requirePositiveInteger(message.pdf_id, "pdf_id");
+			const injectText = optionalString(message.inject_text, "inject_text");
+			return {
+				type,
+				...(pdfId === undefined ? {} : { pdf_id: pdfId }),
+				code: requireNonEmptyString(message.code, "code"),
+				title: requireNonEmptyString(message.title, "title"),
+				detail: requireNonEmptyString(message.detail, "detail"),
+				...(injectText === undefined ? {} : { inject_text: injectText }),
+			};
+		}
 		case "reverse_synctex_hover_result": {
 			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
 			const line = message.line === undefined ? undefined : requirePositiveInteger(message.line, "line");
@@ -602,51 +671,6 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 				...(error === undefined ? {} : { error }),
 			};
 		}
-		case "reverse_synctex_forward_probe_result": {
-			const reverseSourceFile = optionalNonEmptyString(message.reverse_source_file, "reverse_source_file");
-			const reverseLine = message.reverse_line === undefined ? undefined : requirePositiveInteger(message.reverse_line, "reverse_line");
-			const reverseColumn = message.reverse_column === undefined ? undefined : requireCoordinate(message.reverse_column, "reverse_column");
-			const reverseSourceLine = optionalString(message.reverse_source_line, "reverse_source_line");
-			const sourceSpan = optionalSourceSpan(message.source_span, "source_span");
-			const page = message.page === undefined ? undefined : requirePositiveInteger(message.page, "page");
-			const x = message.x === undefined ? undefined : requireCoordinate(message.x, "x");
-			const y = message.y === undefined ? undefined : requireCoordinate(message.y, "y");
-			const width = optionalCoordinate(message.width, "width");
-			const height = optionalCoordinate(message.height, "height");
-			const ranges = optionalSynctexRanges(message.ranges, "ranges");
-			const indicator = optionalBoolean(message.indicator, "indicator");
-			const sourceFile = optionalNonEmptyString(message.source_file, "source_file");
-			const line = message.line === undefined ? undefined : requirePositiveInteger(message.line, "line");
-			const sourceLine = optionalString(message.source_line, "source_line");
-			const error = optionalString(message.error, "error");
-			if (error === undefined && (reverseSourceFile === undefined || reverseLine === undefined || reverseColumn === undefined || page === undefined || x === undefined || y === undefined || sourceFile === undefined || line === undefined)) {
-				throw new Error("reverse_synctex_forward_probe_result requires reverse source and forward mapping fields unless error is set");
-			}
-			return {
-				type,
-				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
-				request_id: requirePositiveInteger(message.request_id, "request_id"),
-				click_page: requirePositiveInteger(message.click_page, "click_page"),
-				click_x: requireCoordinate(message.click_x, "click_x"),
-				click_y: requireCoordinate(message.click_y, "click_y"),
-				...(reverseSourceFile === undefined ? {} : { reverse_source_file: reverseSourceFile }),
-				...(reverseLine === undefined ? {} : { reverse_line: reverseLine }),
-				...(reverseColumn === undefined ? {} : { reverse_column: reverseColumn }),
-				...(reverseSourceLine === undefined ? {} : { reverse_source_line: reverseSourceLine }),
-				...(sourceSpan === undefined ? {} : { source_span: sourceSpan }),
-				...(page === undefined ? {} : { page }),
-				...(x === undefined ? {} : { x }),
-				...(y === undefined ? {} : { y }),
-				...(width === undefined ? {} : { width }),
-				...(height === undefined ? {} : { height }),
-				...(ranges === undefined ? {} : { ranges }),
-				...(indicator === undefined ? {} : { indicator }),
-				...(sourceFile === undefined ? {} : { source_file: sourceFile }),
-				...(line === undefined ? {} : { line }),
-				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
-				...(error === undefined ? {} : { error }),
-			};
-		}
 		default:
 			throw new Error(`unknown message type: ${type}`);
 	}
@@ -663,6 +687,8 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				type,
 				protocol_version: requireProtocolVersion(message.protocol_version),
 				origin: requireOrigin(message.origin),
+				instance_id: requireNonEmptyString(message.instance_id, "instance_id"),
+				...(message.active_viewer_clients === undefined ? {} : { active_viewer_clients: requireNonNegativeInteger(message.active_viewer_clients, "active_viewer_clients") }),
 			};
 		case "viewer_loaded":
 			return { type, pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id") };

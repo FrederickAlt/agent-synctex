@@ -1,11 +1,10 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { PdfAnnotationEvent, PdfEvent } from "./pdf_events.ts";
+import type { ViewerHostPdfAnnotationMessage } from "./viewer_host_protocol.ts";
 
 const DEFAULT_MAX_EVENTS = 20;
 const DEFAULT_MAX_FIELD_LENGTH = 240;
-const DEFAULT_MAX_COMMENT_LENGTH = 500;
-const DEFAULT_MAX_OUTPUT_LENGTH = 8_000;
 
 export interface FetchPdfContextRequest {
 	pdf_id?: number;
@@ -30,32 +29,61 @@ export interface PostUserPdfContextResult {
 
 export function collectPostUserPdfContextFromEvents(events: PdfEvent[], request: PostUserPdfContextRequest = {}): PostUserPdfContextResult {
 	const maxEvents = normalizeMaxEvents(request.maxEvents);
-	const annotations = dedupeAnnotations(events
+	const candidates = dedupeAnnotations(events
 		.filter((event): event is PdfAnnotationEvent => event.type === "pdf_annotation")
 		.filter((event) => request.pdfId === undefined || event.pdf_id === request.pdfId))
 		.slice(0, maxEvents);
-	const text = formatPdfAnnotationContext(annotations, { cwd: request.cwd });
+	const formatted = formatPdfAnnotationContextResult(candidates, { cwd: request.cwd });
 	return {
-		text,
-		pdfIds: Array.from(new Set(annotations.map((event) => event.pdf_id))).sort((left, right) => left - right),
-		eventCount: annotations.length,
-		cleared: request.clearViewer !== false && annotations.length > 0,
-		events: annotations,
+		text: formatted.text,
+		pdfIds: Array.from(new Set(formatted.events.map((event) => event.pdf_id))).sort((left, right) => left - right),
+		eventCount: formatted.events.length,
+		cleared: request.clearViewer !== false && formatted.events.length > 0,
+		events: formatted.events,
 	};
 }
 
+export function pdfAnnotationEventsFromViewerMarks(
+	marks: readonly ViewerHostPdfAnnotationMessage[],
+	options: { timestamp?: string } = {},
+): PdfAnnotationEvent[] {
+	const timestamp = options.timestamp ?? new Date().toISOString();
+	return marks.map((mark, index) => ({
+		type: "pdf_annotation",
+		sequence: index + 1,
+		pdf_id: mark.pdf_id,
+		annotation_id: mark.annotation_id,
+		timestamp,
+		source_file: mark.source_file,
+		line: mark.line,
+		...(mark.source_line === undefined ? {} : { source_line: mark.source_line }),
+		...(mark.source_span === undefined ? {} : { source_span: { ...mark.source_span } }),
+		page: mark.page,
+		x: mark.x,
+		y: mark.y,
+		...(mark.comment === undefined ? {} : { comment: mark.comment }),
+	}));
+}
+
 export function formatPdfAnnotationContext(events: PdfAnnotationEvent[], options: { cwd?: string } = {}): string {
-	if (events.length === 0) return "";
+	return formatPdfAnnotationContextResult(events, options).text;
+}
+
+function formatPdfAnnotationContextResult(events: PdfAnnotationEvent[], options: { cwd?: string } = {}): { text: string; events: PdfAnnotationEvent[] } {
+	if (events.length === 0) return { text: "", events: [] };
 	const lines = ["## PDF marks from the User", ""];
+	const rendered: PdfAnnotationEvent[] = [];
 	for (const event of events) {
 		const sourceLine = sourceLineForEvent(event);
 		const sourceLocation = displaySourceLocation(event, options.cwd);
-		lines.push(`- \`${sourceLocation}\`${sourceLine ? ` — \`${escapeInlineCode(compactText(sourceLine, DEFAULT_MAX_FIELD_LENGTH))}\`` : ""}`);
+		const eventLines = [`- \`${sourceLocation}\`${sourceLine ? ` — \`${escapeInlineCode(compactText(sourceLine, DEFAULT_MAX_FIELD_LENGTH))}\`` : ""}`];
 		if (event.comment?.trim()) {
-			lines.push(`  User comment: ${compactText(event.comment, DEFAULT_MAX_COMMENT_LENGTH)}`);
+			eventLines.push(`  User comment: ${event.comment}`);
 		}
+		lines.push(...eventLines);
+		rendered.push(event);
 	}
-	return compactOutput(lines.join("\n"));
+	return { text: rendered.length === 0 ? "" : lines.join("\n"), events: rendered };
 }
 
 export function normalizeFetchPdfContextRequest(args: Record<string, unknown>): FetchPdfContextRequest {
@@ -123,10 +151,6 @@ function normalizeMaxEvents(maxEvents: number | undefined): number {
 function compactText(value: string, maxLength: number): string {
 	const compacted = value.replace(/\s+/g, " ").trim();
 	return compacted.length > maxLength ? `${compacted.slice(0, maxLength - 1)}…` : compacted;
-}
-
-function compactOutput(value: string): string {
-	return value.length > DEFAULT_MAX_OUTPUT_LENGTH ? `${value.slice(0, DEFAULT_MAX_OUTPUT_LENGTH - 1)}…` : value;
 }
 
 function escapeInlineCode(value: string): string {

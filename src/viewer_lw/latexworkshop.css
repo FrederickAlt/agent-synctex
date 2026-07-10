@@ -275,7 +275,7 @@ body[data-host-lw-continuous-compile="true"] #hostContinuousCompileButton .hostC
     to { transform: rotate(360deg); }
 }
 
-#hostCompileDiagnosticBox {
+#hostViewerNotificationBox {
     position: fixed;
     top: calc(var(--toolbar-height, 32px) + 6px);
     left: 50%;
@@ -292,11 +292,11 @@ body[data-host-lw-continuous-compile="true"] #hostContinuousCompileButton .hostC
     transform: translateX(-50%);
 }
 
-#hostCompileDiagnosticBox[data-severity="error"] {
+#hostViewerNotificationBox[data-severity="error"] {
     border-color: rgb(248 113 113 / .7);
 }
 
-.hostCompileDiagnosticText {
+.hostViewerNotificationText {
     max-height: 8em;
     overflow: auto;
     font: 12px/1.35 sans-serif;
@@ -304,13 +304,13 @@ body[data-host-lw-continuous-compile="true"] #hostContinuousCompileButton .hostC
     overflow-wrap: anywhere;
 }
 
-.hostCompileDiagnosticActions {
+.hostViewerNotificationActions {
     display: flex;
     gap: 8px;
     justify-content: flex-end;
 }
 
-.hostCompileDiagnosticActions button {
+.hostViewerNotificationActions button {
     border: 0;
     border-radius: 5px;
     padding: 4px 8px;
@@ -320,8 +320,8 @@ body[data-host-lw-continuous-compile="true"] #hostContinuousCompileButton .hostC
     font: 12px/1.2 sans-serif;
 }
 
-.hostCompileDiagnosticActions button:hover,
-.hostCompileDiagnosticActions button:focus-visible {
+.hostViewerNotificationActions button:hover,
+.hostViewerNotificationActions button:focus-visible {
     background: rgb(255 255 255 / .22);
 }
 

@@ -45,13 +45,41 @@ test("Viewer Host control channel accepts hello and records protocol readiness",
 		await server.start();
 		const client = new ViewerHostControlClient({ origin: server.origin });
 
-		const response = await client.send({ type: "hello", protocol_version: 2 });
+		const response = await client.send({ type: "hello", protocol_version: 3 });
 
-		assert.deepEqual(response, { ok: true, message: { type: "ready", protocol_version: 2, origin: server.origin, active_viewer_clients: 0 } });
-		assert.deepEqual(server.controlStatus, { ready: true, protocolVersion: 2 });
+		assert.deepEqual(response, { ok: true, message: { type: "ready", protocol_version: 3, origin: server.origin, instance_id: server.instanceId, active_viewer_clients: 0 } });
+		assert.deepEqual(server.controlStatus, { ready: true, protocolVersion: 3 });
 	} finally {
 		await server.stop();
 	}
+});
+
+test("Viewer Host control client bounds stalled requests and rejects malformed responses", async () => {
+	const stalledFetch = ((_input: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+		const signal = init?.signal;
+		const fallback = setTimeout(() => reject(new Error("test fetch did not abort")), 1_000);
+		if (signal?.aborted) {
+			clearTimeout(fallback);
+			reject(signal.reason);
+		} else signal?.addEventListener("abort", () => {
+			clearTimeout(fallback);
+			reject(signal.reason);
+		}, { once: true });
+	})) as typeof fetch;
+	const stalledClient = new ViewerHostControlClient({ origin: "http://127.0.0.1:43125", fetchImpl: stalledFetch, requestTimeoutMs: 20 });
+	await assert.rejects(() => stalledClient.send({ type: "hello", protocol_version: 3 }));
+
+	const malformedClient = new ViewerHostControlClient({
+		origin: "http://127.0.0.1:43125",
+		fetchImpl: (async () => new Response("not-json", { status: 200 })) as typeof fetch,
+	});
+	await assert.rejects(() => malformedClient.send({ type: "hello", protocol_version: 3 }), /malformed JSON/);
+
+	const invalidClient = new ViewerHostControlClient({
+		origin: "http://127.0.0.1:43125",
+		fetchImpl: (async () => new Response(JSON.stringify({ ok: true, message: { type: "ready", protocol_version: 3, origin: "http://127.0.0.1:43125" } }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch,
+	});
+	await assert.rejects(() => invalidClient.send({ type: "hello", protocol_version: 3 }), /instance_id/);
 });
 
 test("Viewer Host MCP endpoints require the configured owner token", async () => {
@@ -59,13 +87,15 @@ test("Viewer Host MCP endpoints require the configured owner token", async () =>
 	const server = new ViewerHostServer({ registry, controlToken: "owner-token" });
 	try {
 		await server.start();
-		const unauthorized = await fetch(`${server.origin}/control`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "hello", protocol_version: 2 }) });
+		const unauthorized = await fetch(`${server.origin}/control`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "hello", protocol_version: 3 }) });
 		assert.equal(unauthorized.status, 403);
 		const unauthorizedDrain = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST" });
 		assert.equal(unauthorizedDrain.status, 403);
+		assert.equal((await fetch(`${server.origin}/marks/claim`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 403);
+		assert.equal((await fetch(`${server.origin}/marks/ack`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ claim_id: "claim", consumed: [] }) })).status, 403);
 
 		const client = new ViewerHostControlClient({ origin: server.origin, controlToken: "owner-token" });
-		assert.equal((await client.send({ type: "hello", protocol_version: 2 })).ok, true);
+		assert.equal((await client.send({ type: "hello", protocol_version: 3 })).ok, true);
 		const authorizedDrain = await fetch(`${server.origin}/mcp-events/drain`, { method: "POST", headers: { [VIEWER_HOST_CONTROL_TOKEN_HEADER]: "owner-token" } });
 		assert.equal(authorizedDrain.status, 200);
 	} finally {

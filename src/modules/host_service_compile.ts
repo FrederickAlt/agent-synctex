@@ -107,13 +107,6 @@ export class HostServiceCompileService {
 		this.cleanupSnippetArtifacts();
 	}
 
-	cancelActiveFileCompiles(reason = "compile stopped by viewer"): void {
-		const stoppedError = new HostServiceCompileCoordinationError(reason, "compile_cancelled");
-		for (const controller of this.activeCompileAbortControllers) {
-			controller.abort(stoppedError);
-		}
-	}
-
 	private recordLastCompileSuccess(
 		rootKey: string,
 		rootSource: string,
