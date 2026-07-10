@@ -64,7 +64,7 @@ test("compile_latex_file performs one fake one-shot compile and returns source/p
 	const service = new ViewerHostMcpService({ client: new FakeViewerHostClient() });
 	try {
 		await withPath(`${join(baseDir, "bin")}:${process.env.PATH ?? ""}`, async () => {
-			const response = await callCompile({ latex_file_path: "paper.tex", compiler: "lualatex", hide_warnings: false, workspace_context: { cwd: baseDir } }, service) as { result?: { isError?: boolean; details?: Record<string, unknown> } };
+			const response = await callCompile({ latex_file_path: "paper.tex", compiler: "lualatex", hide_warnings: false, workspace_context: { cwd: baseDir } }, service) as { result?: { isError?: boolean; content?: Array<{ text?: string }>; details?: Record<string, unknown> } };
 			assert.equal(response.result?.isError, undefined);
 			const details = response.result?.details ?? {};
 			assert.equal(details.source, join(baseDir, "paper.tex"));
@@ -72,6 +72,7 @@ test("compile_latex_file performs one fake one-shot compile and returns source/p
 			assert.equal(details.log, join(baseDir, "paper.log"));
 			assert.equal(details.compile_status, "ok_with_warnings");
 			assert.equal(details.warning_count, 1);
+			assert.match(response.result?.content?.[0]?.text ?? "", /Warnings:\n- LaTeX Warning: Reference x undefined/);
 			assert.equal(details.pdf_id, undefined);
 			assert.equal(readFileSync(join(stateDir, "count.txt"), "utf8"), "1");
 		});
@@ -143,7 +144,10 @@ test("compile_latex_file open_pdf uses Viewer Host and reuses an already tracked
 			const first = await callCompile({ latex_file_path: "paper.tex", open_pdf: true, workspace_context: { cwd: baseDir } }, service) as { result?: { content?: Array<{ text?: string }>; details?: Record<string, unknown> } };
 			assert.equal(first.result?.details?.pdf_id, 42);
 			assert.equal(first.result?.details?.viewer_url, undefined);
-			assert.match(first.result?.content?.[0]?.text ?? "", /^ok_with_warnings: pdf_id=42 warnings=1[\s\S]*Warnings: 1 warnings hidden\.$/);
+			assert.match(first.result?.content?.[0]?.text ?? "", /^ok_with_warnings: pdf_id=42 warnings=1\nLog: .*paper\.log$/);
+			assert.doesNotMatch(first.result?.content?.[0]?.text ?? "", /LaTeX Warning|Warnings:/);
+			assert.equal(first.result?.details?.warnings, undefined);
+			assert.equal(first.result?.details?.warnings_hidden, true);
 			assert.doesNotMatch(JSON.stringify(first.result), /127\.0\.0\.1|viewer_url/);
 
 			const second = await callCompile({ latex_file_path: "paper.tex", open_pdf: true, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };

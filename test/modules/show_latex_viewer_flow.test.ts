@@ -19,7 +19,7 @@ fs.appendFileSync(${JSON.stringify(recordFile)}, JSON.stringify({ args, cwd: pro
 const sourceArg = args[args.length - 1];
 const sourcePath = path.resolve(process.cwd(), sourceArg);
 const base = sourcePath.replace(/\\.tex$/, "");
-fs.writeFileSync(base + ".log", "fake latexmk log\\nOutput written on " + path.basename(base) + ".pdf (1 page).\\n");
+fs.writeFileSync(base + ".log", "LaTeX Warning: Reference missing undefined on input line 1.\\nOutput written on " + path.basename(base) + ".pdf (1 page).\\n");
 fs.writeFileSync(base + ".pdf", "%PDF-1.4\\n% fake pdf\\n");
 if (args.includes("-synctex=1")) fs.writeFileSync(base + ".synctex", "SyncTeX Version:1\\nInput:1:" + sourcePath + "\\n");
 process.exit(0);
@@ -51,13 +51,13 @@ async function callShowLatex(args: Record<string, unknown>, service: ViewerHostM
 	return response as unknown as Record<string, unknown>;
 }
 
-test("show_latex schema exposes source, optional compiler, and preamble_root_file but no inline or raster controls", async () => {
+test("show_latex schema exposes source, compiler, preamble, and warning controls but no inline or raster controls", async () => {
 	const response = await handleMcpRequest(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
 	assert.ok(response && "result" in response);
 	const tools = (response.result as { tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown> } }> }).tools;
 	const showLatex = tools.find((tool) => tool.name === "show_latex");
 	assert.ok(showLatex);
-	assert.deepEqual(Object.keys(showLatex.inputSchema.properties).sort(), ["compiler", "preamble_root_file", "source", "workspace_context"]);
+	assert.deepEqual(Object.keys(showLatex.inputSchema.properties).sort(), ["compiler", "hide_warnings", "preamble_root_file", "source", "workspace_context"]);
 	assert.equal(showLatex.inputSchema.properties.inline, undefined);
 	assert.equal(showLatex.inputSchema.properties.open_pdf, undefined);
 	assert.equal(showLatex.inputSchema.properties.fixed_preview, undefined);
@@ -104,8 +104,12 @@ test("show_latex uses preamble_root_file to wrap source, compiles once with Sync
 			assert.equal(typeof result.details.source, "string");
 			assert.equal(typeof result.details.source_dir, "string");
 			assert.equal(typeof result.details.log, "string");
+			assert.equal(result.details.warning_count, 1);
+			assert.equal(result.details.warnings, undefined);
+			assert.equal(result.details.warnings_hidden, true);
 			assert.equal(result.details.viewer_url, undefined);
-			assert.match(result.content[0].text, /^ok: pdf_id=4242\nEditable source: \.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex$/);
+			assert.match(result.content[0].text, /^ok_with_warnings: pdf_id=4242 warnings=1\nLog: .*\.log\nEditable source: \.agent-synctex\/tmp\/[A-Za-z0-9]{6}\.tex$/);
+			assert.doesNotMatch(result.content[0].text, /LaTeX Warning|Warnings:/);
 			assert.doesNotMatch(JSON.stringify(result), /127\.0\.0\.1|viewer_url/);
 			assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf"]);
 			assert.equal(result.details.inline, undefined);

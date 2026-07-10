@@ -226,15 +226,16 @@ function parseCompileWorkspaceContext(sourcePath: string, rawWorkspaceContext: u
 	}
 	return workspaceContext;
 }
-function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompileSnippetRequest {
+function parseShowLatexRequest(args: Record<string, unknown>): { compileRequest: HostServiceCompileSnippetRequest; hideWarnings: boolean } {
 	for (const key of Object.keys(args)) {
-		if (!["source", "compiler", "preamble_root_file", "workspace_context", "debug_synctex"].includes(key)) {
+		if (!["source", "compiler", "preamble_root_file", "hide_warnings", "workspace_context", "debug_synctex"].includes(key)) {
 			throw new Error(`show_latex unknown argument: ${key}`);
 		}
 	}
 	const source = parseStringArg(args, "source");
 	const compiler = parseOptionalStringArg(args, "compiler");
 	const preambleRootFile = parseOptionalStringArg(args, "preamble_root_file");
+	const hideWarnings = parseBooleanArg(args, "hide_warnings") ?? true;
 	const debugSynctex = parseBooleanArg(args, "debug_synctex");
 	const rawWorkspaceContext = args.workspace_context;
 	const workspaceContext = rawWorkspaceContext === undefined
@@ -244,18 +245,21 @@ function parseShowLatexRequest(args: Record<string, unknown>): HostServiceCompil
 		throw new Error("workspace_context.cwd must be absolute for show_latex");
 	}
 	return {
-		protocol_version: MCP_RUNTIME_PROTOCOL_VERSION,
-		request_id: nextRuntimeRequestId(),
-		operation: "compile_latex_snippet",
-		created_at_ns: Date.now() * 1_000_000,
-		workspace_context: workspaceContext,
-		details: {
-			latex_source: source,
-			...(preambleRootFile === undefined ? {} : { preamble_root_file: preambleRootFile }),
-			...(compiler === undefined ? {} : { compiler }),
-			open_pdf: true,
-			...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
+		compileRequest: {
+			protocol_version: MCP_RUNTIME_PROTOCOL_VERSION,
+			request_id: nextRuntimeRequestId(),
+			operation: "compile_latex_snippet",
+			created_at_ns: Date.now() * 1_000_000,
+			workspace_context: workspaceContext,
+			details: {
+				latex_source: source,
+				...(preambleRootFile === undefined ? {} : { preamble_root_file: preambleRootFile }),
+				...(compiler === undefined ? {} : { compiler }),
+				open_pdf: true,
+				...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
+			},
 		},
+		hideWarnings,
 	};
 }
 
@@ -385,7 +389,7 @@ function parseJumpPdfRequest(args: Record<string, unknown>): HostServiceJumpRequ
 }
 function formatDiagnosticSummary(details: { warnings?: unknown; warning_count?: unknown; warnings_truncated?: unknown }, hideWarnings = false): string {
 	if (typeof details.warning_count !== "number" || details.warning_count <= 0) return "";
-	if (hideWarnings) return `\nWarnings: ${details.warning_count} warnings hidden.`;
+	if (hideWarnings) return "";
 	if (!Array.isArray(details.warnings)) return "";
 	const lines = details.warnings
 		.slice(0, 5)
@@ -613,13 +617,14 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 	const tools: McpToolDefinition[] = [
 		{
 			name: "show_latex",
-			description: "Render LaTeX as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Without preamble_root_file, source must be a complete LaTeX document. With preamble_root_file, the discovered preamble for that LaTeX root wraps either a \\begin{document}...\\end{document} body or document body content. The response includes the generated editable .tex source path so callers can edit it and recompile. If a browser viewer is detected after launch/focus, the tool returns only pdf_id plus that source location because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
+			description: "Render LaTeX as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Without preamble_root_file, source must be a complete LaTeX document. With preamble_root_file, the discovered preamble for that LaTeX root wraps either a \\begin{document}...\\end{document} body or document body content. The response includes the generated editable .tex source path so callers can edit it and recompile. Warning message details are hidden by default; set hide_warnings=false to show them. If a browser viewer is detected after launch/focus, the tool returns only pdf_id plus that source location because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					source: { type: "string", minLength: 1, description: "LaTeX source. Without preamble_root_file, pass a complete document. With preamble_root_file, pass either a \\begin{document}...\\end{document} body or only document body content." },
 					compiler: { type: "string" },
 					preamble_root_file: { type: "string", minLength: 1, description: "LaTeX root file whose discovered preamble should wrap this source. Relative paths resolve from the workspace cwd." },
+					hide_warnings: { type: "boolean", default: true, description: "Defaults to true. Set false to include warning summaries and details.warnings." },
 					workspace_context: workspaceContextSchema(),
 				},
 				required: ["source"],
@@ -732,8 +737,11 @@ async function handleShowLatexTool(
 	options: HostServiceMcpOptions,
 ): Promise<McpResponsePayload> {
 	let compileRequest: HostServiceCompileSnippetRequest;
+	let hideWarnings = true;
 	try {
-		compileRequest = parseShowLatexRequest(args);
+		const parsed = parseShowLatexRequest(args);
+		compileRequest = parsed.compileRequest;
+		hideWarnings = parsed.hideWarnings;
 	} catch (error) {
 		return buildMcpErrorResponse(
 			requestId,
@@ -744,7 +752,7 @@ async function handleShowLatexTool(
 	try {
 		const compileResponse = await mcpCompileService.compileLatexSnippetRequest(compileRequest);
 		emitViewerUrlFallback(compileResponse.status_details as unknown as Record<string, unknown>, options);
-		return buildSuccess(requestId, parseToolResult(compileResponse, "ok", { includeSourceDirectory: true }));
+		return buildSuccess(requestId, parseToolResult(compileResponse, "ok", { hideWarnings, includeSourceDirectory: true }));
 	} catch (error) {
 		const details = error instanceof Error ? error.message : String(error);
 		return buildSuccess(requestId, {

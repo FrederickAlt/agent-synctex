@@ -439,7 +439,7 @@ test("actual agent-synctex mcp entrypoint answers initialize and tools/list over
 		const names = toolsList.result.tools.map((tool) => tool.name);
 		assert.deepEqual(names, ["show_latex", "compile_latex_file", "open_pdf", "jump_pdf", "fetch_pdf_context"]);
 		const showLatexProperties = toolsList.result.tools.find((tool) => tool.name === "show_latex")?.inputSchema.properties ?? {};
-		assert.deepEqual(Object.keys(showLatexProperties).sort(), ["compiler", "preamble_root_file", "source"]);
+		assert.deepEqual(Object.keys(showLatexProperties).sort(), ["compiler", "hide_warnings", "preamble_root_file", "source"]);
 		assert.equal(toolsList.result.tools.find((tool) => tool.name === "compile_latex_file")?.inputSchema.properties?.continuous, undefined);
 	} finally {
 		child.kill("SIGTERM");
