@@ -21,13 +21,16 @@ If `npm run verify` fails with `tsc: not found` or `ERR_MODULE_NOT_FOUND: typesc
 
 For extension composition and transport, keep the installed MCP/runtime path as the composition root:
 
-- `scripts/agent-synctex.ts` dispatches installed CLI/MCP flows.
-- `src/modules/pi_adapter/pi_adapter.ts` should remain the thin Pi dispatch adapter.
+- `scripts/agent-synctex.ts` is the installed CLI entrypoint and dispatches `mcp`, `fetch-info`, installer, uninstaller, and doctor flows through `src/modules/installer/cli.ts`.
+- `scripts/viewer-host-server.ts` is the Viewer Host process entrypoint. Together these are the active production entrypoints tracked by `test/viewer_guardrails.test.ts`.
+- Harness MCP configuration and hook/plugin wrappers are owned by `src/modules/installer/`; Pi uses `src/modules/installer/adapters/pi.ts` and generated wrapper source from `src/modules/installer/pi_extension_source.ts`.
+- `src/modules/pi_adapter/pi_adapter.ts` is an unwired generic Pi tool-registration helper, not an active production entrypoint or integration path.
 - MCP tool protocol and tool schemas are implemented in `src/modules/host_service_mcp.ts`.
-- Keep runtime and artifact-facing operations in `src/modules/stdio_mcp_runtime.ts` and `src/modules/viewer_host_client.ts`; do not reintroduce the removed legacy `pdfjs_viewer_*`, native `pi_extension`, HostService/Zathura, or inline-preview stacks.
+- Keep MCP runtime coordination in `src/modules/stdio_mcp_runtime.ts` and Viewer Host lifecycle, PDF registration, and browser launch/focus at the `src/modules/viewer_host_client.ts` boundary. Do not reintroduce the removed legacy `pdfjs_viewer_*`, native packaged `pi_extension`, HostService/Zathura, or inline-preview stacks.
+- `scripts/tex-actions-mcp.ts` is a source-tree convenience entrypoint and `scripts/pdf-preview-mcp.ts` is its compatibility shim; neither is part of the installed package build.
 - `index.ts`, `scripts/tex-actionsctl.ts`, `scripts/agent-synctex-host-service.ts`, and `scripts/pi_synctex_callback.mjs` are removed in this branch; do not reintroduce these entrypoints.
 
-Avoid reintroducing direct viewer-command spawning in production TypeScript. `test/viewer_guardrails.test.ts` is the production regression guard for this boundary.
+Do not spawn or control native PDF viewers, and do not launch/focus the browser outside `SystemBrowserViewerLauncher` in `src/modules/viewer_host_client.ts`. `test/viewer_guardrails.test.ts` is the production regression guard for this boundary.
 
 ## Hidden development switches
 
