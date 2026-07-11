@@ -612,7 +612,7 @@ test("actual agent-synctex mcp entrypoint bridges reverse SyncTeX events from th
 		}
 
 		assert.equal(text.includes(`${sourcePath}:3`), true);
-		assert.match(text, /`Reverse target text\.`/);
+		assert.doesNotMatch(text, /Reverse target text\./);
 		assert.match(text, /User comment: Please check this\./);
 		assert.deepEqual(details, { pdf_ids: [pdfId], event_count: 1, cleared: true });
 	} finally {

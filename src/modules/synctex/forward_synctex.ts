@@ -826,6 +826,7 @@ function forwardBoxGroupsForSourceLine(input: { sourceFile: string; line: number
 const MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS = 25;
 const FULL_TEXT_CONTAINMENT_CONTEXT_CHARS = 30;
 const END_DOCUMENT_GEOMETRY_TIER = 1;
+const END_DOCUMENT_SCORE_PENALTY = 2_000;
 
 interface ReverseSynctexProposal {
 	kind: "text" | "ranked";
@@ -920,7 +921,7 @@ function scoreReverseSynctexProposal(input: {
 			const containsClick = boxContainsClick(box, input.click);
 			const containment = textContainmentBonus({ proposal: input.proposal, containsClick, fullTextFragment: input.fullTextFragment, partialTextFragment: input.partialTextFragment });
 			const clickContainmentBonus = containsClick ? -1000 : 0;
-			return { box, distance, clickContainmentBonus, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (distanceSquared * FORWARD_DISTANCE_PENALTY_MULTIPLIER) + (Math.sqrt(area) * FORWARD_BOX_SIZE_PENALTY_MULTIPLIER) + clickContainmentBonus + containment.bonus + group.semanticPenalty };
+			return { box, distance, clickContainmentBonus, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (distanceSquared * FORWARD_DISTANCE_PENALTY_MULTIPLIER) + (Math.sqrt(area) * FORWARD_BOX_SIZE_PENALTY_MULTIPLIER) + clickContainmentBonus + containment.bonus + group.semanticPenalty + (input.proposal.sourceLine?.trim() === "\\end{document}" ? END_DOCUMENT_SCORE_PENALTY : 0) };
 		}).sort((left, right) => left.score - right.score);
 		const chosen = scoredSamePageBoxes[0];
 		return {
@@ -1435,6 +1436,7 @@ export function mapReverseSynctex(input: {
 		if (candidateInspection !== undefined) {
 			for (const candidate of candidateInspection.candidates) {
 				const candidateSourceFile = resolveReverseMappedSourceFile(candidateToMapped(candidate), input.cwd);
+				const candidateSourceLine = readSourceLine(candidateSourceFile, candidate.line, input.cwd) ?? candidate.sourceLine;
 				if (proposals.some((proposal) => proposal.sourceFile === candidateSourceFile && proposal.line === candidate.line)) continue;
 				addProposal({
 					kind: "ranked",
@@ -1442,8 +1444,8 @@ export function mapReverseSynctex(input: {
 					sourceFile: candidateSourceFile,
 					line: candidate.line,
 					column: candidate.column,
-					...(candidate.sourceLine === undefined ? {} : { sourceLine: candidate.sourceLine }),
-					structural: candidate.structural || isStructuralReverseSourceLine(candidate.sourceLine),
+					...(candidateSourceLine === undefined ? {} : { sourceLine: candidateSourceLine }),
+					structural: candidate.structural || isStructuralReverseSourceLine(candidateSourceLine),
 				});
 				if (proposals.length >= MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS) break;
 			}

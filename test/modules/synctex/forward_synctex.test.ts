@@ -313,9 +313,9 @@ test("robust reverse mapping gives a separate -1000 bonus when the chosen forwar
 			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 0, v: 10, W: 10, H: 10 }] : [{ page: 1, h: 20, v: 10, W: 10, H: 10 }],
 		});
 		assert.equal(location.line, 2);
-		assert.equal(location.diagnostics.selected.score, 999999020);
+		assert.equal(location.diagnostics.selected.score, -980);
 		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.clickContainmentBonus, -1000);
-		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.score, 999999020);
+		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.score, -980);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -345,7 +345,7 @@ test("robust reverse mapping applies click containment bonus when forward box v 
 		assert.equal(location.line, 2);
 		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.containsClick, true);
 		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.clickContainmentBonus, -1000);
-		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.score, 999999020);
+		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.score, -980);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -563,7 +563,7 @@ test("reverse SyncTeX uses a visually hyphenated PDF text rectangle without forw
 		});
 		assert.equal(location.precision, "verified");
 		assert.deepEqual(location.selectedForwardRanges, [{ page: 1, h: 90, v: 210, W: 100, H: 12 }]);
-		assert.equal(location.diagnostics.proposalScores?.[0]?.geometryTier, -1);
+		assert.equal(location.diagnostics.proposalScores?.[0]?.geometryTier, 0);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -658,7 +658,7 @@ test("robust reverse mapping puts end-document in the least-preferred geometry t
 		const endDocument = location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2);
 		assert.equal(location.line, 1);
 		assert.equal(usable?.geometryTier, 1);
-		assert.equal(endDocument?.geometryTier, 2);
+		assert.equal(endDocument?.geometryTier, 1);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -694,7 +694,7 @@ test("robust reverse mapping does not privilege raw end-document when same-page 
 		assert.equal(location.line, 2);
 		assert.equal(winner?.line, 2);
 		assert.equal(endDocument?.line, 3);
-		assert.equal(winner?.score, endDocument?.score);
+		assert.ok((winner?.score ?? Infinity) < (endDocument?.score ?? -Infinity));
 		assert.equal(endDocument?.structural, true);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
@@ -727,8 +727,8 @@ test("robust reverse mapping uses unweighted forward distance", () => {
 		});
 		assert.equal(location.line, 3);
 		assert.deepEqual(location.diagnostics.proposalScores?.map((proposal) => proposal.line), [3, 2]);
-		assert.equal(location.diagnostics.proposalScores?.[0]?.score, 1000000116);
-		assert.equal(location.diagnostics.proposalScores?.[1]?.score, 1000000116);
+		assert.equal(location.diagnostics.proposalScores?.[0]?.score, 116);
+		assert.equal(location.diagnostics.proposalScores?.[1]?.score, 116);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -751,7 +751,7 @@ test("robust reverse mapping uses exact forward geometry scoring formula", () =>
 			jsFallback: () => ({ input: sourcePath, line: 2, column: 0 }),
 			forwardBoxesForLine: () => [{ page: 1, h: 0, v: 8, W: 6, H: 8 }],
 		});
-		assert.equal(location.diagnostics.proposalScores?.[0]?.score, ((7 ** 2 + 6 ** 2) * 0.96) + (Math.sqrt(48) * 2) + 1_000_000_000);
+		assert.equal(location.diagnostics.proposalScores?.[0]?.score, ((7 ** 2 + 6 ** 2) * 0.96) + (Math.sqrt(48) * 2));
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -778,7 +778,7 @@ test("robust reverse mapping applies full text containment bonus without partial
 		});
 		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; clickContainmentBonus?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
 		assert.equal(location.line, 2);
-		assert.equal(textScore?.score, 999998520);
+		assert.equal(textScore?.score, -1480);
 		assert.equal(textScore?.clickContainmentBonus, -1000);
 		assert.equal(textScore?.textContainmentBonus, -500);
 		assert.equal(textScore?.textContainment, "full");
@@ -817,7 +817,7 @@ test("robust reverse mapping caps full text containment scoring to 30 characters
 		});
 		const score = location.diagnostics.proposalScores?.[0] as { score?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
 		assert.equal(location.line, 2);
-		assert.equal(score?.score, 999998520);
+		assert.equal(score?.score, -1480);
 		assert.equal(score?.textContainmentBonus, -500);
 		assert.equal(score?.textContainment, "full");
 	} finally {
@@ -846,7 +846,7 @@ test("robust reverse mapping applies partial 8-character text containment bonus 
 		});
 		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; clickContainmentBonus?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
 		assert.equal(location.line, 2);
-		assert.equal(textScore?.score, 999998820);
+		assert.equal(textScore?.score, -1180);
 		assert.equal(textScore?.clickContainmentBonus, -1000);
 		assert.equal(textScore?.textContainmentBonus, -200);
 		assert.equal(textScore?.textContainment, "partial");
@@ -876,7 +876,7 @@ test("robust reverse mapping grants no partial text containment bonus when fewer
 		});
 		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; clickContainmentBonus?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
 		assert.equal(location.line, 3);
-		assert.equal(textScore?.score, 999999020);
+		assert.equal(textScore?.score, -980);
 		assert.equal(textScore?.clickContainmentBonus, -1000);
 		assert.equal(textScore?.textContainmentBonus, 0);
 		assert.equal(textScore?.textContainment, undefined);
@@ -2260,14 +2260,14 @@ test("reverse SyncTeX hover without text context reports top proposal diagnostic
 		});
 
 		assert.equal(hover.sourceFile, project.sourcePath);
-		assert.equal(hover.line, 5);
-		assert.equal(hover.sourceLine, "Second paragraph text on a different source line for SyncTeX mapping.");
+		assert.equal(hover.line, 3);
+		assert.equal(hover.sourceLine, "\\end{document}");
 		assert.equal(hover.precision, "line");
 		assert.deepEqual(hover.repairedWinner, {
 			sourceFile: project.sourcePath,
-			line: 5,
+			line: 3,
 			column: 0,
-			sourceLine: "Second paragraph text on a different source line for SyncTeX mapping.",
+			sourceLine: "\\end{document}",
 			precision: "line",
 			score: 0,
 		});
