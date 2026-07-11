@@ -17,7 +17,7 @@ import {
 	mapReverseSynctex,
 	type ForwardSynctexJump,
 	type MapForwardSynctexInput,
-	type ReverseSynctexFormulaSpan,
+	type ReverseSynctexSourceSpan,
 } from "./forward_synctex.ts";
 
 export type ReverseSynctexMapper = typeof mapReverseSynctex;
@@ -28,7 +28,7 @@ export interface RegisteredSynctexPdf {
 	workspaceCwd?: string;
 }
 
-function sourceSpanPayload(span: ReverseSynctexFormulaSpan | undefined): { source_file: string; start_line: number; end_line: number } | undefined {
+function sourceSpanPayload(span: ReverseSynctexSourceSpan | undefined): { source_file: string; start_line: number; end_line: number } | undefined {
 	return span === undefined ? undefined : { source_file: span.sourceFile, start_line: span.startLine, end_line: span.endLine };
 }
 
@@ -104,6 +104,7 @@ export function reverseSynctexPdfEventFromViewerMessage(input: {
 		x: message.x,
 		y: message.y,
 		cwd,
+		...(message.page_height === undefined ? {} : { pageHeight: message.page_height }),
 		...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }),
 		...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }),
 	});
@@ -120,6 +121,7 @@ export function reverseSynctexPdfEventFromViewerMessage(input: {
 				x: message.selectionStartX,
 				y: message.selectionStartY,
 				cwd,
+				...(message.page_height === undefined ? {} : { pageHeight: message.page_height }),
 				...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }),
 				textAfterSelection: message.selectedText,
 			});
@@ -140,6 +142,7 @@ export function reverseSynctexPdfEventFromViewerMessage(input: {
 				x: message.selectionEndX,
 				y: message.selectionEndY,
 				cwd,
+				...(message.page_height === undefined ? {} : { pageHeight: message.page_height }),
 				textBeforeSelection: message.selectedText,
 				...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }),
 			});
@@ -175,14 +178,14 @@ export function reverseSynctexPdfEventFromViewerMessage(input: {
 			raw_mapped_column: location.rawMappedColumn,
 			...(location.rawMappedSourceLine === undefined ? {} : { raw_mapped_source_line: location.rawMappedSourceLine }),
 		}),
-		...(sourceSpanPayload(location.normalizedFormulaSpan) === undefined ? {} : {
-			normalized_formula_span: sourceSpanPayload(location.normalizedFormulaSpan)!,
-			normalized_formula_excerpt: location.normalizedFormulaExcerpt,
+		...(sourceSpanPayload(location.normalizedSourceSpan) === undefined ? {} : {
+			normalized_source_span: sourceSpanPayload(location.normalizedSourceSpan)!,
+			normalized_source_excerpt: location.normalizedSourceExcerpt,
 		}),
 	};
 }
 
-function hoverCandidateSummary(candidate: unknown): { source_file?: string; line: number; column?: number; source_line?: string; score?: number; structural?: boolean; distance?: number; distance_x?: number; distance_y?: number } | undefined {
+function hoverCandidateSummary(candidate: unknown): { source_file?: string; line: number; column?: number; source_line?: string; rect?: { left: number; top: number; right: number; bottom: number }; score?: number; structural?: boolean; distance?: number; distance_x?: number; distance_y?: number } | undefined {
 	if (typeof candidate !== "object" || candidate === null) return undefined;
 	const record = candidate as Record<string, unknown>;
 	if (typeof record.line !== "number") return undefined;
@@ -191,6 +194,7 @@ function hoverCandidateSummary(candidate: unknown): { source_file?: string; line
 		line: record.line,
 		...(typeof record.column === "number" ? { column: record.column } : {}),
 		...(typeof record.sourceLine === "string" ? { source_line: record.sourceLine } : {}),
+		...(typeof record.rect === "object" && record.rect !== null ? { rect: record.rect as { left: number; top: number; right: number; bottom: number } } : {}),
 		...(typeof record.score === "number" ? { score: record.score } : {}),
 		...(typeof record.structural === "boolean" ? { structural: record.structural } : {}),
 		...(typeof record.distance === "number" ? { distance: record.distance } : {}),
@@ -199,9 +203,17 @@ function hoverCandidateSummary(candidate: unknown): { source_file?: string; line
 	};
 }
 
+function debugCandidateDiagnostics(reverse: ReturnType<typeof inspectReverseSynctexHover>): { debug_candidates?: NonNullable<ViewerHostReverseSynctexHoverResultMessage["candidates"]>; debug_selected_score?: number } {
+	const candidates = (reverse.proposalScores ?? reverse.topCandidates)?.map((candidate) => hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined).slice(0, 3);
+	return {
+		...(candidates === undefined || candidates.length === 0 ? {} : { debug_candidates: candidates }),
+		...(reverse.repairedWinner?.score === undefined ? {} : { debug_selected_score: reverse.repairedWinner.score }),
+	};
+}
+
 function hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Partial<ViewerHostReverseSynctexHoverResultMessage> {
 	const nearestCandidate = hoverCandidateSummary(hover.rawWinner);
-	const candidates = hover.topCandidates?.map((candidate) => hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
+	const candidates = (hover.proposalScores ?? hover.topCandidates)?.map((candidate) => hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined).slice(0, 3);
 	return {
 		...(hover.precision === undefined ? {} : { precision: hover.precision }),
 		...(hover.repairedWinner?.score === undefined ? {} : { selected_score: hover.repairedWinner.score }),
@@ -215,7 +227,7 @@ function hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHo
 export function reverseSynctexHoverResult(input: { message: ViewerHostReverseSynctexHoverMessage; pdf: RegisteredSynctexPdf }): ViewerHostReverseSynctexHoverResultMessage {
 	const { message, pdf } = input;
 	const cwd = pdf.workspaceCwd ?? dirname(pdf.pdfPath);
-	const hoverInput = { pdfPath: pdf.pdfPath, page: message.page, x: message.x, y: message.y, ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) };
+	const hoverInput = { pdfPath: pdf.pdfPath, page: message.page, x: message.x, y: message.y, ...(message.page_height === undefined ? {} : { pageHeight: message.page_height }), ...(message.pdf_text_spans === undefined ? {} : { pdfTextSpans: message.pdf_text_spans }), ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) };
 	let hover;
 	try {
 		hover = inspectReverseSynctexHover({ ...hoverInput, cwd });
@@ -239,9 +251,10 @@ export function reverseSynctexHoverResult(input: { message: ViewerHostReverseSyn
 	};
 }
 
-export function reverseSynctexForwardProbeResult(input: { message: ViewerHostReverseSynctexForwardProbeMessage; pdf: RegisteredSynctexPdf }): ViewerHostReverseSynctexForwardProbeResultMessage {
+export function reverseSynctexForwardProbeResult(input: { message: ViewerHostReverseSynctexForwardProbeMessage; pdf: RegisteredSynctexPdf; debugSynctex?: boolean }): ViewerHostReverseSynctexForwardProbeResultMessage {
 	const { message, pdf } = input;
-	const probeInput = { pdfPath: pdf.pdfPath, page: message.page, x: message.x, y: message.y, ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) };
+	const pdfMark = message.pdf_text_spans?.[0]?.text.trim();
+	const probeInput = { pdfPath: pdf.pdfPath, page: message.page, x: message.x, y: message.y, ...(message.page_height === undefined ? {} : { pageHeight: message.page_height }), ...(message.pdf_text_spans === undefined ? {} : { pdfTextSpans: message.pdf_text_spans }), ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) };
 	let probe;
 	try {
 		probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: pdf.workspaceCwd ?? dirname(pdf.pdfPath) });
@@ -260,7 +273,8 @@ export function reverseSynctexForwardProbeResult(input: { message: ViewerHostRev
 		reverse_line: probe.reverse.line,
 		reverse_column: probe.reverse.column,
 		...(probe.reverse.sourceLine === undefined ? {} : { reverse_source_line: probe.reverse.sourceLine }),
-		...(sourceSpanPayload(probe.reverse.normalizedFormulaSpan) === undefined ? {} : { source_span: sourceSpanPayload(probe.reverse.normalizedFormulaSpan)! }),
+		...(pdfMark ? { pdf_mark: pdfMark } : {}),
+		...(sourceSpanPayload(probe.reverse.normalizedSourceSpan) === undefined ? {} : { source_span: sourceSpanPayload(probe.reverse.normalizedSourceSpan)! }),
 		page: probe.forward.page,
 		x: probe.forward.x,
 		y: probe.forward.y,
@@ -268,6 +282,7 @@ export function reverseSynctexForwardProbeResult(input: { message: ViewerHostRev
 		...(probe.forward.height === undefined ? {} : { height: probe.forward.height }),
 		...(probe.forward.ranges === undefined ? {} : { ranges: probe.forward.ranges }),
 		...(probe.forward.indicator === undefined ? {} : { indicator: probe.forward.indicator }),
+		...(input.debugSynctex === true ? debugCandidateDiagnostics(probe.reverse) : {}),
 		source_file: probe.forward.sourceFile,
 		line: probe.forward.line,
 		source_line: probe.forward.sourceLine,

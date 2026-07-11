@@ -745,6 +745,80 @@ test("LaTeX Workshop viewer refreshes from Host socket while preserving page and
 });
 
 
+test("direct viewer restores each tab position after tab switches and browser reload", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-tab-view-state-"));
+	const firstPdfPath = join(baseDir, "first.pdf");
+	const secondPdfPath = join(baseDir, "second.pdf");
+	writeFileSync(firstPdfPath, makeTwoPagePdfWithToken("FIRST"));
+	writeFileSync(secondPdfPath, makeTwoPagePdfWithToken("SECOND"));
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		await server.start();
+		const client = new ViewerHostControlClient({ origin: server.origin });
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 240, pdf_path: firstPdfPath, title: "First" })).ok, true);
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 241, pdf_path: secondPdfPath, title: "Second" })).ok, true);
+
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 500, height: 360 } });
+		await page.goto(`${server.origin}/viewer-lw`, { waitUntil: "domcontentloaded" });
+		await page.waitForFunction(() => {
+			const loaded = (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number; renderedCanvasCount?: number } }).__hostLwLoadedState?.();
+			return loaded?.activePdfId === 241 && (loaded.renderedCanvasCount ?? 0) > 0
+				&& document.querySelectorAll("#hostPdfTabsContainer .hostPdfTab").length === 2;
+		}, undefined, { timeout: 15_000 });
+
+		const readView = async () => await page.evaluate(() => {
+			const application = (window as unknown as { PDFViewerApplication: { pdfViewer: { currentPageNumber: number; currentScaleValue: string } } }).PDFViewerApplication;
+			const container = document.getElementById("viewerContainer");
+			return { page: application.pdfViewer.currentPageNumber, scale: application.pdfViewer.currentScaleValue, scrollTop: container?.scrollTop ?? 0, scrollLeft: container?.scrollLeft ?? 0 };
+		});
+		const waitForView = async (pdfId: number, expected: { page: number; scale: string; scrollTop: number; scrollLeft: number }) => {
+			await page.waitForFunction(({ pdfId: expectedPdfId, expectedState }) => {
+				const loaded = (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number; renderedCanvasCount?: number } }).__hostLwLoadedState?.();
+				const application = (window as unknown as { PDFViewerApplication?: { pdfViewer?: { currentPageNumber: number; currentScaleValue: string } } }).PDFViewerApplication;
+				const container = document.getElementById("viewerContainer");
+				return loaded?.activePdfId === expectedPdfId && (loaded.renderedCanvasCount ?? 0) > 0
+					&& application?.pdfViewer?.currentPageNumber === expectedState.page && application.pdfViewer.currentScaleValue === expectedState.scale
+					&& Math.abs((container?.scrollTop ?? 0) - expectedState.scrollTop) <= 2
+					&& Math.abs((container?.scrollLeft ?? 0) - expectedState.scrollLeft) <= 2;
+			}, { pdfId, expectedState: expected }, { timeout: 10_000 });
+		};
+		const setSecondPageView = async (scale: string, extraScroll: number) => {
+			await page.evaluate(({ scale: nextScale, extraScroll: nextExtraScroll }) => {
+				const application = (window as unknown as { PDFViewerApplication: { page: number; pdfViewer: { currentPageNumber: number; currentScaleValue: string; scrollPageIntoView(input: { pageNumber: number }): void } } }).PDFViewerApplication;
+				application.pdfViewer.currentScaleValue = nextScale;
+				application.pdfViewer.currentPageNumber = 2;
+				application.page = 2;
+				application.pdfViewer.scrollPageIntoView({ pageNumber: 2 });
+				document.getElementById("viewerContainer")?.scrollBy(0, nextExtraScroll);
+			}, { scale, extraScroll });
+			await page.waitForFunction(() => (document.getElementById("viewerContainer")?.scrollTop ?? 0) > 0);
+		};
+
+		await setSecondPageView("150", 40);
+		const secondView = await readView();
+		await page.locator("#hostPdfTabsContainer .hostPdfTabButton[data-pdf-id='240']").click();
+		await page.waitForFunction(() => document.querySelector("#viewer .textLayer")?.textContent?.includes("FIRST") === true, undefined, { timeout: 10_000 });
+		await setSecondPageView("125", 25);
+		const firstView = await readView();
+
+		await page.locator("#hostPdfTabsContainer .hostPdfTabButton[data-pdf-id='241']").click();
+		await waitForView(241, secondView);
+		await page.locator("#hostPdfTabsContainer .hostPdfTabButton[data-pdf-id='240']").click();
+		await waitForView(240, firstView);
+
+		await page.reload({ waitUntil: "domcontentloaded" });
+		await waitForView(240, firstView);
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+
 test("reopening the active PDF never rolls back when an older prefetch finishes late", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-active-reopen-"));
 	const pdfPath = join(baseDir, "paper.pdf");
@@ -1469,11 +1543,55 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 				source_file: source,
 				line: 3,
 				source_line: "First paragraph text that should wrap a little and create boxes.",
+				source_span: { source_file: "/nested/path/this-is-a-very-long-source-name.tex", start_line: 12, end_line: 15 },
 			}, { scroll: false });
 		}, sourcePath);
+		const sourceMarkerBounds = await page.locator("[data-synctex-marker]").evaluateAll((elements) => {
+			const rects = elements.map((element) => element.getBoundingClientRect());
+			return {
+				left: Math.min(...rects.map((rect) => rect.left)),
+				top: Math.min(...rects.map((rect) => rect.top)),
+				right: Math.max(...rects.map((rect) => rect.right)),
+				bottom: Math.max(...rects.map((rect) => rect.bottom)),
+			};
+		});
 		await page.locator("[data-synctex-marker]").first().click();
 		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1);
-		assert.equal(await page.locator("[data-pdf-annotation-box]").count(), 2);
+		assert.equal(await page.locator("[data-pdf-annotation-box]").count(), 1, "boxes for one source line should fuse into one marking");
+		const fusedBoxBounds = await page.locator("[data-pdf-annotation-box]").evaluate((element) => {
+			const rect = element.getBoundingClientRect();
+			return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+		});
+		for (const edge of ["left", "top", "right", "bottom"] as const) {
+			assert.ok(Math.abs(fusedBoxBounds[edge] - sourceMarkerBounds[edge]) < 1, `fused box should preserve the ${edge} extreme`);
+		}
+		const sourceBadges = page.locator("[data-pdf-annotation-source-badge]");
+		assert.equal(await sourceBadges.count(), 1, "a multi-box marking should have one source badge");
+		const badge = await sourceBadges.first().evaluate((element) => {
+			const badgeRect = element.getBoundingClientRect();
+			const boxRect = element.parentElement?.getBoundingClientRect();
+			const boxes = Array.from(element.closest("[data-pdf-annotation]")?.querySelectorAll("[data-pdf-annotation-box]") ?? []);
+			return {
+				text: element.textContent,
+				title: element.getAttribute("title"),
+				display: getComputedStyle(element).display,
+				boxIndex: element.parentElement === null ? -1 : boxes.indexOf(element.parentElement),
+				leftOffset: boxRect === undefined ? Number.NaN : badgeRect.left - boxRect.left,
+				bottomGap: boxRect === undefined ? Number.NaN : boxRect.top - badgeRect.bottom,
+			};
+		});
+		assert.equal(badge.text, "this-is-a-very-long-source-na…:12–15");
+		assert.equal(badge.title, "this-is-a-very-long-source-name.tex:12–15");
+		assert.notEqual(badge.display, "none", "the selected marking should show its source badge");
+		assert.equal(badge.boxIndex, 0, "the badge should attach to the top-left annotation box");
+		assert.ok(Math.abs(badge.leftOffset) < 1 && badge.bottomGap >= 1, "source badge should sit above the annotation box without covering it");
+
+		await page.locator("#viewer .page[data-page-number='1']").evaluate((element) => {
+			element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX: 1, clientY: 1 }));
+		});
+		assert.equal(await sourceBadges.first().evaluate((element) => getComputedStyle(element).display), "none", "an unselected marking should hide its source badge");
+		await page.locator("[data-pdf-annotation-box]").first().click();
+		assert.notEqual(await sourceBadges.first().evaluate((element) => getComputedStyle(element).display), "none", "selecting a marking should reveal its source badge");
 
 		await page.evaluate((source) => {
 			(globalThis as typeof globalThis & { __hostLwSynctexDebug?: { showSynctexMarker: (message: unknown, options?: unknown) => boolean } }).__hostLwSynctexDebug?.showSynctexMarker({
@@ -1492,7 +1610,24 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 			}, { scroll: false });
 		}, sourcePath);
 		await page.locator("[data-synctex-marker]").first().evaluate((element) => (element as HTMLElement).click());
-		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "same source line should reuse the existing annotation");
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "identical geometry should reuse the existing annotation");
+		assert.equal(await page.locator("[data-pdf-annotation-box]").count(), 1);
+
+		await page.evaluate((source) => {
+			(globalThis as typeof globalThis & { __hostLwSynctexDebug?: { showSynctexMarker: (message: unknown, options?: unknown) => boolean } }).__hostLwSynctexDebug?.showSynctexMarker({
+				type: "synctex_forward",
+				pdf_id: 150,
+				page: 1,
+				x: 360,
+				y: 120,
+				ranges: [{ page: 1, h: 360, v: 120, W: 28, H: 16 }],
+				source_file: source,
+				line: 3,
+				source_line: "First paragraph text that should wrap a little and create boxes.",
+			}, { scroll: false });
+		}, sourcePath);
+		await page.locator("[data-synctex-marker]").first().evaluate((element) => (element as HTMLElement).click());
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 2, "non-overlapping geometry on the same source line should remain separate annotations");
 		assert.equal(await page.locator("[data-pdf-annotation-box]").count(), 2);
 
 		await page.evaluate((source) => {
@@ -1509,11 +1644,11 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 			}, { scroll: false });
 		}, sourcePath);
 		await page.locator("[data-synctex-marker]").first().evaluate((element) => (element as HTMLElement).click());
-		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "overlapping boxes should reuse the existing annotation");
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 2, "overlapping boxes should reuse the existing annotation");
 		assert.equal(await page.locator("[data-pdf-annotation-box]").count(), 2);
 
 		await page.locator("[data-pdf-annotation-box]").first().click();
-		await page.locator("button[title='Add comment']").click();
+		await page.locator("[data-pdf-annotation][data-pdf-annotation-selected='true'] button[title='Add comment']").click();
 		assert.equal(await page.locator("[data-pdf-annotation-bubble]").count(), 1);
 		await page.locator("[data-pdf-annotation-bubble] textarea").fill("This comment should be editable outside the page edge.");
 
@@ -1554,7 +1689,7 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 		assert.ok(afterDrag.x2 > beforeDrag.x2 + 30, "connector should follow the dragged bubble horizontally");
 		assert.ok(afterDrag.y2 > beforeDrag.y2 + 20, "connector should follow the dragged bubble vertically");
 
-		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "annotation should be visible before a transient page render gap");
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 2, "annotations should be visible before a transient page render gap");
 		await page.evaluate(() => {
 			const application = (window as unknown as { PDFViewerApplication?: { eventBus?: { dispatch: (name: string, payload: unknown) => void }; pdfViewer?: { _pages?: Array<{ viewport?: unknown; __hostSavedViewport?: unknown }> } } }).PDFViewerApplication;
 			const pageView = application?.pdfViewer?._pages?.[0];
@@ -1564,7 +1699,7 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 			application.eventBus.dispatch("pagerendered", { source: pageView, pageNumber: 1 });
 		});
 		await page.waitForTimeout(200);
-		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "transient PDF.js loading/rendering gaps must not clear visible annotations");
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 2, "transient PDF.js loading/rendering gaps must not clear visible annotations");
 		await page.evaluate(() => {
 			const application = (window as unknown as { PDFViewerApplication?: { eventBus?: { dispatch: (name: string, payload: unknown) => void }; pdfViewer?: { _pages?: Array<{ viewport?: unknown; __hostSavedViewport?: unknown }> } } }).PDFViewerApplication;
 			const pageView = application?.pdfViewer?._pages?.[0];
@@ -1574,7 +1709,7 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 			application.eventBus.dispatch("pagerendered", { source: pageView, pageNumber: 1 });
 		});
 		await page.waitForTimeout(200);
-		assert.equal(await page.locator("[data-pdf-annotation]").count(), 1, "annotation should redraw once PDF.js page geometry is available again");
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 2, "annotations should redraw once PDF.js page geometry is available again");
 		await drainHostMcpEvents(server.origin);
 		await page.evaluate(() => {
 			const pageElement = document.querySelector("#viewer .page[data-page-number='1']") as HTMLElement | null;
@@ -1596,7 +1731,7 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 		await page.locator("[data-host-editable-probe]").click();
 		await new Promise((resolve) => setTimeout(resolve, 500));
 		assert.equal(await page.locator("[data-host-editable-probe]").evaluate((element) => document.activeElement === element), true, "editable target inside the viewer should receive focus");
-		assert.ok(await page.locator("[data-pdf-annotation]").count() <= 1, "clicking an editable target inside the viewer should not create another annotation");
+		assert.ok(await page.locator("[data-pdf-annotation]").count() <= 2, "clicking an editable target inside the viewer should not create another annotation");
 		const eventsAfterEditableClick = await drainHostMcpEvents(server.origin);
 		assert.equal(eventsAfterEditableClick.some((event) => event.type === "pdf_annotation"), false, "editable click should not emit a PDF annotation update");
 

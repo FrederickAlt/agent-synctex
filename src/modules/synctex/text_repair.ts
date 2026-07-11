@@ -136,6 +136,11 @@ function isAbsurdBox(box: ForwardSynctexRange): boolean {
 	return boxArea(box) >= ABSURD_BOX_AREA || box.W >= ABSURD_BOX_SIDE || box.H >= ABSURD_BOX_SIDE;
 }
 
+/** A broad container is retained only as fallback geometry, never as tight evidence. */
+export function forwardBoxGeometryTier(box: ForwardSynctexRange): number {
+	return isAbsurdBox(box) ? 1 : 0;
+}
+
 export function boxContainsClick(box: ForwardSynctexRange, click: PdfClickPoint): boolean {
 	return box.page === click.page
 		&& click.x >= box.h

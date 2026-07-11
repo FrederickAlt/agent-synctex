@@ -354,10 +354,11 @@ export class HostServiceCompileService {
 			crop_to_content: request.details.crop_to_content === true,
 			suppress_page_numbers: request.details.suppress_page_numbers === true,
 			preamble_root_file: request.details.preamble_root_file,
+			name: request.details.name,
 		});
 
 		try {
-			sourcePath = buildSnippetLatexSourcePath(request.workspace_context);
+			sourcePath = buildSnippetLatexSourcePath(request.workspace_context, request.details.name);
 			this.snippetArtifactBases.add(pathWithoutExtension(sourcePath));
 			const source = request.details.latex_source;
 			preambleRoot = resolvePreambleRootForCompile(request.workspace_context, request.details.preamble_root_file);
@@ -689,7 +690,7 @@ export class HostServiceCompileService {
 
 }
 
-function buildSnippetLatexSourcePath(workspaceContext: HostServiceWorkspaceContext): string {
+function buildSnippetLatexSourcePath(workspaceContext: HostServiceWorkspaceContext, requestedName?: string): string {
 	const workspaceRoot = workspaceContext.cwd && workspaceContext.cwd !== "/"
 		? resolve(workspaceContext.cwd)
 		: workspaceContext.workspace_root ?? DEFAULT_HOST_SERVICE_TMPDIR;
@@ -698,11 +699,35 @@ function buildSnippetLatexSourcePath(workspaceContext: HostServiceWorkspaceConte
 
 	ensureDirectory(agentSynctexRoot);
 	ensureDirectory(snippetRoot);
+	if (requestedName !== undefined) {
+		const stem = normalizeSnippetDocumentName(requestedName);
+		for (let number = 0; number < MAX_SNIPPET_DOCUMENT_ID_ATTEMPTS; number += 1) {
+			const artifactBase = join(snippetRoot, `${stem}${number === 0 ? "" : number}`);
+			if (snippetArtifactBaseAvailable(artifactBase)) return `${artifactBase}.tex`;
+		}
+		throw new Error(`failed to allocate a unique show_latex source file name for ${requestedName}`);
+	}
 	for (let attempt = 0; attempt < MAX_SNIPPET_DOCUMENT_ID_ATTEMPTS; attempt += 1) {
-		const sourcePath = join(snippetRoot, `${randomSnippetDocumentId()}.tex`);
-		if (!existsSync(sourcePath)) return sourcePath;
+		const artifactBase = join(snippetRoot, randomSnippetDocumentId());
+		if (snippetArtifactBaseAvailable(artifactBase)) return `${artifactBase}.tex`;
 	}
 	throw new Error("failed to allocate a unique show_latex source file name");
+}
+
+function normalizeSnippetDocumentName(requestedName: string): string {
+	const trimmed = requestedName.trim();
+	if (trimmed.includes("/") || trimmed.includes("\\")) {
+		throw new Error("name must be a filename without path components");
+	}
+	const stem = trimmed.replace(/\.tex$/i, "");
+	if (!stem || stem === "." || stem === "..") {
+		throw new Error("name must contain a filename before the optional .tex suffix");
+	}
+	return stem;
+}
+
+function snippetArtifactBaseAvailable(artifactBase: string): boolean {
+	return SNIPPET_ARTIFACT_EXTENSIONS.every((extension) => !existsSync(`${artifactBase}${extension}`));
 }
 
 function randomSnippetDocumentId(): string {

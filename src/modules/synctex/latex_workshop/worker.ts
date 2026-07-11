@@ -76,18 +76,22 @@ export interface ReverseSyncTeXCandidatesInspection {
 }
 
 export interface ReverseSyncTeXCandidatesOptions {
+	/** Minimum number of distinct source locations to collect before expanding the search radius. */
 	minCandidates?: number;
+	/** Maximum number of nearest distinct source locations to retain. */
 	maxCandidates?: number;
 	minDistance?: number;
 	maxRadius?: number;
+	/** PDF user-space height of the clicked page; bounds radius expansion when available. */
+	pageHeight?: number;
 	enrichSourceLines?: boolean;
 }
 
 const DEFAULT_REVERSE_CANDIDATE_OPTIONS = {
-	minCandidates: 8,
-	maxCandidates: 40,
+	minCandidates: 10,
+	maxCandidates: 25,
 	minDistance: 12,
-	maxRadius: 192,
+	maxRadius: Number.MAX_SAFE_INTEGER,
 };
 
 const STRUCTURAL_SOURCE_LINES = new Set(["\\end{document}", "\\newpage", "\\end{minipage}", "\\end{figure}", "\\begin{document}"]);
@@ -343,10 +347,14 @@ export function collectReverseSyncTeXCandidatesFromParsed(pdfSyncObject: PdfSync
 	const maxCandidates = options.maxCandidates ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.maxCandidates;
 	const minDistance = options.minDistance ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.minDistance;
 	const maxRadius = options.maxRadius ?? DEFAULT_REVERSE_CANDIDATE_OPTIONS.maxRadius;
+	const pageHeight = options.pageHeight;
+	const radiusLimit = Number.isFinite(pageHeight) && (pageHeight as number) > 0
+		? Math.min(maxRadius, pageHeight as number)
+		: maxRadius;
 	const enrichSourceLines = options.enrichSourceLines ?? true;
 	const y0 = y - pdfSyncObject.offset.y;
 	const x0 = x - pdfSyncObject.offset.x;
-	const allCandidates: ReverseSyncTeXCandidate[] = [];
+	const candidatesBySourceLocation = new Map<string, ReverseSyncTeXCandidate>();
 	const resolvedInputs = new Map<string, string | undefined>();
 	const sourceLinesByInput = new Map<string, string[] | undefined>();
 
@@ -372,7 +380,7 @@ export function collectReverseSyncTeXCandidatesFromParsed(pdfSyncObject: PdfSync
 				const distanceY = rect.distanceY(y0);
 				const distance = Math.sqrt(distanceY ** 2 + distanceX ** 2);
 				const area = Math.max(0, rect.right - rect.left) * Math.max(0, rect.bottom - rect.top);
-				allCandidates.push({
+				const candidate: ReverseSyncTeXCandidate = {
 					input: resolvedInput ?? fileName,
 					line: Number(lineNum),
 					column: 0,
@@ -390,17 +398,22 @@ export function collectReverseSyncTeXCandidatesFromParsed(pdfSyncObject: PdfSync
 					containsClick: rect.containsPoint(x0, y0),
 					structural: structuralReason !== undefined,
 					...(structuralReason === undefined ? {} : { structuralReason }),
-				});
+				};
+				const key = JSON.stringify([candidate.input, candidate.line]);
+				const existing = candidatesBySourceLocation.get(key);
+				if (existing === undefined || compareReverseCandidates(candidate, existing) < 0) {
+					candidatesBySourceLocation.set(key, candidate);
+				}
 			}
 		}
 	}
 
-	if (allCandidates.length === 0) return undefined;
-	const sortedCandidates = [...allCandidates].sort(compareReverseCandidates);
+	if (candidatesBySourceLocation.size === 0) return undefined;
+	const sortedCandidates = [...candidatesBySourceLocation.values()].sort(compareReverseCandidates);
 	let radius = Math.max(0, minDistance);
 	let selected = sortedCandidates.filter((candidate) => candidate.distance <= radius);
-	while (selected.length < minCandidates && radius < maxRadius) {
-		radius = radius === 0 ? 1 : Math.min(maxRadius, radius * 2);
+	while (selected.length < minCandidates && selected.length < sortedCandidates.length && radius < radiusLimit) {
+		radius = radius === 0 ? 1 : Math.min(radiusLimit, radius * 2);
 		selected = sortedCandidates.filter((candidate) => candidate.distance <= radius);
 	}
 	const candidates = selected.slice(0, Math.max(1, maxCandidates));

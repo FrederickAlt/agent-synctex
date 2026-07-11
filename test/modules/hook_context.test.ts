@@ -135,11 +135,11 @@ test("hook context claims marks directly from the Viewer Host and acknowledges o
 		writeDiscovery(runtimeRoot, "direct-agent", server, controlToken, baseDir);
 		const config = await (await fetch(`${server.origin}/config/12.json`)).json() as { viewer_socket_url: string };
 		socket = await openViewerSocket(config.viewer_socket_url);
-		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: sourcePath, line: 1, source_line: "Marked source line.", comment: "direct note" }));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: sourcePath, line: 1, source_line: "Marked source line.", pdf_mark: "Visible PDF text.", comment: "direct note" }));
 		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
 
 		const cleared = nextJsonMessage(socket);
-		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "direct-agent", cwd: baseDir }), "## PDF marks from the User\n\n- `main.tex:1` — `Marked source line.`\n  User comment: direct note");
+		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "direct-agent", cwd: baseDir }), "## PDF marks from the User\n\n- main.tex:1\n  PDF mark: `Visible PDF text.`\n  User comment: direct note");
 		assert.deepEqual(await cleared, { type: "annotations_cleared", pdf_id: 12, pdf_ids: [12], annotation_ids: ["a1"] });
 		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "direct-agent", cwd: baseDir }), "");
 	} finally {
@@ -166,7 +166,7 @@ test("hook failures release marks, report the failure to the viewer, and reject 
 		writeDiscovery(runtimeRoot, "release-agent", server, controlToken, baseDir);
 		const config = await (await fetch(`${server.origin}/config/14.json`)).json() as { viewer_socket_url: string };
 		socket = await openViewerSocket(config.viewer_socket_url);
-		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "retry", page: 1, x: 10, y: 20, source_file: sourcePath, line: 1, source_line: "Retryable mark." }));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "retry", page: 1, x: 10, y: 20, source_file: sourcePath, line: 1, source_line: "Retryable mark.", pdf_mark: "Retryable PDF mark." }));
 		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
 
 		let failAcknowledgement = true;
@@ -193,7 +193,7 @@ test("hook failures release marks, report the failure to the viewer, and reject 
 			detail: "simulated acknowledgement failure",
 			inject_text: "PDF mark delivery failed: simulated acknowledgement failure",
 		});
-		assert.match(await fetchHookContext({ runtimeRoot, agentId: "release-agent", cwd: baseDir }), /Retryable mark\./);
+		assert.match(await fetchHookContext({ runtimeRoot, agentId: "release-agent", cwd: baseDir }), /Retryable PDF mark\./);
 	} finally {
 		socket?.close();
 		await server.stop();
@@ -273,11 +273,11 @@ test("hook discovery never overrides an explicit agent identity and uses only an
 		});
 		const config = await (await fetch(`${server.origin}/config/13.json`)).json() as { viewer_socket_url: string };
 		socket = await openViewerSocket(config.viewer_socket_url);
-		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "cwd", page: 1, x: 1, y: 2, source_file: sourcePath, line: 1 }));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "cwd", page: 1, x: 1, y: 2, source_file: sourcePath, line: 1, pdf_mark: "CWD PDF mark." }));
 		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
 
 		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "missing-session", cwd: projectCwd }), "", "an explicit missing agent must not consume another same-project agent's marks");
-		assert.equal(await fetchHookContext({ runtimeRoot, cwd: projectCwd }), "## PDF marks from the User\n\n- `main.tex:1` — `CWD source.`");
+		assert.equal(await fetchHookContext({ runtimeRoot, cwd: projectCwd }), "## PDF marks from the User\n\n- main.tex:1\n  PDF mark: `CWD PDF mark.`");
 	} finally {
 		socket?.close();
 		await server.stop();
@@ -324,7 +324,7 @@ test("agent-synctex fetch-info consumes direct Viewer Host context without a bri
 		writeDiscovery(runtimeRoot, "cli-agent", server, controlToken, baseDir);
 		const config = await (await fetch(`${server.origin}/config/14.json`)).json() as { viewer_socket_url: string };
 		socket = await openViewerSocket(config.viewer_socket_url);
-		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "cli", page: 1, x: 1, y: 2, source_file: sourcePath, line: 1 }));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "cli", page: 1, x: 1, y: 2, source_file: sourcePath, line: 1, pdf_mark: "CLI PDF mark." }));
 		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
 
 		const scriptPath = resolve(process.cwd(), "scripts", "agent-synctex.ts");
@@ -337,7 +337,7 @@ test("agent-synctex fetch-info consumes direct Viewer Host context without a bri
 		child.stdin.end("prompt");
 		const code = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
 		assert.equal(code, 0);
-		assert.equal(stdout, "## PDF marks from the User\n\n- `main.tex:1` — `CLI source.`");
+		assert.equal(stdout, "## PDF marks from the User\n\n- main.tex:1\n  PDF mark: `CLI PDF mark.`");
 	} finally {
 		socket?.close();
 		await server.stop();

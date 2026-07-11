@@ -237,11 +237,13 @@ test("HTTP reverse-forward probe is handled by ViewerHostServer without entering
 		await server.start();
 		service = new ViewerHostMcpService({ client: new HttpViewerHostClient(server.origin), makePdfId: () => 812 });
 		await callTool(1, "open_pdf", { pdf_file_path: pdfPath, workspace_context: { cwd: baseDir } }, service);
-		const config = await (await fetch(`${server.origin}/config/812.json`)).json() as { viewer_socket_token: string };
+		await new ViewerHostControlClient({ origin: server.origin }).send({ type: "set_debug_synctex", pdf_id: 812, enabled: true });
+		const config = await (await fetch(`${server.origin}/config/812.json`)).json() as { viewer_socket_token: string; debug_synctex: boolean };
+		assert.equal(config.debug_synctex, true);
 		const response = await fetch(`${server.origin}/synctex/probe`, {
 			method: "POST",
 			headers: { "content-type": "application/json", "x-agent-synctex-viewer-token": config.viewer_socket_token },
-			body: JSON.stringify({ pdf_id: 812, request_id: 1, page: 1, x: 144, y: 155 }),
+			body: JSON.stringify({ pdf_id: 812, request_id: 1, page: 1, x: 144, y: 155, pdf_text_spans: [{ page: 1, h: 140, v: 155, W: 10, H: 10, text: "Clicked PDF text" }] }),
 		});
 		assert.equal(response.status, 200);
 		const body = await response.json() as { ok: boolean; result: Record<string, unknown> };
@@ -255,7 +257,10 @@ test("HTTP reverse-forward probe is handled by ViewerHostServer without entering
 		assert.equal(result.reverse_line, 3);
 		assert.equal(result.source_file, sourcePath);
 		assert.equal(result.line, 3);
+		assert.equal(result.pdf_mark, "Clicked PDF text");
 		assert.equal(result.page, 1);
+		assert.equal(Array.isArray(result.debug_candidates), true);
+		assert.ok((result.debug_candidates as unknown[]).length > 0, "debug probe should include candidate scores for the browser overlay");
 		const events = await service.getPdfEvents({ pdf_id: 812, max_events: 10, stale: true, debug: true });
 		assert.equal(events.length, 0, "debug probe must not be appended to the MCP event store");
 	} finally {

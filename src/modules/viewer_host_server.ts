@@ -690,7 +690,7 @@ export class ViewerHostServer {
 		}
 		try {
 			const record = this.registry.getPdf(pdfId);
-			jsonResponse(response, 200, { ok: true, result: reverseSynctexForwardProbeResult({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } }) });
+			jsonResponse(response, 200, { ok: true, result: reverseSynctexForwardProbeResult({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd }, debugSynctex: this.debugSynctexByPdfId.get(pdfId) === true }) });
 		} catch (error) {
 			jsonResponse(response, 200, {
 				ok: true,

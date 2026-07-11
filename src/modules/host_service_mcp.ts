@@ -228,11 +228,22 @@ function parseCompileWorkspaceContext(sourcePath: string, rawWorkspaceContext: u
 }
 function parseShowLatexRequest(args: Record<string, unknown>): { compileRequest: HostServiceCompileSnippetRequest; hideWarnings: boolean } {
 	for (const key of Object.keys(args)) {
-		if (!["source", "compiler", "preamble_root_file", "hide_warnings", "workspace_context", "debug_synctex"].includes(key)) {
+		if (!["source", "name", "compiler", "preamble_root_file", "hide_warnings", "workspace_context", "debug_synctex"].includes(key)) {
 			throw new Error(`show_latex unknown argument: ${key}`);
 		}
 	}
 	const source = parseStringArg(args, "source");
+	const name = parseOptionalStringArg(args, "name");
+	if (name !== undefined) {
+		const trimmedName = name.trim();
+		const stem = trimmedName.replace(/\.tex$/i, "");
+		if (trimmedName.includes("/") || trimmedName.includes("\\")) {
+			throw new Error("name must be a filename without path components");
+		}
+		if (!stem || stem === "." || stem === "..") {
+			throw new Error("name must contain a filename before the optional .tex suffix");
+		}
+	}
 	const compiler = parseOptionalStringArg(args, "compiler");
 	const preambleRootFile = parseOptionalStringArg(args, "preamble_root_file");
 	const hideWarnings = parseBooleanArg(args, "hide_warnings") ?? true;
@@ -253,6 +264,7 @@ function parseShowLatexRequest(args: Record<string, unknown>): { compileRequest:
 			workspace_context: workspaceContext,
 			details: {
 				latex_source: source,
+				...(name === undefined ? {} : { name }),
 				...(preambleRootFile === undefined ? {} : { preamble_root_file: preambleRootFile }),
 				...(compiler === undefined ? {} : { compiler }),
 				open_pdf: true,
@@ -622,6 +634,7 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 				type: "object",
 				properties: {
 					source: { type: "string", minLength: 1, description: "LaTeX source. Without preamble_root_file, pass a complete document. With preamble_root_file, pass either a \\begin{document}...\\end{document} body or only document body content." },
+					name: { type: "string", minLength: 1, description: "Optional filename for the generated snippet source, with or without a .tex suffix. Path components are not allowed. Existing names receive an increasing numeric suffix." },
 					compiler: { type: "string" },
 					preamble_root_file: { type: "string", minLength: 1, description: "LaTeX root file whose discovered preamble should wrap this source. Relative paths resolve from the workspace cwd." },
 					hide_warnings: { type: "boolean", default: true, description: "Defaults to true. Set false to include warning summaries and details.warnings." },

@@ -86,6 +86,37 @@ test("reverse SyncTeX candidate collection preserves current raw winner", () => 
 	}
 });
 
+test("reverse SyncTeX candidate collection deduplicates source locations before radius expansion", () => {
+	const fixture = syntheticParsedReverseFixture(["one", "two", "three"], [
+		{ line: 1, left: 0, bottom: 10, width: 10, height: 10 },
+		{ line: 1, left: 1, bottom: 10, width: 10, height: 10 },
+		{ line: 1, left: 2, bottom: 10, width: 10, height: 10 },
+		{ line: 2, left: 20, bottom: 10, width: 10, height: 10 },
+		{ line: 3, left: 40, bottom: 10, width: 10, height: 10 },
+	]);
+	try {
+		const inspection = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 5, 5, { minCandidates: 3, maxCandidates: 25, minDistance: 1, maxRadius: 100, pageHeight: 40 });
+		assert.ok(inspection);
+		assert.deepEqual(inspection.candidates.map((candidate) => candidate.line), [1, 2, 3]);
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX candidate collection stops expansion at the PDF page height", () => {
+	const fixture = syntheticParsedReverseFixture(["near", "far"], [
+		{ line: 1, left: 0, bottom: 10, width: 10, height: 10 },
+		{ line: 2, left: 100, bottom: 10, width: 10, height: 10 },
+	]);
+	try {
+		const inspection = collectReverseSyncTeXCandidatesFromParsed(fixture.parsed, 1, 5, 5, { minCandidates: 2, maxCandidates: 25, minDistance: 1, maxRadius: 100, pageHeight: 20 });
+		assert.ok(inspection);
+		assert.deepEqual(inspection.candidates.map((candidate) => candidate.line), [1]);
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse SyncTeX public raw inspection matches candidate rawWinner", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	const previousCwd = process.cwd();
@@ -282,9 +313,9 @@ test("robust reverse mapping gives a separate -1000 bonus when the chosen forwar
 			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 0, v: 10, W: 10, H: 10 }] : [{ page: 1, h: 20, v: 10, W: 10, H: 10 }],
 		});
 		assert.equal(location.line, 2);
-		assert.equal(location.diagnostics.selected.score, -990);
+		assert.equal(location.diagnostics.selected.score, 999999020);
 		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.clickContainmentBonus, -1000);
-		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.score, -990);
+		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.score, 999999020);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -314,7 +345,7 @@ test("robust reverse mapping applies click containment bonus when forward box v 
 		assert.equal(location.line, 2);
 		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.containsClick, true);
 		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.clickContainmentBonus, -1000);
-		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.score, -990);
+		assert.equal(location.diagnostics.proposalScores?.find((proposal) => proposal.line === 2)?.score, 999999020);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -347,6 +378,46 @@ test("robust reverse mapping uses every JS candidate as a proposal and lets lowe
 		assert.equal(location.line, 3);
 		assert.deepEqual(location.diagnostics.proposalScores?.map((proposal) => proposal.line), [3, 2]);
 		assert.equal(location.diagnostics.proposalScores?.every((proposal) => proposal.kind !== "text"), true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping scores exact structural boxes alongside normalized span alternatives", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-structural-box-pool-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["\\begin{align}", "  a &= b", "\\end{align}", "nearby candidate"].join("\n"));
+		const lookups: string[] = [];
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 5,
+			y: 5,
+			cwd: dir,
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 3, column: 0, sourceLine: "\\end{align}", rect: { left: 0, top: 0, right: 10, bottom: 10 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: true },
+				rawWinner: { input: sourcePath, line: 3, column: 0, sourceLine: "\\end{align}", rect: { left: 0, top: 0, right: 10, bottom: 10 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: true },
+				candidates: [
+					{ input: sourcePath, line: 3, column: 0, sourceLine: "\\end{align}", rect: { left: 0, top: 0, right: 10, bottom: 10 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: true },
+					{ input: sourcePath, line: 4, column: 0, sourceLine: "nearby candidate", rect: { left: 50, top: 50, right: 60, bottom: 60 }, distanceX: 45, distanceY: 45, distance: 63.6, area: 100, containsClick: false, structural: false },
+				],
+			}),
+			forwardBoxesForLine: ({ line, lookupMode }) => {
+				lookups.push(`${lookupMode}:${line}`);
+				if (line === 3 && lookupMode === "exact") return [{ page: 1, h: 0, v: 10, W: 10, H: 10 }];
+				if (line === 2 && lookupMode === "normalized") return [{ page: 1, h: 100, v: 110, W: 10, H: 10 }];
+				return [{ page: 1, h: 50, v: 60, W: 10, H: 10 }];
+			},
+		});
+		assert.deepEqual(lookups, ["exact:3", "normalized:2", "exact:4"]);
+		assert.equal(location.line, 3);
+		assert.equal(location.forwardLookupLine, 3);
+		assert.equal(location.forwardLookupMode, "exact");
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: sourcePath, startLine: 1, endLine: 3 });
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -420,7 +491,85 @@ test("robust reverse mapping falls back to native when JS candidates yield no vi
 	}
 });
 
-test("robust reverse mapping caps JS candidate proposals before forward syncing", () => {
+test("reverse SyncTeX prefers an exact source line over an equal-score normalized closing span", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-exact-over-normalized-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["\\begin{align}", "f(x)", "\\end{align}"].join("\n"));
+		const close = { input: sourcePath, line: 3, column: 0, sourceLine: "\\end{align}", rect: { left: 0, top: 0, right: 1, bottom: 1 }, distanceX: 0, distanceY: 0, distance: 0, area: 1, containsClick: true, structural: false };
+		const content = { input: sourcePath, line: 2, column: 0, sourceLine: "f(x)", rect: { left: 1, top: 1, right: 2, bottom: 2 }, distanceX: 1, distanceY: 1, distance: 1, area: 1, containsClick: false, structural: false };
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 5,
+			y: 5,
+			cwd: dir,
+			inspectCandidates: () => ({ winner: close, rawWinner: close, candidates: [close, content] }),
+			forwardBoxesForLine: ({ line }) => line === 3 ? [{ page: 1, h: 0, v: 70, W: 50, H: 70 }] : [{ page: 1, h: 0, v: 10, W: 10, H: 10 }],
+		});
+		assert.equal(location.line, 2);
+		assert.equal(location.forwardLookupMode, "exact");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX attaches a literal nested environment span as metadata", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-generic-environment-span-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["\\begin{figure}", "outer", "\\begin{proof}", "inner", "\\end{proof}", "\\end{figure}"].join("\n"));
+		const candidate = { input: sourcePath, line: 5, column: 0, sourceLine: "\\end{proof}", rect: { left: 0, top: 0, right: 10, bottom: 10 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false };
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 5,
+			y: 5,
+			cwd: dir,
+			inspectCandidates: () => ({ winner: candidate, rawWinner: candidate, candidates: [candidate] }),
+			forwardBoxesForLine: () => [{ page: 1, h: 0, v: 10, W: 10, H: 10 }],
+		});
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: sourcePath, startLine: 3, endLine: 5 });
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX uses a visually hyphenated PDF text rectangle without forward-geometry overlap", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-verified-pdf-text-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		const sourceLine = "formula close, while the heading exercises PDF text geometry.";
+		writeFileSync(sourcePath, `${sourceLine}\n`);
+		const candidate = { input: sourcePath, line: 1, column: 0, sourceLine, rect: { left: 90, top: 198, right: 190, bottom: 210 }, distanceX: 0, distanceY: 0, distance: 0, area: 1200, containsClick: true, structural: false };
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 100,
+			y: 204,
+			cwd: dir,
+			pdfTextSpans: [{ page: 1, h: 90, v: 210, W: 100, H: 12, text: "while the heading exercises PDF text geome-" }],
+			inspectCandidates: () => ({ winner: candidate, rawWinner: candidate, candidates: [candidate] }),
+			forwardBoxesForLine: () => [{ page: 1, h: 0, v: 30, W: 10, H: 10 }],
+		});
+		assert.equal(location.precision, "verified");
+		assert.deepEqual(location.selectedForwardRanges, [{ page: 1, h: 90, v: 210, W: 100, H: 12 }]);
+		assert.equal(location.diagnostics.proposalScores?.[0]?.geometryTier, -1);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("robust reverse mapping forwards every retained unique candidate proposal", () => {
 	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-candidate-cap-"));
 	try {
 		const pdfPath = join(dir, "paper.pdf");
@@ -442,9 +591,40 @@ test("robust reverse mapping caps JS candidate proposals before forward syncing"
 				return line === 6 ? [{ page: 1, h: 10, v: 11, W: 1, H: 1 }] : [{ page: 1, h: 100 + line, v: 101 + line, W: 1, H: 1 }];
 			},
 		});
-		assert.deepEqual(forwardLines, [1, 2, 3, 4, 5]);
-		assert.notEqual(location.line, 6);
-		assert.equal(location.diagnostics.proposalScores?.length, 5);
+		assert.deepEqual(forwardLines, [1, 2, 3, 4, 5, 6]);
+		assert.equal(location.line, 6);
+		assert.equal(location.diagnostics.proposalScores?.length, 6);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse candidate proposal deduplication retains a later useful source line", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-duplicate-end-document-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		const lines = Array.from({ length: 71 }, (_, index) => index === 35 ? "f(x), & 0<x<L,\\ t=0,\\\\" : index === 70 ? "\\end{document}" : `line ${index + 1}`);
+		writeFileSync(sourcePath, lines.join("\n"));
+		const structural = { input: sourcePath, line: 71, column: 0, sourceLine: "\\end{document}", rect: { left: 390, top: 145, right: 390, bottom: 145 }, distanceX: 0, distanceY: 0, distance: 0, area: 0, containsClick: true, structural: true, structuralReason: "\\end{document}" };
+		const formula = { input: sourcePath, line: 36, column: 0, sourceLine: lines[35]!, rect: { left: 370, top: 133, right: 602, bottom: 149 }, distanceX: 20, distanceY: 0, distance: 20, area: 3712, containsClick: false, structural: false };
+		const forwardLines: number[] = [];
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 390,
+			y: 145,
+			cwd: dir,
+			inspectCandidates: () => ({ winner: structural, rawWinner: structural, candidates: [structural, structural, structural, structural, structural, formula] }),
+			forwardBoxesForLine: ({ line }) => {
+				forwardLines.push(line);
+				return line === 36 ? [{ page: 1, h: 370, v: 149, W: 232, H: 16 }] : [{ page: 1, h: 50, v: 500, W: 511, H: 219 }];
+			},
+		});
+		assert.deepEqual(forwardLines, [71, 36]);
+		assert.equal(location.line, 36);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -547,8 +727,8 @@ test("robust reverse mapping uses unweighted forward distance", () => {
 		});
 		assert.equal(location.line, 3);
 		assert.deepEqual(location.diagnostics.proposalScores?.map((proposal) => proposal.line), [3, 2]);
-		assert.equal(location.diagnostics.proposalScores?.[0]?.score, 130);
-		assert.equal(location.diagnostics.proposalScores?.[1]?.score, 130);
+		assert.equal(location.diagnostics.proposalScores?.[0]?.score, 1000000116);
+		assert.equal(location.diagnostics.proposalScores?.[1]?.score, 1000000116);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -571,7 +751,7 @@ test("robust reverse mapping uses exact forward geometry scoring formula", () =>
 			jsFallback: () => ({ input: sourcePath, line: 2, column: 0 }),
 			forwardBoxesForLine: () => [{ page: 1, h: 0, v: 8, W: 6, H: 8 }],
 		});
-		assert.equal(location.diagnostics.proposalScores?.[0]?.score, ((7 ** 2 + 6 ** 2) * 1.2) + Math.sqrt(48));
+		assert.equal(location.diagnostics.proposalScores?.[0]?.score, ((7 ** 2 + 6 ** 2) * 0.96) + (Math.sqrt(48) * 2) + 1_000_000_000);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -598,7 +778,7 @@ test("robust reverse mapping applies full text containment bonus without partial
 		});
 		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; clickContainmentBonus?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
 		assert.equal(location.line, 2);
-		assert.equal(textScore?.score, -1490);
+		assert.equal(textScore?.score, 999998520);
 		assert.equal(textScore?.clickContainmentBonus, -1000);
 		assert.equal(textScore?.textContainmentBonus, -500);
 		assert.equal(textScore?.textContainment, "full");
@@ -637,7 +817,7 @@ test("robust reverse mapping caps full text containment scoring to 30 characters
 		});
 		const score = location.diagnostics.proposalScores?.[0] as { score?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
 		assert.equal(location.line, 2);
-		assert.equal(score?.score, -1490);
+		assert.equal(score?.score, 999998520);
 		assert.equal(score?.textContainmentBonus, -500);
 		assert.equal(score?.textContainment, "full");
 	} finally {
@@ -666,7 +846,7 @@ test("robust reverse mapping applies partial 8-character text containment bonus 
 		});
 		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; clickContainmentBonus?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
 		assert.equal(location.line, 2);
-		assert.equal(textScore?.score, -1190);
+		assert.equal(textScore?.score, 999998820);
 		assert.equal(textScore?.clickContainmentBonus, -1000);
 		assert.equal(textScore?.textContainmentBonus, -200);
 		assert.equal(textScore?.textContainment, "partial");
@@ -696,7 +876,7 @@ test("robust reverse mapping grants no partial text containment bonus when fewer
 		});
 		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; clickContainmentBonus?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
 		assert.equal(location.line, 3);
-		assert.equal(textScore?.score, -990);
+		assert.equal(textScore?.score, 999999020);
 		assert.equal(textScore?.clickContainmentBonus, -1000);
 		assert.equal(textScore?.textContainmentBonus, 0);
 		assert.equal(textScore?.textContainment, undefined);
@@ -915,6 +1095,7 @@ test("reverse-forward probe default path uses robust text context for forward Sy
 			mapForward: (input) => {
 				forwardLines.push(input.line);
 				assert.equal(input.line, 3);
+				assert.equal(input.lookupMode, "exact");
 				return { page: 1, x: 90, y: 190, ranges: [{ page: 1, h: 90, v: 190, W: 20, H: 10 }], sourceFile: input.sourceFile, line: input.line, sourceLine: "First paragraph text that should wrap a little and create boxes.", sidecarPath: join(project.dir, "paper.synctex"), branch: "js_fallback", diagnostics: { branch: "js_fallback", lookupInput: { pdfPath: project.pdfPath, sourceFile: input.sourceFile, line: input.line, sidecarPath: join(project.dir, "paper.synctex") }, native: { command: "synctex", args: [], cwd: project.dir, parsedRectangles: [] }, jsFallback: { attempted: true } } };
 			},
 		});
@@ -922,6 +1103,43 @@ test("reverse-forward probe default path uses robust text context for forward Sy
 		assert.equal(probe.reverse.line, 3);
 		assert.equal(probe.reverse.precision, "line");
 		assert.equal(probe.forward.line, 3);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse-forward probe renders the selected normalized box group", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		const probe = mapReverseForwardSynctexProbe({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144,
+			y: 155,
+			cwd: project.dir,
+			inspectReverse: (input) => ({
+				page: input.page,
+				x: input.x,
+				y: input.y,
+				sourceFile: project.sourcePath,
+				line: 3,
+				column: 0,
+				sourceLine: "\\end{align}",
+				sidecarPath: join(project.dir, "paper.synctex"),
+				forwardLookupLine: 2,
+				forwardLookupMode: "normalized" as const,
+				selectedForwardBox: { page: 1, h: 140, v: 150, W: 16, H: 10 },
+				rect: { left: 10, top: 20, right: 30, bottom: 40 },
+				distanceFromCenter: 0,
+			}),
+			mapForward: (input) => {
+				assert.equal(input.line, 2);
+				assert.equal(input.lookupMode, "normalized");
+				return { page: 1, x: 140, y: 150, ranges: [{ page: 1, h: 140, v: 150, W: 16, H: 10 }, { page: 1, h: 0, v: 700, W: 500, H: 300 }], sourceFile: input.sourceFile, line: input.line, sourceLine: "formula body", sidecarPath: join(project.dir, "paper.synctex"), branch: "js_fallback", diagnostics: { branch: "js_fallback", lookupInput: { pdfPath: project.pdfPath, sourceFile: input.sourceFile, line: input.line, sidecarPath: join(project.dir, "paper.synctex") }, native: { command: "synctex", args: [], cwd: project.dir, parsedRectangles: [] }, jsFallback: { attempted: true } } };
+			},
+		});
+		assert.equal(probe.forward.line, 2);
+		assert.deepEqual(probe.forward.ranges, [{ page: 1, h: 140, v: 150, W: 16, H: 10 }]);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -1639,7 +1857,7 @@ test("reverse SyncTeX keeps JS lookup semantics when formula normalization can e
 		assert.equal(location.diagnostics.native.attempted, false);
 		assert.equal(location.line, 20);
 		assert.equal(location.sourceLine, "\\end{align}");
-		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 16, endLine: 20 });
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 16, endLine: 20 });
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -1716,8 +1934,8 @@ test("reverse SyncTeX adapter normalizes \\end{equation} to the enclosing formul
 		assert.equal(location.rawMappedLine, 3);
 		assert.equal(location.rawMappedColumn, 0);
 		assert.equal(location.rawMappedSourceLine, "\\end{equation}");
-		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
-		assert.equal(location.normalizedFormulaExcerpt, "\\begin{equation}\n  a = b + c\n\\end{equation}");
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+		assert.equal(location.normalizedSourceExcerpt, "\\begin{equation}\n  a = b + c\n\\end{equation}");
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -1747,11 +1965,41 @@ test("reverse SyncTeX adapter normalizes align and align* closing lines", () => 
 			});
 
 			assert.equal(location.diagnostics.branch, "js");
-			assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
-			assert.equal(location.normalizedFormulaExcerpt, `\\begin{${environment}}\n  a &= b \\\\\n\\end{${environment}}`);
+			assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+			assert.equal(location.normalizedSourceExcerpt, `\\begin{${environment}}\n  a &= b \\\\\n\\end{${environment}}`);
 		} finally {
 			rmSync(project.dir, { recursive: true, force: true });
 		}
+	}
+});
+
+test("reverse SyncTeX attaches the innermost minipage span to a selected closing line", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\begin{minipage}[t]{0.9\\textwidth}",
+			"outer",
+			"\\begin{minipage}{0.8\\linewidth}",
+			"inner",
+			"\\end{minipage}",
+			"outer after",
+			"\\end{minipage}",
+		].join("\n"));
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: () => { throw new Error("native fallback should not be invoked after JS success"); },
+			jsFallback: () => ({ input: "main.tex", line: 5, column: 0 }),
+		});
+
+		assert.equal(location.line, 5);
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 3, endLine: 5 });
+		assert.equal(location.normalizedSourceExcerpt, "\\begin{minipage}{0.8\\linewidth}\ninner\n\\end{minipage}");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
 	}
 });
 
@@ -1808,8 +2056,8 @@ test("reverse SyncTeX adapter normalizes display math opener to the full formula
 
 		assert.equal(location.line, 1);
 		assert.equal(location.sourceLine, "\\[");
-		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
-		assert.equal(location.normalizedFormulaExcerpt, "\\[\n  x^2 + y^2 = z^2\n\\]");
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+		assert.equal(location.normalizedSourceExcerpt, "\\[\n  x^2 + y^2 = z^2\n\\]");
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -1827,8 +2075,8 @@ test("reverse SyncTeX adapter normalizes \\] to the matching display math opener
 
 		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 155.27, cwd: project.dir, nativeRunner: failNativeRunner });
 
-		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
-		assert.equal(location.normalizedFormulaExcerpt, "\\[\n  x^2 + y^2 = z^2\n\\]");
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+		assert.equal(location.normalizedSourceExcerpt, "\\[\n  x^2 + y^2 = z^2\n\\]");
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -1857,8 +2105,8 @@ test("reverse SyncTeX adapter normalizes a standalone closing brace to its brace
 
 		assert.equal(location.line, 4);
 		assert.equal(location.sourceLine, "}");
-		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
-		assert.equal(location.normalizedFormulaExcerpt, "\\bas{\\label{eq:sample}\n  x + \\} + y\n  \\text{nested braces are balanced}");
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+		assert.equal(location.normalizedSourceExcerpt, "\\bas{\\label{eq:sample}\n  x + \\} + y\n  \\text{nested braces are balanced}");
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -1884,8 +2132,8 @@ test("reverse SyncTeX adapter does not treat escaped closing braces as formula-s
 			jsFallback: () => ({ input: "main.tex", line: 3, column: 0 }),
 		});
 
-		assert.equal(Object.hasOwn(location, "normalizedFormulaSpan"), false);
-		assert.equal(Object.hasOwn(location, "normalizedFormulaExcerpt"), false);
+		assert.equal(Object.hasOwn(location, "normalizedSourceSpan"), false);
+		assert.equal(Object.hasOwn(location, "normalizedSourceExcerpt"), false);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -1907,8 +2155,8 @@ test("reverse SyncTeX adapter matches nested same-environment closes to the near
 		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 167.27, cwd: project.dir, nativeRunner: failNativeRunner });
 
 		assert.equal(location.line, 5);
-		assert.deepEqual(location.normalizedFormulaSpan, { sourceFile: project.sourcePath, startLine: 3, endLine: 5 });
-		assert.equal(location.normalizedFormulaExcerpt, "\\begin{equation}\ninner\n\\end{equation}");
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 3, endLine: 5 });
+		assert.equal(location.normalizedSourceExcerpt, "\\begin{equation}\ninner\n\\end{equation}");
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -1921,8 +2169,8 @@ test("reverse SyncTeX adapter leaves non-formula reverse events unchanged", () =
 
 		assert.equal(location.sourceLine, "First paragraph text that should wrap a little and create boxes.");
 		assert.equal(Object.hasOwn(location, "rawMappedLine"), false);
-		assert.equal(Object.hasOwn(location, "normalizedFormulaSpan"), false);
-		assert.equal(Object.hasOwn(location, "normalizedFormulaExcerpt"), false);
+		assert.equal(Object.hasOwn(location, "normalizedSourceSpan"), false);
+		assert.equal(Object.hasOwn(location, "normalizedSourceExcerpt"), false);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

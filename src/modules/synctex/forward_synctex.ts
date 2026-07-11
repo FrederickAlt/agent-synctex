@@ -4,7 +4,7 @@ import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
 import { inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar, type ReverseSyncTeXCandidate, type ReverseSyncTeXCandidatesInspection } from "./latex_workshop/worker.ts";
 import { lineColumnForSourceIndex } from "./source_index.ts";
 import { readSourceLine } from "./source_line.ts";
-import { boxContainsClick, boxDistanceComponentsFromClick, buildSourceSearchFragments, filterForwardBoxes, findSourceTextMatches, type SourceTextMatchResult } from "./text_repair.ts";
+import { boxContainsClick, boxDistanceComponentsFromClick, buildSourceSearchFragments, filterForwardBoxes, findSourceTextMatches, forwardBoxGeometryTier, type SourceTextMatchResult } from "./text_repair.ts";
 
 export interface ForwardSynctexTarget {
 	page: number;
@@ -17,6 +17,7 @@ export interface ForwardSynctexTarget {
 }
 
 export type ForwardSynctexBranch = "native" | "js_fallback";
+export type ForwardSynctexLookupMode = "exact" | "normalized";
 export type ReverseSynctexBranch = "js" | "native_fallback";
 export type ReverseSynctexPrecision = "verified" | "text" | "line" | "raw";
 
@@ -42,6 +43,11 @@ export interface ForwardSynctexRange {
 	v: number;
 	W: number;
 	H: number;
+}
+
+/** Browser-derived PDF.js text geometry, in the same PDF coordinate system as SyncTeX. */
+export interface PdfTextSpan extends ForwardSynctexRange {
+	text: string;
 }
 
 export interface ForwardSynctexDiagnostics {
@@ -96,7 +102,7 @@ export interface ForwardSynctexPoint {
 export type ForwardSynctexJsFallback = (line: number, sourceFile: string, pdfPath: string) => ForwardSynctexPoint | undefined;
 export type ReverseSynctexJsFallback = (page: number, x: number, y: number, pdfPath: string) => ReverseSynctexMappedResult | undefined;
 export type ReverseSynctexCandidateInspector = (page: number, x: number, y: number, pdfPath: string) => ReverseSyncTeXCandidatesInspection | undefined;
-export type ReverseSynctexForwardBoxesForLine = (input: { sourceFile: string; line: number; pdfPath: string; cwd: string }) => ForwardSynctexRange[];
+export type ReverseSynctexForwardBoxesForLine = (input: { sourceFile: string; line: number; pdfPath: string; cwd: string; lookupMode: ForwardSynctexLookupMode }) => ForwardSynctexRange[];
 
 export interface SelectedTextSourceRange {
 	sourceFile: string;
@@ -113,6 +119,8 @@ export interface MapForwardSynctexInput {
 	sourceFile: string;
 	line: number;
 	cwd: string;
+	/** Normal source jumps use a printable content line; reverse candidates preserve the exact artifact line. */
+	lookupMode?: ForwardSynctexLookupMode;
 	nativeRunner?: NativeSynctexRunner;
 	jsFallback?: ForwardSynctexJsFallback;
 	synctexCommand?: string;
@@ -131,6 +139,8 @@ export interface ReverseForwardSynctexProbeInput {
 	cwd: string;
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
+	pageHeight?: number;
+	pdfTextSpans?: PdfTextSpan[];
 	nativeRunner?: NativeSynctexRunner;
 	forwardJsFallback?: ForwardSynctexJsFallback;
 	synctexCommand?: string;
@@ -138,7 +148,7 @@ export interface ReverseForwardSynctexProbeInput {
 	mapForward?: (input: MapForwardSynctexInput) => ForwardSynctexJump;
 }
 
-export interface ReverseSynctexFormulaSpan {
+export interface ReverseSynctexSourceSpan {
 	sourceFile: string;
 	startLine: number;
 	endLine: number;
@@ -158,8 +168,12 @@ export interface ReverseSynctexLocation {
 	rawMappedLine?: number;
 	rawMappedColumn?: number;
 	rawMappedSourceLine?: string;
-	normalizedFormulaSpan?: ReverseSynctexFormulaSpan;
-	normalizedFormulaExcerpt?: string;
+	normalizedSourceSpan?: ReverseSynctexSourceSpan;
+	normalizedSourceExcerpt?: string;
+	forwardLookupLine?: number;
+	forwardLookupMode?: ForwardSynctexLookupMode;
+	selectedForwardBox?: ForwardSynctexRange;
+	selectedForwardRanges?: ForwardSynctexRange[];
 	diagnostics: ReverseSynctexDiagnostics;
 }
 
@@ -175,10 +189,15 @@ export interface ReverseSynctexHoverInspection {
 	precision?: ReverseSynctexPrecision;
 	rawWinner?: unknown;
 	topCandidates?: unknown[];
+	proposalScores?: ReverseSynctexDiagnostics["proposalScores"];
 	repairedWinner?: { sourceFile: string; line: number; column: number; sourceLine?: string; precision: ReverseSynctexPrecision; score?: number };
 	forwardVerification?: ReverseSynctexDiagnostics["forwardVerification"];
-	normalizedFormulaSpan?: ReverseSynctexFormulaSpan;
-	normalizedFormulaExcerpt?: string;
+	normalizedSourceSpan?: ReverseSynctexSourceSpan;
+	normalizedSourceExcerpt?: string;
+	forwardLookupLine?: number;
+	forwardLookupMode?: ForwardSynctexLookupMode;
+	selectedForwardBox?: ForwardSynctexRange;
+	selectedForwardRanges?: ForwardSynctexRange[];
 	rect: { left: number; top: number; right: number; bottom: number };
 	distanceFromCenter: number;
 }
@@ -221,7 +240,7 @@ export interface ReverseSynctexDiagnostics {
 		line: number;
 		column: number;
 		sourceLine?: string;
-		kind: "initial_candidate" | "context_corrected" | "formula_normalized";
+		kind: "initial_candidate" | "context_corrected" | "source_span";
 	}>;
 	selected: {
 		sourceFile: string;
@@ -311,7 +330,7 @@ function cacheKeyForForwardSynctex(input: MapForwardSynctexInput): string | unde
 	const sidecarSnapshot = fileSnapshotCacheKey(sidecarPath);
 	const sourceSnapshot = fileSnapshotCacheKey(sourceFile);
 	if (sidecarSnapshot === undefined || sourceSnapshot === undefined) return undefined;
-	return [input.synctexCommand ?? "synctex", pdfPath, sidecarSnapshot, sourceFile, sourceSnapshot, input.line].join("\0");
+	return [input.synctexCommand ?? "synctex", pdfPath, sidecarSnapshot, sourceFile, sourceSnapshot, input.lookupMode ?? "normalized", input.line].join("\0");
 }
 
 function cloneForwardSynctexJump(jump: ForwardSynctexJump): ForwardSynctexJump {
@@ -497,6 +516,8 @@ export function mapReverseForwardSynctexProbe(input: ReverseForwardSynctexProbeI
 			cwd: input.cwd,
 			...(input.textBeforeSelection === undefined ? {} : { textBeforeSelection: input.textBeforeSelection }),
 			...(input.textAfterSelection === undefined ? {} : { textAfterSelection: input.textAfterSelection }),
+			...(input.pageHeight === undefined ? {} : { pageHeight: input.pageHeight }),
+			...(input.pdfTextSpans === undefined ? {} : { pdfTextSpans: input.pdfTextSpans }),
 			...(input.nativeRunner === undefined ? {} : { nativeRunner: input.nativeRunner }),
 			...(input.synctexCommand === undefined ? {} : { synctexCommand: input.synctexCommand }),
 		}))
@@ -504,22 +525,25 @@ export function mapReverseForwardSynctexProbe(input: ReverseForwardSynctexProbeI
 	const mappedForward = mapForward({
 		pdfPath: input.pdfPath,
 		sourceFile: reverse.sourceFile,
-		line: reverse.line,
+		line: reverse.forwardLookupLine ?? reverse.line,
 		cwd: input.cwd,
+		lookupMode: reverse.forwardLookupMode ?? "exact",
 		...(input.nativeRunner === undefined ? {} : { nativeRunner: input.nativeRunner }),
 		...(input.forwardJsFallback === undefined ? {} : { jsFallback: input.forwardJsFallback }),
 		...(input.synctexCommand === undefined ? {} : { synctexCommand: input.synctexCommand }),
 	});
-	const filtered = mappedForward.ranges === undefined ? undefined : filterForwardBoxes(mappedForward.ranges, { page: input.page, x: input.x, y: input.y });
-	const chosenBox = filtered?.chosenBox;
-	const forward = filtered === undefined || chosenBox === undefined ? mappedForward : {
+	// A normal reverse mapping already scored selectedForwardBox. Custom
+	// inspectReverse callers have no scorer result, so retain the legacy fallback.
+	const selectedBox = reverse.selectedForwardBox
+		?? (mappedForward.ranges === undefined ? undefined : filterForwardBoxes(mappedForward.ranges, { page: input.page, x: input.x, y: input.y }).chosenBox);
+	const forward = selectedBox === undefined ? mappedForward : {
 		...mappedForward,
-		page: chosenBox.page,
-		x: chosenBox.h,
-		y: chosenBox.v,
-		width: chosenBox.W,
-		height: chosenBox.H,
-		ranges: filtered.boxes,
+		page: selectedBox.page,
+		x: selectedBox.h,
+		y: selectedBox.v,
+		width: selectedBox.W,
+		height: selectedBox.H,
+		ranges: [selectedBox],
 	};
 	return { reverse, forward };
 }
@@ -535,7 +559,7 @@ export function mapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctex
 	}
 
 	const sourceFile = isAbsolute(input.sourceFile) ? resolve(input.sourceFile) : resolve(input.cwd, input.sourceFile);
-	const effectiveLine = forwardSynctexLineForSourceLine(sourceFile, input.line);
+	const effectiveLine = input.lookupMode === "exact" ? input.line : forwardSynctexLineForSourceLine(sourceFile, input.line);
 	const sourceLine = readSourceLine(sourceFile, effectiveLine, input.cwd);
 	if (sourceLine === undefined) {
 		throw new Error(`Cannot read source_file line ${sourceFile}:${effectiveLine}`);
@@ -694,7 +718,20 @@ function compactReverseCandidate(candidate: ReverseSyncTeXCandidate, cwd?: strin
 	};
 }
 
-function forwardBoxesForSourceLine(input: { sourceFile: string; line: number; pdfPath: string; cwd: string; nativeRunner?: NativeSynctexRunner; forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine; synctexCommand?: string }): ForwardSynctexRange[] {
+const SYNCTEX_LAYOUT_SEMANTIC_PENALTY = 500;
+const FORWARD_DISTANCE_PENALTY_MULTIPLIER = 0.96;
+const FORWARD_BOX_SIZE_PENALTY_MULTIPLIER = 2;
+
+interface ForwardBoxGroup {
+	lookupMode: ForwardSynctexLookupMode;
+	lookupLine: number;
+	boxes: ForwardSynctexRange[];
+	/** DOM text rectangles describe visual layout; SyncTeX rectangles preserve source semantics. */
+	semanticPenalty: number;
+	verifiedText?: boolean;
+}
+
+function forwardBoxesForLookup(input: { sourceFile: string; line: number; pdfPath: string; cwd: string; lookupMode: ForwardSynctexLookupMode; nativeRunner?: NativeSynctexRunner; forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine; synctexCommand?: string }): ForwardSynctexRange[] {
 	if (input.forwardBoxesForLine !== undefined) return input.forwardBoxesForLine(input);
 	try {
 		const forward = cachedMapForwardSynctex({
@@ -702,6 +739,7 @@ function forwardBoxesForSourceLine(input: { sourceFile: string; line: number; pd
 			sourceFile: input.sourceFile,
 			line: input.line,
 			cwd: input.cwd,
+			lookupMode: input.lookupMode,
 			...(input.nativeRunner === undefined ? {} : { nativeRunner: input.nativeRunner }),
 			...(input.synctexCommand === undefined ? {} : { synctexCommand: input.synctexCommand }),
 		});
@@ -713,9 +751,81 @@ function forwardBoxesForSourceLine(input: { sourceFile: string; line: number; pd
 	}
 }
 
-const MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS = 5;
+function forwardRangeKey(range: ForwardSynctexRange): string {
+	return [range.page, range.h, range.v, range.W, range.H].join(":");
+}
+
+function normalizedVisibleText(value: string): string {
+	return value.replace(/[\u00a0\s]+/g, " ").replace(/[−–—]/g, "-").trim();
+}
+
+/** Only project source lines whose visible text can be established without TeX expansion. */
+function simpleVisibleSourceText(sourceLine: string | undefined): string | undefined {
+	if (sourceLine === undefined) return undefined;
+	let visible = sourceLine.replace(/\\(?:textbf|textit|emph|mathrm|mathbf|text)\{([^{}]*)\}/g, "$1");
+	visible = visible.replace(/\\\\(?:\[[^\]]*\])?/g, " ").replace(/&/g, " ");
+	visible = visible.replace(/\\(?:quad|qquad|enspace|,|;|!|:| )/g, " ");
+	if (/\\[A-Za-z@]+|[{}]/.test(visible)) return undefined;
+	const normalized = normalizedVisibleText(visible);
+	return normalized.length >= 3 ? normalized : undefined;
+}
+
+function uniquelyOccursInSource(sourceText: string, text: string): boolean {
+	const first = sourceText.indexOf(text);
+	return first >= 0 && sourceText.indexOf(text, first + 1) < 0;
+}
+
+/** A PDF.js visual line can end in a discretionary hyphen absent from the TeX source. */
+function isUniqueVisibleSpanInSource(sourceText: string, spanText: string): boolean {
+	if (uniquelyOccursInSource(sourceText, spanText)) return true;
+	if (!spanText.endsWith("-")) return false;
+	const dehyphenated = spanText.slice(0, -1);
+	const first = sourceText.indexOf(dehyphenated);
+	if (first < 0 || sourceText.indexOf(dehyphenated, first + 1) >= 0) return false;
+	return /[A-Za-z0-9]/.test(sourceText[first + dehyphenated.length] ?? "");
+}
+
+function verifiedPdfTextBoxes(input: { sourceLine: string | undefined; click: { page: number; x: number; y: number }; spans: PdfTextSpan[] | undefined }): ForwardSynctexRange[] {
+	const sourceText = simpleVisibleSourceText(input.sourceLine);
+	if (sourceText === undefined || input.spans === undefined) return [];
+	const matches = input.spans.filter((span) => {
+		const text = normalizedVisibleText(span.text);
+		return text.length >= 3 && boxContainsClick(span, input.click) && isUniqueVisibleSpanInSource(sourceText, text);
+	});
+	return matches.length === 1 ? matches.map(({ text: _text, ...box }) => box) : [];
+}
+
+function forwardBoxGroupsForSourceLine(input: { sourceFile: string; line: number; pdfPath: string; cwd: string; click?: { page: number; x: number; y: number }; pdfTextSpans?: PdfTextSpan[]; nativeRunner?: NativeSynctexRunner; forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine; synctexCommand?: string }): ForwardBoxGroup[] {
+	const sourceLines = readSourceLines(input.sourceFile);
+	const sourceSpan = sourceSpanForLine(input.sourceFile, input.line, sourceLines);
+	const lookups: Array<{ line: number; lookupMode: ForwardSynctexLookupMode }> = [{ line: input.line, lookupMode: "exact" }];
+	if (sourceSpan?.contentLine !== undefined && sourceSpan.contentLine !== input.line) {
+		lookups.push({ line: sourceSpan.contentLine, lookupMode: "normalized" });
+	}
+	const seen = new Set<string>();
+	const groups: ForwardBoxGroup[] = lookups.map((lookup) => ({
+		lookupMode: lookup.lookupMode,
+		lookupLine: lookup.line,
+		semanticPenalty: 0,
+		boxes: forwardBoxesForLookup({ ...input, line: lookup.line, lookupMode: lookup.lookupMode }).filter((box) => {
+			const key = forwardRangeKey(box);
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		}),
+	})).filter((group) => group.boxes.length > 0);
+	const textBoxes = input.click === undefined ? [] : verifiedPdfTextBoxes({
+		sourceLine: sourceLines?.[input.line - 1],
+		click: input.click,
+		spans: input.pdfTextSpans,
+	});
+	if (textBoxes.length > 0) groups.push({ lookupMode: "exact", lookupLine: input.line, boxes: textBoxes, semanticPenalty: SYNCTEX_LAYOUT_SEMANTIC_PENALTY, verifiedText: true });
+	return groups;
+}
+
+const MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS = 25;
 const FULL_TEXT_CONTAINMENT_CONTEXT_CHARS = 30;
-const END_DOCUMENT_GEOMETRY_TIER = 2;
+const END_DOCUMENT_GEOMETRY_TIER = 1;
 
 interface ReverseSynctexProposal {
 	kind: "text" | "ranked";
@@ -732,6 +842,8 @@ interface ScoredReverseSynctexProposal extends ReverseSynctexProposal {
 	precision: ReverseSynctexPrecision;
 	geometryTier: number;
 	score: number;
+	forwardLookupLine?: number;
+	forwardLookupMode?: ForwardSynctexLookupMode;
 	boxes: ForwardSynctexRange[];
 	chosenBox?: ForwardSynctexRange;
 	containsClick: boolean;
@@ -773,58 +885,88 @@ function textContainmentBonus(input: { proposal: ReverseSynctexProposal; contain
 	return { bonus: 0 };
 }
 
-function proposalPrecision(proposal: ReverseSynctexProposal, containsClick: boolean): ReverseSynctexPrecision {
-	if (proposal.kind === "text") return containsClick ? "verified" : "text";
+function proposalPrecision(proposal: ReverseSynctexProposal, containsClick: boolean, verifiedTextGeometry = false): ReverseSynctexPrecision {
+	if (verifiedTextGeometry || proposal.kind === "text") return containsClick ? "verified" : "text";
 	return "line";
+}
+
+interface ScoredForwardBoxGroup {
+	group: ForwardBoxGroup;
+	boxes: ForwardSynctexRange[];
+	chosenBox?: ForwardSynctexRange;
+	containsClick: boolean;
+	samePageBoxCount: number;
+	clickContainmentBonus: number;
+	textContainmentBonus: number;
+	textContainment?: "full" | "partial";
+	distance?: number;
+	score: number;
+	geometryTier: number;
 }
 
 function scoreReverseSynctexProposal(input: {
 	proposal: ReverseSynctexProposal;
 	click: { page: number; x: number; y: number };
-	boxes: ForwardSynctexRange[];
+	boxGroups: ForwardBoxGroup[];
 	fullTextFragment?: string;
 	partialTextFragment?: string;
 }): ScoredReverseSynctexProposal {
-	const filtered = filterForwardBoxes(input.boxes, input.click);
-	const samePageBoxes = filtered.boxes.filter((box) => box.page === input.click.page);
-	const scoredSamePageBoxes = samePageBoxes.map((box) => {
-		const { distance, distanceSquared } = boxDistanceComponentsFromClick(box, input.click);
-		const area = Math.max(0, box.W) * Math.max(0, box.H);
-		const containsClick = boxContainsClick(box, input.click);
-		const containment = textContainmentBonus({ proposal: input.proposal, containsClick, fullTextFragment: input.fullTextFragment, partialTextFragment: input.partialTextFragment });
-		const clickContainmentBonus = containsClick ? -1000 : 0;
-		return { box, distance, clickContainmentBonus, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (distanceSquared * 1.2) + Math.sqrt(area) + clickContainmentBonus + containment.bonus };
-	}).sort((left, right) => left.score - right.score);
-	const chosen = scoredSamePageBoxes[0];
-	const chosenSamePageBox = chosen?.box;
-	const containsClick = chosenSamePageBox === undefined ? false : boxContainsClick(chosenSamePageBox, input.click);
-	const distance = chosen?.distance;
-	const baseGeometryTier = chosenSamePageBox === undefined ? 1 : 0;
-	const geometryTier = input.proposal.sourceLine?.trim() === "\\end{document}" ? END_DOCUMENT_GEOMETRY_TIER : baseGeometryTier;
-	const score = chosen?.score ?? 0;
-	const chosenClickContainmentBonus = chosen?.clickContainmentBonus ?? 0;
-	const chosenTextContainmentBonus = chosen?.textContainmentBonus ?? 0;
-	const chosenTextContainment = chosen?.textContainment;
+	const scoredGroups = input.boxGroups.map((group): ScoredForwardBoxGroup => {
+		const filtered = filterForwardBoxes(group.boxes, input.click);
+		const samePageBoxes = filtered.boxes.filter((box) => box.page === input.click.page);
+		const scoredSamePageBoxes = samePageBoxes.map((box) => {
+			const { distance, distanceSquared } = boxDistanceComponentsFromClick(box, input.click);
+			const area = Math.max(0, box.W) * Math.max(0, box.H);
+			const containsClick = boxContainsClick(box, input.click);
+			const containment = textContainmentBonus({ proposal: input.proposal, containsClick, fullTextFragment: input.fullTextFragment, partialTextFragment: input.partialTextFragment });
+			const clickContainmentBonus = containsClick ? -1000 : 0;
+			return { box, distance, clickContainmentBonus, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (distanceSquared * FORWARD_DISTANCE_PENALTY_MULTIPLIER) + (Math.sqrt(area) * FORWARD_BOX_SIZE_PENALTY_MULTIPLIER) + clickContainmentBonus + containment.bonus + group.semanticPenalty };
+		}).sort((left, right) => left.score - right.score);
+		const chosen = scoredSamePageBoxes[0];
+		return {
+			group,
+			boxes: filtered.boxes,
+			...(chosen?.box === undefined ? {} : { chosenBox: chosen.box }),
+			containsClick: chosen?.box === undefined ? false : boxContainsClick(chosen.box, input.click),
+			samePageBoxCount: samePageBoxes.length,
+			clickContainmentBonus: chosen?.clickContainmentBonus ?? 0,
+			textContainmentBonus: chosen?.textContainmentBonus ?? 0,
+			...(chosen?.textContainment === undefined ? {} : { textContainment: chosen.textContainment }),
+			...(chosen?.distance === undefined ? {} : { distance: chosen.distance }),
+			score: chosen?.score ?? 0,
+			geometryTier: chosen?.box === undefined ? 1 : forwardBoxGeometryTier(chosen.box),
+		};
+	}).sort((left, right) => left.geometryTier - right.geometryTier
+		|| left.score - right.score
+		|| (left.group.lookupMode === "exact" ? -1 : 0) - (right.group.lookupMode === "exact" ? -1 : 0));
+	const selectedGroup = scoredGroups[0];
+	const geometryTier = input.proposal.sourceLine?.trim() === "\\end{document}"
+			? END_DOCUMENT_GEOMETRY_TIER
+			: selectedGroup?.geometryTier ?? 1;
+	const chosenBox = selectedGroup?.chosenBox;
+	const containsClick = selectedGroup?.containsClick ?? false;
 	return {
 		...input.proposal,
-		precision: proposalPrecision(input.proposal, containsClick),
+		precision: proposalPrecision(input.proposal, containsClick, selectedGroup?.group.verifiedText === true),
 		geometryTier,
-		score,
-		boxes: filtered.boxes,
-		...(chosenSamePageBox === undefined ? {} : { chosenBox: chosenSamePageBox }),
+		score: selectedGroup?.score ?? 0,
+		...(selectedGroup === undefined ? {} : { forwardLookupLine: selectedGroup.group.lookupLine, forwardLookupMode: selectedGroup.group.lookupMode }),
+		boxes: selectedGroup?.boxes ?? [],
+		...(chosenBox === undefined ? {} : { chosenBox }),
 		containsClick,
-		samePageBoxCount: samePageBoxes.length,
-		clickContainmentBonus: chosenClickContainmentBonus,
-		textContainmentBonus: chosenTextContainmentBonus,
-		...(chosenTextContainment === undefined ? {} : { textContainment: chosenTextContainment }),
-		...(distance === undefined ? {} : { distance }),
-		...(chosenSamePageBox === undefined ? { reason: "no-same-page-forward-box" } : containsClick ? { reason: "contains-click" } : { reason: "nearest-same-page-forward-box" }),
+		samePageBoxCount: selectedGroup?.samePageBoxCount ?? 0,
+		clickContainmentBonus: selectedGroup?.clickContainmentBonus ?? 0,
+		textContainmentBonus: selectedGroup?.textContainmentBonus ?? 0,
+		...(selectedGroup?.textContainment === undefined ? {} : { textContainment: selectedGroup.textContainment }),
+		...(selectedGroup?.distance === undefined ? {} : { distance: selectedGroup.distance }),
+		...(chosenBox === undefined ? { reason: "no-same-page-forward-box" } : containsClick ? { reason: "contains-click" } : { reason: "nearest-same-page-forward-box" }),
 	};
 }
 
 function compareScoredReverseSynctexProposals(left: ScoredReverseSynctexProposal, right: ScoredReverseSynctexProposal): number {
 	return left.geometryTier - right.geometryTier
 		|| left.score - right.score
+		|| (left.forwardLookupMode === "exact" ? -1 : 0) - (right.forwardLookupMode === "exact" ? -1 : 0)
 		|| left.samePageBoxCount - right.samePageBoxCount
 		|| left.rank - right.rank
 		|| left.line - right.line
@@ -887,45 +1029,43 @@ export function findUniqueSelectedTextSourceRange(sourceFile: string, selectedTe
 	};
 }
 
-const FORMULA_ENVIRONMENTS = new Set([
-	"equation",
-	"equation*",
-	"align",
-	"align*",
-	"aligned",
-	"aligned*",
-	"alignedat",
-	"alignedat*",
-	"gather",
-	"gather*",
-	"multline",
-	"multline*",
-	"flalign",
-	"flalign*",
-	"split",
+const NORMALIZABLE_SPAN_ENVIRONMENTS = new Set([
+	"equation", "equation*", "align", "align*", "aligned", "aligned*", "alignedat", "alignedat*", "gather", "gather*", "multline", "multline*", "flalign", "flalign*", "split", "minipage",
 ]);
 
-function formulaEnvironmentClose(line: string): string | undefined {
-	const match = line.trim().match(/^\\end\{([^}]+)\}\s*$/);
-	if (match?.[1] === undefined || !FORMULA_ENVIRONMENTS.has(match[1])) return undefined;
-	return match[1];
-}
-
-function formulaEnvironmentToken(line: string, environment: string): "begin" | "end" | undefined {
+function spanEnvironmentToken(line: string, environment: string): "begin" | "end" | undefined {
 	const escaped = environment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const match = line.trim().match(new RegExp(`^\\\\(begin|end)\\{${escaped}\\}\\s*$`));
-	return match?.[1] === "begin" || match?.[1] === "end" ? match[1] : undefined;
+	const trimmed = line.trim();
+	if (new RegExp(`^\\\\end\\{${escaped}\\}\\s*(?:%.*)?$`).test(trimmed)) return "end";
+	return new RegExp(`^\\\\begin\\{${escaped}\\}(?=\\s|\\[|\\{|%|$)`).test(trimmed) ? "begin" : undefined;
 }
 
-function findFormulaEnvironmentSpan(lines: string[], closeLineIndex: number, environment: string): { startLine: number; endLine: number; excerpt: string } | undefined {
+/**
+ * Conservative lexical begin/end recognition for span metadata. This deliberately
+ * does not attempt TeX macro expansion; it only pairs literal environment tokens.
+ */
+function spanEnvironmentAt(line: string): { environment: string; token: "begin" | "end" } | undefined {
+	const trimmed = line.trim();
+	const match = trimmed.match(/^\\(begin|end)\{([^{}\\]+)\}/);
+	if (match === null) return undefined;
+	const token = match[1] === "begin" || match[1] === "end" ? match[1] : undefined;
+	const environment = match[2];
+	if (token === undefined || environment === undefined || spanEnvironmentToken(line, environment) !== token) return undefined;
+	return { environment, token };
+}
+
+function findEnvironmentSpan(lines: string[], lineIndex: number, environment: string, token: "begin" | "end"): { startLine: number; endLine: number; excerpt: string } | undefined {
 	let depth = 0;
-	for (let index = closeLineIndex; index >= 0; index -= 1) {
-		const token = formulaEnvironmentToken(lines[index] ?? "", environment);
-		if (token === "end") depth += 1;
-		else if (token === "begin") {
+	const step = token === "end" ? -1 : 1;
+	for (let index = lineIndex; index >= 0 && index < lines.length; index += step) {
+		const currentToken = spanEnvironmentToken(lines[index] ?? "", environment);
+		if (currentToken === token) depth += 1;
+		else if (currentToken !== undefined) {
 			depth -= 1;
 			if (depth === 0) {
-				return { startLine: index + 1, endLine: closeLineIndex + 1, excerpt: lines.slice(index, closeLineIndex + 1).join("\n") };
+				const startIndex = Math.min(index, lineIndex);
+				const endIndex = Math.max(index, lineIndex);
+				return { startLine: startIndex + 1, endLine: endIndex + 1, excerpt: lines.slice(startIndex, endIndex + 1).join("\n") };
 			}
 		}
 	}
@@ -999,38 +1139,38 @@ function findBracedMacroSpanFromClose(lines: string[], closeLineIndex: number): 
 	return undefined;
 }
 
-function firstFormulaContentLine(span: { startLine: number; endLine: number }, sourceLines: string[]): number | undefined {
+function firstSpanContentLine(span: { startLine: number; endLine: number }, sourceLines: string[]): number | undefined {
 	for (let line = span.startLine + 1; line <= span.endLine; line += 1) {
 		const trimmed = (sourceLines[line - 1] ?? "").trim();
 		if (!trimmed) continue;
-		if (line === span.endLine && (trimmed === "\\]" || formulaEnvironmentClose(trimmed) !== undefined)) continue;
+		if (line === span.endLine && (trimmed === "\\]" || trimmed === "}" || spanEnvironmentAt(trimmed)?.token === "end")) continue;
 		return line;
 	}
 	return undefined;
 }
 
-function normalizeFormulaSpan(sourceFile: string, line: number, sourceLines: string[] | undefined): { span: ReverseSynctexFormulaSpan; excerpt: string; contentLine?: number } | undefined {
+function sourceSpanForLine(sourceFile: string, line: number, sourceLines: string[] | undefined): { span: ReverseSynctexSourceSpan; excerpt: string; contentLine?: number } | undefined {
 	if (sourceLines === undefined) return undefined;
 	const lineIndex = line - 1;
 	const sourceLine = sourceLines[lineIndex];
 	if (sourceLine === undefined) return undefined;
 	const trimmed = sourceLine.trim();
+	const environment = spanEnvironmentAt(sourceLine);
 	let span: { startLine: number; endLine: number; excerpt: string } | undefined;
 	if (trimmed === "\\]") span = findDisplayMathSpanFromClose(sourceLines, lineIndex);
 	else if (trimmed === "\\[") span = findDisplayMathSpanFromOpen(sourceLines, lineIndex);
 	else if (trimmed === "}") span = findBracedMacroSpanFromClose(sourceLines, lineIndex);
-	else {
-		const environment = formulaEnvironmentClose(sourceLine);
-		span = environment === undefined ? undefined : findFormulaEnvironmentSpan(sourceLines, lineIndex, environment);
-	}
+	else span = environment === undefined ? undefined : findEnvironmentSpan(sourceLines, lineIndex, environment.environment, environment.token);
 	if (span === undefined) return undefined;
-	return { span: { sourceFile, startLine: span.startLine, endLine: span.endLine }, excerpt: span.excerpt, ...(firstFormulaContentLine(span, sourceLines) === undefined ? {} : { contentLine: firstFormulaContentLine(span, sourceLines) }) };
+	const normalizable = trimmed === "\\]" || trimmed === "\\[" || trimmed === "}" || (environment !== undefined && NORMALIZABLE_SPAN_ENVIRONMENTS.has(environment.environment));
+	const contentLine = normalizable ? firstSpanContentLine(span, sourceLines) : undefined;
+	return { span: { sourceFile, startLine: span.startLine, endLine: span.endLine }, excerpt: span.excerpt, ...(contentLine === undefined ? {} : { contentLine }) };
 }
 
 function forwardSynctexLineForSourceLine(sourceFile: string, line: number): number {
 	const sourceLines = readSourceLines(sourceFile);
-	const normalizedFormula = normalizeFormulaSpan(sourceFile, line, sourceLines);
-	return normalizedFormula?.contentLine ?? line;
+	const sourceSpan = sourceSpanForLine(sourceFile, line, sourceLines);
+	return sourceSpan?.contentLine ?? line;
 }
 
 function parseNativeReverseResult(stdout: string): ReverseSynctexMappedResult | undefined {
@@ -1115,10 +1255,15 @@ function reverseLocationToHoverInspection(location: ReverseSynctexLocation): Rev
 		precision: location.precision,
 		...(location.diagnostics.rawWinner === undefined ? {} : { rawWinner: location.diagnostics.rawWinner }),
 		...(location.diagnostics.topCandidates === undefined ? {} : { topCandidates: location.diagnostics.topCandidates }),
+		...(location.diagnostics.proposalScores === undefined ? {} : { proposalScores: location.diagnostics.proposalScores }),
 		repairedWinner: { sourceFile: location.sourceFile, line: location.line, column: location.column, ...(location.sourceLine === undefined ? {} : { sourceLine: location.sourceLine }), precision: location.precision, ...(location.diagnostics.selected.score === undefined ? {} : { score: location.diagnostics.selected.score }) },
 		...(location.diagnostics.forwardVerification === undefined ? {} : { forwardVerification: location.diagnostics.forwardVerification }),
-		...(location.normalizedFormulaSpan === undefined ? {} : { normalizedFormulaSpan: location.normalizedFormulaSpan }),
-		...(location.normalizedFormulaExcerpt === undefined ? {} : { normalizedFormulaExcerpt: location.normalizedFormulaExcerpt }),
+		...(location.normalizedSourceSpan === undefined ? {} : { normalizedSourceSpan: location.normalizedSourceSpan }),
+		...(location.normalizedSourceExcerpt === undefined ? {} : { normalizedSourceExcerpt: location.normalizedSourceExcerpt }),
+		...(location.forwardLookupLine === undefined ? {} : { forwardLookupLine: location.forwardLookupLine }),
+		...(location.forwardLookupMode === undefined ? {} : { forwardLookupMode: location.forwardLookupMode }),
+		...(location.selectedForwardBox === undefined ? {} : { selectedForwardBox: location.selectedForwardBox }),
+		...(location.selectedForwardRanges === undefined ? {} : { selectedForwardRanges: location.selectedForwardRanges }),
 		rect: rectFromDiagnostics(location.diagnostics),
 		distanceFromCenter: 0,
 	};
@@ -1132,6 +1277,8 @@ export function inspectReverseSynctexHover(input: {
 	cwd: string;
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
+	pageHeight?: number;
+	pdfTextSpans?: PdfTextSpan[];
 	nativeRunner?: NativeSynctexRunner;
 	inspectCandidates?: ReverseSynctexCandidateInspector;
 	forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine;
@@ -1148,6 +1295,8 @@ export function mapReverseSynctex(input: {
 	cwd: string;
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
+	pageHeight?: number;
+	pdfTextSpans?: PdfTextSpan[];
 	nativeRunner?: NativeSynctexRunner;
 	jsFallback?: ReverseSynctexJsFallback;
 	inspectCandidates?: ReverseSynctexCandidateInspector;
@@ -1177,7 +1326,9 @@ export function mapReverseSynctex(input: {
 		if (input.jsFallback !== undefined && input.inspectCandidates === undefined) {
 			jsResult = input.jsFallback(input.page, input.x, input.y, pdfPath);
 		} else {
-			candidateInspection = (input.inspectCandidates ?? inspectSyncTeXToTeXCandidates)(input.page, input.x, input.y, pdfPath);
+			candidateInspection = input.inspectCandidates === undefined
+				? inspectSyncTeXToTeXCandidates(input.page, input.x, input.y, pdfPath, ...(input.pageHeight === undefined ? [] : [{ pageHeight: input.pageHeight }]))
+				: input.inspectCandidates(input.page, input.x, input.y, pdfPath);
 			jsResult = candidateInspection?.candidates[0] === undefined ? input.jsFallback?.(input.page, input.x, input.y, pdfPath) : candidateToMapped(candidateInspection.candidates[0]);
 		}
 		if (jsResult === undefined) {
@@ -1266,6 +1417,9 @@ export function mapReverseSynctex(input: {
 	let textRepairChangedLocation = false;
 	let proposalScores: ReverseSynctexDiagnostics["proposalScores"] | undefined;
 	let selectedScore: number | undefined;
+	let forwardLookup: { line: number; mode: ForwardSynctexLookupMode } | undefined;
+	let selectedForwardBox: ForwardSynctexRange | undefined;
+	let selectedForwardRanges: ForwardSynctexRange[] | undefined;
 
 	if (branch === "js") {
 		const proposals: ReverseSynctexProposal[] = [];
@@ -1279,8 +1433,9 @@ export function mapReverseSynctex(input: {
 		};
 		let proposalRank = 0;
 		if (candidateInspection !== undefined) {
-			for (const candidate of candidateInspection.candidates.slice(0, MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS)) {
+			for (const candidate of candidateInspection.candidates) {
 				const candidateSourceFile = resolveReverseMappedSourceFile(candidateToMapped(candidate), input.cwd);
+				if (proposals.some((proposal) => proposal.sourceFile === candidateSourceFile && proposal.line === candidate.line)) continue;
 				addProposal({
 					kind: "ranked",
 					rank: proposalRank++,
@@ -1290,6 +1445,7 @@ export function mapReverseSynctex(input: {
 					...(candidate.sourceLine === undefined ? {} : { sourceLine: candidate.sourceLine }),
 					structural: candidate.structural || isStructuralReverseSourceLine(candidate.sourceLine),
 				});
+				if (proposals.length >= MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS) break;
 			}
 		}
 		if (proposals.length === 0) {
@@ -1342,11 +1498,13 @@ export function mapReverseSynctex(input: {
 				click,
 				...(fullTextFragment === undefined ? {} : { fullTextFragment }),
 				...(partialTextFragment === undefined ? {} : { partialTextFragment }),
-				boxes: forwardBoxesForSourceLine({
+				boxGroups: forwardBoxGroupsForSourceLine({
 					sourceFile: proposal.sourceFile,
 					line: proposal.line,
 					pdfPath,
 					cwd: input.cwd,
+					click,
+					...(input.pdfTextSpans === undefined ? {} : { pdfTextSpans: input.pdfTextSpans }),
 					...(input.nativeRunner === undefined ? {} : { nativeRunner: input.nativeRunner }),
 					...(input.forwardBoxesForLine === undefined ? {} : { forwardBoxesForLine: input.forwardBoxesForLine }),
 					...(input.synctexCommand === undefined ? {} : { synctexCommand: input.synctexCommand }),
@@ -1360,6 +1518,11 @@ export function mapReverseSynctex(input: {
 				column = selectedProposal.column;
 				precision = selectedProposal.precision;
 				selectedScore = selectedProposal.score;
+				selectedForwardBox = selectedProposal.chosenBox;
+				selectedForwardRanges = selectedProposal.boxes;
+				if (selectedProposal.forwardLookupLine !== undefined && selectedProposal.forwardLookupMode !== undefined) {
+					forwardLookup = { line: selectedProposal.forwardLookupLine, mode: selectedProposal.forwardLookupMode };
+				}
 				selectedProposalKind = selectedProposal.kind;
 				textRepairChangedLocation = selectedProposal.kind === "text" && !sameSourceLocation(selectedProposal, { sourceFile: rawSourceFile, line: rawMappedLine });
 				if (selectedProposal.kind === "text" && textRepair !== undefined) {
@@ -1413,7 +1576,7 @@ export function mapReverseSynctex(input: {
 		}
 	}
 	const sourceLine = readSourceLine(sourceFile, line, input.cwd);
-	const normalizedFormula = normalizeFormulaSpan(rawSourceFile, rawMappedLine, readSourceLines(rawSourceFile));
+	const normalizedSource = sourceSpanForLine(sourceFile, line, sourceLines);
 	const candidates: ReverseSynctexDiagnostics["candidates"] = [{
 		sourceFile: rawSourceFile,
 		line: rawMappedLine,
@@ -1430,13 +1593,13 @@ export function mapReverseSynctex(input: {
 			kind: "context_corrected",
 		});
 	}
-	if (normalizedFormula !== undefined) {
+	if (normalizedSource !== undefined) {
 		candidates.push({
-			sourceFile: normalizedFormula.span.sourceFile,
-			line: normalizedFormula.span.startLine,
+			sourceFile: normalizedSource.span.sourceFile,
+			line: normalizedSource.span.startLine,
 			column: 0,
-			sourceLine: normalizedFormula.excerpt,
-			kind: "formula_normalized",
+			sourceLine: normalizedSource.excerpt,
+			kind: "source_span",
 		});
 	}
 	const diagnostics: ReverseSynctexDiagnostics = {
@@ -1473,16 +1636,19 @@ export function mapReverseSynctex(input: {
 		...(sourceLine === undefined ? {} : { sourceLine }),
 		sidecarPath,
 		precision,
-		...(line === rawMappedLine && column === rawMappedColumn && sourceFile === rawSourceFile && normalizedFormula === undefined ? {} : {
+		...(line === rawMappedLine && column === rawMappedColumn && sourceFile === rawSourceFile && normalizedSource === undefined ? {} : {
 			rawMappedSourceFile: rawSourceFile,
 			rawMappedLine,
 			rawMappedColumn,
 			...(rawMappedSourceLine === undefined ? {} : { rawMappedSourceLine }),
 		}),
-		...(normalizedFormula === undefined ? {} : {
-			normalizedFormulaSpan: normalizedFormula.span,
-			normalizedFormulaExcerpt: normalizedFormula.excerpt,
+		...(normalizedSource === undefined ? {} : {
+			normalizedSourceSpan: normalizedSource.span,
+			normalizedSourceExcerpt: normalizedSource.excerpt,
 		}),
+		...(forwardLookup === undefined ? {} : { forwardLookupLine: forwardLookup.line, forwardLookupMode: forwardLookup.mode }),
+		...(selectedForwardBox === undefined ? {} : { selectedForwardBox }),
+		...(selectedForwardRanges === undefined ? {} : { selectedForwardRanges }),
 		diagnostics,
 	};
 }

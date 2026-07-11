@@ -30,6 +30,7 @@ test("fetch_pdf_context formats PDF annotation comments as concise source-cited 
 			source_file: "/tmp/paper/main.tex",
 			line: 42,
 			source_line: "E = mc^2",
+			pdf_mark: "E = mc²",
 			page: 3,
 			x: 110,
 			y: 220,
@@ -49,9 +50,21 @@ test("fetch_pdf_context formats PDF annotation comments as concise source-cited 
 	assert.ok(response && "result" in response);
 	const result = response.result as { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> };
 	const text = result.content?.[0]?.text ?? "";
-	assert.equal(text, "## PDF marks from the User\n\n- `/tmp/paper/main.tex:42` — `E = mc^2`\n  User comment: Please justify this step.");
+	assert.equal(text, "## PDF marks from the User\n\n- /tmp/paper/main.tex:42\n  PDF mark: `E = mc²`\n  User comment: Please justify this step.");
 	assert.deepEqual(result.details, { pdf_ids: [34942382], event_count: 1, cleared: true });
 	assert.doesNotMatch(text, /selection_debug|page=3/);
+});
+
+test("PDF mark context concatenates separate boxes mapped to one source line", () => {
+	const events: PdfEvent[] = [
+		{ type: "pdf_annotation", sequence: 1, pdf_id: 1, annotation_id: "left", timestamp: "2026-07-11T00:00:00.000Z", source_file: "/tmp/paper/main.tex", line: 42, source_line: "The first visible box.", pdf_mark: "First PDF box.", page: 1, x: 10, y: 20 },
+		{ type: "pdf_annotation", sequence: 2, pdf_id: 1, annotation_id: "right", timestamp: "2026-07-11T00:00:01.000Z", source_file: "/tmp/paper/main.tex", line: 42, source_line: "The second visible box.", pdf_mark: "Second PDF box.", page: 1, x: 90, y: 20 },
+	];
+
+	const result = collectPostUserPdfContextFromEvents(events, { pdfId: 1, clearViewer: true });
+
+	assert.equal(result.eventCount, 2);
+	assert.equal(result.text, "## PDF marks from the User\n\n- /tmp/paper/main.tex:42\n  PDF mark: `First PDF box.; Second PDF box.`");
 });
 
 test("PDF mark context preserves long user comments without truncation or omission", () => {
@@ -95,7 +108,7 @@ test("PDF mark context keeps absolute source paths outside cwd", () => {
 		y: 1,
 	}], { cwd: "/tmp/workspace", clearViewer: true });
 
-	assert.equal(result.text, "## PDF marks from the User\n\n- `/tmp/outside/main.tex:3` — `outside`");
+	assert.equal(result.text, "## PDF marks from the User\n\n- /tmp/outside/main.tex:3");
 });
 
 test("PDF mark context formats source spans instead of only the clicked line", () => {
@@ -114,7 +127,7 @@ test("PDF mark context formats source spans instead of only the clicked line", (
 		y: 1,
 	}], { cwd: "/tmp/workspace", clearViewer: true });
 
-	assert.equal(result.text, "## PDF marks from the User\n\n- `main.tex:135-156` — `}`");
+	assert.equal(result.text, "## PDF marks from the User\n\n- main.tex:135-156");
 });
 
 test("PDF mark context delivers every selected event without a hidden output budget", () => {
@@ -183,7 +196,7 @@ test("Viewer Host MCP service fetches context and clears consumed viewer annotat
 
 		const result = await service.fetchPdfContext({ pdf_id: 513, max_events: 5, cwd: dir });
 
-		assert.equal(result.text, "## PDF marks from the User\n\n- `main.tex:5-8` — `marked source`\n  User comment: user note");
+		assert.equal(result.text, "## PDF marks from the User\n\n- main.tex:5-8\n  User comment: user note");
 		assert.deepEqual(client.messages.at(-1), { type: "clear_pdf_annotations", pdf_id: 513 });
 		assert.deepEqual(await service.getPdfEvents({ pdf_id: 513, max_events: 5 }), []);
 	} finally {

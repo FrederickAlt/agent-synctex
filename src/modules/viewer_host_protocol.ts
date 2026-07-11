@@ -36,6 +36,10 @@ export interface ViewerHostSynctexForwardRange {
 	H: number;
 }
 
+export interface ViewerHostPdfTextSpan extends ViewerHostSynctexForwardRange {
+	text: string;
+}
+
 export interface ViewerHostSourceSpan {
 	source_file: string;
 	start_line: number;
@@ -102,6 +106,7 @@ export interface ViewerHostReverseSynctexCandidateSummary {
 	line: number;
 	column?: number;
 	source_line?: string;
+	rect?: { left: number; top: number; right: number; bottom: number };
 	score?: number;
 	structural?: boolean;
 	distance?: number;
@@ -162,6 +167,11 @@ export interface ViewerHostReverseSynctexForwardProbeResultMessage {
 	source_file?: string;
 	line?: number;
 	source_line?: string;
+	/** Exact visible text from the viewer element under the probe click. */
+	pdf_mark?: string;
+	/** Present only for an explicit SyncTeX debug session. */
+	debug_candidates?: ViewerHostReverseSynctexCandidateSummary[];
+	debug_selected_score?: number;
 	error?: string;
 }
 
@@ -201,6 +211,7 @@ export interface ViewerHostReverseSynctexMessage {
 	page: number;
 	x: number;
 	y: number;
+	page_height?: number;
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
 	selectedText?: string;
@@ -220,6 +231,8 @@ export interface ViewerHostPdfAnnotationMessage {
 	source_file: string;
 	line: number;
 	source_line?: string;
+	/** Exact visible text from the viewer element that created this annotation. */
+	pdf_mark?: string;
 	source_span?: ViewerHostSourceSpan;
 	comment?: string;
 }
@@ -246,6 +259,8 @@ export interface ViewerHostReverseSynctexHoverMessage {
 	page: number;
 	x: number;
 	y: number;
+	page_height?: number;
+	pdf_text_spans?: ViewerHostPdfTextSpan[];
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
 }
@@ -257,6 +272,8 @@ export interface ViewerHostReverseSynctexForwardProbeMessage {
 	page: number;
 	x: number;
 	y: number;
+	page_height?: number;
+	pdf_text_spans?: ViewerHostPdfTextSpan[];
 	textBeforeSelection?: string;
 	textAfterSelection?: string;
 }
@@ -383,6 +400,12 @@ function parseSynctexForwardRange(value: unknown, field: string): ViewerHostSync
 	};
 }
 
+function parsePdfTextSpan(value: unknown, field: string): ViewerHostPdfTextSpan {
+	const range = parseSynctexForwardRange(value, field);
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	return { ...range, text: requireNonEmptyString(value.text, `${field}.text`) };
+}
+
 function parseHoverRect(value: unknown, field: string): { left: number; top: number; right: number; bottom: number } {
 	if (!isRecord(value)) {
 		throw new Error(`${field} must be an object`);
@@ -428,6 +451,13 @@ function optionalSynctexRanges(value: unknown, field: string): ViewerHostSynctex
 	return value.map((entry, index) => parseSynctexForwardRange(entry, `${field}[${index}]`));
 }
 
+function optionalPdfTextSpans(value: unknown, field: string): ViewerHostPdfTextSpan[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error(`${field} must be an array`);
+	if (value.length === 0) throw new Error(`${field} must not be empty`);
+	return value.map((entry, index) => parsePdfTextSpan(entry, `${field}[${index}]`));
+}
+
 function optionalNumber(value: unknown, field: string): number | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -464,6 +494,7 @@ function parseReverseSynctexCandidateSummary(value: unknown, field: string): Vie
 	const sourceFile = optionalNonEmptyString(value.source_file, `${field}.source_file`);
 	const column = value.column === undefined ? undefined : requireCoordinate(value.column, `${field}.column`);
 	const sourceLine = optionalString(value.source_line, `${field}.source_line`);
+	const rect = optionalHoverRect(value.rect, `${field}.rect`);
 	const score = optionalNumber(value.score, `${field}.score`);
 	const structural = optionalBoolean(value.structural, `${field}.structural`);
 	const distance = optionalNumber(value.distance, `${field}.distance`);
@@ -474,6 +505,7 @@ function parseReverseSynctexCandidateSummary(value: unknown, field: string): Vie
 		line: requirePositiveInteger(value.line, `${field}.line`),
 		...(column === undefined ? {} : { column }),
 		...(sourceLine === undefined ? {} : { source_line: sourceLine }),
+		...(rect === undefined ? {} : { rect }),
 		...(score === undefined ? {} : { score }),
 		...(structural === undefined ? {} : { structural }),
 		...(distance === undefined ? {} : { distance }),
@@ -702,12 +734,15 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 			const selectionStartY = optionalCoordinate(message.selectionStartY, "selectionStartY");
 			const selectionEndX = optionalCoordinate(message.selectionEndX, "selectionEndX");
 			const selectionEndY = optionalCoordinate(message.selectionEndY, "selectionEndY");
+			const pageHeight = optionalCoordinate(message.page_height, "page_height");
+			if (pageHeight !== undefined && pageHeight <= 0) throw new Error("page_height must be positive");
 			return {
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
 				page: requirePositiveInteger(message.page, "page"),
 				x: requireCoordinate(message.x, "x"),
 				y: requireCoordinate(message.y, "y"),
+				...(pageHeight === undefined ? {} : { page_height: pageHeight }),
 				...(textBeforeSelection === undefined ? {} : { textBeforeSelection }),
 				...(textAfterSelection === undefined ? {} : { textAfterSelection }),
 				...(selectedText === undefined ? {} : { selectedText }),
@@ -719,6 +754,7 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 		}
 		case "pdf_annotation": {
 			const sourceLine = optionalString(message.source_line, "source_line");
+			const pdfMark = optionalString(message.pdf_mark, "pdf_mark");
 			const sourceSpan = optionalSourceSpan(message.source_span, "source_span");
 			const comment = optionalString(message.comment, "comment");
 			return {
@@ -731,6 +767,7 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				source_file: requireNonEmptyString(message.source_file, "source_file"),
 				line: requirePositiveInteger(message.line, "line"),
 				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
+				...(pdfMark === undefined ? {} : { pdf_mark: pdfMark }),
 				...(sourceSpan === undefined ? {} : { source_span: sourceSpan }),
 				...(comment === undefined ? {} : { comment }),
 			};
@@ -765,6 +802,9 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 		case "reverse_synctex_forward_probe": {
 			const textBeforeSelection = optionalString(message.textBeforeSelection, "textBeforeSelection");
 			const textAfterSelection = optionalString(message.textAfterSelection, "textAfterSelection");
+			const pageHeight = optionalCoordinate(message.page_height, "page_height");
+			if (pageHeight !== undefined && pageHeight <= 0) throw new Error("page_height must be positive");
+			const pdfTextSpans = optionalPdfTextSpans(message.pdf_text_spans, "pdf_text_spans");
 			return {
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
@@ -772,6 +812,8 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				page: requirePositiveInteger(message.page, "page"),
 				x: requireCoordinate(message.x, "x"),
 				y: requireCoordinate(message.y, "y"),
+				...(pageHeight === undefined ? {} : { page_height: pageHeight }),
+				...(pdfTextSpans === undefined ? {} : { pdf_text_spans: pdfTextSpans }),
 				...(textBeforeSelection === undefined ? {} : { textBeforeSelection }),
 				...(textAfterSelection === undefined ? {} : { textAfterSelection }),
 			};

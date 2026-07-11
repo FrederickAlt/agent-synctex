@@ -39,6 +39,7 @@ export interface HostServiceCompileSnippetRequest {
 	workspace_context: HostServiceWorkspaceContext;
 	details: {
 		latex_source: string;
+		name?: string;
 		preamble_root_file?: string;
 		compiler?: unknown;
 		suppress_page_numbers?: boolean;

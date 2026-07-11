@@ -46,7 +46,7 @@ test("Viewer Host protocol validates representative Host to MCP messages", () =>
 		{ type: "selection_debug", pdf_id: 123, phase: "send", page: 2, text: "chosen", details: { phase: "send", selectionTextLength: 6 } },
 		{ type: "compile_action", pdf_id: 123, action: "inject_diagnostic", inject_text: "compile failed" },
 		{ type: "reverse_synctex_hover", pdf_id: 123, request_id: 7, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
-		{ type: "reverse_synctex_forward_probe", pdf_id: 123, request_id: 8, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
+		{ type: "reverse_synctex_forward_probe", pdf_id: 123, request_id: 8, page: 2, x: 100, y: 500, page_height: 792, pdf_text_spans: [{ page: 2, h: 90, v: 510, W: 40, H: 12, text: "Heading" }], textBeforeSelection: "before", textAfterSelection: "after" },
 	];
 
 	for (const message of messages) {
@@ -107,6 +107,8 @@ test("Viewer Host protocol validation rejects malformed boundary messages", () =
 		[{ type: "reverse_synctex_hover", pdf_id: 1, request_id: 0, page: 1, x: 1, y: 1 }, /request_id/],
 		[{ type: "reverse_synctex_hover", pdf_id: 1, request_id: 1, page: 1, x: -1, y: 1 }, /x/],
 		[{ type: "reverse_synctex_forward_probe", pdf_id: 1, request_id: 0, page: 1, x: 1, y: 1 }, /request_id/],
+		[{ type: "reverse_synctex_forward_probe", pdf_id: 1, request_id: 1, page: 1, x: 1, y: 1, page_height: 0 }, /page_height/],
+		[{ type: "reverse_synctex_forward_probe", pdf_id: 1, request_id: 1, page: 1, x: 1, y: 1, pdf_text_spans: [{ page: 1, h: 1, v: 1, W: 2, H: 3, text: "" }] }, /pdf_text_spans\[0\]\.text/],
 		[{ type: "compile_action", pdf_id: 1, action: "restart" }, /compile action/],
 	];
 

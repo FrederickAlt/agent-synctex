@@ -1,10 +1,8 @@
-import { readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { PdfAnnotationEvent, PdfEvent } from "./pdf_events.ts";
 import type { ViewerHostPdfAnnotationMessage } from "./viewer_host_protocol.ts";
 
 const DEFAULT_MAX_EVENTS = 20;
-const DEFAULT_MAX_FIELD_LENGTH = 240;
 
 export interface FetchPdfContextRequest {
 	pdf_id?: number;
@@ -57,6 +55,7 @@ export function pdfAnnotationEventsFromViewerMarks(
 		source_file: mark.source_file,
 		line: mark.line,
 		...(mark.source_line === undefined ? {} : { source_line: mark.source_line }),
+		...(mark.pdf_mark === undefined ? {} : { pdf_mark: mark.pdf_mark }),
 		...(mark.source_span === undefined ? {} : { source_span: { ...mark.source_span } }),
 		page: mark.page,
 		x: mark.x,
@@ -71,19 +70,24 @@ export function formatPdfAnnotationContext(events: PdfAnnotationEvent[], options
 
 function formatPdfAnnotationContextResult(events: PdfAnnotationEvent[], options: { cwd?: string } = {}): { text: string; events: PdfAnnotationEvent[] } {
 	if (events.length === 0) return { text: "", events: [] };
-	const lines = ["## PDF marks from the User", ""];
-	const rendered: PdfAnnotationEvent[] = [];
+	const groups = new Map<string, { sourceLocation: string; events: PdfAnnotationEvent[] }>();
 	for (const event of events) {
-		const sourceLine = sourceLineForEvent(event);
 		const sourceLocation = displaySourceLocation(event, options.cwd);
-		const eventLines = [`- \`${sourceLocation}\`${sourceLine ? ` — \`${escapeInlineCode(compactText(sourceLine, DEFAULT_MAX_FIELD_LENGTH))}\`` : ""}`];
-		if (event.comment?.trim()) {
-			eventLines.push(`  User comment: ${event.comment}`);
-		}
-		lines.push(...eventLines);
-		rendered.push(event);
+		const group = groups.get(sourceLocation) ?? { sourceLocation, events: [] };
+		group.events.push(event);
+		groups.set(sourceLocation, group);
 	}
-	return { text: rendered.length === 0 ? "" : lines.join("\n"), events: rendered };
+	const lines = ["## PDF marks from the User", ""];
+	for (const group of groups.values()) {
+		const pdfMarks = group.events.map((event) => event.pdf_mark?.trim()).filter((mark): mark is string => Boolean(mark));
+		const eventLines = [`- ${group.sourceLocation}`];
+		if (pdfMarks.length > 0) eventLines.push(`  PDF mark: \`${escapeInlineCode(pdfMarks.join("; "))}\``);
+		const comments = group.events.map((event) => event.comment?.trim()).filter((comment): comment is string => Boolean(comment));
+		if (comments.length === 1) eventLines.push(`  User comment: ${comments[0]}`);
+		else if (comments.length > 1) eventLines.push(`  User comments: ${comments.join("; ")}`);
+		lines.push(...eventLines);
+	}
+	return { text: lines.join("\n"), events };
 }
 
 export function normalizeFetchPdfContextRequest(args: Record<string, unknown>): FetchPdfContextRequest {
@@ -134,23 +138,8 @@ function displaySourceFile(sourceFile: string, cwd: string | undefined): string 
 	return sourceFile;
 }
 
-function sourceLineForEvent(event: PdfAnnotationEvent): string | undefined {
-	if (event.source_line !== undefined) return event.source_line;
-	try {
-		const lines = readFileSync(event.source_file, "utf8").split(/\r?\n/);
-		return lines[event.line - 1];
-	} catch {
-		return undefined;
-	}
-}
-
 function normalizeMaxEvents(maxEvents: number | undefined): number {
 	return maxEvents === undefined ? DEFAULT_MAX_EVENTS : Math.max(1, Math.min(maxEvents, DEFAULT_MAX_EVENTS));
-}
-
-function compactText(value: string, maxLength: number): string {
-	const compacted = value.replace(/\s+/g, " ").trim();
-	return compacted.length > maxLength ? `${compacted.slice(0, maxLength - 1)}…` : compacted;
 }
 
 function escapeInlineCode(value: string): string {

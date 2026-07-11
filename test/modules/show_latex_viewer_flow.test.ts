@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { test } from "node:test";
 import { handleMcpRequest, MCP_ERROR_INVALID_PARAMS } from "../../src/modules/host_service_mcp.ts";
 import { FakeViewerHostClient, ViewerHostMcpService } from "../../src/modules/viewer_host_client.ts";
@@ -57,7 +57,7 @@ test("show_latex schema exposes source, compiler, preamble, and warning controls
 	const tools = (response.result as { tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown> } }> }).tools;
 	const showLatex = tools.find((tool) => tool.name === "show_latex");
 	assert.ok(showLatex);
-	assert.deepEqual(Object.keys(showLatex.inputSchema.properties).sort(), ["compiler", "hide_warnings", "preamble_root_file", "source", "workspace_context"]);
+	assert.deepEqual(Object.keys(showLatex.inputSchema.properties).sort(), ["compiler", "hide_warnings", "name", "preamble_root_file", "source", "workspace_context"]);
 	assert.equal(showLatex.inputSchema.properties.inline, undefined);
 	assert.equal(showLatex.inputSchema.properties.open_pdf, undefined);
 	assert.equal(showLatex.inputSchema.properties.fixed_preview, undefined);
@@ -73,9 +73,50 @@ test("show_latex rejects empty source and legacy inline arguments before compili
 		response = await callShowLatex({ source: "x", inline: false }, service);
 		assert.equal((response.error as { code?: number }).code, MCP_ERROR_INVALID_PARAMS);
 		assert.match((response.error as { message?: string }).message ?? "", /show_latex unknown argument: inline/);
+		response = await callShowLatex({ source: "x", name: "../escape" }, service);
+		assert.equal((response.error as { code?: number }).code, MCP_ERROR_INVALID_PARAMS);
+		assert.match((response.error as { message?: string }).message ?? "", /name must be a filename without path components/);
 		assert.deepEqual(client.messages, []);
 	} finally {
 		await service.stop();
+	}
+});
+
+test("show_latex uses a requested snippet filename and appends increasing numbers when it is taken", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "show-latex-named-snippet-"));
+	const binDir = join(dir, "bin");
+	const recordFile = join(dir, "latexmk-records.jsonl");
+	const snippetDir = join(dir, ".agent-synctex", "tmp");
+	const client = new FakeViewerHostClient();
+	let nextPdfId = 5000;
+	const service = new ViewerHostMcpService({ client, makePdfId: () => nextPdfId++ });
+	writeFakeLatexmk(binDir, recordFile);
+	mkdirSync(snippetDir, { recursive: true, mode: 0o700 });
+	writeFileSync(join(snippetDir, "proof.tex"), "existing source", { mode: 0o600 });
+	try {
+		await withPath(binDir, async () => {
+			const args = {
+				source: "\\documentclass{article}\\begin{document}Named\\end{document}",
+				name: "proof.tex",
+				workspace_context: { cwd: dir, workspace_root: dir },
+			};
+			const first = await callShowLatex(args, service);
+			const firstResult = first.result as { isError?: boolean; details: Record<string, unknown> };
+			assert.equal(firstResult.isError, undefined);
+			assert.equal(firstResult.details.source, join(snippetDir, "proof1.tex"));
+
+			const second = await callShowLatex(args, service);
+			const secondResult = second.result as { isError?: boolean; details: Record<string, unknown> };
+			assert.equal(secondResult.isError, undefined);
+			assert.equal(secondResult.details.source, join(snippetDir, "proof2.tex"));
+			assert.equal(readFileSync(join(snippetDir, "proof.tex"), "utf8"), "existing source");
+
+			const compilerRecords = readFileSync(recordFile, "utf8").trim().split(/\n/).map((line) => JSON.parse(line) as { args: string[] });
+			assert.deepEqual(compilerRecords.map((record) => basename(record.args.at(-1) ?? "")), ["proof1.tex", "proof2.tex"]);
+		});
+	} finally {
+		await service.stop();
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
 

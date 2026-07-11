@@ -1,4 +1,4 @@
-export interface ReverseSynctexFormulaSpanEvent {
+export interface ReverseSynctexSourceSpanEvent {
 	source_file: string;
 	start_line: number;
 	end_line: number;
@@ -43,8 +43,8 @@ export interface ReverseSynctexPdfEventInput {
 	raw_mapped_line?: number;
 	raw_mapped_column?: number;
 	raw_mapped_source_line?: string;
-	normalized_formula_span?: ReverseSynctexFormulaSpanEvent;
-	normalized_formula_excerpt?: string;
+	normalized_source_span?: ReverseSynctexSourceSpanEvent;
+	normalized_source_excerpt?: string;
 	synctex_diagnostics?: unknown;
 }
 
@@ -60,7 +60,8 @@ export interface PdfAnnotationEventInput {
 	source_file: string;
 	line: number;
 	source_line?: string;
-	source_span?: ReverseSynctexFormulaSpanEvent;
+	pdf_mark?: string;
+	source_span?: ReverseSynctexSourceSpanEvent;
 	page: number;
 	x: number;
 	y: number;
