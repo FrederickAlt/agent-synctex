@@ -30,6 +30,11 @@ export interface AcknowledgedPdfMark {
 
 export type ReleasedPdfMark = AcknowledgedPdfMark;
 
+export interface ReconciledPdfMarks {
+	updated: ViewerHostPdfAnnotationMessage[];
+	cleared: AcknowledgedPdfMark[];
+}
+
 export interface PendingPdfMarkStoreOptions {
 	nowMs?: () => number;
 	makeClaimId?: () => string;
@@ -78,15 +83,40 @@ export class PendingPdfMarkStore {
 		return this.entries.delete(markKey(pdfId, annotationId));
 	}
 
-	clearPdf(pdfId: number): void {
+	clearPdf(pdfId: number): AcknowledgedPdfMark[] {
+		const cleared: AcknowledgedPdfMark[] = [];
 		for (const [key, entry] of this.entries) {
-			if (entry.mark.pdf_id === pdfId) this.entries.delete(key);
+			if (entry.mark.pdf_id !== pdfId) continue;
+			cleared.push({ pdf_id: entry.mark.pdf_id, annotation_id: entry.mark.annotation_id });
+			this.entries.delete(key);
 		}
+		return cleared;
 	}
 
 	clear(): void {
 		this.entries.clear();
 		this.nextSequence = 1;
+	}
+
+	/** Replaces only marks whose new source location can be verified, discarding the rest. */
+	reconcilePdf(pdfId: number, transform: (mark: ViewerHostPdfAnnotationMessage) => ViewerHostPdfAnnotationMessage | undefined): ReconciledPdfMarks {
+		const updated: ViewerHostPdfAnnotationMessage[] = [];
+		const cleared: AcknowledgedPdfMark[] = [];
+		for (const [key, entry] of this.entries) {
+			if (entry.mark.pdf_id !== pdfId) continue;
+			const replacement = transform(copyMark(entry.mark));
+			if (replacement === undefined) {
+				cleared.push({ pdf_id: entry.mark.pdf_id, annotation_id: entry.mark.annotation_id });
+				this.entries.delete(key);
+				continue;
+			}
+			entry.mark = copyMark(replacement);
+			entry.version += 1;
+			// A consumer may hold the old location. Keeping its lease version stale
+			// makes acknowledgement release, rather than consume, the rebased mark.
+			updated.push(copyMark(entry.mark));
+		}
+		return { updated, cleared };
 	}
 
 	claim(options: { pdfIds?: ReadonlySet<number>; maxMarks?: number } = {}): PendingPdfMarkClaim {
@@ -172,6 +202,7 @@ function markKey(pdfId: number, annotationId: string): string {
 function copyMark(mark: ViewerHostPdfAnnotationMessage): ViewerHostPdfAnnotationMessage {
 	return {
 		...mark,
+		...(mark.source_spans === undefined ? {} : { source_spans: mark.source_spans.map((span) => ({ ...span })) }),
 		...(mark.source_span === undefined ? {} : { source_span: { ...mark.source_span } }),
 	};
 }

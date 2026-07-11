@@ -46,6 +46,15 @@ export interface ViewerHostSourceSpan {
 	end_line: number;
 }
 
+/** A page-local PDF-space rectangle using the SyncTeX h/v/W/H convention. */
+export interface ViewerHostSynctexBox {
+	page: number;
+	h: number;
+	v: number;
+	W: number;
+	H: number;
+}
+
 export interface ViewerHostSynctexForwardMessage {
 	type: "synctex_forward";
 	pdf_id: number;
@@ -145,6 +154,35 @@ export interface ViewerHostReverseSynctexHoverResultMessage {
 	error?: string;
 }
 
+export interface ViewerHostReverseSynctexBoxMessage extends ViewerHostSynctexBox {
+	type: "reverse_synctex_box";
+	pdf_id: number;
+	request_id: number;
+	pdf_text_spans?: ViewerHostPdfTextSpan[];
+}
+
+export interface ViewerHostReverseSynctexBoxResultMessage extends ViewerHostSynctexBox {
+	type: "reverse_synctex_box_result";
+	pdf_id: number;
+	request_id: number;
+	source_spans?: ViewerHostSourceSpan[];
+	ranges?: ViewerHostSynctexForwardRange[];
+	source_file?: string;
+	line?: number;
+	source_line?: string;
+	error?: string;
+}
+
+export interface ViewerHostDebugForwardGroup {
+	origin: "synctex_exact" | "synctex_normalized" | "pdf_text_span";
+	lookup_line: number;
+	semantic_penalty: number;
+	geometry_tier: number;
+	score: number;
+	selected: boolean;
+	chosen_box?: ViewerHostSynctexForwardRange;
+}
+
 export interface ViewerHostReverseSynctexForwardProbeResultMessage {
 	type: "reverse_synctex_forward_probe_result";
 	pdf_id: number;
@@ -172,6 +210,8 @@ export interface ViewerHostReverseSynctexForwardProbeResultMessage {
 	/** Present only for an explicit SyncTeX debug session. */
 	debug_candidates?: ViewerHostReverseSynctexCandidateSummary[];
 	debug_selected_score?: number;
+	/** Present only for an explicit SyncTeX debug session. */
+	debug_forward_groups?: ViewerHostDebugForwardGroup[];
 	error?: string;
 }
 
@@ -233,7 +273,12 @@ export interface ViewerHostPdfAnnotationMessage {
 	source_line?: string;
 	/** Exact visible text from the viewer element that created this annotation. */
 	pdf_mark?: string;
+	/** Normalized source ranges belonging to this single annotation. */
+	source_spans?: ViewerHostSourceSpan[];
+	/** @deprecated Use source_spans. Retained for marks created by an older viewer. */
 	source_span?: ViewerHostSourceSpan;
+	/** The source file is newer than the PDF that produced this mapping. */
+	source_stale?: boolean;
 	comment?: string;
 }
 
@@ -295,6 +340,7 @@ export type ViewerHostToMcpMessage =
 	| ViewerHostSelectionDebugMessage
 	| ViewerHostReverseSynctexHoverMessage
 	| ViewerHostReverseSynctexForwardProbeMessage
+	| ViewerHostReverseSynctexBoxMessage
 	| ViewerHostCompileActionMessage;
 
 export interface ViewerHostControlAcceptedResult {
@@ -387,7 +433,7 @@ function optionalBoolean(value: unknown, field: string): boolean | undefined {
 	return value;
 }
 
-function parseSynctexForwardRange(value: unknown, field: string): ViewerHostSynctexForwardRange {
+function parseSynctexBox(value: unknown, field: string): ViewerHostSynctexBox {
 	if (!isRecord(value)) {
 		throw new Error(`${field} must be an object`);
 	}
@@ -398,6 +444,10 @@ function parseSynctexForwardRange(value: unknown, field: string): ViewerHostSync
 		W: requireCoordinate(value.W, `${field}.W`),
 		H: requireCoordinate(value.H, `${field}.H`),
 	};
+}
+
+function parseSynctexForwardRange(value: unknown, field: string): ViewerHostSynctexForwardRange {
+	return parseSynctexBox(value, field);
 }
 
 function parsePdfTextSpan(value: unknown, field: string): ViewerHostPdfTextSpan {
@@ -433,6 +483,14 @@ function parseSourceSpan(value: unknown, field: string): ViewerHostSourceSpan {
 function optionalSourceSpan(value: unknown, field: string): ViewerHostSourceSpan | undefined {
 	if (value === undefined) return undefined;
 	return parseSourceSpan(value, field);
+}
+
+function optionalSourceSpans(value: unknown, field: string): ViewerHostSourceSpan[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length === 0 || value.length > 500) {
+		throw new Error(`${field} must be a non-empty array of at most 500 source spans`);
+	}
+	return value.map((span, index) => parseSourceSpan(span, `${field}[${index}]`));
 }
 
 function optionalHoverRect(value: unknown, field: string): { left: number; top: number; right: number; bottom: number } | undefined {
@@ -708,6 +766,12 @@ export function validateMcpToViewerHostMessage(message: unknown): McpToViewerHos
 	}
 }
 
+export function sourceSpansForPdfAnnotation(mark: Pick<ViewerHostPdfAnnotationMessage, "source_file" | "line" | "source_span" | "source_spans">): ViewerHostSourceSpan[] {
+	if (mark.source_spans !== undefined && mark.source_spans.length > 0) return mark.source_spans.map((span) => ({ ...span }));
+	if (mark.source_span !== undefined) return [{ ...mark.source_span }];
+	return [{ source_file: mark.source_file, start_line: mark.line, end_line: mark.line }];
+}
+
 export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMcpMessage {
 	if (!isRecord(message)) {
 		throw new Error("Viewer Host protocol message must be an object");
@@ -756,6 +820,8 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 			const sourceLine = optionalString(message.source_line, "source_line");
 			const pdfMark = optionalString(message.pdf_mark, "pdf_mark");
 			const sourceSpan = optionalSourceSpan(message.source_span, "source_span");
+			const sourceSpans = optionalSourceSpans(message.source_spans, "source_spans");
+			const sourceStale = optionalBoolean(message.source_stale, "source_stale");
 			const comment = optionalString(message.comment, "comment");
 			return {
 				type,
@@ -768,8 +834,22 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				line: requirePositiveInteger(message.line, "line"),
 				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
 				...(pdfMark === undefined ? {} : { pdf_mark: pdfMark }),
+				...(sourceSpans === undefined ? {} : { source_spans: sourceSpans }),
 				...(sourceSpan === undefined ? {} : { source_span: sourceSpan }),
+				...(sourceStale === undefined ? {} : { source_stale: sourceStale }),
 				...(comment === undefined ? {} : { comment }),
+			};
+		}
+		case "reverse_synctex_box": {
+			const box = parseSynctexBox(message, "reverse_synctex_box");
+			if (box.W <= 0 || box.H <= 0) throw new Error("reverse_synctex_box.W and reverse_synctex_box.H must be positive");
+			const pdfTextSpans = optionalPdfTextSpans(message.pdf_text_spans, "pdf_text_spans");
+			return {
+				type,
+				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
+				request_id: requirePositiveInteger(message.request_id, "request_id"),
+				...box,
+				...(pdfTextSpans === undefined ? {} : { pdf_text_spans: pdfTextSpans }),
 			};
 		}
 		case "pdf_annotation_deleted":

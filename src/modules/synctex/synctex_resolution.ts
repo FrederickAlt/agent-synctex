@@ -1,12 +1,18 @@
-import { dirname } from "node:path";
-import { parseSyncTexForPdf } from "./latex_workshop/worker.ts";
+import { readFileSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { collectCachedSyncTeXPageLeafBoxes, convInputFilePath, getCachedSyncTeXPageLeafBoxes, MAX_CACHED_SYNC_TEX_PAGE_LEAF_BOXES, parseSyncTexForPdf } from "./latex_workshop/worker.ts";
 import type { ReverseSynctexPdfEventInput, ReverseSynctexSourceLocationEvent } from "../pdf_events.ts";
 import type {
+	ViewerHostReverseSynctexBoxMessage,
+	ViewerHostReverseSynctexBoxResultMessage,
 	ViewerHostReverseSynctexForwardProbeMessage,
+	ViewerHostDebugForwardGroup,
 	ViewerHostReverseSynctexForwardProbeResultMessage,
 	ViewerHostReverseSynctexHoverMessage,
 	ViewerHostReverseSynctexHoverResultMessage,
 	ViewerHostReverseSynctexMessage,
+	ViewerHostPdfTextSpan,
+	ViewerHostSourceSpan,
 	ViewerHostSynctexForwardRange,
 } from "../viewer_host_protocol.ts";
 import {
@@ -15,12 +21,21 @@ import {
 	mapForwardSynctex,
 	mapReverseForwardSynctexProbe,
 	mapReverseSynctex,
+	normalizedSourceSpansForLines,
+	normalizedVisibleText,
+	simpleVisibleSourceText,
 	type ForwardSynctexJump,
 	type MapForwardSynctexInput,
 	type ReverseSynctexSourceSpan,
 } from "./forward_synctex.ts";
 
 export type ReverseSynctexMapper = typeof mapReverseSynctex;
+
+const MAX_REVERSE_SYNCTEX_BOX_LEAF_BOXES = MAX_CACHED_SYNC_TEX_PAGE_LEAF_BOXES;
+const MAX_REVERSE_SYNCTEX_BOX_SOURCE_LOCATIONS = 2_000;
+const MIN_BOX_COVERAGE = 0.5;
+const SCORE_EPSILON = 1e-9;
+const MIN_TEXT_MATCH_LENGTH = 8;
 
 export interface RegisteredSynctexPdf {
 	pdfId: number;
@@ -42,6 +57,288 @@ export function prewarmSynctexForPdf(pdfPath: string): void {
 
 export function resolveForwardSynctexJump(input: MapForwardSynctexInput): ForwardSynctexJump {
 	return mapForwardSynctex(input);
+}
+
+/**
+ * Starts from the best source-mapped box in a page-local selection, then grows
+ * through adjacent source lines while their best usable forward box is at
+ * least half covered. Only zero-by-zero SyncTeX markers are transparent.
+ */
+export function resolveReverseSynctexBox(input: {
+	message: ViewerHostReverseSynctexBoxMessage;
+	pdf: RegisteredSynctexPdf;
+}): ViewerHostReverseSynctexBoxResultMessage {
+	const { message, pdf } = input;
+	const workspaceCwd = pdf.workspaceCwd ?? dirname(pdf.pdfPath);
+	const seedQuery = collectCachedSyncTeXPageLeafBoxes({
+		pdfPath: pdf.pdfPath,
+		page: message.page,
+		maxBoxes: MAX_REVERSE_SYNCTEX_BOX_LEAF_BOXES,
+		matches: (box) => usableBox(box) && meetsMinimumCoverage(box, message),
+	});
+	if (seedQuery.exceeded) {
+		throw new Error(`Selection is too dense to resolve exhaustively (more than ${MAX_REVERSE_SYNCTEX_BOX_LEAF_BOXES} SyncTeX boxes). Select a smaller PDF area.`);
+	}
+	const seedBoxes = seedQuery.boxes;
+	const pageBoxesBySource = indexPageBoxesBySource(getCachedSyncTeXPageLeafBoxes(pdf.pdfPath, message.page));
+	const seedLocations = dedupeSourceLocations(seedBoxes.map((box) => ({ sourceFile: box.sourceFile, line: box.line })));
+	if (seedLocations.length > MAX_REVERSE_SYNCTEX_BOX_SOURCE_LOCATIONS) {
+		throw new Error(`Selection resolves to more than ${MAX_REVERSE_SYNCTEX_BOX_SOURCE_LOCATIONS} source locations. Select a smaller PDF area.`);
+	}
+
+	const sources = new Map<string, ResolvedSource | undefined>();
+	const sourceFor = (sourceFile: string): ResolvedSource | undefined => {
+		if (sources.has(sourceFile)) return sources.get(sourceFile);
+		const source = resolveBoxSourceFile(sourceFile, workspaceCwd);
+		sources.set(sourceFile, source);
+		return source;
+	};
+	const seedLinesBySource = new Map<ResolvedSource, Set<number>>();
+	for (const location of seedLocations) {
+		const source = sourceFor(location.sourceFile);
+		if (source !== undefined) (seedLinesBySource.get(source) ?? seedLinesBySource.set(source, new Set()).get(source)!).add(location.line);
+	}
+	for (const [source, lines] of seedLinesBySource) cacheSourceSpans(source, lines);
+
+	const scoredSeeds = seedBoxes.flatMap((box) => {
+		const source = sourceFor(box.sourceFile);
+		const span = source?.spansByLine.get(box.line);
+		const boxesByLine = pageBoxesBySource.get(box.sourceFile);
+		return source === undefined || span === undefined || boxesByLine === undefined || !spanIsSelectionSupported(span, boxesByLine, message)
+			? []
+			: [scoreBoxCandidate(box, source, span, message)];
+	}).sort(compareScoredBoxCandidates);
+	const seed = scoredSeeds[0];
+	if (seed === undefined) {
+		throw new Error("No SyncTeX source boxes in this drag area met the 50% forward-coverage requirement");
+	}
+
+	cacheSourceSpans(seed.source, new Set(seed.source.lines.map((_line, index) => index + 1)));
+	const boxesByLine = pageBoxesBySource.get(seed.rawSourceFile) ?? new Map();
+	const accepted = [seed];
+	const startLine = growBoxSelection({
+		direction: -1,
+		boundary: seed.span.start_line,
+		source: seed.source,
+		rawSourceFile: seed.rawSourceFile,
+		boxesByLine,
+		message,
+		accepted,
+	});
+	const endLine = growBoxSelection({
+		direction: 1,
+		boundary: seed.span.end_line,
+		source: seed.source,
+		rawSourceFile: seed.rawSourceFile,
+		boxesByLine,
+		message,
+		accepted,
+	});
+	const sourceSpan = { source_file: seed.source.sourceFile, start_line: startLine, end_line: endLine };
+	return {
+		type: "reverse_synctex_box_result",
+		pdf_id: message.pdf_id,
+		request_id: message.request_id,
+		page: message.page,
+		h: message.h,
+		v: message.v,
+		W: message.W,
+		H: message.H,
+		source_spans: [sourceSpan],
+		ranges: [{ page: message.page, h: message.h, v: message.v, W: message.W, H: message.H }],
+		source_file: sourceSpan.source_file,
+		line: sourceSpan.start_line,
+	};
+}
+
+interface ResolvedSource {
+	sourceFile: string;
+	lines: string[];
+	spansByLine: Map<number, ViewerHostSourceSpan>;
+}
+
+interface ScoredBoxCandidate {
+	rawSourceFile: string;
+	line: number;
+	box: ViewerHostSynctexForwardRange;
+	coverage: number;
+	source: ResolvedSource;
+	span: ViewerHostSourceSpan;
+	score: number;
+}
+
+function resolveBoxSourceFile(sourceFile: string, workspaceCwd: string): ResolvedSource | undefined {
+	const inputFile = isAbsolute(sourceFile) ? sourceFile : resolve(workspaceCwd, sourceFile);
+	const resolved = convInputFilePath(inputFile) ?? inputFile;
+	if (!sourceFileInsideWorkspace(resolved, workspaceCwd)) return undefined;
+	try {
+		return { sourceFile: resolved, lines: readFileSync(resolved, "utf8").split(/\r?\n/), spansByLine: new Map() };
+	} catch {
+		return undefined;
+	}
+}
+
+function cacheSourceSpans(source: ResolvedSource, lines: ReadonlySet<number>): void {
+	const uncached = [...lines].filter((line) => !source.spansByLine.has(line));
+	if (uncached.length === 0) return;
+	const spans = normalizedSourceSpansForLines(source.sourceFile, uncached);
+	for (const [index, span] of spans.entries()) {
+		const line = uncached[index];
+		if (line === undefined) continue;
+		source.spansByLine.set(line, { source_file: span.sourceFile, start_line: span.startLine, end_line: span.endLine });
+	}
+}
+
+function growBoxSelection(input: {
+	direction: -1 | 1;
+	boundary: number;
+	source: ResolvedSource;
+	rawSourceFile: string;
+	boxesByLine: ReadonlyMap<number, ReadonlyArray<{ page: number; h: number; v: number; W: number; H: number }>>;
+	message: ViewerHostReverseSynctexBoxMessage;
+	accepted: ScoredBoxCandidate[];
+}): number {
+	let boundary = input.boundary;
+	let line = boundary + input.direction;
+	while (line >= 1 && line <= input.source.lines.length) {
+		const boxes = input.boxesByLine.get(line)?.filter(usableBox) ?? [];
+		if (boxes.length === 0) {
+			line += input.direction;
+			continue;
+		}
+		cacheSourceSpans(input.source, new Set([line]));
+		const span = input.source.spansByLine.get(line);
+		if (span === undefined || !spanIsSelectionSupported(span, input.boxesByLine, input.message)) break;
+		const best = boxes
+			.filter((box) => meetsMinimumCoverage(box, input.message))
+			.map((box) => scoreBoxCandidate({ ...box, sourceFile: input.rawSourceFile, line }, input.source, span, input.message))
+			.sort(compareScoredBoxCandidates)[0];
+		if (best === undefined) break;
+		input.accepted.push(best);
+		if (input.direction < 0) {
+			boundary = Math.min(boundary, best.span.start_line);
+			line = best.span.start_line - 1;
+		} else {
+			boundary = Math.max(boundary, best.span.end_line);
+			line = best.span.end_line + 1;
+		}
+	}
+	return boundary;
+}
+
+function indexPageBoxesBySource(boxes: ReadonlyArray<{ sourceFile: string; line: number; page: number; h: number; v: number; W: number; H: number }>): Map<string, Map<number, Array<{ page: number; h: number; v: number; W: number; H: number }>>> {
+	const indexed = new Map<string, Map<number, Array<{ page: number; h: number; v: number; W: number; H: number }>>>();
+	for (const box of boxes) {
+		const boxesByLine = indexed.get(box.sourceFile) ?? new Map();
+		const lineBoxes = boxesByLine.get(box.line) ?? [];
+		lineBoxes.push({ page: box.page, h: box.h, v: box.v, W: box.W, H: box.H });
+		boxesByLine.set(box.line, lineBoxes);
+		indexed.set(box.sourceFile, boxesByLine);
+	}
+	return indexed;
+}
+
+function spanIsSelectionSupported(span: ViewerHostSourceSpan, boxesByLine: ReadonlyMap<number, ReadonlyArray<{ h: number; v: number; W: number; H: number }>>, message: ViewerHostReverseSynctexBoxMessage): boolean {
+	for (let line = span.start_line; line <= span.end_line; line += 1) {
+		const boxes = boxesByLine.get(line)?.filter(usableBox) ?? [];
+		if (boxes.length > 0 && !boxes.some((box) => meetsMinimumCoverage(box, message))) return false;
+	}
+	return true;
+}
+
+function scoreBoxCandidate(box: { sourceFile: string; line: number; page: number; h: number; v: number; W: number; H: number }, source: ResolvedSource, span: ViewerHostSourceSpan, message: ViewerHostReverseSynctexBoxMessage): ScoredBoxCandidate {
+	const coverage = boxCoverage(box, message);
+	const spanLineCount = span.end_line - span.start_line + 1;
+	return {
+		rawSourceFile: box.sourceFile,
+		line: box.line,
+		box: { page: box.page, h: box.h, v: box.v, W: box.W, H: box.H },
+		coverage,
+		source,
+		span,
+		score: (1 / (coverage + SCORE_EPSILON)) + spanLineCount + textMatchBonus(source, span, box, message.pdf_text_spans),
+	};
+}
+
+function compareScoredBoxCandidates(left: ScoredBoxCandidate, right: ScoredBoxCandidate): number {
+	return left.score - right.score
+		|| right.coverage - left.coverage
+		|| left.span.start_line - right.span.start_line
+		|| left.span.end_line - right.span.end_line
+		|| left.box.h - right.box.h
+		|| left.box.v - right.box.v;
+}
+
+function textMatchBonus(source: ResolvedSource, span: ViewerHostSourceSpan, box: ViewerHostSynctexForwardRange, pdfTextSpans: ViewerHostPdfTextSpan[] | undefined): number {
+	const selectedText = normalizedVisibleText((pdfTextSpans ?? [])
+		.filter((textSpan) => textSpan.page === box.page && boxesOverlap(textSpan, box))
+		.map((textSpan) => textSpan.text)
+		.join(" "));
+	if (selectedText.length < MIN_TEXT_MATCH_LENGTH) return 0;
+	const sourceText = normalizedVisibleText(source.lines
+		.slice(span.start_line - 1, span.end_line)
+		.map(simpleVisibleSourceText)
+		.filter((line): line is string => line !== undefined)
+		.join(" "));
+	if (sourceText.length < MIN_TEXT_MATCH_LENGTH) return 0;
+	if (sourceText.includes(selectedText)) return -1;
+	return hasContiguousTextMatch(sourceText, selectedText) ? -0.5 : 0;
+}
+
+function hasContiguousTextMatch(sourceText: string, selectedText: string): boolean {
+	for (let length = Math.min(selectedText.length, 200); length >= MIN_TEXT_MATCH_LENGTH; length -= 1) {
+		for (let start = 0; start + length <= selectedText.length; start += 1) {
+			if (sourceText.includes(selectedText.slice(start, start + length))) return true;
+		}
+	}
+	return false;
+}
+
+function usableBox(box: { W: number; H: number }): boolean {
+	return box.W > 0 || box.H > 0;
+}
+
+function boxCoverage(box: { h: number; v: number; W: number; H: number }, target: { h: number; v: number; W: number; H: number }): number {
+	const overlapWidth = Math.max(0, Math.min(box.h + box.W, target.h + target.W) - Math.max(box.h, target.h));
+	const overlapHeight = Math.max(0, Math.min(box.v, target.v) - Math.max(box.v - box.H, target.v - target.H));
+	if (box.W > 0 && box.H > 0) return (overlapWidth * overlapHeight) / (box.W * box.H);
+	if (box.W === 0 && box.H > 0) return box.h >= target.h && box.h <= target.h + target.W ? overlapHeight / box.H : 0;
+	if (box.W > 0 && box.H === 0) return box.v >= target.v - target.H && box.v <= target.v ? overlapWidth / box.W : 0;
+	return 0;
+}
+
+function meetsMinimumCoverage(box: { h: number; v: number; W: number; H: number }, target: { h: number; v: number; W: number; H: number }): boolean {
+	return boxCoverage(box, target) + SCORE_EPSILON >= MIN_BOX_COVERAGE;
+}
+
+function boxesOverlap(left: { h: number; v: number; W: number; H: number }, right: { h: number; v: number; W: number; H: number }): boolean {
+	return Math.min(left.h + left.W, right.h + right.W) > Math.max(left.h, right.h)
+		&& Math.min(left.v, right.v) > Math.max(left.v - left.H, right.v - right.H);
+}
+
+function sourceLocationKey(sourceFile: string, line: number): string {
+	return `${sourceFile}\0${line}`;
+}
+
+function dedupeSourceLocations(locations: Array<{ sourceFile: string; line: number }>): Array<{ sourceFile: string; line: number }> {
+	const seen = new Set<string>();
+	return locations.filter((location) => {
+		const key = sourceLocationKey(location.sourceFile, location.line);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
+function sourceFileInsideWorkspace(sourceFile: string, workspaceCwd: string): boolean {
+	try {
+		const workspace = realpathSync(resolve(workspaceCwd));
+		const source = realpathSync(isAbsolute(sourceFile) ? resolve(sourceFile) : resolve(workspace, sourceFile));
+		const pathFromWorkspace = relative(workspace, source);
+		return pathFromWorkspace === "" || (!pathFromWorkspace.startsWith("..") && !isAbsolute(pathFromWorkspace));
+	} catch {
+		return false;
+	}
 }
 
 function sourceLocationEventFromReverse(location: ReturnType<ReverseSynctexMapper>, page: number, x: number, y: number): ReverseSynctexSourceLocationEvent {
@@ -211,6 +508,22 @@ function debugCandidateDiagnostics(reverse: ReturnType<typeof inspectReverseSync
 	};
 }
 
+function debugForwardGroupDiagnostics(reverse: Pick<ReturnType<typeof inspectReverseSynctexHover>, "forwardGroupScores">): { debug_forward_groups?: ViewerHostDebugForwardGroup[] } {
+	const groups = reverse.forwardGroupScores;
+	if (groups === undefined || groups.length === 0) return {};
+	return {
+		debug_forward_groups: groups.map((group, index) => ({
+			origin: group.origin,
+			lookup_line: group.lookupLine,
+			semantic_penalty: group.semanticPenalty,
+			geometry_tier: group.geometryTier,
+			score: group.score,
+			selected: index === 0,
+			...(group.chosenBox === undefined ? {} : { chosen_box: group.chosenBox }),
+		})),
+	};
+}
+
 function hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Partial<ViewerHostReverseSynctexHoverResultMessage> {
 	const nearestCandidate = hoverCandidateSummary(hover.rawWinner);
 	const candidates = (hover.proposalScores ?? hover.topCandidates)?.map((candidate) => hoverCandidateSummary(candidate)).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined).slice(0, 3);
@@ -282,7 +595,7 @@ export function reverseSynctexForwardProbeResult(input: { message: ViewerHostRev
 		...(probe.forward.height === undefined ? {} : { height: probe.forward.height }),
 		...(probe.forward.ranges === undefined ? {} : { ranges: probe.forward.ranges }),
 		...(probe.forward.indicator === undefined ? {} : { indicator: probe.forward.indicator }),
-		...(input.debugSynctex === true ? debugCandidateDiagnostics(probe.reverse) : {}),
+		...(input.debugSynctex === true ? { ...debugCandidateDiagnostics(probe.reverse), ...debugForwardGroupDiagnostics(probe.reverse) } : {}),
 		source_file: probe.forward.sourceFile,
 		line: probe.forward.line,
 		source_line: probe.forward.sourceLine,

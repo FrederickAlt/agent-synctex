@@ -1,13 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream, readFileSync } from "node:fs";
+import { createReadStream, readFileSync, realpathSync } from "node:fs";
 import { stat as statFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
-import { basename, dirname, extname, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath, URL } from "node:url";
-import { validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_CONTROL_TOKEN_HEADER, VIEWER_HOST_HEARTBEAT_TOKEN_HEADER, VIEWER_HOST_PROTOCOL_VERSION, VIEWER_HOST_SHUTDOWN_TOKEN_HEADER, type ViewerHostControlResponse, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
-import { prewarmSynctexForPdf, reverseSynctexForwardProbeResult, reverseSynctexHoverResult } from "./synctex/synctex_resolution.ts";
+import { sourceSpansForPdfAnnotation, validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_CONTROL_TOKEN_HEADER, VIEWER_HOST_HEARTBEAT_TOKEN_HEADER, VIEWER_HOST_PROTOCOL_VERSION, VIEWER_HOST_SHUTDOWN_TOKEN_HEADER, type ViewerHostControlResponse, type ViewerHostPdfAnnotationMessage, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
+import { prewarmSynctexForPdf, resolveReverseSynctexBox, reverseSynctexForwardProbeResult, reverseSynctexHoverResult } from "./synctex/synctex_resolution.ts";
+import { capturePdfMarkSourceAnchors, rebasePdfMark, sourceChangedSincePdf, type PdfMarkSourceAnchor } from "./pdf_mark_rebase.ts";
 import { DEFAULT_VIEWER_HOST_ACCESS_POLICY, type ViewerHostAccessPolicy, type ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
 import { PendingPdfMarkStore, type AcknowledgedPdfMark } from "./pending_pdf_marks.ts";
@@ -20,6 +21,7 @@ const LOCAL_HOST = "127.0.0.1";
 const DEFAULT_PORT = 0;
 const MAX_VIEWER_SOCKET_MESSAGE_BYTES = 64 * 1024;
 const DEFAULT_MAX_MCP_EVENT_BACKLOG = 500;
+const MAX_RETAINED_ANNOTATION_TOMBSTONES = 500;
 const LW_VIEWER_ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "viewer_lw");
 const LW_PDFJS_BUILD_ASSETS = new Map<string, { path: string; polyfillModernPromiseHelpers?: boolean }>([
 	["/viewer-lw/build/pdf.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.mjs"), polyfillModernPromiseHelpers: true }],
@@ -143,6 +145,12 @@ export class ViewerHostServer {
 	private readonly heartbeatRequest: ViewerHostHeartbeatRequestHandler | undefined;
 	private readonly controlToken: string | undefined;
 	private readonly pendingPdfMarks: PendingPdfMarkStore;
+	private readonly sourceAnchorsByMarkKey = new Map<string, PdfMarkSourceAnchor[]>();
+	private readonly annotationRebasesByMarkKey = new Map<string, Record<string, unknown>>();
+	private readonly annotationClearIdsByPdfId = new Map<number, Map<string, number>>();
+	private readonly annotationClearOrder: Array<{ pdfId: number; annotationId: string; version: number }> = [];
+	private nextAnnotationClearVersion = 1;
+	private readonly staleSourceNoticeRevisionByPdfId = new Map<number, number>();
 	private readonly instanceIdValue: string;
 	private readonly failureReporter: ViewerFailureReporter;
 	private controlReady = false;
@@ -377,6 +385,10 @@ export class ViewerHostServer {
 			await this.handleSynctexProbeRequest(request, response);
 			return;
 		}
+		if (requestUrl.pathname === "/synctex/box") {
+			await this.handleSynctexBoxRequest(request, response);
+			return;
+		}
 		if (request.method !== "GET" && request.method !== "HEAD") {
 			textResponse(response, 405, "text/plain; charset=utf-8", "method not allowed", false);
 			return;
@@ -478,7 +490,10 @@ export class ViewerHostServer {
 			this.visibleViewerTabs.delete(payload.pdf_id);
 			if (this.activeVisiblePdfId === payload.pdf_id) this.activeVisiblePdfId = this.lastVisibleViewerTab()?.pdf_id;
 			this.discardMcpEventsForPdfId(payload.pdf_id);
-			this.pendingPdfMarks.clearPdf(payload.pdf_id);
+			const cleared = this.pendingPdfMarks.clearPdf(payload.pdf_id);
+			this.clearSourceAnchorsForPdf(payload.pdf_id);
+			this.clearAnnotationRebasesForPdf(payload.pdf_id);
+			for (const mark of cleared) this.rememberAnnotationCleared(mark);
 			this.broadcastAnnotationsCleared([payload.pdf_id]);
 			this.queueMcpEvent({ type: "viewer_tab_closed", pdf_id: payload.pdf_id });
 		}
@@ -576,9 +591,17 @@ export class ViewerHostServer {
 			...(payload.pdf_ids === undefined ? {} : { pdfIds: new Set(payload.pdf_ids as number[]) }),
 			...(payload.max_marks === undefined ? {} : { maxMarks: Number(payload.max_marks) }),
 		});
+		const stalePdfIds = new Set<number>();
+		const marks = claim.marks.map((mark) => {
+			const record = this.registry.getPdf(mark.pdf_id);
+			if (!isMarkSourceInsideWorkspace(mark, record.workspaceCwd, record.pdfPath) || !sourceChangedSincePdf(mark, record.fileSnapshot.mtimeMs, record.workspaceCwd)) return mark;
+			stalePdfIds.add(record.pdfId);
+			return { ...mark, source_stale: true };
+		});
+		for (const pdfId of stalePdfIds) await this.reportStaleSourceNotice(pdfId);
 		jsonResponse(response, 200, {
 			ok: true,
-			marks: claim.marks,
+			marks,
 			...(claim.claimId === undefined ? {} : { claim_id: claim.claimId }),
 			...(claim.expiresAtMs === undefined ? {} : { lease_expires_at_ms: claim.expiresAtMs }),
 		});
@@ -695,6 +718,61 @@ export class ViewerHostServer {
 			jsonResponse(response, 200, {
 				ok: true,
 				result: { type: "reverse_synctex_forward_probe_result", pdf_id: pdfId, request_id: message.request_id, click_page: message.page, click_x: message.x, click_y: message.y, error: errorMessage(error) },
+			});
+		}
+	}
+
+	private async handleSynctexBoxRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		if (request.method !== "POST") {
+			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "SyncTeX box resolution requires POST" } });
+			return;
+		}
+		let payload: unknown;
+		try {
+			payload = JSON.parse(await readRequestBody(request));
+		} catch {
+			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "SyncTeX box body must be valid JSON" } });
+			return;
+		}
+		if (!isRecord(payload)) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_request", message: "SyncTeX box body must be an object" } });
+			return;
+		}
+		const pdfId = parsePositiveInteger(typeof payload.pdf_id === "number" ? String(payload.pdf_id) : undefined);
+		if (pdfId === undefined || !this.hasRegisteredPdf(pdfId)) {
+			jsonResponse(response, 404, { ok: false, error: { code: "unknown_pdf", message: "unknown pdf_id" } });
+			return;
+		}
+		if (request.headers["x-agent-synctex-viewer-token"] !== this.viewerSocketTokenForPdf(pdfId)) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid viewer token" } });
+			return;
+		}
+		let message: Extract<ViewerHostToMcpMessage, { type: "reverse_synctex_box" }>;
+		try {
+			const validated = validateViewerHostToMcpMessage({ ...payload, type: "reverse_synctex_box", pdf_id: pdfId });
+			if (validated.type !== "reverse_synctex_box") throw new Error("invalid SyncTeX box message");
+			message = validated;
+		} catch (error) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_box", message: errorMessage(error) } });
+			return;
+		}
+		try {
+			const record = this.registry.getPdf(pdfId);
+			jsonResponse(response, 200, { ok: true, result: resolveReverseSynctexBox({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } }) });
+		} catch (error) {
+			jsonResponse(response, 200, {
+				ok: true,
+				result: {
+					type: "reverse_synctex_box_result",
+					pdf_id: pdfId,
+					request_id: message.request_id,
+					page: message.page,
+					h: message.h,
+					v: message.v,
+					W: message.W,
+					H: message.H,
+					error: errorMessage(error),
+				},
 			});
 		}
 	}
@@ -977,7 +1055,10 @@ export class ViewerHostServer {
 			}
 			case "clear_pdf_annotations": {
 				const record = this.registry.getPdf(message.pdf_id);
-				this.pendingPdfMarks.clearPdf(record.pdfId);
+				const cleared = this.pendingPdfMarks.clearPdf(record.pdfId);
+				this.clearSourceAnchorsForPdf(record.pdfId);
+				this.clearAnnotationRebasesForPdf(record.pdfId);
+				for (const mark of cleared) this.rememberAnnotationCleared(mark);
 				this.broadcastAnnotationsCleared([record.pdfId]);
 				return { ok: true, result: { type: "clear_pdf_annotations", pdf_id: record.pdfId } };
 			}
@@ -1043,6 +1124,7 @@ export class ViewerHostServer {
 			this.viewerSocketClientsByPdfId.set(pdfId, clients);
 		}
 		clients.add(connection);
+		this.syncAnnotationStateToViewer(connection);
 		const cleanup = () => this.cleanupViewerSocket(connection);
 		socket.once("close", cleanup);
 		socket.once("end", cleanup);
@@ -1095,10 +1177,20 @@ export class ViewerHostServer {
 			}
 			const message = validateViewerHostToMcpMessage({ ...payload, pdf_id: connection.pdfId });
 			if (message.type === "pdf_annotation") {
-				this.pendingPdfMarks.upsert(message);
+				const { source_stale: _ignoredSourceStale, ...mark } = message;
+				const record = this.registry.getPdf(mark.pdf_id);
+				if (!isMarkSourceInsideWorkspace(mark, record.workspaceCwd, record.pdfPath)) throw new Error("annotation source_file must be inside the PDF workspace");
+				const anchors = capturePdfMarkSourceAnchors(mark, record.workspaceCwd);
+				if (anchors === undefined) this.sourceAnchorsByMarkKey.delete(pdfMarkKey(mark));
+				else this.sourceAnchorsByMarkKey.set(pdfMarkKey(mark), anchors);
+				this.annotationClearIdsByPdfId.get(mark.pdf_id)?.delete(mark.annotation_id);
+				this.annotationRebasesByMarkKey.delete(pdfMarkKey(mark));
+				this.pendingPdfMarks.upsert(mark);
 				return;
 			}
 			if (message.type === "pdf_annotation_deleted") {
+				this.sourceAnchorsByMarkKey.delete(pdfMarkKey(message));
+				this.rememberAnnotationCleared(message);
 				this.pendingPdfMarks.delete(message.pdf_id, message.annotation_id);
 				return;
 			}
@@ -1131,6 +1223,96 @@ export class ViewerHostServer {
 		this.mcpEvents.discardPdf(pdfId);
 	}
 
+	private clearSourceAnchorsForPdf(pdfId: number): void {
+		for (const key of this.sourceAnchorsByMarkKey.keys()) {
+			if (key.startsWith(`${pdfId}\0`)) this.sourceAnchorsByMarkKey.delete(key);
+		}
+	}
+
+	private clearAnnotationRebasesForPdf(pdfId: number): void {
+		for (const key of this.annotationRebasesByMarkKey.keys()) {
+			if (key.startsWith(`${pdfId}\0`)) this.annotationRebasesByMarkKey.delete(key);
+		}
+	}
+
+	private rememberAnnotationCleared(mark: Pick<ViewerHostPdfAnnotationMessage, "pdf_id" | "annotation_id">): void {
+		this.annotationRebasesByMarkKey.delete(pdfMarkKey(mark));
+		const annotationIds = this.annotationClearIdsByPdfId.get(mark.pdf_id) ?? new Map<string, number>();
+		if (annotationIds.has(mark.annotation_id)) return;
+		const version = this.nextAnnotationClearVersion++;
+		annotationIds.set(mark.annotation_id, version);
+		this.annotationClearIdsByPdfId.set(mark.pdf_id, annotationIds);
+		this.annotationClearOrder.push({ pdfId: mark.pdf_id, annotationId: mark.annotation_id, version });
+		while (this.annotationClearOrder.length > MAX_RETAINED_ANNOTATION_TOMBSTONES) {
+			const oldest = this.annotationClearOrder.shift();
+			if (oldest === undefined) break;
+			const current = this.annotationClearIdsByPdfId.get(oldest.pdfId);
+			if (current?.get(oldest.annotationId) !== oldest.version) continue;
+			current.delete(oldest.annotationId);
+			if (current.size === 0) this.annotationClearIdsByPdfId.delete(oldest.pdfId);
+		}
+	}
+
+	private rememberAnnotationRebased(mark: ViewerHostPdfAnnotationMessage, message: Record<string, unknown>): void {
+		this.annotationClearIdsByPdfId.get(mark.pdf_id)?.delete(mark.annotation_id);
+		this.annotationRebasesByMarkKey.set(pdfMarkKey(mark), { annotation_id: mark.annotation_id, message });
+	}
+
+	private syncAnnotationStateToViewer(connection: ViewerSocketConnection): void {
+		const clearedIds = this.annotationClearIdsByPdfId.get(connection.pdfId);
+		if (clearedIds?.size) sendViewerSocketJson(connection, { type: "annotations_cleared", pdf_id: connection.pdfId, pdf_ids: [connection.pdfId], annotation_ids: Array.from(clearedIds.keys()) });
+		const updates = Array.from(this.annotationRebasesByMarkKey.entries())
+			.filter(([key]) => key.startsWith(`${connection.pdfId}\0`))
+			.map(([, update]) => update);
+		if (updates.length > 0) sendViewerSocketJson(connection, { type: "annotations_rebased", pdf_id: connection.pdfId, annotations: updates });
+	}
+
+	private async reportStaleSourceNotice(pdfId: number): Promise<void> {
+		const record = this.registry.getPdf(pdfId);
+		if (this.staleSourceNoticeRevisionByPdfId.get(pdfId) === record.revision) return;
+		this.staleSourceNoticeRevisionByPdfId.set(pdfId, record.revision);
+		await this.failureReporter.report("The marked TeX source is newer than this PDF. Recompile to refresh SyncTeX; marks that cannot be uniquely reattached will be cleared.", {
+			pdfId,
+			code: "source_newer_than_pdf",
+			title: "Source changed since this PDF was compiled",
+			detail: "The marked TeX source is newer than this PDF. Recompile to refresh SyncTeX; marks that cannot be uniquely reattached will be cleared.",
+		});
+	}
+
+	private rebasePdfAnnotations(record: ViewerHostPdfRecord): void {
+		const updates: Array<{ annotation_id: string; message: Record<string, unknown> }> = [];
+		const reconciled = this.pendingPdfMarks.reconcilePdf(record.pdfId, (mark) => {
+			const result = rebasePdfMark({
+				mark,
+				anchors: this.sourceAnchorsByMarkKey.get(pdfMarkKey(mark)),
+				pdfPath: record.pdfPath,
+				cwd: record.workspaceCwd,
+			});
+			if (result === undefined || result.anchors.length === 0) {
+				this.sourceAnchorsByMarkKey.delete(pdfMarkKey(mark));
+				return undefined;
+			}
+			this.sourceAnchorsByMarkKey.set(pdfMarkKey(result.mark), result.anchors);
+			const message = { ...result.forward, source_spans: result.mark.source_spans };
+			updates.push({ annotation_id: result.mark.annotation_id, message });
+			this.rememberAnnotationRebased(result.mark, message);
+			return result.mark;
+		});
+		for (const mark of reconciled.cleared) this.rememberAnnotationCleared(mark);
+		if (reconciled.cleared.length > 0) this.broadcastAcknowledgedMarks(reconciled.cleared);
+		if (updates.length > 0) this.broadcastViewerSocketMessage(record.pdfId, { type: "annotations_rebased", pdf_id: record.pdfId, annotations: updates });
+		if (reconciled.updated.length > 0 || reconciled.cleared.length > 0) {
+			this.broadcastViewerSocketMessage(record.pdfId, {
+				type: "compile_status",
+				pdf_id: record.pdfId,
+				running: false,
+				continuous: false,
+				severity: "info",
+				message: `PDF refreshed: reattached ${reconciled.updated.length} mark${reconciled.updated.length === 1 ? "" : "s"}; cleared ${reconciled.cleared.length}.`,
+			});
+		}
+	}
+
 	private queueMcpEvent(message: ViewerHostToMcpMessage): void {
 		this.mcpEvents.enqueue(message);
 	}
@@ -1144,6 +1326,8 @@ export class ViewerHostServer {
 	private broadcastAcknowledgedMarks(acknowledged: readonly AcknowledgedPdfMark[]): void {
 		const annotationIdsByPdfId = new Map<number, string[]>();
 		for (const mark of acknowledged) {
+			this.sourceAnchorsByMarkKey.delete(pdfMarkKey(mark));
+			this.rememberAnnotationCleared(mark);
 			const annotationIds = annotationIdsByPdfId.get(mark.pdf_id) ?? [];
 			annotationIds.push(mark.annotation_id);
 			annotationIdsByPdfId.set(mark.pdf_id, annotationIds);
@@ -1303,6 +1487,7 @@ export class ViewerHostServer {
 		this.pendingPdfRefreshSnapshots.delete(record.pdfId);
 		const updated = this.registry.recordPdfFileChange(record.pdfId, snapshot);
 		this.scheduleSynctexPrewarm(updated);
+		this.rebasePdfAnnotations(updated);
 		this.sendPdfRefresh(record.pdfId);
 	}
 
@@ -1558,6 +1743,27 @@ function jsonResponse(response: ServerResponse, status: number, body: unknown): 
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function pdfMarkKey(mark: Pick<ViewerHostPdfAnnotationMessage, "pdf_id" | "annotation_id">): string {
+	return `${mark.pdf_id}\0${mark.annotation_id}`;
+}
+
+function isMarkSourceInsideWorkspace(mark: ViewerHostPdfAnnotationMessage, workspaceCwd: string | undefined, pdfPath?: string): boolean {
+	const workspacePath = resolve(workspaceCwd ?? (pdfPath === undefined ? process.cwd() : dirname(pdfPath)));
+	try {
+		const resolvedWorkspace = realpathSync(workspacePath);
+		return sourceSpansForPdfAnnotation(mark).every((span) => {
+			const sourcePath = isAbsolute(span.source_file) ? resolve(span.source_file) : resolve(workspacePath, span.source_file);
+			const lexicalRelative = relative(workspacePath, sourcePath);
+			if (lexicalRelative !== "" && (lexicalRelative.startsWith("..") || isAbsolute(lexicalRelative))) return false;
+			const resolvedSource = realpathSync(sourcePath);
+			const resolvedRelative = relative(resolvedWorkspace, resolvedSource);
+			return resolvedRelative === "" || (!resolvedRelative.startsWith("..") && !isAbsolute(resolvedRelative));
+		});
+	} catch {
+		return false;
+	}
 }
 
 class ViewerHostSnapshotError extends Error {

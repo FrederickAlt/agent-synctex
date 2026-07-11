@@ -607,13 +607,13 @@ test("actual agent-synctex mcp entrypoint bridges reverse SyncTeX events from th
 			const [contextFrame] = await output as Array<{ result?: { content?: Array<{ text?: string }>; details?: Record<string, unknown> } }>;
 			text = contextFrame.result?.content?.[0]?.text ?? "";
 			details = contextFrame.result?.details;
-			if (/User comment: Please check this\./.test(text)) break;
+			if (/Messages:\n  - Please check this\./.test(text)) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 
 		assert.equal(text.includes(`${sourcePath}:3`), true);
-		assert.doesNotMatch(text, /Reverse target text\./);
-		assert.match(text, /User comment: Please check this\./);
+		assert.match(text, /Reverse target text\./);
+		assert.match(text, /Messages:\n  - Please check this\./);
 		assert.deepEqual(details, { pdf_ids: [pdfId], event_count: 1, cleared: true });
 	} finally {
 		socket?.close();

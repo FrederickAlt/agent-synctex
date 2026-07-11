@@ -174,6 +174,8 @@ export interface ReverseSynctexLocation {
 	forwardLookupMode?: ForwardSynctexLookupMode;
 	selectedForwardBox?: ForwardSynctexRange;
 	selectedForwardRanges?: ForwardSynctexRange[];
+	/** Exact forward-group scores, emitted only by an explicit debug probe. */
+	forwardGroupScores?: ReverseSynctexForwardGroupScore[];
 	diagnostics: ReverseSynctexDiagnostics;
 }
 
@@ -198,6 +200,7 @@ export interface ReverseSynctexHoverInspection {
 	forwardLookupMode?: ForwardSynctexLookupMode;
 	selectedForwardBox?: ForwardSynctexRange;
 	selectedForwardRanges?: ForwardSynctexRange[];
+	forwardGroupScores?: ReverseSynctexForwardGroupScore[];
 	rect: { left: number; top: number; right: number; bottom: number };
 	distanceFromCenter: number;
 }
@@ -671,8 +674,12 @@ function getRowAndColumn(lines: string[], row: number, textBeforeSelectionFull: 
 	return [row, 0];
 }
 
+const MAX_SYNC_TEX_SOURCE_BYTES = 1_000_000;
+
 function readSourceText(sourceFile: string): string | undefined {
 	try {
+		const status = statSync(sourceFile);
+		if (!status.isFile() || status.size > MAX_SYNC_TEX_SOURCE_BYTES) return undefined;
 		return readFileSync(sourceFile, "utf8");
 	} catch {
 		return undefined;
@@ -718,9 +725,15 @@ function compactReverseCandidate(candidate: ReverseSyncTeXCandidate, cwd?: strin
 	};
 }
 
-const SYNCTEX_LAYOUT_SEMANTIC_PENALTY = 500;
+const SYNCTEX_LAYOUT_SEMANTIC_PENALTY = 1_000_000_000;
 const FORWARD_DISTANCE_PENALTY_MULTIPLIER = 0.96;
 const FORWARD_BOX_SIZE_PENALTY_MULTIPLIER = 2;
+const TINY_BOX_GLYPH_WIDTH_PT = 5.5;
+const TINY_BOX_GLYPH_HEIGHT_PT = 11;
+const TINY_BOX_MAX_PENALTY = 1_000;
+const TINY_BOX_CHARACTER_CUTOFF = 10;
+// Calibrated so a five-glyph-equivalent box receives a 300-point penalty.
+const TINY_BOX_PENALTY_EXPONENT = Math.log(0.3) / Math.log(5 / 9);
 
 interface ForwardBoxGroup {
 	lookupMode: ForwardSynctexLookupMode;
@@ -729,6 +742,15 @@ interface ForwardBoxGroup {
 	/** DOM text rectangles describe visual layout; SyncTeX rectangles preserve source semantics. */
 	semanticPenalty: number;
 	verifiedText?: boolean;
+}
+
+export interface ReverseSynctexForwardGroupScore {
+	origin: "synctex_exact" | "synctex_normalized" | "pdf_text_span";
+	lookupLine: number;
+	semanticPenalty: number;
+	geometryTier: number;
+	score: number;
+	chosenBox?: ForwardSynctexRange;
 }
 
 function forwardBoxesForLookup(input: { sourceFile: string; line: number; pdfPath: string; cwd: string; lookupMode: ForwardSynctexLookupMode; nativeRunner?: NativeSynctexRunner; forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine; synctexCommand?: string }): ForwardSynctexRange[] {
@@ -755,12 +777,24 @@ function forwardRangeKey(range: ForwardSynctexRange): string {
 	return [range.page, range.h, range.v, range.W, range.H].join(":");
 }
 
-function normalizedVisibleText(value: string): string {
+/**
+ * Discourages click candidates whose visible geometry is only glyph-sized.
+ * The positive value is added to the reverse-click score, where lower wins.
+ */
+export function tinyForwardBoxPenalty(box: Pick<ForwardSynctexRange, "W" | "H">): number {
+	const glyphArea = TINY_BOX_GLYPH_WIDTH_PT * TINY_BOX_GLYPH_HEIGHT_PT;
+	const characterEquivalent = Math.max(1, (Math.max(0, box.W) * Math.max(0, box.H)) / glyphArea);
+	if (characterEquivalent >= TINY_BOX_CHARACTER_CUTOFF) return 0;
+	const remaining = (TINY_BOX_CHARACTER_CUTOFF - characterEquivalent) / (TINY_BOX_CHARACTER_CUTOFF - 1);
+	return TINY_BOX_MAX_PENALTY * Math.pow(remaining, TINY_BOX_PENALTY_EXPONENT);
+}
+
+export function normalizedVisibleText(value: string): string {
 	return value.replace(/[\u00a0\s]+/g, " ").replace(/[−–—]/g, "-").trim();
 }
 
 /** Only project source lines whose visible text can be established without TeX expansion. */
-function simpleVisibleSourceText(sourceLine: string | undefined): string | undefined {
+export function simpleVisibleSourceText(sourceLine: string | undefined): string | undefined {
 	if (sourceLine === undefined) return undefined;
 	let visible = sourceLine.replace(/\\(?:textbf|textit|emph|mathrm|mathbf|text)\{([^{}]*)\}/g, "$1");
 	visible = visible.replace(/\\\\(?:\[[^\]]*\])?/g, " ").replace(/&/g, " ");
@@ -854,6 +888,7 @@ interface ScoredReverseSynctexProposal extends ReverseSynctexProposal {
 	textContainment?: "full" | "partial";
 	distance?: number;
 	reason?: string;
+	forwardGroupScores: ReverseSynctexForwardGroupScore[];
 }
 
 function sameSourceLocation(left: { sourceFile: string; line: number }, right: { sourceFile: string; line: number }): boolean {
@@ -921,7 +956,8 @@ function scoreReverseSynctexProposal(input: {
 			const containsClick = boxContainsClick(box, input.click);
 			const containment = textContainmentBonus({ proposal: input.proposal, containsClick, fullTextFragment: input.fullTextFragment, partialTextFragment: input.partialTextFragment });
 			const clickContainmentBonus = containsClick ? -1000 : 0;
-			return { box, distance, clickContainmentBonus, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (distanceSquared * FORWARD_DISTANCE_PENALTY_MULTIPLIER) + (Math.sqrt(area) * FORWARD_BOX_SIZE_PENALTY_MULTIPLIER) + clickContainmentBonus + containment.bonus + group.semanticPenalty + (input.proposal.sourceLine?.trim() === "\\end{document}" ? END_DOCUMENT_SCORE_PENALTY : 0) };
+				const tinyBoxPenalty = tinyForwardBoxPenalty(box);
+			return { box, distance, clickContainmentBonus, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (distanceSquared * FORWARD_DISTANCE_PENALTY_MULTIPLIER) + (Math.sqrt(area) * FORWARD_BOX_SIZE_PENALTY_MULTIPLIER) + tinyBoxPenalty + clickContainmentBonus + containment.bonus + group.semanticPenalty + (input.proposal.sourceLine?.trim() === "\\end{document}" ? END_DOCUMENT_SCORE_PENALTY : 0) };
 		}).sort((left, right) => left.score - right.score);
 		const chosen = scoredSamePageBoxes[0];
 		return {
@@ -949,6 +985,14 @@ function scoreReverseSynctexProposal(input: {
 	return {
 		...input.proposal,
 		precision: proposalPrecision(input.proposal, containsClick, selectedGroup?.group.verifiedText === true),
+		forwardGroupScores: scoredGroups.map((group) => ({
+			origin: group.group.verifiedText === true ? "pdf_text_span" : group.group.lookupMode === "normalized" ? "synctex_normalized" : "synctex_exact",
+			lookupLine: group.group.lookupLine,
+			semanticPenalty: group.group.semanticPenalty,
+			geometryTier: group.geometryTier,
+			score: group.score,
+			...(group.chosenBox === undefined ? {} : { chosenBox: group.chosenBox }),
+		})),
 		geometryTier,
 		score: selectedGroup?.score ?? 0,
 		...(selectedGroup === undefined ? {} : { forwardLookupLine: selectedGroup.group.lookupLine, forwardLookupMode: selectedGroup.group.lookupMode }),
@@ -1168,6 +1212,15 @@ function sourceSpanForLine(sourceFile: string, line: number, sourceLines: string
 	return { span: { sourceFile, startLine: span.startLine, endLine: span.endLine }, excerpt: span.excerpt, ...(contentLine === undefined ? {} : { contentLine }) };
 }
 
+export function normalizedSourceSpansForLines(sourceFile: string, lines: readonly number[]): ReverseSynctexSourceSpan[] {
+	const sourceLines = readSourceLines(sourceFile);
+	return lines.map((line) => sourceSpanForLine(sourceFile, line, sourceLines)?.span ?? { sourceFile, startLine: line, endLine: line });
+}
+
+export function normalizedSourceSpanForLine(sourceFile: string, line: number): ReverseSynctexSourceSpan {
+	return normalizedSourceSpansForLines(sourceFile, [line])[0] as ReverseSynctexSourceSpan;
+}
+
 function forwardSynctexLineForSourceLine(sourceFile: string, line: number): number {
 	const sourceLines = readSourceLines(sourceFile);
 	const sourceSpan = sourceSpanForLine(sourceFile, line, sourceLines);
@@ -1265,6 +1318,7 @@ function reverseLocationToHoverInspection(location: ReverseSynctexLocation): Rev
 		...(location.forwardLookupMode === undefined ? {} : { forwardLookupMode: location.forwardLookupMode }),
 		...(location.selectedForwardBox === undefined ? {} : { selectedForwardBox: location.selectedForwardBox }),
 		...(location.selectedForwardRanges === undefined ? {} : { selectedForwardRanges: location.selectedForwardRanges }),
+		...(location.forwardGroupScores === undefined ? {} : { forwardGroupScores: location.forwardGroupScores }),
 		rect: rectFromDiagnostics(location.diagnostics),
 		distanceFromCenter: 0,
 	};
@@ -1421,6 +1475,7 @@ export function mapReverseSynctex(input: {
 	let forwardLookup: { line: number; mode: ForwardSynctexLookupMode } | undefined;
 	let selectedForwardBox: ForwardSynctexRange | undefined;
 	let selectedForwardRanges: ForwardSynctexRange[] | undefined;
+	let selectedForwardGroupScores: ReverseSynctexForwardGroupScore[] | undefined;
 
 	if (branch === "js") {
 		const proposals: ReverseSynctexProposal[] = [];
@@ -1522,6 +1577,7 @@ export function mapReverseSynctex(input: {
 				selectedScore = selectedProposal.score;
 				selectedForwardBox = selectedProposal.chosenBox;
 				selectedForwardRanges = selectedProposal.boxes;
+					selectedForwardGroupScores = selectedProposal.forwardGroupScores;
 				if (selectedProposal.forwardLookupLine !== undefined && selectedProposal.forwardLookupMode !== undefined) {
 					forwardLookup = { line: selectedProposal.forwardLookupLine, mode: selectedProposal.forwardLookupMode };
 				}
@@ -1651,6 +1707,7 @@ export function mapReverseSynctex(input: {
 		...(forwardLookup === undefined ? {} : { forwardLookupLine: forwardLookup.line, forwardLookupMode: forwardLookup.mode }),
 		...(selectedForwardBox === undefined ? {} : { selectedForwardBox }),
 		...(selectedForwardRanges === undefined ? {} : { selectedForwardRanges }),
+		...(selectedForwardGroupScores === undefined ? {} : { forwardGroupScores: selectedForwardGroupScores }),
 		diagnostics,
 	};
 }

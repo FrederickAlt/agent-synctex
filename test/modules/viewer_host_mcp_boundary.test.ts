@@ -261,6 +261,22 @@ test("HTTP reverse-forward probe is handled by ViewerHostServer without entering
 		assert.equal(result.page, 1);
 		assert.equal(Array.isArray(result.debug_candidates), true);
 		assert.ok((result.debug_candidates as unknown[]).length > 0, "debug probe should include candidate scores for the browser overlay");
+
+		const boxResponse = await fetch(`${server.origin}/synctex/box`, {
+			method: "POST",
+			headers: { "content-type": "application/json", "x-agent-synctex-viewer-token": config.viewer_socket_token },
+			body: JSON.stringify({ pdf_id: 812, request_id: 2, page: 1, h: 0, v: 1000, W: 1000, H: 1000 }),
+		});
+		assert.equal(boxResponse.status, 200);
+		const boxBody = await boxResponse.json() as { ok: boolean; result: Record<string, unknown> };
+		assert.equal(boxBody.ok, true);
+		assert.equal(boxBody.result.type, "reverse_synctex_box_result");
+		assert.equal(boxBody.result.pdf_id, 812);
+		assert.equal(boxBody.result.request_id, 2);
+		assert.equal(Array.isArray(boxBody.result.source_spans), true);
+		assert.ok((boxBody.result.source_spans as unknown[]).length > 0);
+		assert.equal(Array.isArray(boxBody.result.ranges), true);
+		assert.ok((boxBody.result.ranges as unknown[]).length > 0);
 		const events = await service.getPdfEvents({ pdf_id: 812, max_events: 10, stale: true, debug: true });
 		assert.equal(events.length, 0, "debug probe must not be appended to the MCP event store");
 	} finally {

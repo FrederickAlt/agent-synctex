@@ -184,6 +184,55 @@ export interface ParsedSyncTexForPdf {
 	sidecarPath: string;
 }
 
+/** A source-mapped terminal SyncTeX record in PDF user-space coordinates. */
+export interface SyncTeXLeafBox {
+	page: number;
+	sourceFile: string;
+	line: number;
+	h: number;
+	v: number;
+	W: number;
+	H: number;
+}
+
+export interface SyncTeXSourceLocation {
+	sourceFile: string;
+	line: number;
+}
+
+export interface SyncTeXForwardLeafLookup extends SyncTeXSourceLocation {
+	boxes: SyncTeXLeafBox[];
+}
+
+export interface BoundedSyncTeXLeafBoxes {
+	boxes: SyncTeXLeafBox[];
+	exceeded: boolean;
+}
+
+export interface BoundedSyncTeXForwardLeafLookups {
+	lookups: SyncTeXForwardLeafLookup[];
+	exceeded: boolean;
+}
+
+const LEAF_BOX_GRID_CELL_SIZE = 64;
+/** Explicit page-index ceiling: dense pages are rejected, never sampled. */
+export const MAX_CACHED_SYNC_TEX_PAGE_LEAF_BOXES = 5_000;
+
+interface CachedPageLeafBoxIndex {
+	exceeded: boolean;
+	boxes: SyncTeXLeafBox[];
+	boxIndexesByGridCell: Map<string, number[]>;
+	boxIndexesBySourceLocation: Map<string, number[]>;
+}
+
+interface CachedParsedSyncTex {
+	sidecarPath: string;
+	mtimeMs: number;
+	size: number;
+	parsed: ParsedSyncTexForPdf | undefined;
+	leafBoxesByPage: Map<number, CachedPageLeafBoxIndex>;
+}
+
 export function resolveLatexWorkshopSynctexSidecar(pdfPath: string): string | undefined {
 	const synctexPath = pdfPath.slice(0, -path.extname(pdfPath).length) + ".synctex";
 	if (fs.existsSync(synctexPath)) return synctexPath;
@@ -192,23 +241,231 @@ export function resolveLatexWorkshopSynctexSidecar(pdfPath: string): string | un
 	return undefined;
 }
 
-const parsedSyncTexCache = new Map<string, { sidecarPath: string; mtimeMs: number; size: number; parsed: ParsedSyncTexForPdf | undefined }>();
+const parsedSyncTexCache = new Map<string, CachedParsedSyncTex>();
 
-export function parseSyncTexForPdf(pdfPath: string): ParsedSyncTexForPdf | undefined {
+function cachedSyncTexForPdf(pdfPath: string): CachedParsedSyncTex | undefined {
 	const sidecarPath = resolveLatexWorkshopSynctexSidecar(pdfPath);
-	if (sidecarPath === undefined) return undefined;
-	const status = fs.statSync(sidecarPath);
 	const cacheKey = path.resolve(pdfPath);
+	if (sidecarPath === undefined) {
+		parsedSyncTexCache.delete(cacheKey);
+		return undefined;
+	}
+	const status = fs.statSync(sidecarPath);
 	const cached = parsedSyncTexCache.get(cacheKey);
 	if (cached && cached.sidecarPath === sidecarPath && cached.mtimeMs === status.mtimeMs && cached.size === status.size) {
-		return cached.parsed;
+		return cached;
 	}
 	const data = fs.readFileSync(sidecarPath);
 	const body = sidecarPath.endsWith(".gz") ? zlib.gunzipSync(data).toString("binary") : data.toString("utf8");
 	const pdfSyncObject = parseSyncTex(body);
 	const parsed = pdfSyncObject === undefined ? undefined : { pdfSyncObject, sidecarPath };
-	parsedSyncTexCache.set(cacheKey, { sidecarPath, mtimeMs: status.mtimeMs, size: status.size, parsed });
-	return parsed;
+	const entry = { sidecarPath, mtimeMs: status.mtimeMs, size: status.size, parsed, leafBoxesByPage: new Map<number, CachedPageLeafBoxIndex>() };
+	parsedSyncTexCache.set(cacheKey, entry);
+	return entry;
+}
+
+export function parseSyncTexForPdf(pdfPath: string): ParsedSyncTexForPdf | undefined {
+	return cachedSyncTexForPdf(pdfPath)?.parsed;
+}
+
+function cachedPageLeafBoxIndex(pdfPath: string, page: number): CachedPageLeafBoxIndex | undefined {
+	const cached = cachedSyncTexForPdf(pdfPath);
+	if (cached?.parsed === undefined) return undefined;
+	const existing = cached.leafBoxesByPage.get(page);
+	if (existing !== undefined) return existing;
+
+	const { pdfSyncObject } = cached.parsed;
+	const boxes: SyncTeXLeafBox[] = [];
+	for (const sourceFile of Object.keys(pdfSyncObject.blockNumberLine)) {
+		const linePageBlocks = pdfSyncObject.blockNumberLine[sourceFile];
+		for (const lineText of Object.keys(linePageBlocks)) {
+			for (const block of linePageBlocks[Number(lineText)]![page] ?? []) {
+				if (block.elements !== undefined || block.type === "k" || block.type === "r") continue;
+				if (boxes.length >= MAX_CACHED_SYNC_TEX_PAGE_LEAF_BOXES) {
+					const denseIndex = { exceeded: true, boxes: [], boxIndexesByGridCell: new Map<string, number[]>(), boxIndexesBySourceLocation: new Map<string, number[]>() };
+					cached.leafBoxesByPage.set(page, denseIndex);
+					return denseIndex;
+				}
+				boxes.push({
+					page,
+					sourceFile,
+					line: Number(lineText),
+					h: block.left + pdfSyncObject.offset.x,
+					v: block.bottom + pdfSyncObject.offset.y,
+					W: block.width ?? 0,
+					H: block.height,
+				});
+			}
+		}
+	}
+	const boxIndexesByGridCell = new Map<string, number[]>();
+	const boxIndexesBySourceLocation = new Map<string, number[]>();
+	for (const [index, box] of boxes.entries()) {
+		const cell = gridCellKey(Math.floor(box.h / LEAF_BOX_GRID_CELL_SIZE), Math.floor((box.v - box.H) / LEAF_BOX_GRID_CELL_SIZE));
+		const cellIndexes = boxIndexesByGridCell.get(cell) ?? [];
+		cellIndexes.push(index);
+		boxIndexesByGridCell.set(cell, cellIndexes);
+		const sourceIndexes = boxIndexesBySourceLocation.get(sourceLocationKey(box.sourceFile, box.line)) ?? [];
+		sourceIndexes.push(index);
+		boxIndexesBySourceLocation.set(sourceLocationKey(box.sourceFile, box.line), sourceIndexes);
+	}
+	const pageIndex = { exceeded: false, boxes, boxIndexesByGridCell, boxIndexesBySourceLocation };
+	cached.leafBoxesByPage.set(page, pageIndex);
+	return pageIndex;
+}
+
+function cachedPageLeafBoxes(pdfPath: string, page: number): SyncTeXLeafBox[] {
+	return cachedPageLeafBoxIndex(pdfPath, page)?.boxes ?? [];
+}
+
+function copyLeafBoxes(boxes: SyncTeXLeafBox[]): SyncTeXLeafBox[] {
+	return boxes.map((box) => ({ ...box }));
+}
+
+/** Returns source-mapped terminal SyncTeX boxes for one page. */
+export function getCachedSyncTeXPageLeafBoxes(pdfPath: string, page: number): SyncTeXLeafBox[] {
+	return copyLeafBoxes(cachedPageLeafBoxes(pdfPath, page));
+}
+
+/**
+ * Collects matching leaf boxes without materializing an unbounded response.
+ * Hitting the limit is explicit: callers must reject rather than sample.
+ */
+export function collectCachedSyncTeXPageLeafBoxes(input: {
+	pdfPath: string;
+	page: number;
+	maxBoxes: number;
+	bounds?: { h: number; v: number; W: number; H: number };
+	matches: (box: Readonly<SyncTeXLeafBox>) => boolean;
+}): BoundedSyncTeXLeafBoxes {
+	const maxBoxes = Math.max(1, Math.trunc(input.maxBoxes));
+	const pageIndex = cachedPageLeafBoxIndex(input.pdfPath, input.page);
+	if (pageIndex === undefined) return { boxes: [], exceeded: false };
+	if (pageIndex.exceeded) return { boxes: [], exceeded: true };
+	const boxes: SyncTeXLeafBox[] = [];
+	for (const index of leafBoxIndexesForBounds(pageIndex, input.bounds)) {
+		const box = pageIndex.boxes[index];
+		if (box === undefined || !input.matches(box)) continue;
+		if (boxes.length >= maxBoxes) return { boxes: copyLeafBoxes(boxes), exceeded: true };
+		boxes.push(box);
+	}
+	return { boxes: copyLeafBoxes(boxes), exceeded: false };
+}
+
+/** Returns every terminal SyncTeX box for an exact source file and line, optionally on one page. */
+export function getCachedSyncTeXForwardLeafBoxes(input: { pdfPath: string; sourceFile: string; line: number; page?: number }): SyncTeXLeafBox[] {
+	return collectCachedSyncTeXForwardLeafBoxes({ ...input, maxBoxes: Number.MAX_SAFE_INTEGER }).boxes;
+}
+
+/** Exact-line forward geometry with an explicit cap for refresh/rebase paths. */
+export function collectCachedSyncTeXForwardLeafBoxes(input: { pdfPath: string; sourceFile: string; line: number; page?: number; maxBoxes: number }): BoundedSyncTeXLeafBoxes {
+	const cached = cachedSyncTexForPdf(input.pdfPath);
+	if (cached?.parsed === undefined) return { boxes: [], exceeded: false };
+	const sourceFile = findInputFilePathForward(input.sourceFile, cached.parsed.pdfSyncObject);
+	if (sourceFile === undefined) return { boxes: [], exceeded: false };
+	const linePageBlocks = cached.parsed.pdfSyncObject.blockNumberLine[sourceFile]?.[input.line];
+	if (linePageBlocks === undefined) return { boxes: [], exceeded: false };
+	const maxBoxes = Math.max(1, Math.trunc(input.maxBoxes));
+	const pages = input.page === undefined ? Object.keys(linePageBlocks).map(Number) : [input.page];
+	const boxes: SyncTeXLeafBox[] = [];
+	for (const page of pages) {
+		for (const block of linePageBlocks[page] ?? []) {
+			if (block.elements !== undefined || block.type === "k" || block.type === "r") continue;
+			if (boxes.length >= maxBoxes) return { boxes: copyLeafBoxes(boxes), exceeded: true };
+			boxes.push({
+				page,
+				sourceFile,
+				line: input.line,
+				h: block.left + cached.parsed.pdfSyncObject.offset.x,
+				v: block.bottom + cached.parsed.pdfSyncObject.offset.y,
+				W: block.width ?? 0,
+				H: block.height,
+			});
+		}
+	}
+	return { boxes: copyLeafBoxes(boxes), exceeded: false };
+}
+
+/**
+ * Resolves many already-indexed source locations on one page without repeated
+ * sidecar parsing, path matching, or native SyncTeX calls. Locations use the
+ * raw sourceFile returned by getCachedSyncTeXPageLeafBoxes.
+ */
+export function getCachedSyncTeXPageForwardLeafBoxes(input: { pdfPath: string; page: number; locations: readonly SyncTeXSourceLocation[] }): SyncTeXForwardLeafLookup[] {
+	return collectCachedSyncTeXPageForwardLeafBoxes({ ...input, maxBoxes: Number.MAX_SAFE_INTEGER }).lookups;
+}
+
+/**
+ * Batch-forward source locations from one cached page with an explicit output
+ * bound. Hitting the limit means the caller must reject the selection.
+ */
+export function collectCachedSyncTeXPageForwardLeafBoxes(input: {
+	pdfPath: string;
+	page: number;
+	locations: readonly SyncTeXSourceLocation[];
+	maxBoxes: number;
+}): BoundedSyncTeXForwardLeafLookups {
+	const maxBoxes = Math.max(1, Math.trunc(input.maxBoxes));
+	const pageIndex = cachedPageLeafBoxIndex(input.pdfPath, input.page);
+	if (pageIndex === undefined) return { lookups: input.locations.map((location) => ({ ...location, boxes: [] })), exceeded: false };
+	if (pageIndex.exceeded) return { lookups: input.locations.map((location) => ({ ...location, boxes: [] })), exceeded: true };
+	const boxesByLocation = new Map<string, SyncTeXLeafBox[]>();
+	let count = 0;
+	for (const location of input.locations) {
+		const key = sourceLocationKey(location.sourceFile, location.line);
+		if (boxesByLocation.has(key)) continue;
+		const boxes: SyncTeXLeafBox[] = [];
+		for (const index of pageIndex.boxIndexesBySourceLocation.get(key) ?? []) {
+			if (count >= maxBoxes) {
+				return { lookups: copyForwardLeafLookups(input.locations, boxesByLocation), exceeded: true };
+			}
+			const box = pageIndex.boxes[index];
+			if (box === undefined) continue;
+			boxes.push(box);
+			count += 1;
+		}
+		boxesByLocation.set(key, boxes);
+	}
+	return { lookups: copyForwardLeafLookups(input.locations, boxesByLocation), exceeded: false };
+}
+
+function copyForwardLeafLookups(locations: readonly SyncTeXSourceLocation[], boxesByLocation: ReadonlyMap<string, SyncTeXLeafBox[]>): SyncTeXForwardLeafLookup[] {
+	return locations.map((location) => ({
+		...location,
+		boxes: copyLeafBoxes(boxesByLocation.get(sourceLocationKey(location.sourceFile, location.line)) ?? []),
+	}));
+}
+
+function leafBoxIndexesForBounds(pageIndex: CachedPageLeafBoxIndex, bounds: { h: number; v: number; W: number; H: number } | undefined): number[] {
+	if (bounds === undefined) return pageIndex.boxes.map((_box, index) => index);
+	const left = bounds.h;
+	const right = bounds.h + bounds.W;
+	const top = bounds.v - bounds.H;
+	const bottom = bounds.v;
+	if (![left, right, top, bottom].every(Number.isFinite)) return pageIndex.boxes.map((_box, index) => index);
+	const minX = Math.floor(left / LEAF_BOX_GRID_CELL_SIZE);
+	const maxX = Math.floor(right / LEAF_BOX_GRID_CELL_SIZE);
+	const minY = Math.floor(top / LEAF_BOX_GRID_CELL_SIZE);
+	const maxY = Math.floor(bottom / LEAF_BOX_GRID_CELL_SIZE);
+	const cellCount = (maxX - minX + 1) * (maxY - minY + 1);
+	if (!Number.isSafeInteger(cellCount) || cellCount > pageIndex.boxIndexesByGridCell.size * 2) {
+		return pageIndex.boxes.map((_box, index) => index);
+	}
+	const indexes: number[] = [];
+	for (let x = minX; x <= maxX; x += 1) {
+		for (let y = minY; y <= maxY; y += 1) {
+			indexes.push(...(pageIndex.boxIndexesByGridCell.get(gridCellKey(x, y)) ?? []));
+		}
+	}
+	return indexes;
+}
+
+function gridCellKey(x: number, y: number): string {
+	return `${x}\0${y}`;
+}
+
+function sourceLocationKey(sourceFile: string, line: number): string {
+	return `${sourceFile}\0${line}`;
 }
 
 export function findInputFilePathForward(filePath: string, pdfSyncObject: PdfSyncObject): string | undefined {

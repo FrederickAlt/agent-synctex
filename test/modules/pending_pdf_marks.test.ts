@@ -72,6 +72,32 @@ test("subset acknowledgement releases unrendered marks for the next consumer", (
 	assert.deepEqual(store.claim().marks.map((entry) => entry.annotation_id), ["not-shown"]);
 });
 
+test("pending PDF marks retain only successfully reconciled annotations", () => {
+	const store = new PendingPdfMarkStore();
+	store.upsert(mark(1, "keep", "before"));
+	store.upsert(mark(1, "clear", "obsolete"));
+	store.upsert(mark(2, "other", "unchanged"));
+
+	const reconciled = store.reconcilePdf(1, (entry) => entry.annotation_id === "keep" ? { ...entry, comment: "rebased", line: 7 } : undefined);
+
+	assert.deepEqual(reconciled.cleared, [{ pdf_id: 1, annotation_id: "clear" }]);
+	assert.deepEqual(reconciled.updated.map((entry) => [entry.annotation_id, entry.line, entry.comment]), [["keep", 7, "rebased"]]);
+	assert.deepEqual(store.claim().marks.map((entry) => [entry.pdf_id, entry.annotation_id, entry.comment]), [[1, "keep", "rebased"], [2, "other", "unchanged"]]);
+});
+
+test("reconciling a claimed PDF mark invalidates the old claim so the rebased mark is delivered", () => {
+	let claimNumber = 0;
+	const store = new PendingPdfMarkStore({ makeClaimId: () => `claim-${++claimNumber}` });
+	store.upsert(mark(1, "claimed", "old"));
+	const claim = store.claim();
+
+	store.reconcilePdf(1, (entry) => ({ ...entry, comment: "rebased" }));
+
+	assert.deepEqual(store.acknowledge(claim.claimId!), []);
+	assert.equal(store.size, 1);
+	assert.deepEqual(store.claim().marks.map((entry) => [entry.annotation_id, entry.comment]), [["claimed", "rebased"]]);
+});
+
 test("pending PDF mark storage is bounded", () => {
 	const store = new PendingPdfMarkStore({ maxPendingMarks: 2 });
 	store.upsert(mark(1, "oldest", "one"));

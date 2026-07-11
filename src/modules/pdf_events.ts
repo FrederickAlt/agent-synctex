@@ -61,7 +61,11 @@ export interface PdfAnnotationEventInput {
 	line: number;
 	source_line?: string;
 	pdf_mark?: string;
+	/** Normalized source ranges belonging to this single annotation. */
+	source_spans?: ReverseSynctexSourceSpanEvent[];
+	/** @deprecated Use source_spans. Retained for marks created by an older viewer. */
 	source_span?: ReverseSynctexSourceSpanEvent;
+	source_stale?: boolean;
 	page: number;
 	x: number;
 	y: number;

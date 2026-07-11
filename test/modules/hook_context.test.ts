@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -125,6 +125,7 @@ test("hook context claims marks directly from the Viewer Host and acknowledges o
 	const sourcePath = join(baseDir, "main.tex");
 	writeFileSync(pdfPath, "%PDF-1.4\n% direct hook\n%%EOF\n");
 	writeFileSync(sourcePath, "Marked source line.\n");
+	utimesSync(sourcePath, new Date(1_000), new Date(1_000));
 	const registry = new ViewerHostPdfRegistry();
 	const controlToken = "direct-hook-control-token";
 	const server = new ViewerHostServer({ registry, controlToken });
@@ -139,7 +140,7 @@ test("hook context claims marks directly from the Viewer Host and acknowledges o
 		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
 
 		const cleared = nextJsonMessage(socket);
-		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "direct-agent", cwd: baseDir }), "## PDF marks from the User\n\n- main.tex:1\n  PDF mark: `Visible PDF text.`\n  User comment: direct note");
+		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "direct-agent", cwd: baseDir }), "## PDF marks from the User\n\n- main.tex:1\n  Already read TeX source excerpt:\n  ```tex\n  Marked source line.\n  ```\n  Messages:\n  - direct note");
 		assert.deepEqual(await cleared, { type: "annotations_cleared", pdf_id: 12, pdf_ids: [12], annotation_ids: ["a1"] });
 		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "direct-agent", cwd: baseDir }), "");
 	} finally {
@@ -193,7 +194,7 @@ test("hook failures release marks, report the failure to the viewer, and reject 
 			detail: "simulated acknowledgement failure",
 			inject_text: "PDF mark delivery failed: simulated acknowledgement failure",
 		});
-		assert.match(await fetchHookContext({ runtimeRoot, agentId: "release-agent", cwd: baseDir }), /Retryable PDF mark\./);
+		assert.match(await fetchHookContext({ runtimeRoot, agentId: "release-agent", cwd: baseDir }), /Retryable mark\./);
 	} finally {
 		socket?.close();
 		await server.stop();
@@ -256,6 +257,7 @@ test("hook discovery never overrides an explicit agent identity and uses only an
 	mkdirSync(otherCwd, { recursive: true });
 	writeFileSync(pdfPath, "%PDF-1.4\n% cwd hook\n%%EOF\n");
 	writeFileSync(sourcePath, "CWD source.\n");
+	utimesSync(sourcePath, new Date(1_000), new Date(1_000));
 	const registry = new ViewerHostPdfRegistry();
 	const controlToken = "cwd-hook-control-token";
 	const server = new ViewerHostServer({ registry, controlToken });
@@ -277,7 +279,7 @@ test("hook discovery never overrides an explicit agent identity and uses only an
 		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
 
 		assert.equal(await fetchHookContext({ runtimeRoot, agentId: "missing-session", cwd: projectCwd }), "", "an explicit missing agent must not consume another same-project agent's marks");
-		assert.equal(await fetchHookContext({ runtimeRoot, cwd: projectCwd }), "## PDF marks from the User\n\n- main.tex:1\n  PDF mark: `CWD PDF mark.`");
+		assert.equal(await fetchHookContext({ runtimeRoot, cwd: projectCwd }), "## PDF marks from the User\n\n- main.tex:1\n  Already read TeX source excerpt:\n  ```tex\n  CWD source.\n  ```");
 	} finally {
 		socket?.close();
 		await server.stop();
@@ -314,6 +316,7 @@ test("agent-synctex fetch-info consumes direct Viewer Host context without a bri
 	const sourcePath = join(baseDir, "main.tex");
 	writeFileSync(pdfPath, "%PDF-1.4\n% cli hook\n%%EOF\n");
 	writeFileSync(sourcePath, "CLI source.\n");
+	utimesSync(sourcePath, new Date(1_000), new Date(1_000));
 	const registry = new ViewerHostPdfRegistry();
 	const controlToken = "cli-hook-control-token";
 	const server = new ViewerHostServer({ registry, controlToken });
@@ -337,7 +340,7 @@ test("agent-synctex fetch-info consumes direct Viewer Host context without a bri
 		child.stdin.end("prompt");
 		const code = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
 		assert.equal(code, 0);
-		assert.equal(stdout, "## PDF marks from the User\n\n- main.tex:1\n  PDF mark: `CLI PDF mark.`");
+		assert.equal(stdout, "## PDF marks from the User\n\n- main.tex:1\n  Already read TeX source excerpt:\n  ```tex\n  CLI source.\n  ```");
 	} finally {
 		socket?.close();
 		await server.stop();

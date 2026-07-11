@@ -60,7 +60,7 @@ const ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX = 12;
 const SELECTION_DEBUG_TEXT_MAX_LENGTH = 2000;
 const COMPILE_RUNNING_INDICATOR_DELAY_MS = 500;
 const PDF_MARK_PROBE_TIMEOUT_MS = 5_000;
-const ANNOTATION_SOURCE_BADGE_FILENAME_MAX_LENGTH = 30;
+const ANNOTATION_BOX_DRAG_THRESHOLD_PX = 5;
 
 const hostState = {
   config: initialConfig,
@@ -95,6 +95,8 @@ let latestHoverRequestId = 0;
 let probeRequestId = 0;
 let latestProbeRequestId = 0;
 let activeProbeAbortController;
+let boxRequestId = 0;
+let latestBoxRequestId = 0;
 let outlinePromise;
 
 const synctexOverlayState = {
@@ -106,6 +108,8 @@ const synctexOverlayState = {
 const annotations = new Map();
 let nextAnnotationNumber = 1;
 let selectedAnnotationId;
+let annotationBoxDrag;
+let suppressNextAnnotationClick = false;
 const directViewerTabs = new Map();
 const pdfByteCache = new Map();
 const MAX_PDF_BYTE_CACHE_ENTRIES = 20;
@@ -763,6 +767,20 @@ function synctexCapabilityIssueFromError(rawError, fallbackCode = "synctex_faile
       detail: raw,
     };
   }
+  if (/No SyncTeX source boxes in this drag area/i.test(raw)) {
+    return {
+      code: "synctex_selection_unmapped",
+      title: "No SyncTeX mapping for this PDF selection",
+      detail: raw,
+    };
+  }
+  if (/Selection is too dense|disjoint source ranges/i.test(raw)) {
+    return {
+      code: "synctex_selection_too_dense",
+      title: "PDF selection is too dense",
+      detail: raw,
+    };
+  }
   if (/viewer host|websocket|socket|server|network|connection/i.test(raw) || fallbackCode === "server_unreachable") {
     return {
       code: "server_unreachable",
@@ -1201,7 +1219,11 @@ function synctexOverlayPositions(message) {
   const page = pageElement(pageNumber);
   const viewport = pageViewport(pageNumber);
   if (!page || !viewport) return undefined;
-  const ranges = Array.isArray(message.ranges) ? message.ranges.filter((range) => Number(range.page) === pageNumber) : [];
+  const ranges = Array.isArray(message.ranges)
+    ? message.ranges.filter((range) => Number(range.page) === pageNumber)
+    : Number.isFinite(Number(message.h)) && Number.isFinite(Number(message.v)) && Number.isFinite(Number(message.W)) && Number.isFinite(Number(message.H))
+      ? [{ page: pageNumber, h: message.h, v: message.v, W: message.W, H: message.H }]
+      : [];
   const scalarPosition = ranges.length === 0 && message.width !== undefined && message.height !== undefined
     ? forwardMarkerFromPdfPoint({ viewport, pdfX: message.x, pdfY: message.y, width: message.width, height: message.height })
     : undefined;
@@ -1292,27 +1314,32 @@ function annotationSourceLine(message) {
   return message.source_line ?? message.reverse_source_line;
 }
 
-function annotationSourceBadge(message) {
-  const span = message.source_span;
-  const spanStart = Number(span?.start_line);
-  const spanEnd = Number(span?.end_line);
-  const hasSpan = typeof span?.source_file === "string"
-    && Number.isInteger(spanStart)
-    && spanStart > 0
-    && Number.isInteger(spanEnd)
-    && spanEnd >= spanStart;
-  const sourceFile = hasSpan ? span.source_file : message.source_file ?? message.reverse_source_file;
+function annotationSourceSpans(message) {
+  const spans = Array.isArray(message.source_spans) ? message.source_spans : message.source_span === undefined ? [] : [message.source_span];
+  const normalized = spans.map((span) => {
+    const startLine = Number(span?.start_line);
+    const endLine = Number(span?.end_line);
+    return typeof span?.source_file === "string" && span.source_file && Number.isInteger(startLine) && startLine > 0 && Number.isInteger(endLine) && endLine >= startLine
+      ? { source_file: span.source_file, start_line: startLine, end_line: endLine }
+      : undefined;
+  }).filter(Boolean);
+  if (normalized.length > 0) return normalized;
+  const sourceFile = message.source_file ?? message.reverse_source_file;
   const line = Number(message.line ?? message.reverse_line);
-  if (typeof sourceFile !== "string" || !sourceFile || (!hasSpan && (!Number.isInteger(line) || line <= 0))) return undefined;
-  const filename = sourceFile.split(/[\\/]/).pop();
-  if (!filename) return undefined;
-  const displayFilename = filename.length > ANNOTATION_SOURCE_BADGE_FILENAME_MAX_LENGTH
-    ? `${filename.slice(0, ANNOTATION_SOURCE_BADGE_FILENAME_MAX_LENGTH - 1)}…`
-    : filename;
-  const lineLabel = hasSpan
-    ? spanStart === spanEnd ? String(spanStart) : `${spanStart}–${spanEnd}`
-    : String(line);
-  return { text: `${displayFilename}:${lineLabel}`, title: `${filename}:${lineLabel}` };
+  return typeof sourceFile === "string" && sourceFile && Number.isInteger(line) && line > 0
+    ? [{ source_file: sourceFile, start_line: line, end_line: line }]
+    : [];
+}
+
+function annotationSourceBadge(message) {
+  const spans = annotationSourceSpans(message);
+  if (spans.length === 0) return undefined;
+  const labels = spans.map((span) => {
+    const filename = span.source_file.split(/[\\/]/).pop() || span.source_file;
+    const lineLabel = span.start_line === span.end_line ? String(span.start_line) : `${span.start_line}–${span.end_line}`;
+    return `${filename}:${lineLabel}`;
+  });
+  return { text: labels.join(", "), title: labels.join(", ") };
 }
 
 function renderAnnotationSourceBadge(message, marker) {
@@ -1331,7 +1358,11 @@ function renderAnnotationSourceBadge(message, marker) {
   badge.style.background = "rgba(127,29,29,.9)";
   badge.style.color = "white";
   badge.style.font = "10px/1.3 monospace";
-  badge.style.whiteSpace = "nowrap";
+  badge.style.boxSizing = "border-box";
+  badge.style.width = "100%";
+  badge.style.maxWidth = "100%";
+  badge.style.whiteSpace = "normal";
+  badge.style.overflowWrap = "anywhere";
   badge.style.pointerEvents = "none";
   badge.style.boxShadow = "0 1px 2px rgba(0,0,0,.2)";
   marker.appendChild(badge);
@@ -1341,18 +1372,19 @@ function annotationPayload(annotation) {
   const message = annotation.message;
   const sourceFile = message.source_file ?? message.reverse_source_file;
   const line = Number(message.line ?? message.reverse_line);
-  if (!sourceFile || !Number.isInteger(line) || line <= 0) return undefined;
+  const sourceSpans = annotationSourceSpans(message);
+  if (!sourceFile || !Number.isInteger(line) || line <= 0 || sourceSpans.length === 0) return undefined;
   return {
     type: "pdf_annotation",
     annotation_id: annotation.id,
     page: Number(message.page ?? message.click_page),
-    x: Number(message.x ?? message.click_x),
-    y: Number(message.y ?? message.click_y),
+    x: Number(message.x ?? message.click_x ?? message.h),
+    y: Number(message.y ?? message.click_y ?? message.v),
     source_file: sourceFile,
     line,
     ...(annotationSourceLine(message) === undefined ? {} : { source_line: annotationSourceLine(message) }),
     ...(typeof message.pdf_mark === "string" && message.pdf_mark.trim() ? { pdf_mark: message.pdf_mark.trim() } : {}),
-    ...(message.source_span === undefined ? {} : { source_span: message.source_span }),
+    source_spans: sourceSpans,
     ...(annotation.comment ? { comment: annotation.comment } : {}),
   };
 }
@@ -1459,6 +1491,31 @@ function clearUserAnnotations() {
   clearForwardSynctexMarker();
   clearAnnotations();
   for (const annotationId of annotationIds) sendViewerSocketPayload({ type: "pdf_annotation_deleted", annotation_id: annotationId });
+}
+
+function rebaseAnnotationsFromHostMessage(message) {
+	const pdfId = Number(message.pdf_id);
+	if (!Number.isInteger(pdfId) || pdfId <= 0 || !Array.isArray(message.annotations)) return;
+	const updates = new Map(message.annotations
+		.filter((entry) => entry && typeof entry.annotation_id === "string" && entry.message)
+		.map((entry) => [entry.annotation_id, entry.message]));
+	if (updates.size === 0) return;
+	const key = annotationStorageKey(pdfId);
+	if (key) {
+		const all = storedPdfAnnotations();
+		const stored = Array.isArray(all[key]) ? all[key] : [];
+		all[key] = stored.map((annotation) => {
+			const update = updates.get(annotation?.id);
+			return update === undefined ? annotation : { ...annotation, message: { ...annotation.message, ...update } };
+		});
+		localStorage.setItem(PDF_ANNOTATIONS_STORAGE_KEY, JSON.stringify(all));
+	}
+	if (pdfId !== activePdfId()) return;
+	for (const [annotationId, update] of updates) {
+		const annotation = annotations.get(annotationId);
+		if (annotation) annotation.message = { ...annotation.message, ...update };
+	}
+	renderAnnotations(false);
 }
 
 function clearAnnotationsFromHostMessage(message) {
@@ -1893,6 +1950,9 @@ function clearForwardSynctexMarker() {
 function clearTransientSynctexState() {
 	latestHoverRequestId += 1;
 	latestProbeRequestId += 1;
+	latestBoxRequestId += 1;
+	annotationBoxDrag = undefined;
+	clearProvisionalAnnotationBox();
 	pendingHover = undefined;
 	activeProbeAbortController?.abort();
 	activeProbeAbortController = undefined;
@@ -1991,6 +2051,31 @@ function pdfTextSpansAtClientPoint(event, pageNumber) {
   range.selectNodeContents(span);
   const spans = Array.from(range.getClientRects(), (rect) => pdfRangeFromClientRect(rect, page, viewport)).filter((rect) => rect !== undefined).map((rect) => ({ page: pageNumber, ...rect, text }));
   range.detach?.();
+  return spans;
+}
+
+function pdfTextSpansInClientRect(pageNumber, firstEvent, secondEvent) {
+  const page = pageElement(pageNumber);
+  const viewport = pageViewport(pageNumber);
+  const textLayer = page?.querySelector(".textLayer");
+  if (!page || !viewport || !textLayer) return [];
+  const left = Math.min(firstEvent.clientX, secondEvent.clientX);
+  const right = Math.max(firstEvent.clientX, secondEvent.clientX);
+  const top = Math.min(firstEvent.clientY, secondEvent.clientY);
+  const bottom = Math.max(firstEvent.clientY, secondEvent.clientY);
+  const spans = [];
+  for (const span of textLayer.querySelectorAll("span")) {
+    const text = span.textContent?.trim();
+    if (!text) continue;
+    const range = document.createRange();
+    range.selectNodeContents(span);
+    for (const rect of range.getClientRects()) {
+      if (rect.right <= left || rect.left >= right || rect.bottom <= top || rect.top >= bottom) continue;
+      const pdfRect = pdfRangeFromClientRect(rect, page, viewport);
+      if (pdfRect) spans.push({ page: pageNumber, ...pdfRect, text });
+    }
+    range.detach?.();
+  }
   return spans;
 }
 
@@ -2154,6 +2239,9 @@ function setHoverEnabled(enabled) {
   if (!enabled) {
     latestHoverRequestId += 1;
     latestProbeRequestId += 1;
+    latestBoxRequestId += 1;
+    annotationBoxDrag = undefined;
+    clearProvisionalAnnotationBox();
     pendingHover = undefined;
     activeProbeAbortController?.abort();
     activeProbeAbortController = undefined;
@@ -2179,7 +2267,7 @@ function setDebugSynctexEnabled(enabled) {
     if (hoverTimer !== undefined) clearTimeout(hoverTimer);
     hoverTimer = undefined;
     synctexOverlayState.hoverResult = undefined;
-    removeOverlays("[data-reverse-synctex-hover], [data-synctex-probe-debug-summary]");
+    removeOverlays("[data-reverse-synctex-hover], [data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
   }
   updateHostDataset();
 }
@@ -2208,6 +2296,8 @@ function invokeHistoryShortcut(direction, originalTarget) {
 function handleHistoryKeydown(event) {
   if (event.key === "Escape" && !hasEditableFocus()) {
     clearForwardSynctexMarker();
+    synctexOverlayState.hoverResult = undefined;
+    removeOverlays("[data-reverse-synctex-hover], [data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
     return;
   }
   if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
@@ -2954,10 +3044,122 @@ function sendProbe(event, pageNumber) {
   const requestId = probeRequestId + 1;
   probeRequestId = requestId;
   latestProbeRequestId = requestId;
-  removeOverlays("[data-reverse-synctex-forward-probe], [data-pdf-mark-status]");
+  if (hostState.debugSynctexEnabled) {
+    latestHoverRequestId += 1;
+    synctexOverlayState.hoverResult = undefined;
+    removeOverlays("[data-reverse-synctex-hover]");
+  }
+  removeOverlays("[data-reverse-synctex-forward-probe], [data-pdf-mark-status], [data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
   const payload = { type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexProbeContext(event, pageNumber) };
   showPendingProbe(payload);
   void requestProbe(payload);
+}
+
+function clearProvisionalAnnotationBox() {
+  removeOverlays("[data-pdf-annotation-provisional]");
+}
+
+function annotationBoxPayload(pageNumber, startEvent, endEvent) {
+  const start = clientPointToPdfPoint(startEvent, pageNumber);
+  const end = clientPointToPdfPoint(endEvent, pageNumber);
+  if (!start || !end) return undefined;
+  const pdfTextSpans = pdfTextSpansInClientRect(pageNumber, startEvent, endEvent);
+  return {
+    type: "reverse_synctex_box",
+    request_id: boxRequestId + 1,
+    page: pageNumber,
+    h: Math.min(start[0], end[0]),
+    v: Math.max(start[1], end[1]),
+    W: Math.abs(end[0] - start[0]),
+    H: Math.abs(end[1] - start[1]),
+    ...(pdfTextSpans.length > 0 ? { pdf_text_spans: pdfTextSpans } : {}),
+  };
+}
+
+function showProvisionalAnnotationBox(payload) {
+  renderSynctexOverlay(payload, {
+    selector: "[data-pdf-annotation-provisional]",
+    datasetName: "pdfAnnotationProvisional",
+    scroll: false,
+  });
+}
+
+async function requestAnnotationBox(payload) {
+  const pdfId = activePdfId();
+  const viewerToken = hostState.config?.viewer_socket_token;
+  try {
+    if (typeof viewerToken !== "string" || viewerToken.length === 0) throw new Error("The active PDF has no Viewer Host authentication token");
+    const response = await fetch("/synctex/box", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-agent-synctex-viewer-token": viewerToken,
+      },
+      body: JSON.stringify({ ...payload, pdf_id: pdfId }),
+    });
+    const body = await response.json();
+    if (!response.ok || body?.ok !== true || !body.result) throw new Error(body?.error?.message || `Viewer Host returned HTTP ${response.status}`);
+    if (body.result.error) throw new Error(String(body.result.error));
+    if (payload.request_id !== latestBoxRequestId || activePdfId() !== pdfId) return;
+    if (createAnnotationFromMessage(body.result, { select: true, bubble: false, scroll: false })) clearSynctexCapabilityIssue();
+  } catch (error) {
+    if (payload.request_id !== latestBoxRequestId || activePdfId() !== pdfId) return;
+    const detail = error?.message || String(error);
+    setSynctexCapabilityIssue(synctexCapabilityIssueFromError(detail));
+  } finally {
+    if (payload.request_id === latestBoxRequestId) clearProvisionalAnnotationBox();
+  }
+}
+
+function startAnnotationBoxDrag(event, pageNumber) {
+  if (!(event instanceof PointerEvent) || event.button !== 0 || !hostState.hoverEnabled || event.ctrlKey || event.metaKey || isEditableEventTarget(event)) return;
+  const target = event.target instanceof Element ? event.target : undefined;
+  if (target?.closest("[data-pdf-annotation], [data-synctex-marker], a[href]")) return;
+  if (!clientPointToPdfPoint(event, pageNumber)) return;
+  event.preventDefault();
+  annotationBoxDrag = { pageNumber, moved: false };
+  const onMove = (moveEvent) => {
+    if (!annotationBoxDrag || pageNumberFromElement(moveEvent.target) !== pageNumber) return;
+    const dx = moveEvent.clientX - event.clientX;
+    const dy = moveEvent.clientY - event.clientY;
+    if (!annotationBoxDrag.moved && Math.hypot(dx, dy) < ANNOTATION_BOX_DRAG_THRESHOLD_PX) return;
+    annotationBoxDrag.moved = true;
+    const payload = annotationBoxPayload(pageNumber, event, moveEvent);
+    if (payload) showProvisionalAnnotationBox(payload);
+  };
+  const cleanup = () => {
+    window.removeEventListener("pointermove", onMove, true);
+    window.removeEventListener("pointerup", onUp, true);
+    window.removeEventListener("pointercancel", onCancel, true);
+  };
+  const onCancel = () => {
+    cleanup();
+    annotationBoxDrag = undefined;
+    clearProvisionalAnnotationBox();
+  };
+  const onUp = (upEvent) => {
+    cleanup();
+    const drag = annotationBoxDrag;
+    annotationBoxDrag = undefined;
+    if (!drag?.moved || pageNumberFromElement(upEvent.target) !== pageNumber) {
+      clearProvisionalAnnotationBox();
+      return;
+    }
+    const payload = annotationBoxPayload(pageNumber, event, upEvent);
+    if (!payload) {
+      clearProvisionalAnnotationBox();
+      return;
+    }
+    boxRequestId = payload.request_id;
+    latestBoxRequestId = payload.request_id;
+    suppressNextAnnotationClick = true;
+    setTimeout(() => { suppressNextAnnotationClick = false; }, 0);
+    showProvisionalAnnotationBox(payload);
+    void requestAnnotationBox({ ...payload, pdf_id: activePdfId() });
+  };
+  window.addEventListener("pointermove", onMove, true);
+  window.addEventListener("pointerup", onUp, true);
+  window.addEventListener("pointercancel", onCancel, true);
 }
 
 function hoverDiagnosticsLabel(message) {
@@ -2986,9 +3188,43 @@ function debugCandidateLines(candidates, selectedScore) {
   return lines;
 }
 
+function debugForwardGroupLines(groups) {
+  return (Array.isArray(groups) ? groups : []).map((group) => {
+    const score = Number(group?.score);
+    const penalty = Number(group?.semantic_penalty);
+    const tier = Number(group?.geometry_tier);
+    return `${group?.selected === true ? "*" : " "} ${String(group?.origin ?? "unknown")} line ${Number(group?.lookup_line)}`
+      + `${Number.isFinite(tier) ? ` tier ${tier}` : ""}`
+      + `${Number.isFinite(penalty) ? ` penalty ${penalty}` : ""}`
+      + `${Number.isFinite(score) ? ` score ${score}` : ""}`;
+  });
+}
+
+function selectedDebugForwardBox(message) {
+  const selected = Array.isArray(message.debug_forward_groups)
+    ? message.debug_forward_groups.find((group) => group?.selected === true && group.chosen_box)
+    : undefined;
+  return selected?.chosen_box;
+}
+
+function renderProbeDebugBox(message) {
+  removeOverlays("[data-synctex-probe-debug-box]");
+  if (!hostState.debugSynctexEnabled) return;
+  const box = selectedDebugForwardBox(message);
+  if (!box) return;
+  renderSynctexOverlay({ page: box.page, ranges: [box] }, {
+    selector: "[data-synctex-probe-debug-box]",
+    datasetName: "synctexProbeDebugBox",
+    scroll: false,
+  });
+}
+
 function renderProbeDebugSummary(message) {
-  if (!hostState.debugSynctexEnabled || !Array.isArray(message.debug_candidates) || message.debug_candidates.length === 0) return;
-  const overlay = synctexOverlayPositions({ page: message.page, x: message.x, y: message.y, width: message.width, height: message.height, ranges: message.ranges });
+  const groups = Array.isArray(message.debug_forward_groups) ? message.debug_forward_groups : [];
+  const candidates = Array.isArray(message.debug_candidates) ? message.debug_candidates : [];
+  if (!hostState.debugSynctexEnabled || (groups.length === 0 && candidates.length === 0)) return;
+  const box = selectedDebugForwardBox(message);
+  const overlay = synctexOverlayPositions(box ? { page: box.page, ranges: [box] } : { page: message.page, x: message.x, y: message.y, width: message.width, height: message.height, ranges: message.ranges });
   const position = overlay?.positions[0];
   if (!overlay || !position) return;
   removeOverlays("[data-synctex-probe-debug-summary]");
@@ -3003,7 +3239,7 @@ function renderProbeDebugSummary(message) {
   summary.style.width = `${ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX}px`;
   summary.style.maxWidth = `calc(100% - ${ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX * 2}px)`;
   summary.style.whiteSpace = "pre-wrap";
-  summary.textContent = debugCandidateLines(message.debug_candidates, message.debug_selected_score).join("\n");
+  summary.textContent = [...debugCandidateLines(candidates, message.debug_selected_score), ...debugForwardGroupLines(groups)].join("\n");
   overlay.overlayParent.append(summary);
 }
 
@@ -3044,7 +3280,7 @@ function showHoverResult(message, options = {}) {
 
 function showProbeResult(message, options = {}) {
   if (Number(message.request_id) !== latestProbeRequestId) return;
-  removeOverlays("[data-reverse-synctex-forward-probe], [data-pdf-mark-status], [data-synctex-probe-debug-summary]");
+  removeOverlays("[data-reverse-synctex-forward-probe], [data-pdf-mark-status], [data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
   if (message.error) {
     setSynctexCapabilityIssue(synctexCapabilityIssueFromError(message.error));
     return;
@@ -3054,6 +3290,7 @@ function showProbeResult(message, options = {}) {
     return;
   }
   if (createAnnotationFromMessage(message, { select: true, bubble: false, scroll: options.scroll !== false })) clearSynctexCapabilityIssue();
+  renderProbeDebugBox(message);
   renderProbeDebugSummary(message);
 }
 
@@ -3161,6 +3398,12 @@ function installPageEventHandlers() {
   if (!viewer || viewer.dataset.hostSynctexHandlers === "true") return;
   viewer.dataset.hostSynctexHandlers = "true";
   viewer.addEventListener("click", (event) => {
+    if (suppressNextAnnotationClick) {
+      suppressNextAnnotationClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     const target = event.target instanceof Element ? event.target : undefined;
     const linkHash = internalLinkHashFromEvent(event);
     if (linkHash) {
@@ -3188,6 +3431,10 @@ function installPageEventHandlers() {
       return;
     }
     sendProbe(event, pageNumber);
+  }, true);
+  viewer.addEventListener("pointerdown", (event) => {
+    const pageNumber = pageNumberFromElement(event.target);
+    if (pageNumber) startAnnotationBoxDrag(event, pageNumber);
   }, true);
   viewer.addEventListener("mousedown", (event) => {
     const pageNumber = pageNumberFromElement(event.target);
@@ -3221,6 +3468,10 @@ function handleHostMessage(message) {
   }
   if (message.type === "annotations_cleared") {
     clearAnnotationsFromHostMessage(message);
+    return;
+  }
+  if (message.type === "annotations_rebased") {
+    rebaseAnnotationsFromHostMessage(message);
     return;
   }
   if (message.type === "compile_status") {

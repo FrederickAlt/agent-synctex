@@ -411,6 +411,7 @@ test("generic event drains do not consume or clear pending PDF marks", async () 
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-filtered-drain-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFakePdf(pdfPath);
+	writeFileSync(join(baseDir, "main.tex"), "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n");
 	const registry = new ViewerHostPdfRegistry();
 	const server = new ViewerHostServer({ registry });
 	let socket: TestWebSocket | undefined;
@@ -442,10 +443,52 @@ test("generic event drains do not consume or clear pending PDF marks", async () 
 	}
 });
 
+test("multi-range annotation socket payloads retain every normalized source span", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-multi-range-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	const firstSource = join(baseDir, "first.tex");
+	const secondSource = join(baseDir, "second.tex");
+	writeFakePdf(pdfPath);
+	writeFileSync(firstSource, "one\ntwo\nthree\n");
+	writeFileSync(secondSource, "one\ntwo\nthree\nfour\nfive\n");
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 32, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		socket = await openViewerSocket(server.origin, 32, await getViewerSocketToken(server.origin, 32));
+		socket.send(JSON.stringify({
+			type: "pdf_annotation",
+			annotation_id: "multi",
+			page: 1,
+			x: 10,
+			y: 20,
+			source_file: firstSource,
+			line: 2,
+			source_spans: [
+				{ source_file: firstSource, start_line: 2, end_line: 2 },
+				{ source_file: secondSource, start_line: 3, end_line: 5 },
+			],
+		}));
+		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+		const claim = await claimMarks(server.origin, { pdf_ids: [32] });
+		assert.deepEqual(claim.marks[0]?.source_spans, [
+			{ source_file: firstSource, start_line: 2, end_line: 2 },
+			{ source_file: secondSource, start_line: 3, end_line: 5 },
+		]);
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("PDF annotation socket payloads are coalesced for mark claims and targeted acknowledgement", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-annotation-"));
 	const pdfPath = join(baseDir, "paper.pdf");
 	writeFakePdf(pdfPath);
+	writeFileSync(join(baseDir, "main.tex"), "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n");
 	const registry = new ViewerHostPdfRegistry();
 	const server = new ViewerHostServer({ registry });
 	let socket: TestWebSocket | undefined;
@@ -478,6 +521,8 @@ test("mark claims can be scoped to owned pdf_ids without consuming other marks",
 	const secondPdf = join(baseDir, "second.pdf");
 	writeFakePdf(firstPdf, "first");
 	writeFakePdf(secondPdf, "second");
+	writeFileSync(join(baseDir, "first.tex"), "first\n");
+	writeFileSync(join(baseDir, "second.tex"), "first\nsecond\n");
 	const registry = new ViewerHostPdfRegistry();
 	const server = new ViewerHostServer({ registry });
 	let firstSocket: TestWebSocket | undefined;

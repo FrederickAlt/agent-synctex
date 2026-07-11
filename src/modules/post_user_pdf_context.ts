@@ -1,8 +1,10 @@
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { PdfAnnotationEvent, PdfEvent } from "./pdf_events.ts";
 import type { ViewerHostPdfAnnotationMessage } from "./viewer_host_protocol.ts";
 
 const DEFAULT_MAX_EVENTS = 20;
+const MAX_SOURCE_EXCERPT_BYTES = 1_000_000;
 
 export interface FetchPdfContextRequest {
 	pdf_id?: number;
@@ -56,7 +58,9 @@ export function pdfAnnotationEventsFromViewerMarks(
 		line: mark.line,
 		...(mark.source_line === undefined ? {} : { source_line: mark.source_line }),
 		...(mark.pdf_mark === undefined ? {} : { pdf_mark: mark.pdf_mark }),
+		...(mark.source_spans === undefined ? {} : { source_spans: mark.source_spans.map((span) => ({ ...span })) }),
 		...(mark.source_span === undefined ? {} : { source_span: { ...mark.source_span } }),
+		...(mark.source_stale === true ? { source_stale: true } : {}),
 		page: mark.page,
 		x: mark.x,
 		y: mark.y,
@@ -70,24 +74,79 @@ export function formatPdfAnnotationContext(events: PdfAnnotationEvent[], options
 
 function formatPdfAnnotationContextResult(events: PdfAnnotationEvent[], options: { cwd?: string } = {}): { text: string; events: PdfAnnotationEvent[] } {
 	if (events.length === 0) return { text: "", events: [] };
-	const groups = new Map<string, { sourceLocation: string; events: PdfAnnotationEvent[] }>();
-	for (const event of events) {
-		const sourceLocation = displaySourceLocation(event, options.cwd);
-		const group = groups.get(sourceLocation) ?? { sourceLocation, events: [] };
-		group.events.push(event);
-		groups.set(sourceLocation, group);
-	}
+	const sourceCache = new Map<string, string[] | undefined>();
 	const lines = ["## PDF marks from the User", ""];
-	for (const group of groups.values()) {
-		const pdfMarks = group.events.map((event) => event.pdf_mark?.trim()).filter((mark): mark is string => Boolean(mark));
-		const eventLines = [`- ${group.sourceLocation}`];
-		if (pdfMarks.length > 0) eventLines.push(`  PDF mark: \`${escapeInlineCode(pdfMarks.join("; "))}\``);
-		const comments = group.events.map((event) => event.comment?.trim()).filter((comment): comment is string => Boolean(comment));
-		if (comments.length === 1) eventLines.push(`  User comment: ${comments[0]}`);
-		else if (comments.length > 1) eventLines.push(`  User comments: ${comments.join("; ")}`);
-		lines.push(...eventLines);
+	for (const event of events) {
+		const spans = sourceSpansForAnnotation(event);
+		const sourceLine = event.source_line?.trim();
+		const comment = event.comment?.trim();
+		let remainingLines = 50;
+		lines.push(`- ${spans.map((span) => `${displaySourceFile(span.source_file, options.cwd)}:${formatLineRange(span.start_line, span.end_line)}`).join(", ")}`);
+		if (event.source_stale === true) {
+			lines.push("  Warning: this source changed after the displayed PDF was compiled; the excerpt is current, but the mark may refer to the earlier PDF.");
+		}
+		let sourceBudgetOmitted = false;
+		for (const span of spans) {
+			if (remainingLines === 0) {
+				sourceBudgetOmitted = true;
+				continue;
+			}
+			const sourceExcerpt = readSourceExcerpt(span.source_file, span.start_line, span.end_line, options.cwd, sourceCache, remainingLines);
+			if (sourceExcerpt !== undefined) {
+				const excerptLabel = spans.length === 1
+					? "  Already read TeX source excerpt:"
+					: `  Already read TeX source excerpt: ${displaySourceFile(span.source_file, options.cwd)}:${formatLineRange(span.start_line, span.end_line)}`;
+				lines.push(excerptLabel, "  ```tex", ...sourceExcerpt.lines.map((line) => `  ${line}`), "  ```");
+				remainingLines -= sourceExcerpt.lines.length;
+				if (sourceExcerpt.truncated) lines.push(remainingLines === 0 && spans.length > 1
+					? "  (excerpt truncated to the 50-source-line total budget per annotation)"
+					: "  (excerpt truncated to 50 lines)");
+			} else if (spans.length === 1 && sourceLine !== undefined) {
+				lines.push(`  Already read TeX source excerpt: \`${escapeInlineCode(sourceLine)}\``);
+			}
+		}
+		if (sourceBudgetOmitted) lines.push("  (source excerpt omitted: 50-source-line total budget per annotation exhausted)");
+		if (comment !== undefined && comment !== "") {
+			lines.push("  Messages:", `  - ${comment.replace(/\n/g, "\n    ")}`);
+		}
 	}
 	return { text: lines.join("\n"), events };
+}
+
+function sourceSpansForAnnotation(event: PdfAnnotationEvent): Array<{ source_file: string; start_line: number; end_line: number }> {
+	if (event.source_spans !== undefined && event.source_spans.length > 0) return event.source_spans;
+	if (event.source_span !== undefined) return [event.source_span];
+	return [{ source_file: event.source_file, start_line: event.line, end_line: event.line }];
+}
+
+function readSourceExcerpt(sourceFile: string, startLine: number, endLine: number, cwd: string | undefined, cache: Map<string, string[] | undefined>, maxLines: number): { lines: string[]; truncated: boolean } | undefined {
+	const path = isAbsolute(sourceFile) ? resolve(sourceFile) : resolve(cwd ?? process.cwd(), sourceFile);
+	let sourceLines: string[] | undefined;
+	if (cache.has(path)) sourceLines = cache.get(path);
+	else {
+		try {
+			const resolvedPath = realpathSync(path);
+			if (cwd !== undefined) {
+				const workspacePath = realpathSync(resolve(cwd));
+				const relativePath = relative(workspacePath, resolvedPath);
+				if (relativePath !== "" && (relativePath.startsWith("..") || isAbsolute(relativePath))) throw new Error("source is outside workspace");
+			}
+			const status = statSync(resolvedPath);
+			sourceLines = !status.isFile() || status.size > MAX_SOURCE_EXCERPT_BYTES
+				? undefined
+				: readFileSync(resolvedPath, "utf8").replace(/\r\n?/g, "\n").split("\n");
+		} catch {
+			sourceLines = undefined;
+		}
+		cache.set(path, sourceLines);
+	}
+	if (sourceLines === undefined) return undefined;
+	const lines = sourceLines.slice(startLine - 1, endLine);
+	return lines.length === 0 ? undefined : { lines: lines.slice(0, maxLines), truncated: lines.length > maxLines };
+}
+
+function formatLineRange(startLine: number, endLine: number): string {
+	return startLine === endLine ? String(startLine) : `${startLine}-${endLine}`;
 }
 
 export function normalizeFetchPdfContextRequest(args: Record<string, unknown>): FetchPdfContextRequest {
@@ -114,15 +173,6 @@ function dedupeAnnotations(events: PdfAnnotationEvent[]): PdfAnnotationEvent[] {
 		byKey.set(`${event.pdf_id}:${event.annotation_id}`, event);
 	}
 	return Array.from(byKey.values()).sort((left, right) => left.sequence - right.sequence);
-}
-
-function displaySourceLocation(event: PdfAnnotationEvent, cwd: string | undefined): string {
-	const span = event.source_span;
-	if (span !== undefined) {
-		const spanFile = displaySourceFile(span.source_file, cwd);
-		return `${spanFile}:${span.start_line}-${span.end_line}`;
-	}
-	return `${displaySourceFile(event.source_file, cwd)}:${event.line}`;
 }
 
 function displaySourceFile(sourceFile: string, cwd: string | undefined): string {

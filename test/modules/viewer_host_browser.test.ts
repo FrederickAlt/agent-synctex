@@ -1304,6 +1304,7 @@ test("LaTeX Workshop viewer selection reverse SyncTeX payload preserves selected
 		await page.goto(`${server.origin}/viewer-lw/148`, { waitUntil: "domcontentloaded" });
 		await waitForLwPageReady(page);
 		await drainHostMcpEvents(server.origin);
+		await page.locator("#hostSynctexHoverButton").click(); // Text selection remains available outside annotation mode.
 
 		const expected = await lwSelectionDragProbe(page, "DRAGTOKENALPHA");
 		await page.mouse.move(expected.startClientX, expected.startClientY);
@@ -1377,6 +1378,48 @@ test("LaTeX Workshop viewer annotation is active by default and hidden debug swi
 		assert.equal(overlay.pressed, "true");
 		assert.equal(overlay.debugEnabled, "true");
 		assert.ok(overlay.width > 0 && overlay.height > 0, "hover result should render a visible overlay");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("SyncTeX debug probe shows one selected forward-group box and Escape clears it", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-debug-forward-group-"));
+	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 259, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		await new ViewerHostControlClient({ origin: server.origin }).send({ type: "set_debug_synctex", pdf_id: 259, enabled: true });
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		await page.route("**/synctex/probe", async (route) => {
+			const body = route.request().postDataJSON() as { request_id: number };
+			await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, result: {
+				type: "reverse_synctex_forward_probe_result", pdf_id: 259, request_id: body.request_id,
+				click_page: 1, click_x: 100, click_y: 100, page: 1, x: 40, y: 150, width: 20, height: 10,
+				ranges: [{ page: 1, h: 40, v: 150, W: 20, H: 10 }], source_file: sourcePath, line: 3, source_line: "fixture source",
+				debug_forward_groups: [
+					{ origin: "synctex_exact", lookup_line: 3, semantic_penalty: 0, geometry_tier: 0, score: 12, selected: true, chosen_box: { page: 1, h: 40, v: 150, W: 20, H: 10 } },
+					{ origin: "pdf_text_span", lookup_line: 3, semantic_penalty: 1_000_000_000, geometry_tier: 0, score: 1_000_000_012, selected: false, chosen_box: { page: 1, h: 90, v: 150, W: 30, H: 10 } },
+				],
+			} }) });
+		});
+		await page.goto(`${server.origin}/viewer-lw/259`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		const point = await lwCanvasPoint(page, 1, 120, 70);
+		await page.mouse.click(point.clientX, point.clientY);
+		const debugBoxes = page.locator("[data-synctex-probe-debug-box]");
+		await debugBoxes.waitFor({ state: "attached" });
+		assert.equal(await debugBoxes.count(), 1);
+		const summary = page.locator("[data-synctex-probe-debug-summary]");
+		assert.match(await summary.textContent() ?? "", /pdf_text_span line 3 tier 0 penalty 1000000000 score 1000000012/);
+		await page.keyboard.press("Escape");
+		await page.waitForFunction(() => document.querySelectorAll("[data-synctex-probe-debug-box], [data-synctex-probe-debug-summary]").length === 0);
 	} finally {
 		await browser?.close();
 		await server.stop();
@@ -1580,7 +1623,7 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 				bottomGap: boxRect === undefined ? Number.NaN : boxRect.top - badgeRect.bottom,
 			};
 		});
-		assert.equal(badge.text, "this-is-a-very-long-source-na…:12–15");
+		assert.equal(badge.text, "this-is-a-very-long-source-name.tex:12–15");
 		assert.equal(badge.title, "this-is-a-very-long-source-name.tex:12–15");
 		assert.notEqual(badge.display, "none", "the selected marking should show its source badge");
 		assert.equal(badge.boxIndex, 0, "the badge should attach to the top-left annotation box");
@@ -1742,6 +1785,115 @@ test("LaTeX Workshop annotation comment bubble can extend outside the PDF page a
 	}
 });
 
+
+test("LaTeX Workshop annotation-mode drag resolves a page-local multi-span box", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-annotation-box-drag-"));
+	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	let boxRequest: { headers: Record<string, string>; body: Record<string, unknown> } | undefined;
+	try {
+		registry.registerPdf({ pdfId: 157, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 720, height: 500 } });
+		await page.route("**/synctex/box", async (route) => {
+			boxRequest = { headers: route.request().headers(), body: route.request().postDataJSON() as Record<string, unknown> };
+			await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, result: {
+				type: "reverse_synctex_box_result", request_id: boxRequest.body.request_id, pdf_id: 157, page: 1, h: 40, v: 150, W: 100, H: 30,
+				source_spans: [{ source_file: sourcePath, start_line: 3, end_line: 3 }, { source_file: sourcePath, start_line: 8, end_line: 10 }],
+				ranges: [{ page: 1, h: 40, v: 150, W: 45, H: 30 }, { page: 1, h: 90, v: 150, W: 50, H: 30 }], source_file: sourcePath, line: 3,
+			} }) });
+		});
+		await page.goto(`${server.origin}/viewer-lw/157`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		await page.waitForFunction(() => document.body.dataset.hostLwSocket === "connected");
+		await page.evaluate(() => {
+			type TestWindow = Window & { __hostLwSentSocketMessages?: unknown[] };
+			const testWindow = window as TestWindow;
+			testWindow.__hostLwSentSocketMessages = [];
+			const nativeSend = WebSocket.prototype.send;
+			WebSocket.prototype.send = function(data: unknown): void {
+				if (typeof data === "string") try { testWindow.__hostLwSentSocketMessages?.push(JSON.parse(data)); } catch {}
+				nativeSend.call(this, data as string);
+			};
+		});
+		const pageBox = await page.locator("#viewer .page[data-page-number='1']").boundingBox();
+		assert.ok(pageBox, "source page should be visible");
+		await page.mouse.move(pageBox.x + 60, pageBox.y + 60);
+		await page.mouse.down();
+		await page.mouse.move(pageBox.x + 180, pageBox.y + 100, { steps: 4 });
+		await page.waitForSelector("[data-pdf-annotation-provisional]", { state: "attached" });
+		await page.mouse.up();
+		await page.waitForSelector("[data-pdf-annotation-box]", { state: "attached" });
+		assert.ok(boxRequest, "drag should request the browser box endpoint");
+		assert.equal(boxRequest.headers["x-agent-synctex-viewer-token"]?.length > 0, true);
+		assert.deepEqual(Object.keys(boxRequest.body).sort(), ["H", "W", "h", "page", "pdf_id", "pdf_text_spans", "request_id", "type", "v"]);
+		assert.ok(Array.isArray(boxRequest.body.pdf_text_spans) && boxRequest.body.pdf_text_spans.length > 0, "drag should include overlapping PDF text spans");
+		assert.equal(boxRequest.body.type, "reverse_synctex_box");
+		assert.equal(boxRequest.body.page, 1);
+		assert.equal(boxRequest.body.pdf_id, 157);
+		assert.ok(Number(boxRequest.body.W) > 0 && Number(boxRequest.body.H) > 0);
+		assert.equal(await page.locator("[data-pdf-annotation-box]").count(), 1, "returned ranges should fuse into one annotation box");
+		const badge = await page.locator("[data-pdf-annotation-source-badge]").evaluate((element) => {
+			const badgeRect = element.getBoundingClientRect();
+			return { text: element.textContent, width: badgeRect.width, boxWidth: element.parentElement?.getBoundingClientRect().width };
+		});
+		assert.equal(badge.text, "main.tex:3, main.tex:8–10");
+		assert.ok(badge.width <= Number(badge.boxWidth) + 1, "multi-span badge must wrap within its fused annotation box");
+		const annotationPayload = await page.evaluate(() => {
+			const messages = (window as Window & { __hostLwSentSocketMessages?: Array<{ type?: string }> }).__hostLwSentSocketMessages ?? [];
+			return messages.find((message) => message.type === "pdf_annotation");
+		}) as { source_spans?: unknown; x?: unknown; y?: unknown } | undefined;
+		assert.deepEqual(annotationPayload?.source_spans, [{ source_file: sourcePath, start_line: 3, end_line: 3 }, { source_file: sourcePath, start_line: 8, end_line: 10 }]);
+		assert.equal(annotationPayload?.x, 40, "box annotations must send a valid x coordinate");
+		assert.equal(annotationPayload?.y, 150, "box annotations must send a valid y coordinate");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("annotation box with no matching source uses the standard SyncTeX warning banner", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-annotation-box-no-match-"));
+	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 158, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 720, height: 500 } });
+		await page.route("**/synctex/box", async (route) => {
+			const body = route.request().postDataJSON() as Record<string, unknown>;
+			await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, result: {
+				type: "reverse_synctex_box_result", pdf_id: 158, request_id: body.request_id,
+				error: "No SyncTeX source boxes in this drag area met the 50% forward-coverage requirement",
+			} }) });
+		});
+		await page.goto(`${server.origin}/viewer-lw/158`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		const pageBox = await page.locator("#viewer .page[data-page-number='1']").boundingBox();
+		assert.ok(pageBox);
+		await page.mouse.move(pageBox.x + 50, pageBox.y + 50);
+		await page.mouse.down();
+		await page.mouse.move(pageBox.x + 160, pageBox.y + 95, { steps: 3 });
+		await page.mouse.up();
+		const banner = page.locator("#hostSynctexCapabilityBanner");
+		await banner.waitFor({ state: "visible" });
+		assert.match(await banner.textContent() ?? "", /No SyncTeX mapping for this PDF selection/);
+		assert.match(await banner.textContent() ?? "", /No SyncTeX source boxes in this drag area/);
+		assert.equal(await page.locator("[data-pdf-annotation-no-match-notice]").count(), 0);
+		assert.equal(await page.locator("[data-pdf-annotation]").count(), 0);
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
 
 test("deselecting then editing a comment bubble preserves its DOM and never probes the PDF", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-deselected-comment-"));
