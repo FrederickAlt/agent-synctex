@@ -60,9 +60,9 @@ export function resolveForwardSynctexJump(input: MapForwardSynctexInput): Forwar
 }
 
 /**
- * Starts from the best source-mapped box in a page-local selection, then grows
- * through adjacent source lines while their best usable forward box is at
- * least half covered. Only zero-by-zero SyncTeX markers are transparent.
+ * Seeds from the best half-covered SyncTeX record, grows through source lines
+ * with half-covered geometry while skipping lines without geometry, then
+ * normalizes accepted lines and merges their spans across gaps of at most two lines.
  */
 export function resolveReverseSynctexBox(input: {
 	message: ViewerHostReverseSynctexBoxMessage;
@@ -93,48 +93,21 @@ export function resolveReverseSynctexBox(input: {
 		sources.set(sourceFile, source);
 		return source;
 	};
-	const seedLinesBySource = new Map<ResolvedSource, Set<number>>();
-	for (const location of seedLocations) {
-		const source = sourceFor(location.sourceFile);
-		if (source !== undefined) (seedLinesBySource.get(source) ?? seedLinesBySource.set(source, new Set()).get(source)!).add(location.line);
-	}
-	for (const [source, lines] of seedLinesBySource) cacheSourceSpans(source, lines);
-
 	const scoredSeeds = seedBoxes.flatMap((box) => {
 		const source = sourceFor(box.sourceFile);
-		const span = source?.spansByLine.get(box.line);
-		const boxesByLine = pageBoxesBySource.get(box.sourceFile);
-		return source === undefined || span === undefined || boxesByLine === undefined || !spanIsSelectionSupported(span, boxesByLine, message)
-			? []
-			: [scoreBoxCandidate(box, source, span, message)];
+		return source === undefined ? [] : [scoreBoxCandidate(box, source, message)];
 	}).sort(compareScoredBoxCandidates);
 	const seed = scoredSeeds[0];
 	if (seed === undefined) {
 		throw new Error("No SyncTeX source boxes in this drag area met the 50% forward-coverage requirement");
 	}
 
-	cacheSourceSpans(seed.source, new Set(seed.source.lines.map((_line, index) => index + 1)));
 	const boxesByLine = pageBoxesBySource.get(seed.rawSourceFile) ?? new Map();
 	const accepted = [seed];
-	const startLine = growBoxSelection({
-		direction: -1,
-		boundary: seed.span.start_line,
-		source: seed.source,
-		rawSourceFile: seed.rawSourceFile,
-		boxesByLine,
-		message,
-		accepted,
-	});
-	const endLine = growBoxSelection({
-		direction: 1,
-		boundary: seed.span.end_line,
-		source: seed.source,
-		rawSourceFile: seed.rawSourceFile,
-		boxesByLine,
-		message,
-		accepted,
-	});
-	const sourceSpan = { source_file: seed.source.sourceFile, start_line: startLine, end_line: endLine };
+	growBoxSelection({ direction: -1, seedLine: seed.line, source: seed.source, rawSourceFile: seed.rawSourceFile, boxesByLine, message, accepted });
+	growBoxSelection({ direction: 1, seedLine: seed.line, source: seed.source, rawSourceFile: seed.rawSourceFile, boxesByLine, message, accepted });
+	const sourceSpans = mergeAcceptedSourceSpans(normalizedSourceSpansForLines(seed.source.sourceFile, accepted.map((candidate) => candidate.line)));
+	const firstSpan = sourceSpans[0]!;
 	return {
 		type: "reverse_synctex_box_result",
 		pdf_id: message.pdf_id,
@@ -144,17 +117,16 @@ export function resolveReverseSynctexBox(input: {
 		v: message.v,
 		W: message.W,
 		H: message.H,
-		source_spans: [sourceSpan],
+		source_spans: sourceSpans,
 		ranges: [{ page: message.page, h: message.h, v: message.v, W: message.W, H: message.H }],
-		source_file: sourceSpan.source_file,
-		line: sourceSpan.start_line,
+		source_file: firstSpan.source_file,
+		line: firstSpan.start_line,
 	};
 }
 
 interface ResolvedSource {
 	sourceFile: string;
 	lines: string[];
-	spansByLine: Map<number, ViewerHostSourceSpan>;
 }
 
 interface ScoredBoxCandidate {
@@ -163,7 +135,6 @@ interface ScoredBoxCandidate {
 	box: ViewerHostSynctexForwardRange;
 	coverage: number;
 	source: ResolvedSource;
-	span: ViewerHostSourceSpan;
 	score: number;
 }
 
@@ -172,58 +143,63 @@ function resolveBoxSourceFile(sourceFile: string, workspaceCwd: string): Resolve
 	const resolved = convInputFilePath(inputFile) ?? inputFile;
 	if (!sourceFileInsideWorkspace(resolved, workspaceCwd)) return undefined;
 	try {
-		return { sourceFile: resolved, lines: readFileSync(resolved, "utf8").split(/\r?\n/), spansByLine: new Map() };
+		return { sourceFile: resolved, lines: readFileSync(resolved, "utf8").split(/\r?\n/) };
 	} catch {
 		return undefined;
 	}
 }
 
-function cacheSourceSpans(source: ResolvedSource, lines: ReadonlySet<number>): void {
-	const uncached = [...lines].filter((line) => !source.spansByLine.has(line));
-	if (uncached.length === 0) return;
-	const spans = normalizedSourceSpansForLines(source.sourceFile, uncached);
-	for (const [index, span] of spans.entries()) {
-		const line = uncached[index];
-		if (line === undefined) continue;
-		source.spansByLine.set(line, { source_file: span.sourceFile, start_line: span.startLine, end_line: span.endLine });
-	}
-}
-
 function growBoxSelection(input: {
 	direction: -1 | 1;
-	boundary: number;
+	seedLine: number;
 	source: ResolvedSource;
 	rawSourceFile: string;
 	boxesByLine: ReadonlyMap<number, ReadonlyArray<{ page: number; h: number; v: number; W: number; H: number }>>;
 	message: ViewerHostReverseSynctexBoxMessage;
 	accepted: ScoredBoxCandidate[];
-}): number {
-	let boundary = input.boundary;
-	let line = boundary + input.direction;
+}): void {
+	const pendingOpeningEnvironmentMarkers: ScoredBoxCandidate[] = [];
+	let line = input.seedLine + input.direction;
 	while (line >= 1 && line <= input.source.lines.length) {
 		const boxes = input.boxesByLine.get(line)?.filter(usableBox) ?? [];
 		if (boxes.length === 0) {
 			line += input.direction;
 			continue;
 		}
-		cacheSourceSpans(input.source, new Set([line]));
-		const span = input.source.spansByLine.get(line);
-		if (span === undefined || !spanIsSelectionSupported(span, input.boxesByLine, input.message)) break;
 		const best = boxes
 			.filter((box) => meetsMinimumCoverage(box, input.message))
-			.map((box) => scoreBoxCandidate({ ...box, sourceFile: input.rawSourceFile, line }, input.source, span, input.message))
+			.map((box) => scoreBoxCandidate({ ...box, sourceFile: input.rawSourceFile, line }, input.source, input.message))
 			.sort(compareScoredBoxCandidates)[0];
 		if (best === undefined) break;
-		input.accepted.push(best);
-		if (input.direction < 0) {
-			boundary = Math.min(boundary, best.span.start_line);
-			line = best.span.start_line - 1;
+		if (isOpeningEnvironmentMarker(input.source.lines[line - 1])) {
+			pendingOpeningEnvironmentMarkers.push(best);
 		} else {
-			boundary = Math.max(boundary, best.span.end_line);
-			line = best.span.end_line + 1;
+			input.accepted.push(...pendingOpeningEnvironmentMarkers, best);
+			pendingOpeningEnvironmentMarkers.length = 0;
+		}
+		line += input.direction;
+	}
+}
+
+function isOpeningEnvironmentMarker(sourceLine: string | undefined): boolean {
+	return sourceLine?.trim().startsWith("\\begin{") ?? false;
+}
+
+const MAX_SOURCE_SPAN_MERGE_GAP_LINES = 2;
+
+function mergeAcceptedSourceSpans(spans: readonly ReverseSynctexSourceSpan[]): ViewerHostSourceSpan[] {
+	const sorted = [...new Map(spans.map((span) => [`${span.sourceFile}\0${span.startLine}\0${span.endLine}`, span])).values()]
+		.sort((left, right) => left.sourceFile.localeCompare(right.sourceFile) || left.startLine - right.startLine || left.endLine - right.endLine);
+	const merged: ViewerHostSourceSpan[] = [];
+	for (const span of sorted) {
+		const previous = merged.at(-1);
+		if (previous !== undefined && previous.source_file === span.sourceFile && span.startLine - previous.end_line - 1 <= MAX_SOURCE_SPAN_MERGE_GAP_LINES) {
+			previous.end_line = Math.max(previous.end_line, span.endLine);
+		} else {
+			merged.push({ source_file: span.sourceFile, start_line: span.startLine, end_line: span.endLine });
 		}
 	}
-	return boundary;
+	return merged;
 }
 
 function indexPageBoxesBySource(boxes: ReadonlyArray<{ sourceFile: string; line: number; page: number; h: number; v: number; W: number; H: number }>): Map<string, Map<number, Array<{ page: number; h: number; v: number; W: number; H: number }>>> {
@@ -238,33 +214,23 @@ function indexPageBoxesBySource(boxes: ReadonlyArray<{ sourceFile: string; line:
 	return indexed;
 }
 
-function spanIsSelectionSupported(span: ViewerHostSourceSpan, boxesByLine: ReadonlyMap<number, ReadonlyArray<{ h: number; v: number; W: number; H: number }>>, message: ViewerHostReverseSynctexBoxMessage): boolean {
-	for (let line = span.start_line; line <= span.end_line; line += 1) {
-		const boxes = boxesByLine.get(line)?.filter(usableBox) ?? [];
-		if (boxes.length > 0 && !boxes.some((box) => meetsMinimumCoverage(box, message))) return false;
-	}
-	return true;
-}
-
-function scoreBoxCandidate(box: { sourceFile: string; line: number; page: number; h: number; v: number; W: number; H: number }, source: ResolvedSource, span: ViewerHostSourceSpan, message: ViewerHostReverseSynctexBoxMessage): ScoredBoxCandidate {
+function scoreBoxCandidate(box: { sourceFile: string; line: number; page: number; h: number; v: number; W: number; H: number }, source: ResolvedSource, message: ViewerHostReverseSynctexBoxMessage): ScoredBoxCandidate {
 	const coverage = boxCoverage(box, message);
-	const spanLineCount = span.end_line - span.start_line + 1;
+	const sourceLine = { source_file: source.sourceFile, start_line: box.line, end_line: box.line };
 	return {
 		rawSourceFile: box.sourceFile,
 		line: box.line,
 		box: { page: box.page, h: box.h, v: box.v, W: box.W, H: box.H },
 		coverage,
 		source,
-		span,
-		score: (1 / (coverage + SCORE_EPSILON)) + spanLineCount + textMatchBonus(source, span, box, message.pdf_text_spans),
+		score: (1 / (coverage + SCORE_EPSILON)) + 1 + textMatchBonus(source, sourceLine, box, message.pdf_text_spans),
 	};
 }
 
 function compareScoredBoxCandidates(left: ScoredBoxCandidate, right: ScoredBoxCandidate): number {
 	return left.score - right.score
 		|| right.coverage - left.coverage
-		|| left.span.start_line - right.span.start_line
-		|| left.span.end_line - right.span.end_line
+		|| left.line - right.line
 		|| left.box.h - right.box.h
 		|| left.box.v - right.box.v;
 }
@@ -508,20 +474,91 @@ function debugCandidateDiagnostics(reverse: ReturnType<typeof inspectReverseSync
 	};
 }
 
-function debugForwardGroupDiagnostics(reverse: Pick<ReturnType<typeof inspectReverseSynctexHover>, "forwardGroupScores">): { debug_forward_groups?: ViewerHostDebugForwardGroup[] } {
-	const groups = reverse.forwardGroupScores;
-	if (groups === undefined || groups.length === 0) return {};
-	return {
-		debug_forward_groups: groups.map((group, index) => ({
-			origin: group.origin,
-			lookup_line: group.lookupLine,
-			semantic_penalty: group.semanticPenalty,
+function debugForwardGroupDiagnostics(reverse: Pick<ReturnType<typeof inspectReverseSynctexHover>, "debugProposalScores">): { debug_forward_groups?: ViewerHostDebugForwardGroup[] } {
+	const proposals = reverse.debugProposalScores;
+	if (proposals === undefined || proposals.length === 0) return {};
+	const groups = proposals.flatMap((proposal, proposalIndex) => proposal.forwardGroupScores.map((group, groupIndex): ViewerHostDebugForwardGroup => ({
+		proposal: {
+			kind: proposal.kind,
+			provenance: proposal.provenance,
+			source_file: proposal.sourceFile,
+			line: proposal.line,
+			column: proposal.column,
+			rank: proposal.rank,
+			structural: proposal.structural,
+			...(proposal.textStatus === undefined ? {} : { text_status: proposal.textStatus }),
+		},
+		proposal_selected: proposalIndex === 0,
+		proposal_order: {
+			index: proposalIndex,
+			geometry_tier: proposal.geometryTier,
+			total: proposal.score,
+			exact_lookup_preferred: proposal.forwardLookupMode === "exact",
+			same_page_box_count: proposal.samePageBoxCount,
+			rank: proposal.rank,
+			line: proposal.line,
+			source_file: proposal.sourceFile,
+		},
+		origin: group.origin,
+		lookup_line: group.lookupLine,
+		semantic_penalty: group.semanticPenalty,
+		pdf_text_span_semantic_penalty: group.pdfTextSpanSemanticPenalty,
+		selection_text_context_semantic_penalty: group.selectionTextContextSemanticPenalty,
+		blank_source_line_penalty: group.blankSourceLinePenalty,
+		original_box_count: group.originalBoxCount,
+		filtered_box_count: group.filteredBoxCount,
+		same_page_box_count: group.samePageBoxCount,
+		rejected_invalid: group.rejectedInvalid,
+		rejected_absurd: group.rejectedAbsurd,
+		contains_click: group.containsClick,
+		geometry_tier: group.geometryTier,
+		...(group.distance === undefined ? {} : { distance: group.distance }),
+		...(group.distanceSquared === undefined ? {} : { distance_squared: group.distanceSquared }),
+		...(group.distanceMultiplier === undefined ? {} : { distance_multiplier: group.distanceMultiplier }),
+		...(group.distanceTerm === undefined ? {} : { distance_term: group.distanceTerm }),
+		...(group.area === undefined ? {} : { area: group.area }),
+		...(group.areaTerm === undefined ? {} : { area_term: group.areaTerm }),
+		...(group.tinyPenalty === undefined ? {} : { tiny_penalty: group.tinyPenalty }),
+		click_containment_bonus: group.clickContainmentBonus,
+		text_containment_bonus: group.textContainmentBonus,
+		...(group.textContainment === undefined ? {} : { text_containment: group.textContainment }),
+		...(group.endDocumentPenalty === undefined ? {} : { end_document_penalty: group.endDocumentPenalty }),
+		score: group.score,
+		group_order: {
+			index: groupIndex,
 			geometry_tier: group.geometryTier,
-			score: group.score,
-			selected: index === 0,
-			...(group.chosenBox === undefined ? {} : { chosen_box: group.chosenBox }),
+			total: group.score,
+			exact_lookup_preferred: group.origin === "synctex_exact",
+		},
+		selected: proposalIndex === 0 && groupIndex === 0,
+		...(group.chosenBox === undefined ? {} : { chosen_box: group.chosenBox }),
+		box_score_count: group.boxScoreCount,
+		box_scores_truncated: group.boxScoresTruncated,
+		box_scores: group.boxScores.map((box, boxIndex) => ({
+			box: box.box,
+			contains_click: box.containsClick,
+			geometry_tier: box.geometryTier,
+			distance: box.distance,
+			distance_squared: box.distanceSquared,
+			distance_multiplier: box.distanceMultiplier,
+			distance_term: box.distanceTerm,
+			area: box.area,
+			area_term: box.areaTerm,
+			tiny_penalty: box.tinyPenalty,
+			semantic_penalty: box.semanticPenalty,
+			pdf_text_span_semantic_penalty: box.pdfTextSpanSemanticPenalty,
+			selection_text_context_semantic_penalty: box.selectionTextContextSemanticPenalty,
+			blank_source_line_penalty: box.blankSourceLinePenalty,
+			click_containment_bonus: box.clickContainmentBonus,
+			text_containment_bonus: box.textContainmentBonus,
+			...(box.textContainment === undefined ? {} : { text_containment: box.textContainment }),
+			end_document_penalty: box.endDocumentPenalty,
+			total: box.score,
+			order: boxIndex,
+			selected: boxIndex === 0,
 		})),
-	};
+	})));
+	return groups.length === 0 ? {} : { debug_forward_groups: groups };
 }
 
 function hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Partial<ViewerHostReverseSynctexHoverResultMessage> {
@@ -570,10 +607,10 @@ export function reverseSynctexForwardProbeResult(input: { message: ViewerHostRev
 	const probeInput = { pdfPath: pdf.pdfPath, page: message.page, x: message.x, y: message.y, ...(message.page_height === undefined ? {} : { pageHeight: message.page_height }), ...(message.pdf_text_spans === undefined ? {} : { pdfTextSpans: message.pdf_text_spans }), ...(message.textBeforeSelection === undefined ? {} : { textBeforeSelection: message.textBeforeSelection }), ...(message.textAfterSelection === undefined ? {} : { textAfterSelection: message.textAfterSelection }) };
 	let probe;
 	try {
-		probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: pdf.workspaceCwd ?? dirname(pdf.pdfPath) });
+		probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: pdf.workspaceCwd ?? dirname(pdf.pdfPath), ...(input.debugSynctex === true ? { debugTrace: true } : {}) });
 	} catch (error) {
 		if (pdf.workspaceCwd === undefined || pdf.workspaceCwd === dirname(pdf.pdfPath)) throw error;
-		probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: dirname(pdf.pdfPath) });
+		probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: dirname(pdf.pdfPath), ...(input.debugSynctex === true ? { debugTrace: true } : {}) });
 	}
 	return {
 		type: "reverse_synctex_forward_probe_result",

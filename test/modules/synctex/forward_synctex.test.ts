@@ -77,6 +77,35 @@ test("tiny click-box penalty falls from one 11pt glyph to zero at ten glyphs", (
 	assert.equal(tinyForwardBoxPenalty({ W: 0, H: glyph.H }), 1_000);
 });
 
+test("reverse SyncTeX retains full proposal box traces only for explicit debug probes", () => {
+	const dir = mkdtempSync(join(tmpdir(), "reverse-synctex-debug-retention-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, "source line\n");
+		const candidate = { input: sourcePath, line: 1, column: 0, sourceLine: "source line", rect: { left: 0, top: 0, right: 10, bottom: 10 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false };
+		const baseInput = {
+			pdfPath,
+			page: 1,
+			x: 5,
+			y: 5,
+			cwd: dir,
+			inspectCandidates: () => ({ winner: candidate, rawWinner: candidate, candidates: [candidate] }),
+			forwardBoxesForLine: () => [{ page: 1, h: 0, v: 10, W: 10, H: 10 }],
+		};
+		const normal = mapReverseSynctex(baseInput);
+		assert.equal(normal.debugProposalScores, undefined);
+		assert.equal((normal.forwardGroupScores?.some((group) => "boxScores" in group)) ?? false, false);
+
+		const debug = mapReverseSynctex({ ...baseInput, debugTrace: true });
+		assert.ok(debug.debugProposalScores?.[0]?.forwardGroupScores[0]?.boxScores.length, "debug probe should retain bounded box scoring details");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse SyncTeX candidate collection preserves current raw winner", () => {
 	const fixture = syntheticParsedReverseFixture(["one", "two", "three"], [
 		{ line: 1, left: 100, bottom: 110, width: 10, height: 10 },
@@ -391,7 +420,7 @@ test("robust reverse mapping uses every JS candidate as a proposal and lets lowe
 	}
 });
 
-test("robust reverse mapping scores exact structural boxes alongside normalized span alternatives", () => {
+test("robust reverse mapping scores only exact structural boxes", () => {
 	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-structural-box-pool-"));
 	try {
 		const pdfPath = join(dir, "paper.pdf");
@@ -414,14 +443,13 @@ test("robust reverse mapping scores exact structural boxes alongside normalized 
 					{ input: sourcePath, line: 4, column: 0, sourceLine: "nearby candidate", rect: { left: 50, top: 50, right: 60, bottom: 60 }, distanceX: 45, distanceY: 45, distance: 63.6, area: 100, containsClick: false, structural: false },
 				],
 			}),
-			forwardBoxesForLine: ({ line, lookupMode }) => {
-				lookups.push(`${lookupMode}:${line}`);
-				if (line === 3 && lookupMode === "exact") return [{ page: 1, h: 0, v: 10, W: 10, H: 10 }];
-				if (line === 2 && lookupMode === "normalized") return [{ page: 1, h: 100, v: 110, W: 10, H: 10 }];
+			forwardBoxesForLine: ({ line }) => {
+				lookups.push(`exact:${line}`);
+				if (line === 3) return [{ page: 1, h: 0, v: 10, W: 10, H: 10 }];
 				return [{ page: 1, h: 50, v: 60, W: 10, H: 10 }];
 			},
 		});
-		assert.deepEqual(lookups, ["exact:3", "normalized:2", "exact:4"]);
+		assert.deepEqual(lookups, ["exact:3", "exact:4"]);
 		assert.equal(location.line, 3);
 		assert.equal(location.forwardLookupLine, 3);
 		assert.equal(location.forwardLookupMode, "exact");
@@ -549,7 +577,7 @@ test("reverse SyncTeX attaches a literal nested environment span as metadata", (
 	}
 });
 
-test("reverse SyncTeX uses a visually hyphenated PDF text rectangle without forward-geometry overlap", () => {
+test("reverse SyncTeX selects a visually hyphenated PDF text box by score", () => {
 	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-verified-pdf-text-"));
 	try {
 		const pdfPath = join(dir, "paper.pdf");
@@ -559,20 +587,161 @@ test("reverse SyncTeX uses a visually hyphenated PDF text rectangle without forw
 		const sourceLine = "formula close, while the heading exercises PDF text geometry.";
 		writeFileSync(sourcePath, `${sourceLine}\n`);
 		const candidate = { input: sourcePath, line: 1, column: 0, sourceLine, rect: { left: 90, top: 198, right: 190, bottom: 210 }, distanceX: 0, distanceY: 0, distance: 0, area: 1200, containsClick: true, structural: false };
+		const synctexBox = { page: 1, h: 0, v: 30, W: 10, H: 10 };
 		const location = mapReverseSynctex({
 			pdfPath,
 			page: 1,
 			x: 100,
 			y: 204,
 			cwd: dir,
+			debugTrace: true,
 			pdfTextSpans: [{ page: 1, h: 90, v: 210, W: 100, H: 12, text: "while the heading exercises PDF text geome-" }],
 			inspectCandidates: () => ({ winner: candidate, rawWinner: candidate, candidates: [candidate] }),
-			forwardBoxesForLine: () => [{ page: 1, h: 0, v: 30, W: 10, H: 10 }],
+			forwardBoxesForLine: () => [synctexBox],
 		});
 		assert.equal(location.precision, "verified");
 		assert.deepEqual(location.selectedForwardRanges, [{ page: 1, h: 90, v: 210, W: 100, H: 12 }]);
 		assert.equal(location.diagnostics.proposalScores?.[0]?.geometryTier, 0);
-			assert.ok(Math.abs((location.diagnostics.proposalScores?.[0]?.score ?? Number.NaN) - (Math.sqrt(1_200) * 2)) < 1e-9);
+		assert.equal(location.debugProposalScores?.[0]?.provenance, "synctex_reverse");
+		assert.deepEqual(location.debugProposalScores?.[0]?.forwardGroupScores.map((group) => [group.origin, group.geometryTier, group.semanticPenalty]), [
+			["pdf_text_span", 0, 0],
+			["synctex_exact", 0, 0],
+		]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("selection text context exact SyncTeX geometry is scored without a semantic penalty", () => {
+	const dir = mkdtempSync(join(tmpdir(), "reverse-synctex-selection-context-penalty-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["SELECTIONCONTEXTPROPOSAL", "pure reverse proposal"].join("\n"));
+		const pureReverse = { input: sourcePath, line: 2, column: 0, sourceLine: "pure reverse proposal", rect: { left: 0, top: 0, right: 10, bottom: 10 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false };
+		const exactBox = { page: 1, h: 0, v: 10, W: 10, H: 10 };
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 5,
+			y: 5,
+			cwd: dir,
+			debugTrace: true,
+			textBeforeSelection: "SELECTIONCONTEXTPROPOSAL",
+			textAfterSelection: "",
+			inspectCandidates: () => ({ winner: pureReverse, rawWinner: pureReverse, candidates: [pureReverse] }),
+			forwardBoxesForLine: () => [exactBox],
+		});
+		const proposals = location.debugProposalScores ?? [];
+		const pure = proposals.find((proposal) => proposal.provenance === "synctex_reverse");
+		const textContext = proposals.find((proposal) => proposal.provenance === "selection_text_context");
+		assert.equal(location.line, 1, "the text-context proposal should win on rank after tied geometry");
+		assert.equal(pure?.line, 2);
+		assert.equal(textContext?.line, 1);
+		assert.equal(textContext?.forwardGroupScores[0]?.origin, "synctex_exact", "forward lookup flavor must remain distinct from proposal provenance");
+		assert.equal(textContext?.forwardGroupScores[0]?.semanticPenalty, 0);
+		assert.equal(textContext?.forwardGroupScores[0]?.boxScores[0]?.semanticPenalty, 0);
+		assert.equal(pure?.forwardGroupScores[0]?.semanticPenalty, 0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("selection text context and a PDF text span have no semantic penalty", () => {
+	const dir = mkdtempSync(join(tmpdir(), "reverse-synctex-selection-context-dom-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["SELECTIONCONTEXTDOM", "wrong page reverse proposal"].join("\n"));
+		const pureReverse = { input: sourcePath, line: 2, column: 0, sourceLine: "wrong page reverse proposal", rect: { left: 20, top: 20, right: 30, bottom: 30 }, distanceX: 20, distanceY: 20, distance: 28, area: 100, containsClick: false, structural: false };
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 5,
+			y: 5,
+			cwd: dir,
+			debugTrace: true,
+			textBeforeSelection: "SELECTIONCONTEXTDOM",
+			textAfterSelection: "",
+			pdfTextSpans: [{ page: 1, h: 0, v: 10, W: 10, H: 10, text: "SELECTIONCONTEXTDOM" }],
+			inspectCandidates: () => ({ winner: pureReverse, rawWinner: pureReverse, candidates: [pureReverse] }),
+			forwardBoxesForLine: ({ line }) => line === 1 ? [{ page: 1, h: 0, v: 10, W: 10, H: 10 }] : [{ page: 2, h: 0, v: 10, W: 10, H: 10 }],
+		});
+		const textContext = location.debugProposalScores?.find((proposal) => proposal.provenance === "selection_text_context");
+		assert.equal(location.line, 1);
+		assert.deepEqual(textContext?.forwardGroupScores.map((group) => [group.origin, group.semanticPenalty, group.pdfTextSpanSemanticPenalty, group.selectionTextContextSemanticPenalty, group.boxScores[0]?.semanticPenalty]), [
+			["synctex_exact", 0, 0, 0, 0],
+			["pdf_text_span", 0, 0, 0, 0],
+		]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("blank source-line penalty breaks an otherwise tied SyncTeX proposal", () => {
+	const dir = mkdtempSync(join(tmpdir(), "reverse-synctex-blank-source-line-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		writeFileSync(sourcePath, ["", "nonblank SyncTeX candidate"].join("\n"));
+		const blank = { input: sourcePath, line: 1, column: 0, sourceLine: "", rect: { left: 0, top: 0, right: 10, bottom: 10 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false };
+		const text = { input: sourcePath, line: 2, column: 0, sourceLine: "nonblank SyncTeX candidate", rect: { left: 0, top: 0, right: 10, bottom: 10 }, distanceX: 0, distanceY: 0, distance: 0, area: 100, containsClick: true, structural: false };
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 5,
+			y: 5,
+			cwd: dir,
+			debugTrace: true,
+			inspectCandidates: () => ({ winner: blank, rawWinner: blank, candidates: [blank, text] }),
+			forwardBoxesForLine: () => [{ page: 1, h: 0, v: 10, W: 10, H: 10 }],
+		});
+		const blankScore = location.debugProposalScores?.find((proposal) => proposal.line === 1);
+		const textScore = location.debugProposalScores?.find((proposal) => proposal.line === 2);
+		assert.equal(location.line, 2);
+		assert.equal((blankScore?.score ?? Number.NaN) - (textScore?.score ?? Number.NaN), 500);
+		assert.equal(blankScore?.forwardGroupScores[0]?.blankSourceLinePenalty, 500);
+		assert.equal(blankScore?.forwardGroupScores[0]?.boxScores[0]?.blankSourceLinePenalty, 500);
+		assert.equal(textScore?.forwardGroupScores[0]?.blankSourceLinePenalty, 0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("reverse SyncTeX selects a narrower DOM span over a wide SyncTeX box by score", () => {
+	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-wide-semantic-box-"));
+	try {
+		const pdfPath = join(dir, "paper.pdf");
+		const sourcePath = join(dir, "main.tex");
+		writeFileSync(pdfPath, "%PDF-1.4\nfixture\n%%EOF\n");
+		writeFileSync(join(dir, "paper.synctex"), "fixture");
+		const sourceLine = "WIDECOLUMN starts a deliberately moderate visible line.";
+		writeFileSync(sourcePath, `${sourceLine}\n`);
+		const candidate = { input: sourcePath, line: 1, column: 0, sourceLine, rect: { left: 100, top: 90, right: 200, bottom: 110 }, distanceX: 0, distanceY: 0, distance: 0, area: 2000, containsClick: true, structural: false };
+		const synctexBox = { page: 1, h: 0, v: 110, W: 576, H: 10 };
+		const location = mapReverseSynctex({
+			pdfPath,
+			page: 1,
+			x: 150,
+			y: 105,
+			cwd: dir,
+			debugTrace: true,
+			pdfTextSpans: [{ page: 1, h: 100, v: 110, W: 285, H: 12, text: sourceLine }],
+			inspectCandidates: () => ({ winner: candidate, rawWinner: candidate, candidates: [candidate] }),
+			forwardBoxesForLine: () => [synctexBox],
+		});
+		assert.deepEqual(location.selectedForwardRanges, [{ page: 1, h: 100, v: 110, W: 285, H: 12 }]);
+		assert.equal(location.diagnostics.proposalScores?.[0]?.geometryTier, 0);
+		assert.deepEqual(location.debugProposalScores?.[0]?.forwardGroupScores.map((group) => [group.origin, group.geometryTier, group.semanticPenalty]), [
+			["pdf_text_span", 0, 0],
+			["synctex_exact", 0, 0],
+		]);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -786,7 +955,7 @@ test("robust reverse mapping applies full text containment bonus without partial
 			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 5, v: 15, W: 10, H: 10 }] : [{ page: 1, h: 5, v: 15, W: 10, H: 10 }],
 		});
 		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; clickContainmentBonus?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
-		assert.equal(location.line, 2);
+		assert.equal(location.line, 2, "the text-context proposal should win with its containment bonus");
 		assert.equal(textScore?.score, -1480 + tinyForwardBoxPenalty({ W: 10, H: 10 }));
 		assert.equal(textScore?.clickContainmentBonus, -1000);
 		assert.equal(textScore?.textContainmentBonus, -500);
@@ -854,7 +1023,7 @@ test("robust reverse mapping applies partial 8-character text containment bonus 
 			forwardBoxesForLine: ({ line }) => line === 2 ? [{ page: 1, h: 5, v: 15, W: 10, H: 10 }] : [{ page: 1, h: 5, v: 15, W: 10, H: 10 }],
 		});
 		const textScore = location.diagnostics.proposalScores?.find((proposal) => proposal.kind === "text") as { score?: number; clickContainmentBonus?: number; textContainmentBonus?: number; textContainment?: string } | undefined;
-		assert.equal(location.line, 2);
+		assert.equal(location.line, 2, "the text-context proposal should win with its containment bonus");
 		assert.equal(textScore?.score, -1180 + tinyForwardBoxPenalty({ W: 10, H: 10 }));
 		assert.equal(textScore?.clickContainmentBonus, -1000);
 		assert.equal(textScore?.textContainmentBonus, -200);
@@ -1117,7 +1286,7 @@ test("reverse-forward probe default path uses robust text context for forward Sy
 	}
 });
 
-test("reverse-forward probe renders the selected normalized box group", () => {
+test("reverse-forward probe renders the selected exact box group", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		const probe = mapReverseForwardSynctexProbe({
@@ -1135,19 +1304,19 @@ test("reverse-forward probe renders the selected normalized box group", () => {
 				column: 0,
 				sourceLine: "\\end{align}",
 				sidecarPath: join(project.dir, "paper.synctex"),
-				forwardLookupLine: 2,
-				forwardLookupMode: "normalized" as const,
+				forwardLookupLine: 3,
+				forwardLookupMode: "exact" as const,
 				selectedForwardBox: { page: 1, h: 140, v: 150, W: 16, H: 10 },
 				rect: { left: 10, top: 20, right: 30, bottom: 40 },
 				distanceFromCenter: 0,
 			}),
 			mapForward: (input) => {
-				assert.equal(input.line, 2);
-				assert.equal(input.lookupMode, "normalized");
+				assert.equal(input.line, 3);
+				assert.equal(input.lookupMode, "exact");
 				return { page: 1, x: 140, y: 150, ranges: [{ page: 1, h: 140, v: 150, W: 16, H: 10 }, { page: 1, h: 0, v: 700, W: 500, H: 300 }], sourceFile: input.sourceFile, line: input.line, sourceLine: "formula body", sidecarPath: join(project.dir, "paper.synctex"), branch: "js_fallback", diagnostics: { branch: "js_fallback", lookupInput: { pdfPath: project.pdfPath, sourceFile: input.sourceFile, line: input.line, sidecarPath: join(project.dir, "paper.synctex") }, native: { command: "synctex", args: [], cwd: project.dir, parsedRectangles: [] }, jsFallback: { attempted: true } } };
 			},
 		});
-		assert.equal(probe.forward.line, 2);
+		assert.equal(probe.forward.line, 3);
 		assert.deepEqual(probe.forward.ranges, [{ page: 1, h: 140, v: 150, W: 16, H: 10 }]);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
@@ -2012,7 +2181,7 @@ test("reverse SyncTeX attaches the innermost minipage span to a selected closing
 	}
 });
 
-test("forward SyncTeX maps display math delimiter lines to the formula body", () => {
+test("forward SyncTeX queries display math delimiter lines exactly", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		writeFileSync(project.sourcePath, [
@@ -2035,9 +2204,9 @@ test("forward SyncTeX maps display math delimiter lines to the formula body", ()
 			},
 		});
 
-		assert.deepEqual(requestedLines, [3]);
-		assert.equal(jump.line, 3);
-		assert.equal(jump.sourceLine, "  x^2 + y^2 = z^2");
+		assert.deepEqual(requestedLines, [2]);
+		assert.equal(jump.line, 2);
+		assert.equal(jump.sourceLine, "\\[");
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}

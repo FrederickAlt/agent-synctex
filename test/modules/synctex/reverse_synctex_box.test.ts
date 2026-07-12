@@ -35,7 +35,7 @@ function writeFixture(source: string, leaves: string[]): { dir: string; pdfPath:
 	return { dir, pdfPath, sourcePath };
 }
 
-test("box reverse SyncTeX seeds from the smallest supported span and stops before a failing box", () => {
+test("box reverse SyncTeX seeds from the best covered line and stops before failing geometry", () => {
 	const fixture = writeFixture([
 		"\\begin{document}",
 		"prior text",
@@ -91,41 +91,62 @@ test("box reverse SyncTeX uses one-dimensional glyph markers but ignores zero-by
 	}
 });
 
-test("box reverse SyncTeX rejects an expanded span with unselected source geometry", () => {
-	const fixture = writeFixture("selected prose\n\\[\nformula outside selection\n\\]\n", [
-		...pageLeaf(1, 0, 100, 0),
-		...pageLeaf(2, 0, 100, 0),
-		...pageLeaf(3, 0, 70, 0),
+test("box reverse SyncTeX does not promote an opening environment marker without later matching content", () => {
+	const fixture = writeFixture("selected text\n\\begin{align*}\nformula without geometry\n\\end{align*}\noutside selection\n", [
+		...pageLeaf(1, 0, 100),
+		...pageLeaf(2, 0, 105, 0),
+		...pageLeaf(5, 6, 100),
+	]);
+	try {
+		const result = resolveReverseSynctexBox({ message: message(), pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
+		assert.deepEqual(result.source_spans, [{ source_file: fixture.sourcePath, start_line: 1, end_line: 1 }]);
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("box reverse SyncTeX promotes an opening environment marker only with later matching content", () => {
+	const fixture = writeFixture("selected text\n\\begin{align*}\nmatching formula\n\\end{align*}\noutside selection\n", [
+		...pageLeaf(1, 0, 100),
+		...pageLeaf(2, 0, 105, 0),
+		...pageLeaf(3, 0, 100),
+		...pageLeaf(5, 6, 100),
+	]);
+	try {
+		const result = resolveReverseSynctexBox({ message: message(), pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
+		assert.deepEqual(result.source_spans, [{ source_file: fixture.sourcePath, start_line: 1, end_line: 4 }]);
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("box reverse SyncTeX does not reject a covered line because TeX syntax surrounds it", () => {
+	const fixture = writeFixture("\\begin{align*}\nformula outside selection\n\\end{align*}\n", [
+		...pageLeaf(1, 0, 70, 0),
+		...pageLeaf(3, 0, 100, 0),
 	]);
 	try {
 		const selection = message();
 		const result = resolveReverseSynctexBox({ message: selection, pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
-		assert.deepEqual(result.source_spans, [{ source_file: fixture.sourcePath, start_line: 1, end_line: 1 }]);
+		assert.deepEqual(result.source_spans, [{ source_file: fixture.sourcePath, start_line: 1, end_line: 3 }]);
 		assert.deepEqual(result.ranges, [{ page: selection.page, h: selection.h, v: selection.v, W: selection.W, H: selection.H }]);
 	} finally {
 		rmSync(fixture.dir, { recursive: true, force: true });
 	}
 });
 
-test("box reverse SyncTeX resumes growth from normalized span boundaries", () => {
-	const fixture = writeFixture([
-		"outside before",
-		"before equation",
-		"\\begin{equation}",
-		"x = y",
-		"\\end{equation}",
-		"after equation",
-		"outside after",
-	].join("\n"), [
-		...pageLeaf(1, 6, 100),
-		...pageLeaf(2, 0, 100),
-		...pageLeaf(3, 0, 100, 6),
-		...pageLeaf(6, 0, 100),
-		...pageLeaf(7, 6, 100),
+test("box reverse SyncTeX merges accepted lines across at most two missing lines", () => {
+	const fixture = writeFixture(Array.from({ length: 8 }, (_, index) => `line ${index + 1}`).join("\n"), [
+		...pageLeaf(1, 0, 100, 6),
+		...pageLeaf(4, 0, 100, 6),
+		...pageLeaf(8, 0, 100, 6),
 	]);
 	try {
 		const result = resolveReverseSynctexBox({ message: message({ W: 6 }), pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
-		assert.deepEqual(result.source_spans, [{ source_file: fixture.sourcePath, start_line: 2, end_line: 6 }]);
+		assert.deepEqual(result.source_spans, [
+			{ source_file: fixture.sourcePath, start_line: 1, end_line: 4 },
+			{ source_file: fixture.sourcePath, start_line: 8, end_line: 8 },
+		]);
 		assert.equal(result.ranges?.length, 1);
 	} finally {
 		rmSync(fixture.dir, { recursive: true, force: true });

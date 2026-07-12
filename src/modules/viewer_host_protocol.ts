@@ -173,14 +173,93 @@ export interface ViewerHostReverseSynctexBoxResultMessage extends ViewerHostSync
 	error?: string;
 }
 
+export interface ViewerHostDebugProposalIdentity {
+	kind: "text" | "ranked";
+	/** Source-proposal provenance, not the forward lookup or box-group flavor. */
+	provenance: "synctex_reverse" | "selection_text_context";
+	source_file: string;
+	line: number;
+	column: number;
+	rank: number;
+	structural: boolean;
+	text_status?: "unique" | "ambiguous-small";
+}
+
+export interface ViewerHostDebugForwardBoxScore {
+	box: ViewerHostSynctexForwardRange;
+	contains_click: boolean;
+	geometry_tier: number;
+	distance: number;
+	distance_squared: number;
+	distance_multiplier: number;
+	distance_term: number;
+	area: number;
+	area_term: number;
+	tiny_penalty: number;
+	/** Max of the independent semantic sources below; it is not their sum. */
+	semantic_penalty: number;
+	pdf_text_span_semantic_penalty: number;
+	selection_text_context_semantic_penalty: number;
+	blank_source_line_penalty: number;
+	click_containment_bonus: number;
+	text_containment_bonus: number;
+	text_containment?: "full" | "partial";
+	end_document_penalty: number;
+	total: number;
+	order: number;
+	selected: boolean;
+}
+
 export interface ViewerHostDebugForwardGroup {
-	origin: "synctex_exact" | "synctex_normalized" | "pdf_text_span";
+	proposal: ViewerHostDebugProposalIdentity;
+	proposal_selected: boolean;
+	proposal_order: {
+		index: number;
+		geometry_tier: number;
+		total: number;
+		exact_lookup_preferred: boolean;
+		same_page_box_count: number;
+		rank: number;
+		line: number;
+		source_file: string;
+	};
+	/** Forward box-group/lookup flavor, distinct from proposal.provenance. */
+	origin: "synctex_exact" | "pdf_text_span";
 	lookup_line: number;
 	semantic_penalty: number;
+	pdf_text_span_semantic_penalty: number;
+	selection_text_context_semantic_penalty: number;
+	blank_source_line_penalty: number;
+	original_box_count: number;
+	filtered_box_count: number;
+	same_page_box_count: number;
+	rejected_invalid: number;
+	rejected_absurd: number;
+	contains_click: boolean;
 	geometry_tier: number;
+	distance?: number;
+	distance_squared?: number;
+	distance_multiplier?: number;
+	distance_term?: number;
+	area?: number;
+	area_term?: number;
+	tiny_penalty?: number;
+	click_containment_bonus: number;
+	text_containment_bonus: number;
+	text_containment?: "full" | "partial";
+	end_document_penalty?: number;
 	score: number;
+	group_order: {
+		index: number;
+		geometry_tier: number;
+		total: number;
+		exact_lookup_preferred: boolean;
+	};
 	selected: boolean;
 	chosen_box?: ViewerHostSynctexForwardRange;
+	box_score_count: number;
+	box_scores_truncated: boolean;
+	box_scores: ViewerHostDebugForwardBoxScore[];
 }
 
 export interface ViewerHostReverseSynctexForwardProbeResultMessage {

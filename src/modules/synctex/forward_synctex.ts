@@ -4,7 +4,7 @@ import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
 import { inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar, type ReverseSyncTeXCandidate, type ReverseSyncTeXCandidatesInspection } from "./latex_workshop/worker.ts";
 import { lineColumnForSourceIndex } from "./source_index.ts";
 import { readSourceLine } from "./source_line.ts";
-import { boxContainsClick, boxDistanceComponentsFromClick, buildSourceSearchFragments, filterForwardBoxes, findSourceTextMatches, forwardBoxGeometryTier, type SourceTextMatchResult } from "./text_repair.ts";
+import { boxContainsClick, boxDistanceComponentsFromClick, buildSourceSearchFragments, filterForwardBoxes, findSourceTextMatches, type SourceTextMatchResult } from "./text_repair.ts";
 
 export interface ForwardSynctexTarget {
 	page: number;
@@ -17,9 +17,11 @@ export interface ForwardSynctexTarget {
 }
 
 export type ForwardSynctexBranch = "native" | "js_fallback";
-export type ForwardSynctexLookupMode = "exact" | "normalized";
+export type ForwardSynctexLookupMode = "exact";
 export type ReverseSynctexBranch = "js" | "native_fallback";
 export type ReverseSynctexPrecision = "verified" | "text" | "line" | "raw";
+/** How this source proposal entered reverse SyncTeX scoring, independent of its forward box-group flavor. */
+export type ReverseSynctexProposalProvenance = "synctex_reverse" | "selection_text_context";
 
 export interface ForwardSynctexJump {
 	page: number;
@@ -144,6 +146,8 @@ export interface ReverseForwardSynctexProbeInput {
 	nativeRunner?: NativeSynctexRunner;
 	forwardJsFallback?: ForwardSynctexJsFallback;
 	synctexCommand?: string;
+	/** Retains bounded proposal/group/box arithmetic for an explicit debug probe only. */
+	debugTrace?: boolean;
 	inspectReverse?: (input: { pdfPath: string; page: number; x: number; y: number; cwd: string }) => ReverseSynctexHoverInspection;
 	mapForward?: (input: MapForwardSynctexInput) => ForwardSynctexJump;
 }
@@ -176,6 +180,8 @@ export interface ReverseSynctexLocation {
 	selectedForwardRanges?: ForwardSynctexRange[];
 	/** Exact forward-group scores, emitted only by an explicit debug probe. */
 	forwardGroupScores?: ReverseSynctexForwardGroupScore[];
+	/** Full bounded proposal/group/box trace retained only for an explicit debug probe. */
+	debugProposalScores?: ReverseSynctexProposalScore[];
 	diagnostics: ReverseSynctexDiagnostics;
 }
 
@@ -192,6 +198,7 @@ export interface ReverseSynctexHoverInspection {
 	rawWinner?: unknown;
 	topCandidates?: unknown[];
 	proposalScores?: ReverseSynctexDiagnostics["proposalScores"];
+	debugProposalScores?: ReverseSynctexProposalScore[];
 	repairedWinner?: { sourceFile: string; line: number; column: number; sourceLine?: string; precision: ReverseSynctexPrecision; score?: number };
 	forwardVerification?: ReverseSynctexDiagnostics["forwardVerification"];
 	normalizedSourceSpan?: ReverseSynctexSourceSpan;
@@ -273,6 +280,7 @@ export interface ReverseSynctexDiagnostics {
 	};
 	proposalScores?: Array<{
 		kind: "text" | "ranked";
+		provenance: ReverseSynctexProposalProvenance;
 		sourceFile: string;
 		line: number;
 		column: number;
@@ -333,7 +341,7 @@ function cacheKeyForForwardSynctex(input: MapForwardSynctexInput): string | unde
 	const sidecarSnapshot = fileSnapshotCacheKey(sidecarPath);
 	const sourceSnapshot = fileSnapshotCacheKey(sourceFile);
 	if (sidecarSnapshot === undefined || sourceSnapshot === undefined) return undefined;
-	return [input.synctexCommand ?? "synctex", pdfPath, sidecarSnapshot, sourceFile, sourceSnapshot, input.lookupMode ?? "normalized", input.line].join("\0");
+	return [input.synctexCommand ?? "synctex", pdfPath, sidecarSnapshot, sourceFile, sourceSnapshot, input.lookupMode ?? "exact", input.line].join("\0");
 }
 
 function cloneForwardSynctexJump(jump: ForwardSynctexJump): ForwardSynctexJump {
@@ -371,7 +379,9 @@ interface NativeForwardRecord {
 
 function completeRange(record: NativeForwardRecord): ForwardSynctexRange | undefined {
 	if (record.page === undefined || record.h === undefined || record.v === undefined || record.W === undefined || record.H === undefined) return undefined;
-	return { page: record.page, h: record.h, v: record.v, W: record.W, H: record.H };
+	const h = record.W < 0 ? record.h + record.W : record.h;
+	const v = record.H < 0 ? record.v - record.H : record.v;
+	return { page: record.page, h, v, W: Math.abs(record.W), H: Math.abs(record.H) };
 }
 
 function parseNativeForwardResult(stdout: string): ForwardSynctexPoint | undefined {
@@ -523,6 +533,7 @@ export function mapReverseForwardSynctexProbe(input: ReverseForwardSynctexProbeI
 			...(input.pdfTextSpans === undefined ? {} : { pdfTextSpans: input.pdfTextSpans }),
 			...(input.nativeRunner === undefined ? {} : { nativeRunner: input.nativeRunner }),
 			...(input.synctexCommand === undefined ? {} : { synctexCommand: input.synctexCommand }),
+			...(input.debugTrace === true ? { debugTrace: true } : {}),
 		}))
 		: input.inspectReverse({ pdfPath: input.pdfPath, page: input.page, x: input.x, y: input.y, cwd: input.cwd });
 	const mappedForward = mapForward({
@@ -562,7 +573,7 @@ export function mapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctex
 	}
 
 	const sourceFile = isAbsolute(input.sourceFile) ? resolve(input.sourceFile) : resolve(input.cwd, input.sourceFile);
-	const effectiveLine = input.lookupMode === "exact" ? input.line : forwardSynctexLineForSourceLine(sourceFile, input.line);
+	const effectiveLine = input.line;
 	const sourceLine = readSourceLine(sourceFile, effectiveLine, input.cwd);
 	if (sourceLine === undefined) {
 		throw new Error(`Cannot read source_file line ${sourceFile}:${effectiveLine}`);
@@ -725,7 +736,6 @@ function compactReverseCandidate(candidate: ReverseSyncTeXCandidate, cwd?: strin
 	};
 }
 
-const SYNCTEX_LAYOUT_SEMANTIC_PENALTY = 1_000_000_000;
 const FORWARD_DISTANCE_PENALTY_MULTIPLIER = 0.96;
 const FORWARD_BOX_SIZE_PENALTY_MULTIPLIER = 2;
 const TINY_BOX_GLYPH_WIDTH_PT = 5.5;
@@ -744,13 +754,87 @@ interface ForwardBoxGroup {
 	verifiedText?: boolean;
 }
 
+export interface ReverseSynctexForwardBoxScore {
+	box: ForwardSynctexRange;
+	containsClick: boolean;
+	geometryTier: number;
+	distance: number;
+	distanceSquared: number;
+	distanceMultiplier: number;
+	distanceTerm: number;
+	area: number;
+	areaTerm: number;
+	tinyPenalty: number;
+	/** Max of the independent semantic penalty sources below; never their sum. */
+	semanticPenalty: number;
+	pdfTextSpanSemanticPenalty: number;
+	selectionTextContextSemanticPenalty: number;
+	blankSourceLinePenalty: number;
+	clickContainmentBonus: number;
+	textContainmentBonus: number;
+	textContainment?: "full" | "partial";
+	endDocumentPenalty: number;
+	score: number;
+}
+
+/** Minimal selected-group data retained by normal reverse SyncTeX resolution. */
 export interface ReverseSynctexForwardGroupScore {
-	origin: "synctex_exact" | "synctex_normalized" | "pdf_text_span";
+	origin: "synctex_exact" | "pdf_text_span";
 	lookupLine: number;
 	semanticPenalty: number;
 	geometryTier: number;
 	score: number;
 	chosenBox?: ForwardSynctexRange;
+}
+
+/** Bounded box arithmetic retained only for an explicit debug probe. */
+export interface ReverseSynctexDebugForwardGroupScore extends ReverseSynctexForwardGroupScore {
+	pdfTextSpanSemanticPenalty: number;
+	selectionTextContextSemanticPenalty: number;
+	blankSourceLinePenalty: number;
+	originalBoxCount: number;
+	filteredBoxCount: number;
+	samePageBoxCount: number;
+	rejectedInvalid: number;
+	rejectedAbsurd: number;
+	containsClick: boolean;
+	distance?: number;
+	distanceSquared?: number;
+	distanceMultiplier?: number;
+	distanceTerm?: number;
+	area?: number;
+	areaTerm?: number;
+	tinyPenalty?: number;
+	endDocumentPenalty?: number;
+	clickContainmentBonus: number;
+	textContainmentBonus: number;
+	textContainment?: "full" | "partial";
+	boxScoreCount: number;
+	boxScoresTruncated: boolean;
+	boxScores: ReverseSynctexForwardBoxScore[];
+}
+
+export interface ReverseSynctexProposalScore {
+	kind: "text" | "ranked";
+	provenance: ReverseSynctexProposalProvenance;
+	sourceFile: string;
+	line: number;
+	column: number;
+	rank: number;
+	textStatus?: "unique" | "ambiguous-small";
+	geometryTier: number;
+	score: number;
+	precision: ReverseSynctexPrecision;
+	samePageBoxCount: number;
+	containsClick: boolean;
+	structural: boolean;
+	clickContainmentBonus: number;
+	textContainmentBonus: number;
+	textContainment?: "full" | "partial";
+	distance?: number;
+	reason?: string;
+	forwardLookupMode?: ForwardSynctexLookupMode;
+	forwardGroupScores: ReverseSynctexDebugForwardGroupScore[];
 }
 
 function forwardBoxesForLookup(input: { sourceFile: string; line: number; pdfPath: string; cwd: string; lookupMode: ForwardSynctexLookupMode; nativeRunner?: NativeSynctexRunner; forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine; synctexCommand?: string }): ForwardSynctexRange[] {
@@ -831,39 +915,31 @@ function verifiedPdfTextBoxes(input: { sourceLine: string | undefined; click: { 
 
 function forwardBoxGroupsForSourceLine(input: { sourceFile: string; line: number; pdfPath: string; cwd: string; click?: { page: number; x: number; y: number }; pdfTextSpans?: PdfTextSpan[]; nativeRunner?: NativeSynctexRunner; forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine; synctexCommand?: string }): ForwardBoxGroup[] {
 	const sourceLines = readSourceLines(input.sourceFile);
-	const sourceSpan = sourceSpanForLine(input.sourceFile, input.line, sourceLines);
-	const lookups: Array<{ line: number; lookupMode: ForwardSynctexLookupMode }> = [{ line: input.line, lookupMode: "exact" }];
-	if (sourceSpan?.contentLine !== undefined && sourceSpan.contentLine !== input.line) {
-		lookups.push({ line: sourceSpan.contentLine, lookupMode: "normalized" });
-	}
-	const seen = new Set<string>();
-	const groups: ForwardBoxGroup[] = lookups.map((lookup) => ({
-		lookupMode: lookup.lookupMode,
-		lookupLine: lookup.line,
+	const groups: ForwardBoxGroup[] = [{
+		lookupMode: "exact" as const,
+		lookupLine: input.line,
 		semanticPenalty: 0,
-		boxes: forwardBoxesForLookup({ ...input, line: lookup.line, lookupMode: lookup.lookupMode }).filter((box) => {
-			const key = forwardRangeKey(box);
-			if (seen.has(key)) return false;
-			seen.add(key);
-			return true;
-		}),
-	})).filter((group) => group.boxes.length > 0);
+		boxes: forwardBoxesForLookup({ ...input, lookupMode: "exact" }),
+	}].filter((group) => group.boxes.length > 0);
 	const textBoxes = input.click === undefined ? [] : verifiedPdfTextBoxes({
 		sourceLine: sourceLines?.[input.line - 1],
 		click: input.click,
 		spans: input.pdfTextSpans,
 	});
-	if (textBoxes.length > 0) groups.push({ lookupMode: "exact", lookupLine: input.line, boxes: textBoxes, semanticPenalty: SYNCTEX_LAYOUT_SEMANTIC_PENALTY, verifiedText: true });
+	if (textBoxes.length > 0) groups.push({ lookupMode: "exact", lookupLine: input.line, boxes: textBoxes, semanticPenalty: 0, verifiedText: true });
 	return groups;
 }
 
 const MAX_REVERSE_SYNCTEX_CANDIDATE_PROPOSALS = 25;
+const MAX_REVERSE_SYNCTEX_DEBUG_BOX_SCORES = 16;
 const FULL_TEXT_CONTAINMENT_CONTEXT_CHARS = 30;
 const END_DOCUMENT_GEOMETRY_TIER = 1;
 const END_DOCUMENT_SCORE_PENALTY = 2_000;
+const BLANK_SOURCE_LINE_SCORE_PENALTY = 500;
 
 interface ReverseSynctexProposal {
 	kind: "text" | "ranked";
+	provenance: ReverseSynctexProposalProvenance;
 	sourceFile: string;
 	line: number;
 	column: number;
@@ -889,6 +965,7 @@ interface ScoredReverseSynctexProposal extends ReverseSynctexProposal {
 	distance?: number;
 	reason?: string;
 	forwardGroupScores: ReverseSynctexForwardGroupScore[];
+	debugForwardGroupScores?: ReverseSynctexDebugForwardGroupScore[];
 }
 
 function sameSourceLocation(left: { sourceFile: string; line: number }, right: { sourceFile: string; line: number }): boolean {
@@ -926,18 +1003,16 @@ function proposalPrecision(proposal: ReverseSynctexProposal, containsClick: bool
 	return "line";
 }
 
-interface ScoredForwardBoxGroup {
+interface ScoredForwardBoxGroup extends ReverseSynctexForwardGroupScore {
 	group: ForwardBoxGroup;
 	boxes: ForwardSynctexRange[];
-	chosenBox?: ForwardSynctexRange;
 	containsClick: boolean;
 	samePageBoxCount: number;
 	clickContainmentBonus: number;
 	textContainmentBonus: number;
 	textContainment?: "full" | "partial";
 	distance?: number;
-	score: number;
-	geometryTier: number;
+	debugScore?: ReverseSynctexDebugForwardGroupScore;
 }
 
 function scoreReverseSynctexProposal(input: {
@@ -946,36 +1021,97 @@ function scoreReverseSynctexProposal(input: {
 	boxGroups: ForwardBoxGroup[];
 	fullTextFragment?: string;
 	partialTextFragment?: string;
+	debugTrace?: boolean;
 }): ScoredReverseSynctexProposal {
 	const scoredGroups = input.boxGroups.map((group): ScoredForwardBoxGroup => {
 		const filtered = filterForwardBoxes(group.boxes, input.click);
 		const samePageBoxes = filtered.boxes.filter((box) => box.page === input.click.page);
-		const scoredSamePageBoxes = samePageBoxes.map((box) => {
+		const pdfTextSpanSemanticPenalty = group.semanticPenalty;
+		const selectionTextContextSemanticPenalty = 0;
+		const semanticPenalty = 0;
+		const scoredSamePageBoxes = samePageBoxes.map((box): ReverseSynctexForwardBoxScore => {
 			const { distance, distanceSquared } = boxDistanceComponentsFromClick(box, input.click);
+			const distanceMultiplier = FORWARD_DISTANCE_PENALTY_MULTIPLIER;
+			const distanceTerm = distanceSquared * distanceMultiplier;
 			const area = Math.max(0, box.W) * Math.max(0, box.H);
+			const areaTerm = Math.sqrt(area) * FORWARD_BOX_SIZE_PENALTY_MULTIPLIER;
 			const containsClick = boxContainsClick(box, input.click);
 			const containment = textContainmentBonus({ proposal: input.proposal, containsClick, fullTextFragment: input.fullTextFragment, partialTextFragment: input.partialTextFragment });
 			const clickContainmentBonus = containsClick ? -1000 : 0;
-				const tinyBoxPenalty = tinyForwardBoxPenalty(box);
-			return { box, distance, clickContainmentBonus, textContainmentBonus: containment.bonus, textContainment: containment.containment, score: (distanceSquared * FORWARD_DISTANCE_PENALTY_MULTIPLIER) + (Math.sqrt(area) * FORWARD_BOX_SIZE_PENALTY_MULTIPLIER) + tinyBoxPenalty + clickContainmentBonus + containment.bonus + group.semanticPenalty + (input.proposal.sourceLine?.trim() === "\\end{document}" ? END_DOCUMENT_SCORE_PENALTY : 0) };
+			const tinyPenalty = tinyForwardBoxPenalty(box);
+			const blankSourceLinePenalty = input.proposal.sourceLine?.trim() === "" ? BLANK_SOURCE_LINE_SCORE_PENALTY : 0;
+			const endDocumentPenalty = input.proposal.sourceLine?.trim() === "\\end{document}" ? END_DOCUMENT_SCORE_PENALTY : 0;
+			return {
+				box,
+				containsClick,
+				geometryTier: 0,
+				distance,
+				distanceSquared,
+				distanceMultiplier,
+				distanceTerm,
+				area,
+				areaTerm,
+				tinyPenalty,
+				semanticPenalty,
+				pdfTextSpanSemanticPenalty,
+				selectionTextContextSemanticPenalty,
+				blankSourceLinePenalty,
+				clickContainmentBonus,
+				textContainmentBonus: containment.bonus,
+				...(containment.containment === undefined ? {} : { textContainment: containment.containment }),
+				endDocumentPenalty,
+				score: distanceTerm + areaTerm + tinyPenalty + semanticPenalty + blankSourceLinePenalty + clickContainmentBonus + containment.bonus + endDocumentPenalty,
+			};
 		}).sort((left, right) => left.score - right.score);
 		const chosen = scoredSamePageBoxes[0];
+		const origin: ReverseSynctexForwardGroupScore["origin"] = group.verifiedText === true ? "pdf_text_span" : "synctex_exact";
+		const basic = {
+			origin,
+			lookupLine: group.lookupLine,
+			semanticPenalty,
+			...(chosen?.box === undefined ? {} : { chosenBox: chosen.box }),
+			geometryTier: chosen?.geometryTier ?? 1,
+			score: chosen?.score ?? 0,
+		};
+		const debugScore = input.debugTrace !== true ? undefined : {
+			...basic,
+			pdfTextSpanSemanticPenalty,
+			selectionTextContextSemanticPenalty,
+			blankSourceLinePenalty: chosen?.blankSourceLinePenalty ?? 0,
+			originalBoxCount: group.boxes.length,
+			filteredBoxCount: filtered.boxes.length,
+			samePageBoxCount: samePageBoxes.length,
+			rejectedInvalid: filtered.rejectedInvalid,
+			rejectedAbsurd: filtered.rejectedAbsurd,
+			containsClick: chosen?.containsClick ?? false,
+			...(chosen?.distance === undefined ? {} : { distance: chosen.distance }),
+			...(chosen?.distanceSquared === undefined ? {} : { distanceSquared: chosen.distanceSquared }),
+			...(chosen?.distanceMultiplier === undefined ? {} : { distanceMultiplier: chosen.distanceMultiplier }),
+			...(chosen?.distanceTerm === undefined ? {} : { distanceTerm: chosen.distanceTerm }),
+			...(chosen?.area === undefined ? {} : { area: chosen.area }),
+			...(chosen?.areaTerm === undefined ? {} : { areaTerm: chosen.areaTerm }),
+			...(chosen?.tinyPenalty === undefined ? {} : { tinyPenalty: chosen.tinyPenalty }),
+			...(chosen?.endDocumentPenalty === undefined ? {} : { endDocumentPenalty: chosen.endDocumentPenalty }),
+			clickContainmentBonus: chosen?.clickContainmentBonus ?? 0,
+			textContainmentBonus: chosen?.textContainmentBonus ?? 0,
+			...(chosen?.textContainment === undefined ? {} : { textContainment: chosen.textContainment }),
+			boxScoreCount: scoredSamePageBoxes.length,
+			boxScoresTruncated: scoredSamePageBoxes.length > MAX_REVERSE_SYNCTEX_DEBUG_BOX_SCORES,
+			boxScores: scoredSamePageBoxes.slice(0, MAX_REVERSE_SYNCTEX_DEBUG_BOX_SCORES),
+		} satisfies ReverseSynctexDebugForwardGroupScore;
 		return {
 			group,
 			boxes: filtered.boxes,
-			...(chosen?.box === undefined ? {} : { chosenBox: chosen.box }),
-			containsClick: chosen?.box === undefined ? false : boxContainsClick(chosen.box, input.click),
+			...basic,
+			containsClick: chosen?.containsClick ?? false,
 			samePageBoxCount: samePageBoxes.length,
 			clickContainmentBonus: chosen?.clickContainmentBonus ?? 0,
 			textContainmentBonus: chosen?.textContainmentBonus ?? 0,
 			...(chosen?.textContainment === undefined ? {} : { textContainment: chosen.textContainment }),
 			...(chosen?.distance === undefined ? {} : { distance: chosen.distance }),
-			score: chosen?.score ?? 0,
-			geometryTier: chosen?.box === undefined ? 1 : forwardBoxGeometryTier(chosen.box),
+			...(debugScore === undefined ? {} : { debugScore }),
 		};
-	}).sort((left, right) => left.geometryTier - right.geometryTier
-		|| left.score - right.score
-		|| (left.group.lookupMode === "exact" ? -1 : 0) - (right.group.lookupMode === "exact" ? -1 : 0));
+	}).sort((left, right) => left.geometryTier - right.geometryTier || left.score - right.score);
 	const selectedGroup = scoredGroups[0];
 	const geometryTier = input.proposal.sourceLine?.trim() === "\\end{document}"
 			? END_DOCUMENT_GEOMETRY_TIER
@@ -985,14 +1121,8 @@ function scoreReverseSynctexProposal(input: {
 	return {
 		...input.proposal,
 		precision: proposalPrecision(input.proposal, containsClick, selectedGroup?.group.verifiedText === true),
-		forwardGroupScores: scoredGroups.map((group) => ({
-			origin: group.group.verifiedText === true ? "pdf_text_span" : group.group.lookupMode === "normalized" ? "synctex_normalized" : "synctex_exact",
-			lookupLine: group.group.lookupLine,
-			semanticPenalty: group.group.semanticPenalty,
-			geometryTier: group.geometryTier,
-			score: group.score,
-			...(group.chosenBox === undefined ? {} : { chosenBox: group.chosenBox }),
-		})),
+		forwardGroupScores: scoredGroups.map(({ group: _group, boxes: _boxes, containsClick: _containsClick, samePageBoxCount: _samePageBoxCount, clickContainmentBonus: _clickContainmentBonus, textContainmentBonus: _textContainmentBonus, textContainment: _textContainment, distance: _distance, debugScore: _debugScore, ...score }) => score),
+		...(input.debugTrace !== true ? {} : { debugForwardGroupScores: scoredGroups.flatMap((group) => group.debugScore === undefined ? [] : [group.debugScore]) }),
 		geometryTier,
 		score: selectedGroup?.score ?? 0,
 		...(selectedGroup === undefined ? {} : { forwardLookupLine: selectedGroup.group.lookupLine, forwardLookupMode: selectedGroup.group.lookupMode }),
@@ -1021,6 +1151,7 @@ function compareScoredReverseSynctexProposals(left: ScoredReverseSynctexProposal
 function compactProposalScore(proposal: ScoredReverseSynctexProposal): NonNullable<ReverseSynctexDiagnostics["proposalScores"]>[number] {
 	return {
 		kind: proposal.kind,
+		provenance: proposal.provenance,
 		sourceFile: proposal.sourceFile,
 		line: proposal.line,
 		column: proposal.column,
@@ -1035,6 +1166,16 @@ function compactProposalScore(proposal: ScoredReverseSynctexProposal): NonNullab
 		...(proposal.textContainment === undefined ? {} : { textContainment: proposal.textContainment }),
 		...(proposal.distance === undefined ? {} : { distance: proposal.distance }),
 		...(proposal.reason === undefined ? {} : { reason: proposal.reason }),
+	};
+}
+
+function debugProposalScore(proposal: ScoredReverseSynctexProposal): ReverseSynctexProposalScore {
+	return {
+		...compactProposalScore(proposal),
+		rank: proposal.rank,
+		...(proposal.textStatus === undefined ? {} : { textStatus: proposal.textStatus }),
+		...(proposal.forwardLookupMode === undefined ? {} : { forwardLookupMode: proposal.forwardLookupMode }),
+		forwardGroupScores: proposal.debugForwardGroupScores ?? [],
 	};
 }
 
@@ -1221,12 +1362,6 @@ export function normalizedSourceSpanForLine(sourceFile: string, line: number): R
 	return normalizedSourceSpansForLines(sourceFile, [line])[0] as ReverseSynctexSourceSpan;
 }
 
-function forwardSynctexLineForSourceLine(sourceFile: string, line: number): number {
-	const sourceLines = readSourceLines(sourceFile);
-	const sourceSpan = sourceSpanForLine(sourceFile, line, sourceLines);
-	return sourceSpan?.contentLine ?? line;
-}
-
 function parseNativeReverseResult(stdout: string): ReverseSynctexMappedResult | undefined {
 	let started = false;
 	let input: string | undefined;
@@ -1310,6 +1445,7 @@ function reverseLocationToHoverInspection(location: ReverseSynctexLocation): Rev
 		...(location.diagnostics.rawWinner === undefined ? {} : { rawWinner: location.diagnostics.rawWinner }),
 		...(location.diagnostics.topCandidates === undefined ? {} : { topCandidates: location.diagnostics.topCandidates }),
 		...(location.diagnostics.proposalScores === undefined ? {} : { proposalScores: location.diagnostics.proposalScores }),
+		...(location.debugProposalScores === undefined ? {} : { debugProposalScores: location.debugProposalScores }),
 		repairedWinner: { sourceFile: location.sourceFile, line: location.line, column: location.column, ...(location.sourceLine === undefined ? {} : { sourceLine: location.sourceLine }), precision: location.precision, ...(location.diagnostics.selected.score === undefined ? {} : { score: location.diagnostics.selected.score }) },
 		...(location.diagnostics.forwardVerification === undefined ? {} : { forwardVerification: location.diagnostics.forwardVerification }),
 		...(location.normalizedSourceSpan === undefined ? {} : { normalizedSourceSpan: location.normalizedSourceSpan }),
@@ -1357,6 +1493,8 @@ export function mapReverseSynctex(input: {
 	inspectCandidates?: ReverseSynctexCandidateInspector;
 	forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine;
 	synctexCommand?: string;
+	/** Retains bounded proposal/group/box arithmetic for an explicit debug probe only. */
+	debugTrace?: boolean;
 }): ReverseSynctexLocation {
 	if (!Number.isInteger(input.page) || input.page < 1) {
 		throw new Error("page must be a positive integer");
@@ -1471,6 +1609,7 @@ export function mapReverseSynctex(input: {
 	let forwardVerification: ReverseSynctexDiagnostics["forwardVerification"] | undefined;
 	let textRepairChangedLocation = false;
 	let proposalScores: ReverseSynctexDiagnostics["proposalScores"] | undefined;
+	let debugProposalScores: ReverseSynctexProposalScore[] | undefined;
 	let selectedScore: number | undefined;
 	let forwardLookup: { line: number; mode: ForwardSynctexLookupMode } | undefined;
 	let selectedForwardBox: ForwardSynctexRange | undefined;
@@ -1483,7 +1622,7 @@ export function mapReverseSynctex(input: {
 			const existingIndex = proposals.findIndex((existing) => existing.sourceFile === proposal.sourceFile && existing.line === proposal.line);
 			if (existingIndex < 0) {
 				proposals.push(proposal);
-			} else if (proposal.kind === "text" && proposals[existingIndex]?.kind !== "text") {
+			} else if (proposal.provenance === "selection_text_context" && proposals[existingIndex]?.provenance !== "selection_text_context") {
 				proposals[existingIndex] = { ...proposal, rank: proposals[existingIndex]?.rank ?? proposal.rank };
 			}
 		};
@@ -1495,6 +1634,7 @@ export function mapReverseSynctex(input: {
 				if (proposals.some((proposal) => proposal.sourceFile === candidateSourceFile && proposal.line === candidate.line)) continue;
 				addProposal({
 					kind: "ranked",
+					provenance: "synctex_reverse",
 					rank: proposalRank++,
 					sourceFile: candidateSourceFile,
 					line: candidate.line,
@@ -1508,6 +1648,7 @@ export function mapReverseSynctex(input: {
 		if (proposals.length === 0) {
 			addProposal({
 				kind: "ranked",
+				provenance: "synctex_reverse",
 				rank: proposalRank++,
 				sourceFile: rawSourceFile,
 				line: rawMappedLine,
@@ -1536,6 +1677,7 @@ export function mapReverseSynctex(input: {
 				for (const match of matches.matches) {
 					addProposal({
 						kind: "text",
+						provenance: "selection_text_context",
 						rank: proposalRank++,
 						sourceFile: match.sourceFile,
 						line: match.line,
@@ -1555,6 +1697,7 @@ export function mapReverseSynctex(input: {
 				click,
 				...(fullTextFragment === undefined ? {} : { fullTextFragment }),
 				...(partialTextFragment === undefined ? {} : { partialTextFragment }),
+				...(input.debugTrace === true ? { debugTrace: true } : {}),
 				boxGroups: forwardBoxGroupsForSourceLine({
 					sourceFile: proposal.sourceFile,
 					line: proposal.line,
@@ -1568,6 +1711,7 @@ export function mapReverseSynctex(input: {
 				}),
 			})).sort(compareScoredReverseSynctexProposals);
 			proposalScores = scored.map(compactProposalScore);
+			if (input.debugTrace === true) debugProposalScores = scored.map(debugProposalScore);
 			const selectedProposal = scored[0];
 			if (selectedProposal !== undefined) {
 				sourceFile = selectedProposal.sourceFile;
@@ -1708,6 +1852,7 @@ export function mapReverseSynctex(input: {
 		...(selectedForwardBox === undefined ? {} : { selectedForwardBox }),
 		...(selectedForwardRanges === undefined ? {} : { selectedForwardRanges }),
 		...(selectedForwardGroupScores === undefined ? {} : { forwardGroupScores: selectedForwardGroupScores }),
+		...(debugProposalScores === undefined ? {} : { debugProposalScores }),
 		diagnostics,
 	};
 }

@@ -681,11 +681,14 @@ test("reverse SyncTeX viewer socket payloads flow through Host to MCP event stor
 		const diagnostics = event?.synctex_diagnostics as {
 			context: { hasSelectionContext: boolean; textBeforeSelection?: string };
 			candidates: Array<{ kind: string }>;
+			proposalScores?: Array<{ provenance: "synctex_reverse" | "selection_text_context"; line: number }>;
 			selected: { sourceFile: string; line: number; column: number };
 		};
 		assert.equal(diagnostics.context.hasSelectionContext, true);
 		assert.equal(diagnostics.context.textBeforeSelection, "First paragraph");
 		assert.deepEqual(diagnostics.candidates.map((candidate) => candidate.kind), ["initial_candidate", "context_corrected"]);
+		assert.deepEqual(diagnostics.proposalScores?.[0] === undefined ? undefined : [diagnostics.proposalScores[0].line, diagnostics.proposalScores[0].provenance], [3, "selection_text_context"]);
+		assert.equal(diagnostics.proposalScores?.some((proposal) => proposal.line === 3 && proposal.provenance === "selection_text_context"), true);
 		assert.equal(diagnostics.selected.sourceFile, sourcePath);
 		assert.equal(diagnostics.selected.line, 3);
 		assert.equal(diagnostics.selected.column, 6);

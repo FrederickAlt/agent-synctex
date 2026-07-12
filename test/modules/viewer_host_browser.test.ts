@@ -11,6 +11,7 @@ import { ViewerHostMcpService, type ViewerHostClient } from "../../src/modules/v
 import type { McpToViewerHostMessage, ViewerHostControlResponse } from "../../src/modules/viewer_host_protocol.ts";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
+import { forceViewerProbeClick, installCaptureHelper, installInteractiveForcedClickCapture, type InteractiveForcedClick } from "../../scripts/debug-viewer-synctex.ts";
 
 function makeTwoPagePdfWithToken(token: string): Buffer {
 	const chunks: string[] = ["%PDF-1.4\n%\u00e2\u00e3\u00cf\u00d3\n"];
@@ -1082,6 +1083,48 @@ async function lwSelectionDragProbe(page: Page, token: string): Promise<{ startC
 	}, token);
 }
 
+async function lwSetCollapsedSelection(page: Page, token: string): Promise<{ textBeforeSelection: string; textAfterSelection: string }> {
+	return await page.evaluate((needle) => {
+		const textLayer = document.querySelector("#viewer .page[data-page-number='1'] .textLayer") as HTMLElement | null;
+		if (!textLayer) throw new Error("missing LW text layer");
+		const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
+		let node = walker.nextNode();
+		while (node) {
+			const text = node.textContent ?? "";
+			const offset = text.indexOf(needle);
+			if (offset >= 0) {
+				const collapsedOffset = offset + Math.floor(needle.length / 2);
+				const range = document.createRange();
+				range.setStart(node, collapsedOffset);
+				range.collapse(true);
+				const selection = window.getSelection();
+				if (!selection) throw new Error("browser selection is unavailable");
+				selection.removeAllRanges();
+				selection.addRange(range);
+				return { textBeforeSelection: text.substring(0, collapsedOffset), textAfterSelection: text.substring(collapsedOffset) };
+			}
+			node = walker.nextNode();
+		}
+		throw new Error(`collapsed selection token not found: ${needle}`);
+	}, token);
+}
+
+async function lwCollapsedSelectionContext(page: Page): Promise<{ isCollapsed: boolean; textBeforeSelection?: string; textAfterSelection?: string }> {
+	return await page.evaluate(() => {
+		const pageElement = document.querySelector("#viewer .page[data-page-number='1']") as HTMLElement | null;
+		const textLayer = pageElement?.querySelector(".textLayer");
+		const selection = window.getSelection();
+		if (!textLayer || !selection || selection.rangeCount === 0) return { isCollapsed: false };
+		const range = selection.getRangeAt(0);
+		if (!selection.isCollapsed || !textLayer.contains(range.commonAncestorContainer) || selection.anchorNode?.nodeType !== Node.TEXT_NODE || typeof selection.anchorNode.textContent !== "string") return { isCollapsed: false };
+		return {
+			isCollapsed: true,
+			textBeforeSelection: selection.anchorNode.textContent.substring(0, selection.anchorOffset),
+			textAfterSelection: selection.anchorNode.textContent.substring(selection.anchorOffset),
+		};
+	});
+}
+
 async function drainHostMcpEvents(origin: string): Promise<Array<Record<string, unknown>>> {
 	const response = await fetch(`${origin}/mcp-events/drain`, { method: "POST" });
 	assert.equal(response.status, 200);
@@ -1385,6 +1428,175 @@ test("LaTeX Workshop viewer annotation is active by default and hidden debug swi
 	}
 });
 
+test("LaTeX Workshop viewer sends an unmocked marking probe for arbitrary blank PDF coordinates", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-unmocked-probe-"));
+	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	const requests: Array<Record<string, unknown>> = [];
+	try {
+		registry.registerPdf({ pdfId: 258, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 500, height: 360 } });
+		page.on("request", (request) => {
+			if (new URL(request.url()).pathname !== "/synctex/probe") return;
+			requests.push(request.postDataJSON() as Record<string, unknown>);
+		});
+		await page.goto(`${server.origin}/viewer-lw/258`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		const point = await lwCanvasPoint(page, 1, 280, 180);
+		const hitsTextLayer = await page.evaluate(({ clientX, clientY }) => document.elementsFromPoint(clientX, clientY).some((element) => element.closest(".textLayer span")), point);
+		assert.equal(hitsTextLayer, false, "fixture point must be blank PDF space rather than a text span");
+		const responsePromise = page.waitForResponse((response) => new URL(response.url()).pathname === "/synctex/probe" && response.request().method() === "POST");
+		await page.mouse.click(point.clientX, point.clientY);
+		const response = await responsePromise;
+		assert.equal(response.status(), 200);
+		const body = await response.json() as { ok: boolean; result: Record<string, unknown> };
+		assert.equal(body.ok, true);
+		assert.equal(body.result.error, undefined, `real probe should resolve: ${JSON.stringify(body.result)}`);
+		assert.equal(requests.length, 1, "blank-space click must issue one real marking probe");
+		assert.equal(requests[0]?.pdf_id, 258);
+		assert.equal(requests[0]?.page, 1);
+		assertApproximatelyEqual(Number(requests[0]?.x), point.pdfX, 1, "request x should use the real PDF.js viewport conversion");
+		assertApproximatelyEqual(Number(requests[0]?.y), point.pdfY, 1, "request y should use the real PDF.js viewport conversion");
+		assert.equal(Object.hasOwn(body.result, "debug_forward_groups"), false, "debug trace must remain absent outside explicit debug mode");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("LaTeX Workshop forced page-target click bypasses an annotation overlay and uses the real probe endpoint", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-forced-probe-"));
+	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	const requests: Array<Record<string, unknown>> = [];
+	try {
+		registry.registerPdf({ pdfId: 257, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 500, height: 360 } });
+		page.on("request", (request) => {
+			if (new URL(request.url()).pathname !== "/synctex/probe") return;
+			requests.push(request.postDataJSON() as Record<string, unknown>);
+		});
+		await page.goto(`${server.origin}/viewer-lw/257`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		const point = await lwCanvasPoint(page, 1, 280, 180);
+		const overlayTarget = await page.evaluate(({ clientX, clientY }) => {
+			const pageElement = document.querySelector("#viewer .page[data-page-number='1']") as HTMLElement | null;
+			if (!pageElement) throw new Error("missing page");
+			const rect = pageElement.getBoundingClientRect();
+			const overlay = document.createElement("div");
+			overlay.dataset.pdfAnnotation = "forced-probe-test";
+			overlay.dataset.forcedProbeOverlay = "true";
+			overlay.style.cssText = `position:absolute;left:${clientX - rect.left - 12}px;top:${clientY - rect.top - 12}px;width:24px;height:24px;z-index:100100;`;
+			pageElement.append(overlay);
+			return document.elementsFromPoint(clientX, clientY).some((element) => element.getAttribute("data-forced-probe-overlay") === "true");
+		}, point);
+		assert.equal(overlayTarget, true, "the physical point should be policy-blocked by an annotation overlay");
+		const expectedSelection = await lwSetCollapsedSelection(page, "DRAGTOKENALPHA");
+		const responsePromise = page.waitForResponse((response) => new URL(response.url()).pathname === "/synctex/probe" && response.request().method() === "POST");
+		const dispatched = await forceViewerProbeClick(page, { page: 1, clientX: point.clientX, clientY: point.clientY });
+		assert.equal(dispatched.tag, "div");
+		assert.equal(dispatched.page, 1);
+		const response = await responsePromise;
+		assert.equal(response.status(), 200);
+		const body = await response.json() as { ok: boolean; result: Record<string, unknown> };
+		assert.equal(body.ok, true);
+		assert.equal(body.result.error, undefined, `forced page-target probe should resolve: ${JSON.stringify(body.result)}`);
+		assert.equal(requests.length, 1, "forced click must use the viewer's unmocked /synctex/probe path");
+		assertApproximatelyEqual(Number(requests[0]?.x), point.pdfX, 1, "forced dispatch should retain PDF.js x conversion");
+		assertApproximatelyEqual(Number(requests[0]?.y), point.pdfY, 1, "forced dispatch should retain PDF.js y conversion");
+		assert.equal(requests[0]?.textBeforeSelection, expectedSelection.textBeforeSelection);
+		assert.equal(requests[0]?.textAfterSelection, expectedSelection.textAfterSelection);
+		assert.deepEqual(await lwCollapsedSelectionContext(page), { isCollapsed: true, ...expectedSelection }, "forced diagnostic clicks must retain collapsed selection context");
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("interactive diagnostic capture forces PDF clicks past annotations without touching toolbar clicks", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-interactive-forced-probe-"));
+	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	const requests: Array<Record<string, unknown>> = [];
+	try {
+		registry.registerPdf({ pdfId: 256, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 500, height: 360 } });
+		page.on("request", (request) => {
+			if (new URL(request.url()).pathname !== "/synctex/probe") return;
+			requests.push(request.postDataJSON() as Record<string, unknown>);
+		});
+		await page.goto(`${server.origin}/viewer-lw/256`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		await installCaptureHelper(page);
+		const recorded: InteractiveForcedClick[] = [];
+		let resolveRecorded: (() => void) | undefined;
+		const recordedPromise = new Promise<void>((resolveRecordedClick) => { resolveRecorded = resolveRecordedClick; });
+		await installInteractiveForcedClickCapture(page, {
+			onClick(value) {
+				recorded.push(value);
+				resolveRecorded?.();
+			},
+			onExit() {},
+		});
+		const point = await lwCanvasPoint(page, 1, 280, 180);
+		const toolbarPoint = await page.evaluate(({ clientX, clientY }) => {
+			const pageElement = document.querySelector("#viewer .page[data-page-number='1']") as HTMLElement | null;
+			if (!pageElement) throw new Error("missing page");
+			const rect = pageElement.getBoundingClientRect();
+			const overlay = document.createElement("div");
+			overlay.dataset.interactiveForcedProbeOverlay = "true";
+			overlay.style.cssText = `position:absolute;left:${clientX - rect.left - 12}px;top:${clientY - rect.top - 12}px;width:24px;height:24px;z-index:100100;`;
+			overlay.addEventListener("click", () => { document.body.dataset.interactiveOverlayClicked = "true"; });
+			pageElement.append(overlay);
+			const toolbar = document.createElement("button");
+			toolbar.textContent = "Unrelated toolbar control";
+			toolbar.style.cssText = "position:fixed;left:4px;top:4px;z-index:100101;";
+			toolbar.addEventListener("click", () => { document.body.dataset.interactiveToolbarClicked = "true"; });
+			document.body.append(toolbar);
+			const toolbarRect = toolbar.getBoundingClientRect();
+			return { x: toolbarRect.left + toolbarRect.width / 2, y: toolbarRect.top + toolbarRect.height / 2 };
+		}, point);
+		const expectedSelection = await lwSetCollapsedSelection(page, "DRAGTOKENALPHA");
+		const responsePromise = page.waitForResponse((response) => new URL(response.url()).pathname === "/synctex/probe" && response.request().method() === "POST");
+		await page.mouse.click(point.clientX, point.clientY);
+		const response = await responsePromise;
+		await recordedPromise;
+		assert.equal(response.status(), 200);
+		assert.equal(requests.length, 1, "the guarded redispatch must issue exactly one real probe");
+		assertApproximatelyEqual(Number(requests[0]?.x), point.pdfX, 1, "forced interactive click should retain PDF.js x conversion");
+		assertApproximatelyEqual(Number(requests[0]?.y), point.pdfY, 1, "forced interactive click should retain PDF.js y conversion");
+		assert.equal(requests[0]?.textBeforeSelection, expectedSelection.textBeforeSelection);
+		assert.equal(requests[0]?.textAfterSelection, expectedSelection.textAfterSelection);
+		assert.deepEqual(await lwCollapsedSelectionContext(page), { isCollapsed: true, ...expectedSelection }, "interactive diagnostic capture must retain collapsed selection context");
+		assert.equal(recorded.length, 1, "the guarded synthetic click must not recurse into another capture");
+		assert.equal(recorded[0]?.dispatch_target.tag, "div");
+		assert.equal(recorded[0]?.dispatch_target.page, 1);
+		assert.equal(await page.evaluate(() => document.body.dataset.interactiveOverlayClicked), undefined, "physical annotation click should be suppressed");
+		await page.mouse.click(toolbarPoint.x, toolbarPoint.y);
+		assert.equal(await page.evaluate(() => document.body.dataset.interactiveToolbarClicked), "true", "non-page clicks must remain untouched");
+		assert.equal(recorded.length, 1);
+		assert.equal(requests.length, 1);
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("SyncTeX debug probe shows one selected forward-group box and Escape clears it", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-debug-forward-group-"));
 	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
@@ -1405,7 +1617,7 @@ test("SyncTeX debug probe shows one selected forward-group box and Escape clears
 				ranges: [{ page: 1, h: 40, v: 150, W: 20, H: 10 }], source_file: sourcePath, line: 3, source_line: "fixture source",
 				debug_forward_groups: [
 					{ origin: "synctex_exact", lookup_line: 3, semantic_penalty: 0, geometry_tier: 0, score: 12, selected: true, chosen_box: { page: 1, h: 40, v: 150, W: 20, H: 10 } },
-					{ origin: "pdf_text_span", lookup_line: 3, semantic_penalty: 1_000_000_000, geometry_tier: 0, score: 1_000_000_012, selected: false, chosen_box: { page: 1, h: 90, v: 150, W: 30, H: 10 } },
+					{ origin: "pdf_text_span", lookup_line: 3, semantic_penalty: 0, geometry_tier: 0, score: 12, selected: false, chosen_box: { page: 1, h: 90, v: 150, W: 30, H: 10 } },
 				],
 			} }) });
 		});
@@ -1417,7 +1629,7 @@ test("SyncTeX debug probe shows one selected forward-group box and Escape clears
 		await debugBoxes.waitFor({ state: "attached" });
 		assert.equal(await debugBoxes.count(), 1);
 		const summary = page.locator("[data-synctex-probe-debug-summary]");
-		assert.match(await summary.textContent() ?? "", /pdf_text_span line 3 tier 0 penalty 1000000000 score 1000000012/);
+		assert.match(await summary.textContent() ?? "", /pdf_text_span line 3 tier 0 penalty 0 score 12/);
 		await page.keyboard.press("Escape");
 		await page.waitForFunction(() => document.querySelectorAll("[data-synctex-probe-debug-box], [data-synctex-probe-debug-summary]").length === 0);
 	} finally {
