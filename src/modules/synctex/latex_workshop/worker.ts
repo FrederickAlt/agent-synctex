@@ -214,6 +214,31 @@ export interface BoundedSyncTeXForwardLeafLookups {
 	exceeded: boolean;
 }
 
+/** One parsed box on the exact source leaf's ancestor path, in PDF user-space coordinates. */
+export interface SyncTeXForwardTreeBox {
+	type: string;
+	page: number;
+	sourceFile: string;
+	line: number;
+	h: number;
+	v: number;
+	W: number;
+	H: number;
+}
+
+/** A forward candidate preserves both its exact source leaf and the box's remaining path to the page root. */
+export interface SyncTeXForwardTreeCandidate {
+	leaf: SyncTeXLeafBox;
+	box: SyncTeXForwardTreeBox;
+	/** Immediate parent first; excludes the page root, which has no SyncTeX box geometry. */
+	ancestors: SyncTeXForwardTreeBox[];
+}
+
+export interface BoundedSyncTeXForwardTreeCandidates {
+	candidates: SyncTeXForwardTreeCandidate[];
+	exceeded: boolean;
+}
+
 const LEAF_BOX_GRID_CELL_SIZE = 64;
 /** Explicit page-index ceiling: dense pages are rejected, never sampled. */
 export const MAX_CACHED_SYNC_TEX_PAGE_LEAF_BOXES = 5_000;
@@ -355,6 +380,56 @@ export function collectCachedSyncTeXPageLeafBoxes(input: {
 /** Returns every terminal SyncTeX box for an exact source file and line, optionally on one page. */
 export function getCachedSyncTeXForwardLeafBoxes(input: { pdfPath: string; sourceFile: string; line: number; page?: number }): SyncTeXLeafBox[] {
 	return collectCachedSyncTeXForwardLeafBoxes({ ...input, maxBoxes: Number.MAX_SAFE_INTEGER }).boxes;
+}
+
+function isSyncTeXBlock(value: Block | { type: string; page: number }): value is Block {
+	return "parent" in value;
+}
+
+function forwardTreeBox(block: Block, offset: PdfSyncObject["offset"]): SyncTeXForwardTreeBox {
+	return {
+		type: block.type,
+		page: block.page,
+		sourceFile: block.file.path,
+		line: block.line,
+		h: block.left + offset.x,
+		v: block.bottom + offset.y,
+		W: block.width ?? 0,
+		H: block.height,
+	};
+}
+
+/**
+ * Returns every terminal record and enclosing parsed box for an exact source line.
+ * No visible-box or mean-line filtering is applied: callers receive the whole candidate pool.
+ */
+export function collectCachedSyncTeXForwardTreeCandidates(input: { pdfPath: string; sourceFile: string; line: number; page?: number; maxCandidates: number }): BoundedSyncTeXForwardTreeCandidates {
+	const cached = cachedSyncTexForPdf(input.pdfPath);
+	if (cached?.parsed === undefined) return { candidates: [], exceeded: false };
+	const { pdfSyncObject } = cached.parsed;
+	const sourceFile = findInputFilePathForward(input.sourceFile, pdfSyncObject);
+	if (sourceFile === undefined) return { candidates: [], exceeded: false };
+	const linePageBlocks = pdfSyncObject.blockNumberLine[sourceFile]?.[input.line];
+	if (linePageBlocks === undefined) return { candidates: [], exceeded: false };
+	const maxCandidates = Math.max(1, Math.trunc(input.maxCandidates));
+	const candidates: SyncTeXForwardTreeCandidate[] = [];
+	for (const page of input.page === undefined ? Object.keys(linePageBlocks).map(Number) : [input.page]) {
+		for (const leafBlock of linePageBlocks[page] ?? []) {
+			if (leafBlock.elements !== undefined || leafBlock.type === "k" || leafBlock.type === "r") continue;
+			const leaf = { page, sourceFile, line: input.line, h: leafBlock.left + pdfSyncObject.offset.x, v: leafBlock.bottom + pdfSyncObject.offset.y, W: leafBlock.width ?? 0, H: leafBlock.height };
+			const path = [leafBlock];
+			let parent = leafBlock.parent;
+			while (isSyncTeXBlock(parent)) {
+				path.push(parent);
+				parent = parent.parent;
+			}
+			for (let index = 0; index < path.length; index += 1) {
+				if (candidates.length >= maxCandidates) return { candidates, exceeded: true };
+				candidates.push({ leaf: { ...leaf }, box: forwardTreeBox(path[index]!, pdfSyncObject.offset), ancestors: path.slice(index + 1).map((ancestor) => forwardTreeBox(ancestor, pdfSyncObject.offset)) });
+			}
+		}
+	}
+	return { candidates, exceeded: false };
 }
 
 /** Exact-line forward geometry with an explicit cap for refresh/rebase paths. */

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { getCachedSyncTeXForwardLeafBoxes, getCachedSyncTeXPageForwardLeafBoxes, getCachedSyncTeXPageLeafBoxes } from "../../../src/modules/synctex/latex_workshop/worker.ts";
+import { collectCachedSyncTeXForwardTreeCandidates, getCachedSyncTeXForwardLeafBoxes, getCachedSyncTeXPageForwardLeafBoxes, getCachedSyncTeXPageLeafBoxes } from "../../../src/modules/synctex/latex_workshop/worker.ts";
 
 test("cached SyncTeX leaf boxes are page-scoped, source-filterable, copied, and invalidated with the sidecar", () => {
 	const dir = mkdtempSync(join(tmpdir(), "synctex-leaf-boxes-"));
@@ -46,6 +46,21 @@ test("cached SyncTeX leaf boxes are page-scoped, source-filterable, copied, and 
 		assert.deepEqual(getCachedSyncTeXForwardLeafBoxes({ pdfPath, sourceFile: sourcePath, line: 12, page: 2 }), [
 			{ page: 2, sourceFile: sourcePath, line: 12, h: coord(26312704) + coord(6578176), v: coord(26312704) + coord(13156352), W: 0, H },
 		]);
+		assert.deepEqual(collectCachedSyncTeXForwardTreeCandidates({ pdfPath, sourceFile: sourcePath, line: 12, page: 1, maxCandidates: 10 }), {
+			candidates: [
+				{
+					leaf: { page: 1, sourceFile: sourcePath, line: 12, h: coord(19734528) + coord(6578176), v: coord(19734528) + coord(13156352), W: 0, H },
+					box: { type: "x", page: 1, sourceFile: sourcePath, line: 12, h: coord(19734528) + coord(6578176), v: coord(19734528) + coord(13156352), W: 0, H },
+					ancestors: [{ type: "horizontal", page: 1, sourceFile: sourcePath, line: 12, h: coord(13156352) + coord(6578176), v: coord(19734528) + coord(13156352), W: coord(6578176), H }],
+				},
+				{
+					leaf: { page: 1, sourceFile: sourcePath, line: 12, h: coord(19734528) + coord(6578176), v: coord(19734528) + coord(13156352), W: 0, H },
+					box: { type: "horizontal", page: 1, sourceFile: sourcePath, line: 12, h: coord(13156352) + coord(6578176), v: coord(19734528) + coord(13156352), W: coord(6578176), H },
+					ancestors: [],
+				},
+			],
+			exceeded: false,
+		});
 		assert.deepEqual(getCachedSyncTeXPageForwardLeafBoxes({
 			pdfPath,
 			page: 1,
