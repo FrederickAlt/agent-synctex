@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { ViewerHostPdfAnnotationMessage } from "./viewer_host_protocol.ts";
 
 const DEFAULT_LEASE_MS = 30_000;
@@ -110,10 +111,11 @@ export class PendingPdfMarkStore {
 				this.entries.delete(key);
 				continue;
 			}
+			if (isDeepStrictEqual(replacement, entry.mark)) continue;
 			entry.mark = copyMark(replacement);
 			entry.version += 1;
 			// A consumer may hold the old location. Keeping its lease version stale
-			// makes acknowledgement release, rather than consume, the rebased mark.
+			// makes acknowledgement release, rather than consume, the refreshed mark.
 			updated.push(copyMark(entry.mark));
 		}
 		return { updated, cleared };

@@ -108,6 +108,27 @@ const REMOVED_IMPLEMENTED_DOC_PATHS = [
 	"docs/issues/synctex-native-parity/006-synctex-diagnostics-and-acceptance.md",
 ] as const;
 
+test("annotation editing stays in the browser viewer and reverse-resolves completed geometry edits", () => {
+	const adapter = readFileSync(join(REPO_ROOT, "src/viewer_lw/host_lw_adapter.mjs"), "utf8");
+	assert.match(adapter, /marker\.style\.cursor = selected \? "move" : "pointer"/);
+	assert.match(adapter, /handle\.dataset\.pdfAnnotationResizeHandle = direction/);
+	assert.match(adapter, /n: \{ left: "5px", right: "5px", top: "-5px", height: "10px" \}/);
+	assert.match(adapter, /e: \{ right: "-5px", top: "5px", bottom: "5px", width: "10px" \}/);
+	assert.match(adapter, /handle\.style\.border = "0"/);
+	assert.match(adapter, /handle\.style\.background = "transparent"/);
+	assert.match(adapter, /startAnnotationGeometryEdit\(editEvent, annotation, marker/);
+	assert.match(adapter, /function annotationResizeDirectionAtPoint\(marker, clientX, clientY\)/);
+	assert.match(adapter, /if \(startSelectedAnnotationBorderResize\(event\)\) return/);
+	assert.match(adapter, /badge\.style\.cursor = "move"/);
+	assert.match(adapter, /badge\.addEventListener\("pointerdown", \(event\) => startAnnotationGeometryEdit\(event, annotation, marker\)\)/);
+	assert.match(adapter, /suppressNextAnnotationClick = true/);
+	assert.match(adapter, /requestAnnotationBox\(\{ \.\.\.payload, pdf_id: activePdfId\(\) \}, annotation, annotation\.geometryGeneration\)/);
+	assert.match(adapter, /annotations\.get\(annotation\.id\) !== annotation \|\| annotation\.geometryGeneration !== geometryGeneration/);
+	assert.match(adapter, /const first = ranges\?\.\[0\]/);
+	assert.match(adapter, /\.\.\.annotationBoxGeometry\(message\)/);
+	assert.doesNotMatch(adapter, /pdf-annotation-drag-handle|Drag annotation box/);
+});
+
 const STALE_PI_EXTENSION_BRANDING_PATTERNS: Array<[RegExp, string]> = [
 	[/\bPi extension\b/gi, "stale Pi extension branding"],
 	[/\bpi-extension\b/gi, "stale pi-extension keyword branding"],

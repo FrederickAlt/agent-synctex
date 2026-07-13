@@ -112,6 +112,15 @@ test("reconciling a claimed PDF mark invalidates the old claim so the rebased ma
 	assert.deepEqual(store.claim().marks.map((entry) => [entry.annotation_id, entry.comment]), [["claimed", "rebased"]]);
 });
 
+test("reconciling an unchanged mark preserves its active lease version", () => {
+	const store = new PendingPdfMarkStore({ makeClaimId: () => "lease" });
+	store.upsert(mark(1, "unchanged", "keep"));
+	assert.equal(store.claim().claimId, "lease");
+	assert.deepEqual(store.reconcilePdf(1, (entry) => entry), { updated: [], cleared: [] });
+	assert.deepEqual(store.acknowledge("lease"), [{ pdf_id: 1, annotation_id: "unchanged" }]);
+	assert.deepEqual(store.claim().marks, []);
+});
+
 test("pending PDF mark storage is bounded", () => {
 	const store = new PendingPdfMarkStore({ maxPendingMarks: 2 });
 	store.upsert(mark(1, "oldest", "one"));

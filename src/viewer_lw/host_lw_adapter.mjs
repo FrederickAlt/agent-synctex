@@ -1386,8 +1386,8 @@ function annotationSourceBadge(message) {
   return { text: labels.join(", "), title: labels.join(", ") };
 }
 
-function renderAnnotationSourceBadge(message, marker) {
-  const sourceBadge = annotationSourceBadge(message);
+function renderAnnotationSourceBadge(annotation, marker) {
+  const sourceBadge = annotationSourceBadge(annotation.message);
   if (!sourceBadge) return;
   const badge = document.createElement("span");
   badge.dataset.pdfAnnotationSourceBadge = "true";
@@ -1407,9 +1407,24 @@ function renderAnnotationSourceBadge(message, marker) {
   badge.style.maxWidth = "100%";
   badge.style.whiteSpace = "normal";
   badge.style.overflowWrap = "anywhere";
-  badge.style.pointerEvents = "none";
+  badge.style.pointerEvents = "auto";
+  badge.style.cursor = "move";
+  badge.style.userSelect = "none";
   badge.style.boxShadow = "0 1px 2px rgba(0,0,0,.2)";
+  badge.addEventListener("pointerdown", (event) => startAnnotationGeometryEdit(event, annotation, marker));
   marker.appendChild(badge);
+}
+
+function annotationBoxGeometry(message) {
+  const ranges = Array.isArray(message.ranges) ? message.ranges.map((range) => ({ ...range })) : undefined;
+  const first = ranges?.[0];
+  const h = Number(message.h ?? first?.h);
+  const v = Number(message.v ?? first?.v);
+  const W = Number(message.W ?? first?.W);
+  const H = Number(message.H ?? first?.H);
+  if (!Number.isFinite(h) || !Number.isFinite(v) || !(W > 0) || !(H > 0)) return {};
+  const page = Number(message.page ?? message.click_page);
+  return { h, v, W, H, ranges: ranges ?? [{ page, h, v, W, H }] };
 }
 
 function annotationPayload(annotation) {
@@ -1424,6 +1439,7 @@ function annotationPayload(annotation) {
     page: Number(message.page ?? message.click_page),
     x: Number(message.x ?? message.click_x ?? message.h),
     y: Number(message.y ?? message.click_y ?? message.v),
+    ...annotationBoxGeometry(message),
     source_file: sourceFile,
     line,
     ...(annotationSourceLine(message) === undefined ? {} : { source_line: annotationSourceLine(message) }),
@@ -1921,6 +1937,115 @@ function renderAnnotationControls(annotation, root, anchor) {
   return controls;
 }
 
+function annotationEditPayload(pageNumber, clientRect) {
+  const page = pageElement(pageNumber);
+  const viewport = pageViewport(pageNumber);
+  const range = page && viewport ? pdfRangeFromClientRect(clientRect, page, viewport) : undefined;
+  if (!range) return undefined;
+  return { type: "reverse_synctex_box", request_id: boxRequestId + 1, page: pageNumber, ...range };
+}
+
+function startAnnotationGeometryEdit(event, annotation, marker, resizeDirection) {
+  if (!(event instanceof PointerEvent) || event.button !== 0 || selectedAnnotationId !== annotation.id) return;
+  const pageNumber = Number(annotation.message.page);
+  const page = pageElement(pageNumber);
+  if (!page) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const startRect = marker.getBoundingClientRect();
+  const startX = event.clientX;
+  const startY = event.clientY;
+  const minSize = 4;
+  const editedRect = (moveEvent) => {
+    const dx = moveEvent.clientX - startX;
+    const dy = moveEvent.clientY - startY;
+    if (!resizeDirection) return { left: startRect.left + dx, top: startRect.top + dy, right: startRect.right + dx, bottom: startRect.bottom + dy };
+    let { left, top, right, bottom } = startRect;
+    if (resizeDirection.includes("w")) left = Math.min(right - minSize, left + dx);
+    if (resizeDirection.includes("e")) right = Math.max(left + minSize, right + dx);
+    if (resizeDirection.includes("n")) top = Math.min(bottom - minSize, top + dy);
+    if (resizeDirection.includes("s")) bottom = Math.max(top + minSize, bottom + dy);
+    return { left, top, right, bottom };
+  };
+  const onMove = (moveEvent) => {
+    const payload = annotationEditPayload(pageNumber, editedRect(moveEvent));
+    if (payload) showProvisionalAnnotationBox(payload);
+  };
+  const cleanup = () => {
+    window.removeEventListener("pointermove", onMove, true);
+    window.removeEventListener("pointerup", onUp, true);
+    window.removeEventListener("pointercancel", onCancel, true);
+  };
+  const onCancel = () => { cleanup(); clearProvisionalAnnotationBox(); };
+  const onUp = (upEvent) => {
+    cleanup();
+    suppressNextAnnotationClick = true;
+    setTimeout(() => { suppressNextAnnotationClick = false; }, 0);
+    const payload = annotationEditPayload(pageNumber, editedRect(upEvent));
+    if (!payload) { clearProvisionalAnnotationBox(); return; }
+    boxRequestId = payload.request_id;
+    latestBoxRequestId = payload.request_id;
+    showProvisionalAnnotationBox(payload);
+    annotation.geometryGeneration = (annotation.geometryGeneration ?? 0) + 1;
+    void requestAnnotationBox({ ...payload, pdf_id: activePdfId() }, annotation, annotation.geometryGeneration);
+  };
+  window.addEventListener("pointermove", onMove, true);
+  window.addEventListener("pointerup", onUp, true);
+  window.addEventListener("pointercancel", onCancel, true);
+}
+
+function annotationResizeDirectionAtPoint(marker, clientX, clientY) {
+  const rect = marker.getBoundingClientRect();
+  const tolerance = 6;
+  if (clientX < rect.left - tolerance || clientX > rect.right + tolerance || clientY < rect.top - tolerance || clientY > rect.bottom + tolerance) return undefined;
+  const west = Math.abs(clientX - rect.left) <= tolerance;
+  const east = Math.abs(clientX - rect.right) <= tolerance;
+  const north = Math.abs(clientY - rect.top) <= tolerance;
+  const south = Math.abs(clientY - rect.bottom) <= tolerance;
+  return `${north ? "n" : south ? "s" : ""}${west ? "w" : east ? "e" : ""}` || undefined;
+}
+
+function startSelectedAnnotationBorderResize(event) {
+  const annotation = selectedAnnotationId === undefined ? undefined : annotations.get(selectedAnnotationId);
+  if (!annotation) return false;
+  const root = document.querySelector(`[data-pdf-annotation='${annotation.id}']`);
+  if (!root) return false;
+  for (const marker of root.querySelectorAll("[data-pdf-annotation-box]")) {
+    if (!(marker instanceof HTMLElement)) continue;
+    const direction = annotationResizeDirectionAtPoint(marker, event.clientX, event.clientY);
+    if (!direction) continue;
+    startAnnotationGeometryEdit(event, annotation, marker, direction);
+    return true;
+  }
+  return false;
+}
+
+function renderAnnotationResizeHandles(annotation, marker) {
+  if (selectedAnnotationId !== annotation.id) return;
+  const positions = {
+    nw: { left: "-5px", top: "-5px", width: "10px", height: "10px" },
+    n: { left: "5px", right: "5px", top: "-5px", height: "10px" },
+    ne: { right: "-5px", top: "-5px", width: "10px", height: "10px" },
+    e: { right: "-5px", top: "5px", bottom: "5px", width: "10px" },
+    se: { right: "-5px", bottom: "-5px", width: "10px", height: "10px" },
+    s: { left: "5px", right: "5px", bottom: "-5px", height: "10px" },
+    sw: { left: "-5px", bottom: "-5px", width: "10px", height: "10px" },
+    w: { left: "-5px", top: "5px", bottom: "5px", width: "10px" },
+  };
+  for (const [direction, position] of Object.entries(positions)) {
+    const handle = document.createElement("span");
+    handle.dataset.pdfAnnotationResizeHandle = direction;
+    handle.style.position = "absolute";
+    Object.assign(handle.style, position);
+    handle.style.border = "0";
+    handle.style.background = "transparent";
+    handle.style.cursor = `${direction}-resize`;
+    handle.style.pointerEvents = "auto";
+    handle.addEventListener("pointerdown", (editEvent) => startAnnotationGeometryEdit(editEvent, annotation, marker, direction));
+    marker.appendChild(handle);
+  }
+}
+
 function renderAnnotation(annotation, scroll = false, overlay = synctexOverlayPositions(annotation.message)) {
   if (!overlay) return false;
   const selected = selectedAnnotationId === annotation.id;
@@ -1953,13 +2078,19 @@ function renderAnnotation(annotation, scroll = false, overlay = synctexOverlayPo
     marker.style.boxShadow = selected ? "0 0 0 3px rgba(239,68,68,.16), 0 6px 18px rgba(0,0,0,.16)" : "none";
     marker.style.borderRadius = pagePosition.width === undefined ? "50%" : "2px";
     marker.style.pointerEvents = "auto";
-    marker.style.cursor = "pointer";
+    marker.style.cursor = selected ? "move" : "pointer";
+    marker.addEventListener("pointerdown", (editEvent) => {
+      if (selectedAnnotationId === annotation.id && !(editEvent.target instanceof Element && editEvent.target.closest("[data-pdf-annotation-resize-handle]"))) {
+        startAnnotationGeometryEdit(editEvent, annotation, marker);
+      }
+    });
     marker.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      selectAnnotation(annotation.id);
+      if (selectAnnotation(annotation.id)) renderAnnotations(false);
     });
-    if (positionIndex === sourceBadgePositionIndex) renderAnnotationSourceBadge(annotation.message, marker);
+    if (positionIndex === sourceBadgePositionIndex) renderAnnotationSourceBadge(annotation, marker);
+    renderAnnotationResizeHandles(annotation, marker);
     root.appendChild(marker);
     return marker;
   });
@@ -3149,7 +3280,7 @@ function showProvisionalAnnotationBox(payload) {
   });
 }
 
-async function requestAnnotationBox(payload) {
+async function requestAnnotationBox(payload, annotation, geometryGeneration) {
   const pdfId = activePdfId();
   const viewerToken = hostState.config?.viewer_socket_token;
   try {
@@ -3167,8 +3298,15 @@ async function requestAnnotationBox(payload) {
     if (!response.ok || body?.ok !== true || !body.result) throw new Error(body?.error?.message || `Viewer Host returned HTTP ${response.status}`);
     if (body.result.error) throw new Error(String(body.result.error));
     if (payload.request_id !== latestBoxRequestId || activePdfId() !== pdfId) return;
+    if (annotation && (annotations.get(annotation.id) !== annotation || annotation.geometryGeneration !== geometryGeneration)) return;
     viewerLog("info", "synctex.box.result", { request_id: payload.request_id, page: payload.page, source_file: body.result.source_file, line: body.result.line });
-    if (createAnnotationFromMessage(body.result, { select: true, bubble: false, scroll: false })) clearSynctexCapabilityIssue();
+    if (annotation) {
+      annotation.message = { ...annotation.message, ...body.result };
+      persistAnnotations();
+      sendAnnotationUpdate(annotation);
+      renderAnnotations(false);
+      clearSynctexCapabilityIssue();
+    } else if (createAnnotationFromMessage(body.result, { select: true, bubble: false, scroll: false })) clearSynctexCapabilityIssue();
   } catch (error) {
     if (payload.request_id !== latestBoxRequestId || activePdfId() !== pdfId) return;
     const detail = error?.message || String(error);
@@ -3383,6 +3521,7 @@ function installPageEventHandlers() {
     sendProbe(event, pageNumber);
   }, true);
   viewer.addEventListener("pointerdown", (event) => {
+    if (startSelectedAnnotationBorderResize(event)) return;
     const pageNumber = pageNumberFromElement(event.target);
     if (pageNumber) startAnnotationBoxDrag(event, pageNumber);
   }, true);

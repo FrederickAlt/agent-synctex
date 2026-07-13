@@ -341,6 +341,72 @@ test("synctex_forward and pdf_refresh messages are delivered only to viewer sock
 	}
 });
 
+test("PDF refresh preserves annotation geometry and reverse-resolves source spans from that geometry", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-annotation-geometry-refresh-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	const sourcePath = join(baseDir, "main.tex");
+	writeFakePdf(pdfPath, "before");
+	writeFileSync(sourcePath, "old\nnew target\n");
+	const registry = new ViewerHostPdfRegistry();
+	const resolvedBoxes: Array<Record<string, unknown>> = [];
+	const server = new ViewerHostServer({
+		registry,
+		pdfChangeDetection: { debounceMs: 0, pollIntervalMs: 60_000 },
+		waitForSynctexReady: async () => true,
+		resolveReverseBox: ({ message }) => {
+			resolvedBoxes.push({ ...message });
+			return { type: "reverse_synctex_box_result", pdf_id: message.pdf_id, request_id: message.request_id, page: message.page, h: message.h, v: message.v, W: message.W, H: message.H, ranges: [{ page: message.page, h: message.h, v: message.v, W: message.W, H: message.H }], source_file: sourcePath, line: 2, source_spans: [{ source_file: sourcePath, start_line: 2, end_line: 2 }] };
+		},
+	});
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 71, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		socket = await openViewerSocket(server.origin, 71, await getViewerSocketToken(server.origin, 71));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "fixed", page: 1, x: 10, y: 40, h: 10, v: 40, W: 30, H: 12, ranges: [{ page: 1, h: 10, v: 40, W: 30, H: 12 }], source_file: sourcePath, line: 1, source_spans: [{ source_file: sourcePath, start_line: 1, end_line: 1 }], comment: "keep me" }));
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		writeFakePdf(pdfPath, "after recompilation with changed size");
+		const rebasedMessage = nextJsonMessage(socket, (message) => message.type === "annotations_rebased");
+		await server.verifyPdfChangesNow(71);
+		await server.verifyPdfChangesNow(71);
+		assert.deepEqual(resolvedBoxes, [{ type: "reverse_synctex_box", pdf_id: 71, request_id: 2, page: 1, h: 10, v: 40, W: 30, H: 12 }]);
+		assert.deepEqual(await rebasedMessage, { type: "annotations_rebased", pdf_id: 71, annotations: [{ annotation_id: "fixed", message: { page: 1, h: 10, v: 40, W: 30, H: 12, ranges: [{ page: 1, h: 10, v: 40, W: 30, H: 12 }], source_file: sourcePath, line: 2, source_spans: [{ source_file: sourcePath, start_line: 2, end_line: 2 }], source_stale: false } }] });
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("failed annotation refresh broadcasts stale state and a later refresh clears it", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-annotation-stale-recovery-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	const sourcePath = join(baseDir, "main.tex");
+	writeFakePdf(pdfPath, "one");
+	writeFileSync(sourcePath, "old\nrecovered\n");
+	const registry = new ViewerHostPdfRegistry();
+	let ready = false;
+	const server = new ViewerHostServer({ registry, pdfChangeDetection: { debounceMs: 0, pollIntervalMs: 60_000 }, waitForSynctexReady: async () => ready, resolveReverseBox: ({ message }) => ({ type: "reverse_synctex_box_result", pdf_id: message.pdf_id, request_id: message.request_id, page: message.page, h: message.h, v: message.v, W: message.W, H: message.H, source_file: sourcePath, line: 2, source_spans: [{ source_file: sourcePath, start_line: 2, end_line: 2 }] }) });
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 72, pdfPath, title: basename(pdfPath), revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		socket = await openViewerSocket(server.origin, 72, await getViewerSocketToken(server.origin, 72));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "stale", page: 1, x: 10, y: 40, h: 10, v: 40, W: 30, H: 12, source_file: sourcePath, line: 1, comment: "keep" }));
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		writeFakePdf(pdfPath, "two changed");
+		const staleUpdate = nextJsonMessage(socket, (message) => message.type === "annotations_rebased");
+		await server.verifyPdfChangesNow(72); await server.verifyPdfChangesNow(72);
+		assert.deepEqual(await staleUpdate, { type: "annotations_rebased", pdf_id: 72, annotations: [{ annotation_id: "stale", message: { source_stale: true } }] });
+		ready = true;
+		writeFakePdf(pdfPath, "three changed again");
+		const recoveredUpdate = nextJsonMessage(socket, (message) => message.type === "annotations_rebased");
+		await server.verifyPdfChangesNow(72); await server.verifyPdfChangesNow(72);
+		const recovered = await recoveredUpdate as { annotations: Array<{ message: { source_stale?: boolean } }> };
+		assert.equal(recovered.annotations[0]?.message.source_stale, false);
+	} finally { socket?.close(); await server.stop(); rmSync(baseDir, { recursive: true, force: true }); }
+});
+
 test("compile status broadcasts to viewer sockets and compile actions drain to MCP", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-compile-action-"));
 	const pdfPath = join(baseDir, "paper.pdf");

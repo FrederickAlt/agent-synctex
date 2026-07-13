@@ -8,7 +8,8 @@ import type { Readable } from "node:stream";
 import { fileURLToPath, URL } from "node:url";
 import { sourceSpansForPdfAnnotation, validateMcpToViewerHostMessage, validateViewerHostToMcpMessage, VIEWER_HOST_CONTROL_TOKEN_HEADER, VIEWER_HOST_HEARTBEAT_TOKEN_HEADER, VIEWER_HOST_PROTOCOL_VERSION, VIEWER_HOST_SHUTDOWN_TOKEN_HEADER, type ViewerHostControlResponse, type ViewerHostPdfAnnotationMessage, type ViewerHostSynctexForwardMessage, type ViewerHostToMcpMessage } from "./viewer_host_protocol.ts";
 import { prewarmSynctexForPdf, resolveReverseSynctexBox, reverseSynctexForwardProbeResult, reverseSynctexHoverResult } from "./synctex/synctex_resolution.ts";
-import { capturePdfMarkSourceAnchors, rebasePdfMark, sourceChangedSincePdf, type PdfMarkSourceAnchor } from "./pdf_mark_rebase.ts";
+import { resolveLatexWorkshopSynctexSidecar } from "./synctex/latex_workshop/worker.ts";
+import { sourceChangedSincePdf } from "./pdf_mark_rebase.ts";
 import { DEFAULT_VIEWER_HOST_ACCESS_POLICY, type ViewerHostAccessPolicy, type ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
 import type { ViewerHostFileSnapshot, ViewerHostPdfRecord, ViewerHostPdfRegistry } from "./viewer_host_registry.ts";
 import { PendingPdfMarkStore, type AcknowledgedPdfMark } from "./pending_pdf_marks.ts";
@@ -29,6 +30,8 @@ const MAX_RETAINED_ANNOTATION_TOMBSTONES = 500;
 const VIEWER_MARK_SNAPSHOT_TIMEOUT_MS = 1_000;
 const VIEWER_LOG_LEVELS = new Set(["debug", "info", "warn", "error"] as const);
 const VIEWER_LOG_EVENT_PATTERN = /^[a-z0-9_.:-]{1,128}$/i;
+const SYNCTEX_SETTLE_RETRIES = 20;
+const SYNCTEX_SETTLE_DELAY_MS = 25;
 const LW_VIEWER_ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "viewer_lw");
 const LW_PDFJS_BUILD_ASSETS = new Map<string, { path: string; polyfillModernPromiseHelpers?: boolean }>([
 	["/viewer-lw/build/pdf.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.mjs"), polyfillModernPromiseHelpers: true }],
@@ -143,6 +146,27 @@ export interface ViewerHostServerOptions {
 	pendingPdfMarks?: PendingPdfMarkStore;
 	instanceId?: string;
 	maxMcpEventBacklog?: number;
+	resolveReverseBox?: typeof resolveReverseSynctexBox;
+	waitForSynctexReady?: (record: ViewerHostPdfRecord) => Promise<boolean>;
+}
+
+async function waitForCurrentSynctexSidecar(record: ViewerHostPdfRecord): Promise<boolean> {
+	let previous: { path: string; mtimeMs: number; size: number } | undefined;
+	for (let attempt = 0; attempt < SYNCTEX_SETTLE_RETRIES; attempt += 1) {
+		const sidecarPath = resolveLatexWorkshopSynctexSidecar(record.pdfPath);
+		if (sidecarPath !== undefined) {
+			try {
+				const status = await statFile(sidecarPath);
+				const current = { path: sidecarPath, mtimeMs: status.mtimeMs, size: status.size };
+				if (status.mtimeMs >= record.fileSnapshot.mtimeMs && previous?.path === current.path && previous.mtimeMs === current.mtimeMs && previous.size === current.size) return true;
+				previous = current;
+			} catch {
+				previous = undefined;
+			}
+		}
+		await new Promise((resolveWait) => setTimeout(resolveWait, SYNCTEX_SETTLE_DELAY_MS));
+	}
+	return false;
 }
 
 export class ViewerHostServer {
@@ -159,7 +183,8 @@ export class ViewerHostServer {
 	private readonly heartbeatRequest: ViewerHostHeartbeatRequestHandler | undefined;
 	private readonly controlToken: string | undefined;
 	private readonly pendingPdfMarks: PendingPdfMarkStore;
-	private readonly sourceAnchorsByMarkKey = new Map<string, PdfMarkSourceAnchor[]>();
+	private readonly resolveReverseBox: typeof resolveReverseSynctexBox;
+	private readonly waitForSynctexReady: (record: ViewerHostPdfRecord) => Promise<boolean>;
 	private readonly annotationRebasesByMarkKey = new Map<string, Record<string, unknown>>();
 	private readonly annotationClearIdsByPdfId = new Map<number, Map<string, number>>();
 	private readonly annotationClearOrder: Array<{ pdfId: number; annotationId: string; version: number }> = [];
@@ -206,6 +231,8 @@ export class ViewerHostServer {
 		this.heartbeatRequest = options.heartbeatRequest;
 		this.controlToken = options.controlToken;
 		this.pendingPdfMarks = options.pendingPdfMarks ?? new PendingPdfMarkStore();
+		this.resolveReverseBox = options.resolveReverseBox ?? resolveReverseSynctexBox;
+		this.waitForSynctexReady = options.waitForSynctexReady ?? waitForCurrentSynctexSidecar;
 		this.instanceIdValue = options.instanceId?.trim() || randomBytes(24).toString("base64url");
 		this.mcpEvents = new ViewerHostEventBacklog(options.maxMcpEventBacklog ?? DEFAULT_MAX_MCP_EVENT_BACKLOG);
 		this.failureReporter = new ViewerFailureReporter((message) => {
@@ -539,7 +566,6 @@ export class ViewerHostServer {
 			if (this.activeVisiblePdfId === payload.pdf_id) this.activeVisiblePdfId = this.lastVisibleViewerTab()?.pdf_id;
 			this.discardMcpEventsForPdfId(payload.pdf_id);
 			const cleared = this.pendingPdfMarks.clearPdf(payload.pdf_id);
-			this.clearSourceAnchorsForPdf(payload.pdf_id);
 			this.clearAnnotationRebasesForPdf(payload.pdf_id);
 			for (const mark of cleared) this.rememberAnnotationCleared(mark);
 			this.broadcastAnnotationsCleared([payload.pdf_id]);
@@ -861,7 +887,7 @@ export class ViewerHostServer {
 		}
 		try {
 			const record = this.registry.getPdf(pdfId);
-			const result = resolveReverseSynctexBox({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } });
+			const result = this.resolveReverseBox({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } });
 			logger.debug("synctex.box", { pdf_id: pdfId, request_id: message.request_id, page: message.page, has_error: "error" in result });
 			jsonResponse(response, 200, { ok: true, result });
 		} catch (error) {
@@ -1169,7 +1195,6 @@ export class ViewerHostServer {
 			case "clear_pdf_annotations": {
 				const record = this.registry.getPdf(message.pdf_id);
 				const cleared = this.pendingPdfMarks.clearPdf(record.pdfId);
-				this.clearSourceAnchorsForPdf(record.pdfId);
 				this.clearAnnotationRebasesForPdf(record.pdfId);
 				for (const mark of cleared) this.rememberAnnotationCleared(mark);
 				this.broadcastAnnotationsCleared([record.pdfId]);
@@ -1309,7 +1334,6 @@ export class ViewerHostServer {
 				return;
 			}
 			if (message.type === "pdf_annotation_deleted") {
-				this.sourceAnchorsByMarkKey.delete(pdfMarkKey(message));
 				this.rememberAnnotationCleared(message);
 				this.pendingPdfMarks.delete(message.pdf_id, message.annotation_id);
 				logger.info("marks.viewer_deleted", { pdf_id: message.pdf_id, annotation_id: message.annotation_id });
@@ -1345,9 +1369,6 @@ export class ViewerHostServer {
 		const { source_stale: _ignoredSourceStale, ...mark } = message;
 		const record = this.registry.getPdf(mark.pdf_id);
 		if (!isMarkSourceInsideWorkspace(mark, record.workspaceCwd, record.pdfPath)) throw new Error("annotation source_file must be inside the PDF workspace");
-		const anchors = capturePdfMarkSourceAnchors(mark, record.workspaceCwd);
-		if (anchors === undefined) this.sourceAnchorsByMarkKey.delete(pdfMarkKey(mark));
-		else this.sourceAnchorsByMarkKey.set(pdfMarkKey(mark), anchors);
 		this.annotationClearIdsByPdfId.get(mark.pdf_id)?.delete(mark.annotation_id);
 		this.annotationRebasesByMarkKey.delete(pdfMarkKey(mark));
 		this.pendingPdfMarks.upsert(mark);
@@ -1488,12 +1509,6 @@ export class ViewerHostServer {
 		this.mcpEvents.discardPdf(pdfId);
 	}
 
-	private clearSourceAnchorsForPdf(pdfId: number): void {
-		for (const key of this.sourceAnchorsByMarkKey.keys()) {
-			if (key.startsWith(`${pdfId}\0`)) this.sourceAnchorsByMarkKey.delete(key);
-		}
-	}
-
 	private clearAnnotationRebasesForPdf(pdfId: number): void {
 		for (const key of this.annotationRebasesByMarkKey.keys()) {
 			if (key.startsWith(`${pdfId}\0`)) this.annotationRebasesByMarkKey.delete(key);
@@ -1536,46 +1551,49 @@ export class ViewerHostServer {
 		const record = this.registry.getPdf(pdfId);
 		if (this.staleSourceNoticeRevisionByPdfId.get(pdfId) === record.revision) return;
 		this.staleSourceNoticeRevisionByPdfId.set(pdfId, record.revision);
-		await this.failureReporter.report("The marked TeX source is newer than this PDF. Recompile to refresh SyncTeX; marks that cannot be uniquely reattached will be cleared.", {
+		await this.failureReporter.report("The marked TeX source is newer than this PDF. Recompile to refresh SyncTeX; mark geometry will be preserved and its source rows recomputed.", {
 			pdfId,
 			code: "source_newer_than_pdf",
 			title: "Source changed since this PDF was compiled",
-			detail: "The marked TeX source is newer than this PDF. Recompile to refresh SyncTeX; marks that cannot be uniquely reattached will be cleared.",
+			detail: "The marked TeX source is newer than this PDF. Recompile to refresh SyncTeX; mark geometry will be preserved and its source rows recomputed.",
 		});
 	}
 
-	private rebasePdfAnnotations(record: ViewerHostPdfRecord): void {
+	private async refreshPdfAnnotationSources(record: ViewerHostPdfRecord): Promise<void> {
+		const synctexReady = await this.waitForSynctexReady(record);
+		if (this.registry.getPdf(record.pdfId).revision !== record.revision) return;
+		if (synctexReady) prewarmSynctexForPdf(record.pdfPath);
 		const updates: Array<{ annotation_id: string; message: Record<string, unknown> }> = [];
+		const staleMark = (mark: ViewerHostPdfAnnotationMessage): ViewerHostPdfAnnotationMessage => {
+			if (mark.source_stale === true) return mark;
+			const stale = { ...mark, source_stale: true };
+			const message = { source_stale: true };
+			updates.push({ annotation_id: mark.annotation_id, message });
+			this.rememberAnnotationRebased(stale, message);
+			return stale;
+		};
 		const reconciled = this.pendingPdfMarks.reconcilePdf(record.pdfId, (mark) => {
-			const result = rebasePdfMark({
-				mark,
-				anchors: this.sourceAnchorsByMarkKey.get(pdfMarkKey(mark)),
-				pdfPath: record.pdfPath,
-				cwd: record.workspaceCwd,
-			});
-			if (result === undefined || result.anchors.length === 0) {
-				this.sourceAnchorsByMarkKey.delete(pdfMarkKey(mark));
-				return undefined;
+			if (mark.h === undefined || mark.v === undefined || mark.W === undefined || mark.H === undefined) return mark;
+			if (!synctexReady) return staleMark(mark);
+			try {
+				const result = this.resolveReverseBox({
+					message: { type: "reverse_synctex_box", pdf_id: mark.pdf_id, request_id: record.revision, page: mark.page, h: mark.h, v: mark.v, W: mark.W, H: mark.H },
+					pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd },
+				});
+				if (result.error || result.source_file === undefined || result.line === undefined || result.source_spans === undefined) return staleMark(mark);
+				const { source_span: _oldSourceSpan, source_spans: _oldSourceSpans, ...markWithoutSpans } = mark;
+				const refreshed: ViewerHostPdfAnnotationMessage = { ...markWithoutSpans, source_file: result.source_file, line: result.line, source_spans: result.source_spans, source_stale: false };
+				const message = { page: mark.page, h: mark.h, v: mark.v, W: mark.W, H: mark.H, ranges: mark.ranges ?? [{ page: mark.page, h: mark.h, v: mark.v, W: mark.W, H: mark.H }], source_file: refreshed.source_file, line: refreshed.line, source_spans: refreshed.source_spans, source_stale: false };
+				updates.push({ annotation_id: mark.annotation_id, message });
+				this.rememberAnnotationRebased(refreshed, message);
+				return refreshed;
+			} catch {
+				return staleMark(mark);
 			}
-			this.sourceAnchorsByMarkKey.set(pdfMarkKey(result.mark), result.anchors);
-			const message = { ...result.forward, source_spans: result.mark.source_spans };
-			updates.push({ annotation_id: result.mark.annotation_id, message });
-			this.rememberAnnotationRebased(result.mark, message);
-			return result.mark;
 		});
-		for (const mark of reconciled.cleared) this.rememberAnnotationCleared(mark);
-		if (reconciled.cleared.length > 0) this.broadcastAcknowledgedMarks(reconciled.cleared);
+		if (this.registry.getPdf(record.pdfId).revision !== record.revision) return;
 		if (updates.length > 0) this.broadcastViewerSocketMessage(record.pdfId, { type: "annotations_rebased", pdf_id: record.pdfId, annotations: updates });
-		if (reconciled.updated.length > 0 || reconciled.cleared.length > 0) {
-			this.broadcastViewerSocketMessage(record.pdfId, {
-				type: "compile_status",
-				pdf_id: record.pdfId,
-				running: false,
-				continuous: false,
-				severity: "info",
-				message: `PDF refreshed: reattached ${reconciled.updated.length} mark${reconciled.updated.length === 1 ? "" : "s"}; cleared ${reconciled.cleared.length}.`,
-			});
-		}
+		if (reconciled.updated.length > 0) this.broadcastViewerSocketMessage(record.pdfId, { type: "compile_status", pdf_id: record.pdfId, running: false, continuous: false, severity: "info", message: synctexReady ? `PDF refreshed: reverse-resolved ${updates.length} mark${updates.length === 1 ? "" : "s"} from preserved PDF geometry.` : "PDF refreshed before its SyncTeX sidecar settled; annotation source mappings are stale." });
 	}
 
 	private queueMcpEvent(message: ViewerHostToMcpMessage): void {
@@ -1591,7 +1609,6 @@ export class ViewerHostServer {
 	private broadcastAcknowledgedMarks(acknowledged: readonly AcknowledgedPdfMark[]): void {
 		const annotationIdsByPdfId = new Map<number, string[]>();
 		for (const mark of acknowledged) {
-			this.sourceAnchorsByMarkKey.delete(pdfMarkKey(mark));
 			this.rememberAnnotationCleared(mark);
 			const annotationIds = annotationIdsByPdfId.get(mark.pdf_id) ?? [];
 			annotationIds.push(mark.annotation_id);
@@ -1760,8 +1777,8 @@ export class ViewerHostServer {
 
 		this.pendingPdfRefreshSnapshots.delete(record.pdfId);
 		const updated = this.registry.recordPdfFileChange(record.pdfId, snapshot);
-		this.scheduleSynctexPrewarm(updated);
-		this.rebasePdfAnnotations(updated);
+		await this.refreshPdfAnnotationSources(updated);
+		if (this.registry.getPdf(record.pdfId).revision !== updated.revision) return;
 		this.sendPdfRefresh(record.pdfId);
 	}
 

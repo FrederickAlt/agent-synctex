@@ -41,7 +41,7 @@ test("Viewer Host protocol validates representative Host to MCP messages", () =>
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500 },
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500, textBeforeSelection: "before", textAfterSelection: "after" },
 		{ type: "reverse_synctex", pdf_id: 123, page: 2, x: 100, y: 500, selectedText: "chosen", selectionStartX: 95, selectionStartY: 500, selectionEndX: 150, selectionEndY: 500 },
-		{ type: "pdf_annotation", pdf_id: 123, annotation_id: "a1", page: 2, x: 100, y: 500, source_file: "/tmp/main.tex", line: 42, source_line: "hello", source_spans: [{ source_file: "/tmp/main.tex", start_line: 40, end_line: 42 }, { source_file: "/tmp/other.tex", start_line: 7, end_line: 7 }], comment: "please check" },
+		{ type: "pdf_annotation", pdf_id: 123, annotation_id: "a1", page: 2, x: 100, y: 500, h: 90, v: 510, W: 40, H: 12, ranges: [{ page: 2, h: 90, v: 510, W: 40, H: 12 }], source_file: "/tmp/main.tex", line: 42, source_line: "hello", source_spans: [{ source_file: "/tmp/main.tex", start_line: 40, end_line: 42 }, { source_file: "/tmp/other.tex", start_line: 7, end_line: 7 }], comment: "please check" },
 		{ type: "pdf_annotation_deleted", pdf_id: 123, annotation_id: "a1" },
 		{ type: "selection_debug", pdf_id: 123, phase: "send", page: 2, text: "chosen", details: { phase: "send", selectionTextLength: 6 } },
 		{ type: "compile_action", pdf_id: 123, action: "inject_diagnostic", inject_text: "compile failed" },
@@ -53,6 +53,12 @@ test("Viewer Host protocol validates representative Host to MCP messages", () =>
 	for (const message of messages) {
 		assert.deepEqual(validateViewerHostToMcpMessage(message), message);
 	}
+});
+
+test("Viewer Host protocol derives scalar geometry from validated same-page annotation ranges", () => {
+	const message = { type: "pdf_annotation", pdf_id: 1, annotation_id: "ranges", page: 2, x: 90, y: 510, ranges: [{ page: 2, h: 90, v: 510, W: 40, H: 12 }, { page: 2, h: 140, v: 510, W: 20, H: 12 }], source_file: "/tmp/main.tex", line: 42 };
+	assert.deepEqual(validateViewerHostToMcpMessage(message), { ...message, h: 90, v: 510, W: 40, H: 12 });
+	assert.throws(() => validateViewerHostToMcpMessage({ ...message, ranges: [{ page: 3, h: 90, v: 510, W: 40, H: 12 }] }), /annotation page/);
 });
 
 test("Viewer Host protocol retains bounded SyncTeX diagnostics on PDF annotations", () => {
@@ -182,6 +188,7 @@ test("Viewer Host protocol validation rejects malformed boundary messages", () =
 		[{ type: "pdf_annotation", pdf_id: 1, annotation_id: "a1", page: 1, x: 1, y: 1, source_file: "/tmp/main.tex", line: 0 }, /line/],
 		[{ type: "pdf_annotation", pdf_id: 1, annotation_id: "a1", page: 1, x: 1, y: 1, source_file: "/tmp/main.tex", line: 1, source_span: { source_file: "/tmp/main.tex", start_line: 3, end_line: 2 } }, /source_span\.end_line/],
 		[{ type: "pdf_annotation", pdf_id: 1, annotation_id: "a1", page: 1, x: 1, y: 1, source_file: "/tmp/main.tex", line: 1, source_spans: [] }, /source_spans/],
+		[{ type: "pdf_annotation", pdf_id: 1, annotation_id: "a1", page: 1, x: 1, y: 1, h: 1, v: 2, W: 0, H: 3, source_file: "/tmp/main.tex", line: 1 }, /W/],
 		[{ type: "reverse_synctex_box", pdf_id: 1, request_id: 1, page: 1, h: 1, v: 1, W: 0, H: 3 }, /W/],
 		[{ type: "reverse_synctex_box", pdf_id: 1, request_id: 1, page: 1, h: 1, v: 1, W: 2, H: 3, pdf_text_spans: [{ page: 1, h: 1, v: 1, W: 2, H: 3, text: "" }] }, /pdf_text_spans\[0\]\.text/],
 		[{ type: "pdf_annotation_deleted", pdf_id: 1, annotation_id: "" }, /annotation_id/],

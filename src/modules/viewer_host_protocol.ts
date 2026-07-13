@@ -393,6 +393,12 @@ export interface ViewerHostPdfAnnotationMessage {
 	page: number;
 	x: number;
 	y: number;
+	/** Exact page-local PDF geometry for box annotations. */
+	h?: number;
+	v?: number;
+	W?: number;
+	H?: number;
+	ranges?: ViewerHostSynctexForwardRange[];
 	source_file: string;
 	line: number;
 	source_line?: string;
@@ -1142,6 +1148,13 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 			};
 		}
 		case "pdf_annotation": {
+			const page = requirePositiveInteger(message.page, "page");
+			const ranges = optionalSynctexRanges(message.ranges, "ranges");
+			if (ranges?.some((range) => range.W <= 0 || range.H <= 0)) throw new Error("pdf_annotation ranges must have positive W and H");
+			if (ranges?.some((range) => range.page !== page)) throw new Error("pdf_annotation ranges must belong to the annotation page");
+			const hasScalarGeometry = message.h !== undefined || message.v !== undefined || message.W !== undefined || message.H !== undefined;
+			const box = hasScalarGeometry ? parseSynctexBox({ ...message, page }, "pdf_annotation") : ranges?.[0];
+			if (box !== undefined && (box.W <= 0 || box.H <= 0)) throw new Error("pdf_annotation.W and pdf_annotation.H must be positive");
 			const sourceLine = optionalString(message.source_line, "source_line");
 			const pdfMark = optionalString(message.pdf_mark, "pdf_mark");
 			const sourceSpan = optionalSourceSpan(message.source_span, "source_span");
@@ -1153,9 +1166,11 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				type,
 				pdf_id: requirePositiveInteger(message.pdf_id, "pdf_id"),
 				annotation_id: requireNonEmptyString(message.annotation_id, "annotation_id"),
-				page: requirePositiveInteger(message.page, "page"),
+				page,
 				x: requireCoordinate(message.x, "x"),
 				y: requireCoordinate(message.y, "y"),
+				...(box === undefined ? {} : { h: box.h, v: box.v, W: box.W, H: box.H }),
+				...(ranges === undefined ? {} : { ranges }),
 				source_file: requireNonEmptyString(message.source_file, "source_file"),
 				line: requirePositiveInteger(message.line, "line"),
 				...(sourceLine === undefined ? {} : { source_line: sourceLine }),
