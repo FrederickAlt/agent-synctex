@@ -4,6 +4,10 @@
 
 `CONTEXT.md` outlines the current repository architecture, active viewer/server split, important module ownership, and high-signal tests. Read it before making architectural, viewer, SyncTeX, MCP runtime, or compile-flow changes. Unless it is clear where to start reading when discovering, this should be the first place.
 
+## Vocabulary
+
+- **Box score**: the lower-is-better numerical score assigned to one candidate geometry box during reverse SyncTeX resolution. The selected box's score is used to choose its containing group and source proposal.
+
 ## Implementation lineage
 
 This implementation is based on/derived from the sibling LaTeX Workshop repo (`../latex-workshop`; this workspace may have it as `../LaTeX-Workshop`). When changing LaTeX build, SyncTeX, or PDF viewer behavior, compare the relevant behavior and design against that repo before diverging.

@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
-import { inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar, type ReverseSyncTeXCandidate, type ReverseSyncTeXCandidatesInspection } from "./latex_workshop/worker.ts";
+import { collectCachedSyncTeXForwardTreeCandidates, inspectSyncTeXToTeXCandidates, syncTeXToPDF, syncTeXToTeX, resolveLatexWorkshopSynctexSidecar, type ReverseSyncTeXCandidate, type ReverseSyncTeXCandidatesInspection, type SyncTeXForwardTreeCandidate } from "./latex_workshop/worker.ts";
 import { lineColumnForSourceIndex } from "./source_index.ts";
 import { readSourceLine } from "./source_line.ts";
 import { boxContainsClick, boxDistanceComponentsFromClick, buildSourceSearchFragments, filterForwardBoxes, findSourceTextMatches, type SourceTextMatchResult } from "./text_repair.ts";
@@ -45,6 +45,8 @@ export interface ForwardSynctexRange {
 	v: number;
 	W: number;
 	H: number;
+	/** Present only for JS parsed-tree candidates used by reverse click scoring. */
+	treeCandidate?: SyncTeXForwardTreeCandidate;
 }
 
 /** Browser-derived PDF.js text geometry, in the same PDF coordinate system as SyncTeX. */
@@ -736,6 +738,9 @@ function compactReverseCandidate(candidate: ReverseSyncTeXCandidate, cwd?: strin
 	};
 }
 
+/** Reject rather than sample an unbounded parsed-tree click candidate pool. */
+const MAX_FORWARD_TREE_CANDIDATES = 2_000;
+
 const FORWARD_DISTANCE_PENALTY_MULTIPLIER = 0.96;
 const FORWARD_BOX_SIZE_PENALTY_MULTIPLIER = 2;
 const TINY_BOX_GLYPH_WIDTH_PT = 5.5;
@@ -839,6 +844,30 @@ export interface ReverseSynctexProposalScore {
 
 function forwardBoxesForLookup(input: { sourceFile: string; line: number; pdfPath: string; cwd: string; lookupMode: ForwardSynctexLookupMode; nativeRunner?: NativeSynctexRunner; forwardBoxesForLine?: ReverseSynctexForwardBoxesForLine; synctexCommand?: string }): ForwardSynctexRange[] {
 	if (input.forwardBoxesForLine !== undefined) return input.forwardBoxesForLine(input);
+	let treeCandidates;
+	const previousCwd = process.cwd();
+	try {
+		process.chdir(input.cwd);
+		treeCandidates = collectCachedSyncTeXForwardTreeCandidates({
+			pdfPath: input.pdfPath,
+			sourceFile: input.sourceFile,
+			line: input.line,
+			maxCandidates: MAX_FORWARD_TREE_CANDIDATES,
+		});
+	} finally {
+		process.chdir(previousCwd);
+	}
+	if (treeCandidates.exceeded) return [];
+	if (treeCandidates.candidates.length > 0) {
+		const seen = new Set<string>();
+		return treeCandidates.candidates.flatMap((candidate) => {
+			const box: ForwardSynctexRange = { ...candidate.box, treeCandidate: candidate };
+			const key = forwardRangeKey(box);
+			if (seen.has(key)) return [];
+			seen.add(key);
+			return [box];
+		});
+	}
 	try {
 		const forward = cachedMapForwardSynctex({
 			pdfPath: input.pdfPath,

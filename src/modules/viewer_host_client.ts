@@ -1102,6 +1102,7 @@ export class ViewerHostMcpService {
 				line: parsed.line,
 				...(parsed.source_line === undefined ? {} : { source_line: parsed.source_line }),
 				...(parsed.source_span === undefined ? {} : { source_span: parsed.source_span }),
+				...(parsed.synctex_diagnostics === undefined ? {} : { synctex_diagnostics: structuredClone(parsed.synctex_diagnostics) }),
 				page: parsed.page,
 				x: parsed.x,
 				y: parsed.y,

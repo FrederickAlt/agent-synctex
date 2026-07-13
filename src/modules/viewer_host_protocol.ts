@@ -185,6 +185,27 @@ export interface ViewerHostDebugProposalIdentity {
 	text_status?: "unique" | "ambiguous-small";
 }
 
+export interface ViewerHostDebugParsedTreeLeaf {
+	page: number;
+	source_file: string;
+	line: number;
+	h: number;
+	v: number;
+	W: number;
+	H: number;
+}
+
+export interface ViewerHostDebugParsedTreeBox extends ViewerHostDebugParsedTreeLeaf {
+	type: string;
+}
+
+export interface ViewerHostDebugParsedTreeCandidate {
+	leaf: ViewerHostDebugParsedTreeLeaf;
+	box: ViewerHostDebugParsedTreeBox;
+	ancestors: ViewerHostDebugParsedTreeBox[];
+	ancestors_truncated?: boolean;
+}
+
 export interface ViewerHostDebugForwardBoxScore {
 	box: ViewerHostSynctexForwardRange;
 	contains_click: boolean;
@@ -208,6 +229,8 @@ export interface ViewerHostDebugForwardBoxScore {
 	total: number;
 	order: number;
 	selected: boolean;
+	/** Parsed-tree provenance when this score came from a JS SyncTeX tree candidate. */
+	tree_candidate?: ViewerHostDebugParsedTreeCandidate;
 }
 
 export interface ViewerHostDebugForwardGroup {
@@ -262,6 +285,27 @@ export interface ViewerHostDebugForwardGroup {
 	box_scores: ViewerHostDebugForwardBoxScore[];
 }
 
+export interface ViewerHostDebugProposalScore extends ViewerHostDebugProposalIdentity {
+	geometry_tier: number;
+	score: number;
+	precision: ViewerHostSynctexPrecision;
+	same_page_box_count: number;
+	contains_click: boolean;
+	click_containment_bonus: number;
+	text_containment_bonus: number;
+	text_containment?: "full" | "partial";
+	distance?: number;
+	reason?: string;
+	forward_lookup_mode?: "exact";
+}
+
+/** Bounded trace captured for a debug reverse-forward probe and retained with its annotation. */
+export interface ViewerHostPdfAnnotationSynctexDiagnostics {
+	top_proposals: ViewerHostDebugProposalScore[];
+	selected_score?: number;
+	forward_groups: ViewerHostDebugForwardGroup[];
+}
+
 export interface ViewerHostReverseSynctexForwardProbeResultMessage {
 	type: "reverse_synctex_forward_probe_result";
 	pdf_id: number;
@@ -291,6 +335,8 @@ export interface ViewerHostReverseSynctexForwardProbeResultMessage {
 	debug_selected_score?: number;
 	/** Present only for an explicit SyncTeX debug session. */
 	debug_forward_groups?: ViewerHostDebugForwardGroup[];
+	/** Bounded trace intended for a debug-created PDF annotation. */
+	synctex_diagnostics?: ViewerHostPdfAnnotationSynctexDiagnostics;
 	error?: string;
 }
 
@@ -358,6 +404,8 @@ export interface ViewerHostPdfAnnotationMessage {
 	source_span?: ViewerHostSourceSpan;
 	/** The source file is newer than the PDF that produced this mapping. */
 	source_stale?: boolean;
+	/** Bounded trace retained only when this mark was created from an explicit debug probe. */
+	synctex_diagnostics?: ViewerHostPdfAnnotationSynctexDiagnostics;
 	comment?: string;
 }
 
@@ -510,6 +558,12 @@ function optionalBoolean(value: unknown, field: string): boolean | undefined {
 		throw new Error(`${field} must be a boolean`);
 	}
 	return value;
+}
+
+function requireBoolean(value: unknown, field: string): boolean {
+	const parsed = optionalBoolean(value, field);
+	if (parsed === undefined) throw new Error(`${field} must be a boolean`);
+	return parsed;
 }
 
 function parseSynctexBox(value: unknown, field: string): ViewerHostSynctexBox {
@@ -674,6 +728,198 @@ function optionalForwardVerificationSummary(value: unknown, field: string): View
 		...(boxesConsidered === undefined ? {} : { boxes_considered: boxesConsidered }),
 		...(boxesFiltered === undefined ? {} : { boxes_filtered: boxesFiltered }),
 		...(chosenBox === undefined ? {} : { chosen_box: chosenBox }),
+	};
+}
+
+const MAX_SYNCTEX_DEBUG_TOP_PROPOSALS = 3;
+const MAX_SYNCTEX_DEBUG_FORWARD_GROUPS = 12;
+const MAX_SYNCTEX_DEBUG_BOX_SCORES = 16;
+const MAX_SYNCTEX_DEBUG_TREE_ANCESTORS = 8;
+
+function optionalTextContainment(value: unknown, field: string): "full" | "partial" | undefined {
+	if (value === undefined) return undefined;
+	if (value !== "full" && value !== "partial") throw new Error(`${field} must be full or partial`);
+	return value;
+}
+
+function parseDebugProposalIdentity(value: unknown, field: string): ViewerHostDebugProposalIdentity {
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	const textStatus = value.text_status === undefined ? undefined : value.text_status;
+	if (textStatus !== undefined && textStatus !== "unique" && textStatus !== "ambiguous-small") throw new Error(`${field}.text_status must be unique or ambiguous-small`);
+	if (value.kind !== "text" && value.kind !== "ranked") throw new Error(`${field}.kind must be text or ranked`);
+	if (value.provenance !== "synctex_reverse" && value.provenance !== "selection_text_context") throw new Error(`${field}.provenance must be a SyncTeX proposal provenance`);
+	return {
+		kind: value.kind,
+		provenance: value.provenance,
+		source_file: requireNonEmptyString(value.source_file, `${field}.source_file`),
+		line: requirePositiveInteger(value.line, `${field}.line`),
+		column: requireCoordinate(value.column, `${field}.column`),
+		rank: requireNonNegativeInteger(value.rank, `${field}.rank`),
+		structural: requireBoolean(value.structural, `${field}.structural`),
+		...(textStatus === undefined ? {} : { text_status: textStatus }),
+	};
+}
+
+function parseDebugProposalScore(value: unknown, field: string): ViewerHostDebugProposalScore {
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	const identity = parseDebugProposalIdentity(value, field);
+	const textContainment = optionalTextContainment(value.text_containment, `${field}.text_containment`);
+	const distance = optionalNumber(value.distance, `${field}.distance`);
+	const reason = optionalString(value.reason, `${field}.reason`);
+	if (value.precision !== "verified" && value.precision !== "text" && value.precision !== "line" && value.precision !== "raw") throw new Error(`${field}.precision must be a SyncTeX precision`);
+	if (value.forward_lookup_mode !== undefined && value.forward_lookup_mode !== "exact") throw new Error(`${field}.forward_lookup_mode must be exact`);
+	return {
+		...identity,
+		geometry_tier: requireNonNegativeInteger(value.geometry_tier, `${field}.geometry_tier`),
+		score: optionalNumber(value.score, `${field}.score`) ?? (() => { throw new Error(`${field}.score must be a finite number`); })(),
+		precision: value.precision,
+		same_page_box_count: requireNonNegativeInteger(value.same_page_box_count, `${field}.same_page_box_count`),
+		contains_click: requireBoolean(value.contains_click, `${field}.contains_click`),
+		click_containment_bonus: optionalNumber(value.click_containment_bonus, `${field}.click_containment_bonus`) ?? (() => { throw new Error(`${field}.click_containment_bonus must be a finite number`); })(),
+		text_containment_bonus: optionalNumber(value.text_containment_bonus, `${field}.text_containment_bonus`) ?? (() => { throw new Error(`${field}.text_containment_bonus must be a finite number`); })(),
+		...(textContainment === undefined ? {} : { text_containment: textContainment }),
+		...(distance === undefined ? {} : { distance }),
+		...(reason === undefined ? {} : { reason }),
+		...(value.forward_lookup_mode === undefined ? {} : { forward_lookup_mode: value.forward_lookup_mode }),
+	};
+}
+
+function parseDebugTreeLeaf(value: unknown, field: string): ViewerHostDebugParsedTreeLeaf {
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	return {
+		page: requirePositiveInteger(value.page, `${field}.page`),
+		source_file: requireNonEmptyString(value.source_file, `${field}.source_file`),
+		line: requirePositiveInteger(value.line, `${field}.line`),
+		h: requireCoordinate(value.h, `${field}.h`),
+		v: requireCoordinate(value.v, `${field}.v`),
+		W: requireCoordinate(value.W, `${field}.W`),
+		H: requireCoordinate(value.H, `${field}.H`),
+	};
+}
+
+function parseDebugTreeBox(value: unknown, field: string): ViewerHostDebugParsedTreeBox {
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	return { type: requireNonEmptyString(value.type, `${field}.type`), ...parseDebugTreeLeaf(value, field) };
+}
+
+function optionalDebugTreeCandidate(value: unknown, field: string): ViewerHostDebugParsedTreeCandidate | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	if (!Array.isArray(value.ancestors) || value.ancestors.length > MAX_SYNCTEX_DEBUG_TREE_ANCESTORS) throw new Error(`${field}.ancestors must be an array of at most ${MAX_SYNCTEX_DEBUG_TREE_ANCESTORS} entries`);
+	const truncated = optionalBoolean(value.ancestors_truncated, `${field}.ancestors_truncated`);
+	return {
+		leaf: parseDebugTreeLeaf(value.leaf, `${field}.leaf`),
+		box: parseDebugTreeBox(value.box, `${field}.box`),
+		ancestors: value.ancestors.map((ancestor, index) => parseDebugTreeBox(ancestor, `${field}.ancestors[${index}]`)),
+		...(truncated === undefined ? {} : { ancestors_truncated: truncated }),
+	};
+}
+
+function parseDebugForwardBoxScore(value: unknown, field: string): ViewerHostDebugForwardBoxScore {
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	const textContainment = optionalTextContainment(value.text_containment, `${field}.text_containment`);
+	const treeCandidate = optionalDebugTreeCandidate(value.tree_candidate, `${field}.tree_candidate`);
+	const requiredNumber = (key: string) => optionalNumber(value[key], `${field}.${key}`) ?? (() => { throw new Error(`${field}.${key} must be a finite number`); })();
+	return {
+		box: parseSynctexForwardRange(value.box, `${field}.box`),
+		contains_click: requireBoolean(value.contains_click, `${field}.contains_click`),
+		geometry_tier: requireNonNegativeInteger(value.geometry_tier, `${field}.geometry_tier`),
+		distance: requiredNumber("distance"),
+		distance_squared: requiredNumber("distance_squared"),
+		distance_multiplier: requiredNumber("distance_multiplier"),
+		distance_term: requiredNumber("distance_term"),
+		area: requiredNumber("area"),
+		area_term: requiredNumber("area_term"),
+		tiny_penalty: requiredNumber("tiny_penalty"),
+		semantic_penalty: requiredNumber("semantic_penalty"),
+		pdf_text_span_semantic_penalty: requiredNumber("pdf_text_span_semantic_penalty"),
+		selection_text_context_semantic_penalty: requiredNumber("selection_text_context_semantic_penalty"),
+		blank_source_line_penalty: requiredNumber("blank_source_line_penalty"),
+		click_containment_bonus: requiredNumber("click_containment_bonus"),
+		text_containment_bonus: requiredNumber("text_containment_bonus"),
+		...(textContainment === undefined ? {} : { text_containment: textContainment }),
+		end_document_penalty: requiredNumber("end_document_penalty"),
+		total: requiredNumber("total"),
+		order: requireNonNegativeInteger(value.order, `${field}.order`),
+		selected: requireBoolean(value.selected, `${field}.selected`),
+		...(treeCandidate === undefined ? {} : { tree_candidate: treeCandidate }),
+	};
+}
+
+function parseDebugForwardGroup(value: unknown, field: string): ViewerHostDebugForwardGroup {
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	if (value.origin !== "synctex_exact" && value.origin !== "pdf_text_span") throw new Error(`${field}.origin must be a SyncTeX forward-group origin`);
+	const proposalOrder = requireRecord(value.proposal_order, `${field}.proposal_order`);
+	const groupOrder = requireRecord(value.group_order, `${field}.group_order`);
+	const textContainment = optionalTextContainment(value.text_containment, `${field}.text_containment`);
+	const optionalScore = (key: string) => optionalNumber(value[key], `${field}.${key}`);
+	const requiredScore = (key: string) => optionalScore(key) ?? (() => { throw new Error(`${field}.${key} must be a finite number`); })();
+	if (!Array.isArray(value.box_scores) || value.box_scores.length > MAX_SYNCTEX_DEBUG_BOX_SCORES) throw new Error(`${field}.box_scores must be an array of at most ${MAX_SYNCTEX_DEBUG_BOX_SCORES} entries`);
+	const boxScoreCount = requireNonNegativeInteger(value.box_score_count, `${field}.box_score_count`);
+	const boxScoresTruncated = requireBoolean(value.box_scores_truncated, `${field}.box_scores_truncated`);
+	if (value.box_scores.length > boxScoreCount || (!boxScoresTruncated && value.box_scores.length !== boxScoreCount)) throw new Error(`${field}.box_scores must match box_score_count unless truncated`);
+	return {
+		proposal: parseDebugProposalIdentity(value.proposal, `${field}.proposal`),
+		proposal_selected: requireBoolean(value.proposal_selected, `${field}.proposal_selected`),
+		proposal_order: {
+			index: requireNonNegativeInteger(proposalOrder.index, `${field}.proposal_order.index`),
+			geometry_tier: requireNonNegativeInteger(proposalOrder.geometry_tier, `${field}.proposal_order.geometry_tier`),
+			total: optionalNumber(proposalOrder.total, `${field}.proposal_order.total`) ?? (() => { throw new Error(`${field}.proposal_order.total must be a finite number`); })(),
+			exact_lookup_preferred: requireBoolean(proposalOrder.exact_lookup_preferred, `${field}.proposal_order.exact_lookup_preferred`),
+			same_page_box_count: requireNonNegativeInteger(proposalOrder.same_page_box_count, `${field}.proposal_order.same_page_box_count`),
+			rank: requireNonNegativeInteger(proposalOrder.rank, `${field}.proposal_order.rank`),
+			line: requirePositiveInteger(proposalOrder.line, `${field}.proposal_order.line`),
+			source_file: requireNonEmptyString(proposalOrder.source_file, `${field}.proposal_order.source_file`),
+		},
+		origin: value.origin,
+		lookup_line: requirePositiveInteger(value.lookup_line, `${field}.lookup_line`),
+		semantic_penalty: requiredScore("semantic_penalty"),
+		pdf_text_span_semantic_penalty: requiredScore("pdf_text_span_semantic_penalty"),
+		selection_text_context_semantic_penalty: requiredScore("selection_text_context_semantic_penalty"),
+		blank_source_line_penalty: requiredScore("blank_source_line_penalty"),
+		original_box_count: requireNonNegativeInteger(value.original_box_count, `${field}.original_box_count`),
+		filtered_box_count: requireNonNegativeInteger(value.filtered_box_count, `${field}.filtered_box_count`),
+		same_page_box_count: requireNonNegativeInteger(value.same_page_box_count, `${field}.same_page_box_count`),
+		rejected_invalid: requireNonNegativeInteger(value.rejected_invalid, `${field}.rejected_invalid`),
+		rejected_absurd: requireNonNegativeInteger(value.rejected_absurd, `${field}.rejected_absurd`),
+		contains_click: requireBoolean(value.contains_click, `${field}.contains_click`),
+		geometry_tier: requireNonNegativeInteger(value.geometry_tier, `${field}.geometry_tier`),
+		...(optionalScore("distance") === undefined ? {} : { distance: optionalScore("distance") }),
+		...(optionalScore("distance_squared") === undefined ? {} : { distance_squared: optionalScore("distance_squared") }),
+		...(optionalScore("distance_multiplier") === undefined ? {} : { distance_multiplier: optionalScore("distance_multiplier") }),
+		...(optionalScore("distance_term") === undefined ? {} : { distance_term: optionalScore("distance_term") }),
+		...(optionalScore("area") === undefined ? {} : { area: optionalScore("area") }),
+		...(optionalScore("area_term") === undefined ? {} : { area_term: optionalScore("area_term") }),
+		...(optionalScore("tiny_penalty") === undefined ? {} : { tiny_penalty: optionalScore("tiny_penalty") }),
+		click_containment_bonus: requiredScore("click_containment_bonus"),
+		text_containment_bonus: requiredScore("text_containment_bonus"),
+		...(textContainment === undefined ? {} : { text_containment: textContainment }),
+		...(optionalScore("end_document_penalty") === undefined ? {} : { end_document_penalty: optionalScore("end_document_penalty") }),
+		score: requiredScore("score"),
+		group_order: {
+			index: requireNonNegativeInteger(groupOrder.index, `${field}.group_order.index`),
+			geometry_tier: requireNonNegativeInteger(groupOrder.geometry_tier, `${field}.group_order.geometry_tier`),
+			total: optionalNumber(groupOrder.total, `${field}.group_order.total`) ?? (() => { throw new Error(`${field}.group_order.total must be a finite number`); })(),
+			exact_lookup_preferred: requireBoolean(groupOrder.exact_lookup_preferred, `${field}.group_order.exact_lookup_preferred`),
+		},
+		selected: requireBoolean(value.selected, `${field}.selected`),
+		...(value.chosen_box === undefined ? {} : { chosen_box: parseSynctexForwardRange(value.chosen_box, `${field}.chosen_box`) }),
+		box_score_count: boxScoreCount,
+		box_scores_truncated: boxScoresTruncated,
+		box_scores: value.box_scores.map((box, index) => parseDebugForwardBoxScore(box, `${field}.box_scores[${index}]`)),
+	};
+}
+
+function optionalPdfAnnotationSynctexDiagnostics(value: unknown, field: string): ViewerHostPdfAnnotationSynctexDiagnostics | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) throw new Error(`${field} must be an object`);
+	if (!Array.isArray(value.top_proposals) || value.top_proposals.length === 0 || value.top_proposals.length > MAX_SYNCTEX_DEBUG_TOP_PROPOSALS) throw new Error(`${field}.top_proposals must be a non-empty array of at most ${MAX_SYNCTEX_DEBUG_TOP_PROPOSALS} entries`);
+	if (!Array.isArray(value.forward_groups) || value.forward_groups.length > MAX_SYNCTEX_DEBUG_FORWARD_GROUPS) throw new Error(`${field}.forward_groups must be an array of at most ${MAX_SYNCTEX_DEBUG_FORWARD_GROUPS} entries`);
+	const selectedScore = optionalNumber(value.selected_score, `${field}.selected_score`);
+	return {
+		top_proposals: value.top_proposals.map((proposal, index) => parseDebugProposalScore(proposal, `${field}.top_proposals[${index}]`)),
+		...(selectedScore === undefined ? {} : { selected_score: selectedScore }),
+		forward_groups: value.forward_groups.map((group, index) => parseDebugForwardGroup(group, `${field}.forward_groups[${index}]`)),
 	};
 }
 
@@ -901,6 +1147,7 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 			const sourceSpan = optionalSourceSpan(message.source_span, "source_span");
 			const sourceSpans = optionalSourceSpans(message.source_spans, "source_spans");
 			const sourceStale = optionalBoolean(message.source_stale, "source_stale");
+			const synctexDiagnostics = optionalPdfAnnotationSynctexDiagnostics(message.synctex_diagnostics, "synctex_diagnostics");
 			const comment = optionalString(message.comment, "comment");
 			return {
 				type,
@@ -916,6 +1163,7 @@ export function validateViewerHostToMcpMessage(message: unknown): ViewerHostToMc
 				...(sourceSpans === undefined ? {} : { source_spans: sourceSpans }),
 				...(sourceSpan === undefined ? {} : { source_span: sourceSpan }),
 				...(sourceStale === undefined ? {} : { source_stale: sourceStale }),
+				...(synctexDiagnostics === undefined ? {} : { synctex_diagnostics: synctexDiagnostics }),
 				...(comment === undefined ? {} : { comment }),
 			};
 		}

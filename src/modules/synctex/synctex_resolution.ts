@@ -7,6 +7,8 @@ import type {
 	ViewerHostReverseSynctexBoxResultMessage,
 	ViewerHostReverseSynctexForwardProbeMessage,
 	ViewerHostDebugForwardGroup,
+	ViewerHostDebugProposalScore,
+	ViewerHostPdfAnnotationSynctexDiagnostics,
 	ViewerHostReverseSynctexForwardProbeResultMessage,
 	ViewerHostReverseSynctexHoverMessage,
 	ViewerHostReverseSynctexHoverResultMessage,
@@ -25,6 +27,7 @@ import {
 	normalizedVisibleText,
 	simpleVisibleSourceText,
 	type ForwardSynctexJump,
+	type ForwardSynctexRange,
 	type MapForwardSynctexInput,
 	type ReverseSynctexSourceSpan,
 } from "./forward_synctex.ts";
@@ -36,6 +39,9 @@ const MAX_REVERSE_SYNCTEX_BOX_SOURCE_LOCATIONS = 2_000;
 const MIN_BOX_COVERAGE = 0.5;
 const SCORE_EPSILON = 1e-9;
 const MIN_TEXT_MATCH_LENGTH = 8;
+const MAX_DEBUG_SYNCTEX_PROPOSALS = 3;
+const MAX_DEBUG_SYNCTEX_FORWARD_GROUPS_PER_PROPOSAL = 4;
+const MAX_DEBUG_SYNCTEX_TREE_ANCESTORS = 8;
 
 export interface RegisteredSynctexPdf {
 	pdfId: number;
@@ -474,91 +480,161 @@ function debugCandidateDiagnostics(reverse: ReturnType<typeof inspectReverseSync
 	};
 }
 
+function protocolForwardRange(range: ForwardSynctexRange): ViewerHostSynctexForwardRange {
+	return { page: range.page, h: range.h, v: range.v, W: range.W, H: range.H };
+}
+
+function debugTreeCandidate(range: ForwardSynctexRange): ViewerHostDebugForwardGroup["box_scores"][number]["tree_candidate"] | undefined {
+	const candidate = range.treeCandidate;
+	if (candidate === undefined) return undefined;
+	const treeBox = (box: typeof candidate.box) => ({
+		type: box.type,
+		page: box.page,
+		source_file: box.sourceFile,
+		line: box.line,
+		h: box.h,
+		v: box.v,
+		W: box.W,
+		H: box.H,
+	});
+	return {
+		leaf: {
+			page: candidate.leaf.page,
+			source_file: candidate.leaf.sourceFile,
+			line: candidate.leaf.line,
+			h: candidate.leaf.h,
+			v: candidate.leaf.v,
+			W: candidate.leaf.W,
+			H: candidate.leaf.H,
+		},
+		box: treeBox(candidate.box),
+		ancestors: candidate.ancestors.slice(0, MAX_DEBUG_SYNCTEX_TREE_ANCESTORS).map(treeBox),
+		...(candidate.ancestors.length > MAX_DEBUG_SYNCTEX_TREE_ANCESTORS ? { ancestors_truncated: true } : {}),
+	};
+}
+
+function debugProposalScore(proposal: NonNullable<ReturnType<typeof inspectReverseSynctexHover>["debugProposalScores"]>[number]): ViewerHostDebugProposalScore {
+	return {
+		kind: proposal.kind,
+		provenance: proposal.provenance,
+		source_file: proposal.sourceFile,
+		line: proposal.line,
+		column: proposal.column,
+		rank: proposal.rank,
+		structural: proposal.structural,
+		...(proposal.textStatus === undefined ? {} : { text_status: proposal.textStatus }),
+		geometry_tier: proposal.geometryTier,
+		score: proposal.score,
+		precision: proposal.precision,
+		same_page_box_count: proposal.samePageBoxCount,
+		contains_click: proposal.containsClick,
+		click_containment_bonus: proposal.clickContainmentBonus,
+		text_containment_bonus: proposal.textContainmentBonus,
+		...(proposal.textContainment === undefined ? {} : { text_containment: proposal.textContainment }),
+		...(proposal.distance === undefined ? {} : { distance: proposal.distance }),
+		...(proposal.reason === undefined ? {} : { reason: proposal.reason }),
+		...(proposal.forwardLookupMode === undefined ? {} : { forward_lookup_mode: proposal.forwardLookupMode }),
+	};
+}
+
 function debugForwardGroupDiagnostics(reverse: Pick<ReturnType<typeof inspectReverseSynctexHover>, "debugProposalScores">): { debug_forward_groups?: ViewerHostDebugForwardGroup[] } {
-	const proposals = reverse.debugProposalScores;
+	const proposals = reverse.debugProposalScores?.slice(0, MAX_DEBUG_SYNCTEX_PROPOSALS);
 	if (proposals === undefined || proposals.length === 0) return {};
-	const groups = proposals.flatMap((proposal, proposalIndex) => proposal.forwardGroupScores.map((group, groupIndex): ViewerHostDebugForwardGroup => ({
-		proposal: {
-			kind: proposal.kind,
-			provenance: proposal.provenance,
-			source_file: proposal.sourceFile,
-			line: proposal.line,
-			column: proposal.column,
-			rank: proposal.rank,
-			structural: proposal.structural,
-			...(proposal.textStatus === undefined ? {} : { text_status: proposal.textStatus }),
-		},
-		proposal_selected: proposalIndex === 0,
-		proposal_order: {
-			index: proposalIndex,
-			geometry_tier: proposal.geometryTier,
-			total: proposal.score,
-			exact_lookup_preferred: proposal.forwardLookupMode === "exact",
-			same_page_box_count: proposal.samePageBoxCount,
-			rank: proposal.rank,
-			line: proposal.line,
-			source_file: proposal.sourceFile,
-		},
-		origin: group.origin,
-		lookup_line: group.lookupLine,
-		semantic_penalty: group.semanticPenalty,
-		pdf_text_span_semantic_penalty: group.pdfTextSpanSemanticPenalty,
-		selection_text_context_semantic_penalty: group.selectionTextContextSemanticPenalty,
-		blank_source_line_penalty: group.blankSourceLinePenalty,
-		original_box_count: group.originalBoxCount,
-		filtered_box_count: group.filteredBoxCount,
-		same_page_box_count: group.samePageBoxCount,
-		rejected_invalid: group.rejectedInvalid,
-		rejected_absurd: group.rejectedAbsurd,
-		contains_click: group.containsClick,
-		geometry_tier: group.geometryTier,
-		...(group.distance === undefined ? {} : { distance: group.distance }),
-		...(group.distanceSquared === undefined ? {} : { distance_squared: group.distanceSquared }),
-		...(group.distanceMultiplier === undefined ? {} : { distance_multiplier: group.distanceMultiplier }),
-		...(group.distanceTerm === undefined ? {} : { distance_term: group.distanceTerm }),
-		...(group.area === undefined ? {} : { area: group.area }),
-		...(group.areaTerm === undefined ? {} : { area_term: group.areaTerm }),
-		...(group.tinyPenalty === undefined ? {} : { tiny_penalty: group.tinyPenalty }),
-		click_containment_bonus: group.clickContainmentBonus,
-		text_containment_bonus: group.textContainmentBonus,
-		...(group.textContainment === undefined ? {} : { text_containment: group.textContainment }),
-		...(group.endDocumentPenalty === undefined ? {} : { end_document_penalty: group.endDocumentPenalty }),
-		score: group.score,
-		group_order: {
-			index: groupIndex,
+	const groups = proposals.flatMap((proposal, proposalIndex) => proposal.forwardGroupScores
+		.slice(0, MAX_DEBUG_SYNCTEX_FORWARD_GROUPS_PER_PROPOSAL)
+		.map((group, groupIndex): ViewerHostDebugForwardGroup => ({
+			proposal: {
+				kind: proposal.kind,
+				provenance: proposal.provenance,
+				source_file: proposal.sourceFile,
+				line: proposal.line,
+				column: proposal.column,
+				rank: proposal.rank,
+				structural: proposal.structural,
+				...(proposal.textStatus === undefined ? {} : { text_status: proposal.textStatus }),
+			},
+			proposal_selected: proposalIndex === 0,
+			proposal_order: {
+				index: proposalIndex,
+				geometry_tier: proposal.geometryTier,
+				total: proposal.score,
+				exact_lookup_preferred: proposal.forwardLookupMode === "exact",
+				same_page_box_count: proposal.samePageBoxCount,
+				rank: proposal.rank,
+				line: proposal.line,
+				source_file: proposal.sourceFile,
+			},
+			origin: group.origin,
+			lookup_line: group.lookupLine,
+			semantic_penalty: group.semanticPenalty,
+			pdf_text_span_semantic_penalty: group.pdfTextSpanSemanticPenalty,
+			selection_text_context_semantic_penalty: group.selectionTextContextSemanticPenalty,
+			blank_source_line_penalty: group.blankSourceLinePenalty,
+			original_box_count: group.originalBoxCount,
+			filtered_box_count: group.filteredBoxCount,
+			same_page_box_count: group.samePageBoxCount,
+			rejected_invalid: group.rejectedInvalid,
+			rejected_absurd: group.rejectedAbsurd,
+			contains_click: group.containsClick,
 			geometry_tier: group.geometryTier,
-			total: group.score,
-			exact_lookup_preferred: group.origin === "synctex_exact",
-		},
-		selected: proposalIndex === 0 && groupIndex === 0,
-		...(group.chosenBox === undefined ? {} : { chosen_box: group.chosenBox }),
-		box_score_count: group.boxScoreCount,
-		box_scores_truncated: group.boxScoresTruncated,
-		box_scores: group.boxScores.map((box, boxIndex) => ({
-			box: box.box,
-			contains_click: box.containsClick,
-			geometry_tier: box.geometryTier,
-			distance: box.distance,
-			distance_squared: box.distanceSquared,
-			distance_multiplier: box.distanceMultiplier,
-			distance_term: box.distanceTerm,
-			area: box.area,
-			area_term: box.areaTerm,
-			tiny_penalty: box.tinyPenalty,
-			semantic_penalty: box.semanticPenalty,
-			pdf_text_span_semantic_penalty: box.pdfTextSpanSemanticPenalty,
-			selection_text_context_semantic_penalty: box.selectionTextContextSemanticPenalty,
-			blank_source_line_penalty: box.blankSourceLinePenalty,
-			click_containment_bonus: box.clickContainmentBonus,
-			text_containment_bonus: box.textContainmentBonus,
-			...(box.textContainment === undefined ? {} : { text_containment: box.textContainment }),
-			end_document_penalty: box.endDocumentPenalty,
-			total: box.score,
-			order: boxIndex,
-			selected: boxIndex === 0,
-		})),
-	})));
+			...(group.distance === undefined ? {} : { distance: group.distance }),
+			...(group.distanceSquared === undefined ? {} : { distance_squared: group.distanceSquared }),
+			...(group.distanceMultiplier === undefined ? {} : { distance_multiplier: group.distanceMultiplier }),
+			...(group.distanceTerm === undefined ? {} : { distance_term: group.distanceTerm }),
+			...(group.area === undefined ? {} : { area: group.area }),
+			...(group.areaTerm === undefined ? {} : { area_term: group.areaTerm }),
+			...(group.tinyPenalty === undefined ? {} : { tiny_penalty: group.tinyPenalty }),
+			click_containment_bonus: group.clickContainmentBonus,
+			text_containment_bonus: group.textContainmentBonus,
+			...(group.textContainment === undefined ? {} : { text_containment: group.textContainment }),
+			...(group.endDocumentPenalty === undefined ? {} : { end_document_penalty: group.endDocumentPenalty }),
+			score: group.score,
+			group_order: {
+				index: groupIndex,
+				geometry_tier: group.geometryTier,
+				total: group.score,
+				exact_lookup_preferred: group.origin === "synctex_exact",
+			},
+			selected: proposalIndex === 0 && groupIndex === 0,
+			...(group.chosenBox === undefined ? {} : { chosen_box: protocolForwardRange(group.chosenBox) }),
+			box_score_count: group.boxScoreCount,
+			box_scores_truncated: group.boxScoresTruncated,
+			box_scores: group.boxScores.map((box, boxIndex) => ({
+				box: protocolForwardRange(box.box),
+				contains_click: box.containsClick,
+				geometry_tier: box.geometryTier,
+				distance: box.distance,
+				distance_squared: box.distanceSquared,
+				distance_multiplier: box.distanceMultiplier,
+				distance_term: box.distanceTerm,
+				area: box.area,
+				area_term: box.areaTerm,
+				tiny_penalty: box.tinyPenalty,
+				semantic_penalty: box.semanticPenalty,
+				pdf_text_span_semantic_penalty: box.pdfTextSpanSemanticPenalty,
+				selection_text_context_semantic_penalty: box.selectionTextContextSemanticPenalty,
+				blank_source_line_penalty: box.blankSourceLinePenalty,
+				click_containment_bonus: box.clickContainmentBonus,
+				text_containment_bonus: box.textContainmentBonus,
+				...(box.textContainment === undefined ? {} : { text_containment: box.textContainment }),
+				end_document_penalty: box.endDocumentPenalty,
+				total: box.score,
+				order: boxIndex,
+				selected: boxIndex === 0,
+				...(debugTreeCandidate(box.box) === undefined ? {} : { tree_candidate: debugTreeCandidate(box.box) }),
+			})),
+		})));
 	return groups.length === 0 ? {} : { debug_forward_groups: groups };
+}
+
+function debugAnnotationDiagnostics(reverse: Pick<ReturnType<typeof inspectReverseSynctexHover>, "debugProposalScores" | "repairedWinner">, forwardGroups: { debug_forward_groups?: ViewerHostDebugForwardGroup[] }): ViewerHostPdfAnnotationSynctexDiagnostics | undefined {
+	const proposals = reverse.debugProposalScores?.slice(0, MAX_DEBUG_SYNCTEX_PROPOSALS).map(debugProposalScore);
+	if (proposals === undefined || proposals.length === 0) return undefined;
+	return {
+		top_proposals: proposals,
+		...(reverse.repairedWinner?.score === undefined ? {} : { selected_score: reverse.repairedWinner.score }),
+		forward_groups: forwardGroups.debug_forward_groups ?? [],
+	};
 }
 
 function hoverResultDiagnostics(hover: ReturnType<typeof inspectReverseSynctexHover>): Partial<ViewerHostReverseSynctexHoverResultMessage> {
@@ -612,6 +688,9 @@ export function reverseSynctexForwardProbeResult(input: { message: ViewerHostRev
 		if (pdf.workspaceCwd === undefined || pdf.workspaceCwd === dirname(pdf.pdfPath)) throw error;
 		probe = mapReverseForwardSynctexProbe({ ...probeInput, cwd: dirname(pdf.pdfPath), ...(input.debugSynctex === true ? { debugTrace: true } : {}) });
 	}
+	const debugCandidates = input.debugSynctex === true ? debugCandidateDiagnostics(probe.reverse) : {};
+	const debugForwardGroups = input.debugSynctex === true ? debugForwardGroupDiagnostics(probe.reverse) : {};
+	const synctexDiagnostics = input.debugSynctex === true ? debugAnnotationDiagnostics(probe.reverse, debugForwardGroups) : undefined;
 	return {
 		type: "reverse_synctex_forward_probe_result",
 		pdf_id: message.pdf_id,
@@ -632,7 +711,9 @@ export function reverseSynctexForwardProbeResult(input: { message: ViewerHostRev
 		...(probe.forward.height === undefined ? {} : { height: probe.forward.height }),
 		...(probe.forward.ranges === undefined ? {} : { ranges: probe.forward.ranges }),
 		...(probe.forward.indicator === undefined ? {} : { indicator: probe.forward.indicator }),
-		...(input.debugSynctex === true ? { ...debugCandidateDiagnostics(probe.reverse), ...debugForwardGroupDiagnostics(probe.reverse) } : {}),
+		...debugCandidates,
+		...debugForwardGroups,
+		...(synctexDiagnostics === undefined ? {} : { synctex_diagnostics: synctexDiagnostics }),
 		source_file: probe.forward.sourceFile,
 		line: probe.forward.line,
 		source_line: probe.forward.sourceLine,

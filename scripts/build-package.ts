@@ -11,6 +11,7 @@ const tsRoots = [
 	"scripts/debug-forward-synctex.ts",
 	"src",
 ];
+const developmentOnlyOutputs = ["scripts/debug-viewer-synctex.js"];
 const copyRoots = ["src"];
 const ignoredDirectoryNames = new Set(["node_modules", ".git", "__pycache__", "dist"]);
 const ignoredExtensions = new Set([".pyc"]);
@@ -38,9 +39,23 @@ for (const root of copyRoots) {
 	}
 }
 
+for (const developmentOnlyOutput of developmentOnlyOutputs) {
+	if (existsInDist(developmentOnlyOutput)) {
+		throw new Error(`Development-only diagnostic runner must not be packaged: ${developmentOnlyOutput}`);
+	}
+}
+
 for (const bin of ["scripts/agent-synctex.js"]) {
 	const path = join(outDir, bin);
 	chmodSync(path, 0o755);
+}
+
+function existsInDist(relativePath: string): boolean {
+	try {
+		return statSync(join(outDir, relativePath)).isFile();
+	} catch {
+		return false;
+	}
 }
 
 function compileTypeScriptFile(path: string): void {

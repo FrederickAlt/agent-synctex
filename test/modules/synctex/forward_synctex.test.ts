@@ -420,6 +420,32 @@ test("robust reverse mapping uses every JS candidate as a proposal and lets lowe
 	}
 });
 
+test("reverse click scoring uses parsed-tree candidates before native forward SyncTeX", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	const sourcePath = project.sourcePath;
+	try {
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144,
+			y: 155,
+			cwd: project.dir,
+			inspectCandidates: () => ({
+				winner: { input: sourcePath, line: 3, column: 0, sourceLine: "First paragraph text that should wrap a little and create boxes.", rect: { left: 140, top: 150, right: 160, bottom: 170 }, distanceX: 0, distanceY: 0, distance: 0, area: 400, containsClick: true, structural: false },
+				rawWinner: { input: sourcePath, line: 3, column: 0, sourceLine: "First paragraph text that should wrap a little and create boxes.", rect: { left: 140, top: 150, right: 160, bottom: 170 }, distanceX: 0, distanceY: 0, distance: 0, area: 400, containsClick: true, structural: false },
+				candidates: [{ input: sourcePath, line: 3, column: 0, sourceLine: "First paragraph text that should wrap a little and create boxes.", rect: { left: 140, top: 150, right: 160, bottom: 170 }, distanceX: 0, distanceY: 0, distance: 0, area: 400, containsClick: true, structural: false }],
+			}),
+			nativeRunner: () => {
+				throw new Error("reverse click scoring must not invoke native forward SyncTeX");
+			},
+		});
+		assert.equal(location.selectedForwardBox?.treeCandidate?.leaf.line, 3);
+		assert.ok(location.selectedForwardBox?.treeCandidate?.ancestors.length);
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("robust reverse mapping scores only exact structural boxes", () => {
 	const dir = mkdtempSync(join(tmpdir(), "robust-reverse-structural-box-pool-"));
 	try {
@@ -1258,7 +1284,7 @@ test("robust reverse mapping selects the top scored proposal when no proposal ha
 	}
 });
 
-test("reverse-forward probe default path uses robust text context for forward SyncTeX", () => {
+test("reverse-forward probe uses the parsed-tree click candidate selected by text context", () => {
 	const project = makeFixtureProject({ sidecar: "synctex" });
 	try {
 		const forwardLines: number[] = [];
@@ -1272,15 +1298,15 @@ test("reverse-forward probe default path uses robust text context for forward Sy
 			textAfterSelection: "",
 			mapForward: (input) => {
 				forwardLines.push(input.line);
-				assert.equal(input.line, 3);
+				assert.equal(input.line, 5);
 				assert.equal(input.lookupMode, "exact");
-				return { page: 1, x: 90, y: 190, ranges: [{ page: 1, h: 90, v: 190, W: 20, H: 10 }], sourceFile: input.sourceFile, line: input.line, sourceLine: "First paragraph text that should wrap a little and create boxes.", sidecarPath: join(project.dir, "paper.synctex"), branch: "js_fallback", diagnostics: { branch: "js_fallback", lookupInput: { pdfPath: project.pdfPath, sourceFile: input.sourceFile, line: input.line, sidecarPath: join(project.dir, "paper.synctex") }, native: { command: "synctex", args: [], cwd: project.dir, parsedRectangles: [] }, jsFallback: { attempted: true } } };
+				return { page: 1, x: 90, y: 190, ranges: [{ page: 1, h: 90, v: 190, W: 20, H: 10 }], sourceFile: input.sourceFile, line: input.line, sourceLine: "Second paragraph text on a different source line for SyncTeX mapping.", sidecarPath: join(project.dir, "paper.synctex"), branch: "js_fallback", diagnostics: { branch: "js_fallback", lookupInput: { pdfPath: project.pdfPath, sourceFile: input.sourceFile, line: input.line, sidecarPath: join(project.dir, "paper.synctex") }, native: { command: "synctex", args: [], cwd: project.dir, parsedRectangles: [] }, jsFallback: { attempted: true } } };
 			},
 		});
-		assert.deepEqual(forwardLines, [3]);
-		assert.equal(probe.reverse.line, 3);
-		assert.equal(probe.reverse.precision, "line");
-		assert.equal(probe.forward.line, 3);
+		assert.deepEqual(forwardLines, [5]);
+		assert.equal(probe.reverse.line, 5);
+		assert.equal(probe.reverse.precision, "verified");
+		assert.equal(probe.forward.line, 5);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -1800,7 +1826,7 @@ test("reverse SyncTeX defaults to JS reverse lookup when candidate proposal scor
 			},
 		});
 
-		assert.equal(nativeCalls > 0, true);
+		assert.equal(nativeCalls, 0);
 		assert.equal(location.sourceFile, project.sourcePath);
 		assert.equal(location.line, 3);
 		assert.equal(location.column, 0);
@@ -2317,7 +2343,7 @@ test("reverse SyncTeX adapter does not treat escaped closing braces as formula-s
 	}
 });
 
-test("reverse SyncTeX adapter matches nested same-environment closes to the nearest opener", () => {
+test("reverse SyncTeX adapter scores nested same-environment close candidates from the parsed tree", () => {
 	const project = makeFixtureProject({ sidecar: "synctex.gz" });
 	try {
 		writeFileSync(project.sourcePath, [
@@ -2332,9 +2358,9 @@ test("reverse SyncTeX adapter matches nested same-environment closes to the near
 
 		const location = mapReverseSynctex({ pdfPath: project.pdfPath, page: 1, x: 144.27, y: 167.27, cwd: project.dir, nativeRunner: failNativeRunner });
 
-		assert.equal(location.line, 5);
-		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 3, endLine: 5 });
-		assert.equal(location.normalizedSourceExcerpt, "\\begin{equation}\ninner\n\\end{equation}");
+		assert.equal(location.line, 6);
+		assert.equal(Object.hasOwn(location, "normalizedSourceSpan"), false);
+		assert.equal(Object.hasOwn(location, "normalizedSourceExcerpt"), false);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -2375,13 +2401,14 @@ test("reverse SyncTeX adapter uses LaTeX-Workshop selection context to correct c
 		assert.equal(location.diagnostics.context.hasSelectionContext, true);
 		assert.equal(location.diagnostics.context.textBeforeSelection, "First paragraph");
 		assert.deepEqual(location.diagnostics.candidates.map((candidate) => candidate.kind), ["initial_candidate", "context_corrected"]);
-		assert.deepEqual(location.diagnostics.selected, {
+		assert.deepEqual({ ...location.diagnostics.selected, score: undefined }, {
 			sourceFile: project.sourcePath,
 			line: 3,
 			column: 6,
 			sourceLine: "First paragraph text that should wrap a little and create boxes.",
-			score: 0,
+			score: undefined,
 		});
+		assert.equal((location.diagnostics.selected.score ?? 0) < 0, true);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -2404,13 +2431,14 @@ test("reverse SyncTeX adapter leaves no-context fallback mapping unchanged", () 
 		assert.equal(location.column, 0);
 		assert.equal(location.diagnostics.context.hasSelectionContext, false);
 		assert.deepEqual(location.diagnostics.candidates.map((candidate) => candidate.kind), ["initial_candidate"]);
-		assert.deepEqual(location.diagnostics.selected, {
+		assert.deepEqual({ ...location.diagnostics.selected, score: undefined }, {
 			sourceFile: project.sourcePath,
 			line: 3,
 			column: 0,
 			sourceLine: "First paragraph text that should wrap a little and create boxes.",
-			score: 0,
+			score: undefined,
 		});
+		assert.equal((location.diagnostics.selected.score ?? 0) < 0, true);
 	} finally {
 		rmSync(project.dir, { recursive: true, force: true });
 	}
@@ -2438,17 +2466,18 @@ test("reverse SyncTeX hover without text context reports top proposal diagnostic
 		});
 
 		assert.equal(hover.sourceFile, project.sourcePath);
-		assert.equal(hover.line, 3);
-		assert.equal(hover.sourceLine, "\\end{document}");
+		assert.equal(hover.line, 4);
+		assert.equal(hover.sourceLine, "% filler");
 		assert.equal(hover.precision, "line");
-		assert.deepEqual(hover.repairedWinner, {
+		assert.deepEqual({ ...hover.repairedWinner, score: undefined }, {
 			sourceFile: project.sourcePath,
-			line: 3,
+			line: 4,
 			column: 0,
-			sourceLine: "\\end{document}",
+			sourceLine: "% filler",
 			precision: "line",
-			score: 0,
+			score: undefined,
 		});
+		assert.equal((hover.repairedWinner?.score ?? 0) < 0, true);
 		assert.equal((hover.rawWinner as { line?: number; structural?: boolean; sourceLine?: string }).line, 3);
 		assert.equal((hover.rawWinner as { line?: number; structural?: boolean; sourceLine?: string }).structural, true);
 		assert.equal((hover.rawWinner as { line?: number; structural?: boolean; sourceLine?: string }).sourceLine, "\\end{document}");

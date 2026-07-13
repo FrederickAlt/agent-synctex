@@ -43,8 +43,6 @@ export interface ForwardVerifiedSourceMatch {
 
 const DEFAULT_MAX_TEXT_MATCHES_FOR_FORWARD_VERIFICATION = 5;
 const MIN_USEFUL_FRAGMENT_LENGTH = 3;
-const ABSURD_BOX_AREA = 200_000;
-const ABSURD_BOX_SIDE = 500;
 
 function normalizeWhitespace(value: string): string {
 	return value.replace(/\s+/g, " ").trim();
@@ -132,15 +130,6 @@ function isValidBox(box: ForwardSynctexRange): boolean {
 	return [box.page, box.h, box.v, box.W, box.H].every(Number.isFinite) && box.W > 0 && box.H > 0;
 }
 
-function isAbsurdBox(box: ForwardSynctexRange): boolean {
-	return boxArea(box) >= ABSURD_BOX_AREA || box.W >= ABSURD_BOX_SIDE || box.H >= ABSURD_BOX_SIDE;
-}
-
-/** A broad container is retained only as fallback geometry, never as tight evidence. */
-export function forwardBoxGeometryTier(box: ForwardSynctexRange): number {
-	return isAbsurdBox(box) ? 1 : 0;
-}
-
 export function boxContainsClick(box: ForwardSynctexRange, click: PdfClickPoint): boolean {
 	return box.page === click.page
 		&& click.x >= box.h
@@ -178,14 +167,12 @@ export function filterForwardBoxes(boxes: ForwardSynctexRange[], click: PdfClick
 	const valid = boxes.filter(isValidBox);
 	const samePage = valid.filter((box) => box.page === click.page);
 	const pagePreferred = samePage.length > 0 ? samePage : valid;
-	const nonAbsurd = pagePreferred.filter((box) => !isAbsurdBox(box));
-	const usable = nonAbsurd.length > 0 ? nonAbsurd : pagePreferred;
-	const sorted = [...usable].sort(compareBoxes(click));
+	const sorted = [...pagePreferred].sort(compareBoxes(click));
 	return {
 		boxes: sorted,
 		...(sorted[0] === undefined ? {} : { chosenBox: sorted[0] }),
 		rejectedInvalid: boxes.length - valid.length,
-		rejectedAbsurd: pagePreferred.length - usable.length,
+		rejectedAbsurd: 0,
 	};
 }
 

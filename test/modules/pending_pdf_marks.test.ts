@@ -72,6 +72,20 @@ test("subset acknowledgement releases unrendered marks for the next consumer", (
 	assert.deepEqual(store.claim().marks.map((entry) => entry.annotation_id), ["not-shown"]);
 });
 
+test("pending PDF marks deep-copy SyncTeX debug diagnostics", () => {
+	const store = new PendingPdfMarkStore();
+	const diagnostics = {
+		top_proposals: [{ source_file: "/tmp/1.tex", line: 1, score: -100 }],
+		forward_groups: [],
+	} as unknown as NonNullable<ViewerHostPdfAnnotationMessage["synctex_diagnostics"]>;
+	const input = { ...mark(1, "debug", "trace"), synctex_diagnostics: diagnostics };
+	store.upsert(input);
+	diagnostics.top_proposals[0]!.score = 999;
+
+	const claimed = store.claim().marks[0];
+	assert.equal(claimed?.synctex_diagnostics?.top_proposals[0]?.score, -100);
+});
+
 test("pending PDF marks retain only successfully reconciled annotations", () => {
 	const store = new PendingPdfMarkStore();
 	store.upsert(mark(1, "keep", "before"));

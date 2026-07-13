@@ -204,6 +204,7 @@ function copyMark(mark: ViewerHostPdfAnnotationMessage): ViewerHostPdfAnnotation
 		...mark,
 		...(mark.source_spans === undefined ? {} : { source_spans: mark.source_spans.map((span) => ({ ...span })) }),
 		...(mark.source_span === undefined ? {} : { source_span: { ...mark.source_span } }),
+		...(mark.synctex_diagnostics === undefined ? {} : { synctex_diagnostics: structuredClone(mark.synctex_diagnostics) }),
 	};
 }
 

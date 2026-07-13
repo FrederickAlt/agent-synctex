@@ -61,6 +61,7 @@ export function pdfAnnotationEventsFromViewerMarks(
 		...(mark.source_spans === undefined ? {} : { source_spans: mark.source_spans.map((span) => ({ ...span })) }),
 		...(mark.source_span === undefined ? {} : { source_span: { ...mark.source_span } }),
 		...(mark.source_stale === true ? { source_stale: true } : {}),
+			...(mark.synctex_diagnostics === undefined ? {} : { synctex_diagnostics: structuredClone(mark.synctex_diagnostics) }),
 		page: mark.page,
 		x: mark.x,
 		y: mark.y,
@@ -106,11 +107,42 @@ function formatPdfAnnotationContextResult(events: PdfAnnotationEvent[], options:
 			}
 		}
 		if (sourceBudgetOmitted) lines.push("  (source excerpt omitted: 50-source-line total budget per annotation exhausted)");
+			formatSynctexDiagnostics(event, lines);
 		if (comment !== undefined && comment !== "") {
 			lines.push("  Messages:", `  - ${comment.replace(/\n/g, "\n    ")}`);
 		}
 	}
 	return { text: lines.join("\n"), events };
+}
+
+const MAX_FORMATTED_SYNCTEX_DEBUG_PROPOSALS = 3;
+const MAX_FORMATTED_SYNCTEX_DEBUG_GROUPS = 12;
+const MAX_FORMATTED_SYNCTEX_DEBUG_BOXES = 4;
+
+function formatSynctexDiagnostics(event: PdfAnnotationEvent, lines: string[]): void {
+	const diagnostics = event.synctex_diagnostics;
+	if (diagnostics === undefined) return;
+	lines.push("  SyncTeX debug diagnostics (bounded):");
+	if (diagnostics.selected_score !== undefined) lines.push(`  - selected proposal score: ${formatDebugNumber(diagnostics.selected_score)}`);
+	for (const [index, proposal] of diagnostics.top_proposals.slice(0, MAX_FORMATTED_SYNCTEX_DEBUG_PROPOSALS).entries()) {
+		lines.push(`  - top proposal #${index + 1}: ${proposal.source_file}:${proposal.line}:${proposal.column}; provenance=${proposal.provenance}; score=${formatDebugNumber(proposal.score)}; tier=${proposal.geometry_tier}; precision=${proposal.precision}`);
+	}
+	if (diagnostics.top_proposals.length > MAX_FORMATTED_SYNCTEX_DEBUG_PROPOSALS) lines.push(`  - (top proposals truncated to ${MAX_FORMATTED_SYNCTEX_DEBUG_PROPOSALS})`);
+	for (const [groupIndex, group] of diagnostics.forward_groups.slice(0, MAX_FORMATTED_SYNCTEX_DEBUG_GROUPS).entries()) {
+		lines.push(`  - forward group ${group.selected ? "* " : ""}#${groupIndex + 1}: ${group.origin} lookup line ${group.lookup_line}; proposal=${group.proposal.provenance}; score=${formatDebugNumber(group.score)}; tier=${group.geometry_tier}; boxes=${group.box_scores.length}/${group.box_score_count}`);
+		for (const [boxIndex, boxScore] of group.box_scores.slice(0, MAX_FORMATTED_SYNCTEX_DEBUG_BOXES).entries()) {
+			const box = boxScore.box;
+			lines.push(`    - box ${boxScore.selected ? "* " : ""}#${boxIndex + 1}: page ${box.page} [${formatDebugNumber(box.h)}, ${formatDebugNumber(box.v)}, ${formatDebugNumber(box.W)}, ${formatDebugNumber(box.H)}]; score=${formatDebugNumber(boxScore.total)}; terms distance=${formatDebugNumber(boxScore.distance_term)}, area=${formatDebugNumber(boxScore.area_term)}, tiny=${formatDebugNumber(boxScore.tiny_penalty)}, semantic=${formatDebugNumber(boxScore.semantic_penalty)}, blank=${formatDebugNumber(boxScore.blank_source_line_penalty)}, click=${formatDebugNumber(boxScore.click_containment_bonus)}, text=${formatDebugNumber(boxScore.text_containment_bonus)}, end=${formatDebugNumber(boxScore.end_document_penalty)}`);
+			const treeCandidate = boxScore.tree_candidate;
+			if (treeCandidate !== undefined) lines.push(`      parsed tree: leaf ${treeCandidate.leaf.source_file}:${treeCandidate.leaf.line}; box ${treeCandidate.box.type}; ancestors=${treeCandidate.ancestors.length}${treeCandidate.ancestors_truncated === true ? "+" : ""}`);
+		}
+		if (group.box_scores.length > MAX_FORMATTED_SYNCTEX_DEBUG_BOXES) lines.push(`    - (box scores truncated to ${MAX_FORMATTED_SYNCTEX_DEBUG_BOXES})`);
+	}
+	if (diagnostics.forward_groups.length > MAX_FORMATTED_SYNCTEX_DEBUG_GROUPS) lines.push(`  - (forward groups truncated to ${MAX_FORMATTED_SYNCTEX_DEBUG_GROUPS})`);
+}
+
+function formatDebugNumber(value: number): string {
+	return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/\.?(?:0+)$/, "");
 }
 
 function sourceSpansForAnnotation(event: PdfAnnotationEvent): Array<{ source_file: string; start_line: number; end_line: number }> {

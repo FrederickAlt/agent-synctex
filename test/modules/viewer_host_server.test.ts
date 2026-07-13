@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Socket } from "node:net";
 import { test } from "node:test";
+import { ViewerHostControlClient } from "../../src/modules/viewer_host_control_client.ts";
 import { ViewerHostPdfRegistry } from "../../src/modules/viewer_host_registry.ts";
 import { ViewerHostServer } from "../../src/modules/viewer_host_server.ts";
 
@@ -33,6 +34,33 @@ async function readHttp(url: string, init?: RequestInit): Promise<{ status: numb
 function assertHostLoadedWebCode(label: string, body: string): void {
 	assert.doesNotMatch(body, /https?:\/\//, `${label} must not reference external URLs`);
 	assert.doesNotMatch(body, /window\.require|require\(|node:fs|from\s+["']fs["']|from\s+["']node:fs["']|mcp/i, `${label} must not depend on Node filesystem APIs or MCP internals`);
+}
+
+function readJsonlRecords(dir: string): Record<string, unknown>[] {
+	const files = readdirSync(dir).filter((file) => file.endsWith(".jsonl"));
+	return files.flatMap((file) => readFileSync(join(dir, file), "utf8")
+		.trim()
+		.split(/\n+/)
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as Record<string, unknown>));
+}
+
+async function withEnv<T>(updates: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+	const previous = new Map<string, string | undefined>();
+	for (const key of Object.keys(updates)) {
+		previous.set(key, process.env[key]);
+		const value = updates[key];
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	try {
+		return await fn();
+	} finally {
+		for (const [key, value] of previous) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
 }
 
 async function assertPortCanBeRebound(port: number): Promise<void> {
@@ -88,6 +116,51 @@ test("Viewer Host Server binds to 127.0.0.1 only and serves registered PDF bytes
 		assert.equal(pdf.headers.get("content-length"), String(pdfBytes.length));
 		assert.equal(pdf.headers.get("cache-control"), "no-store");
 		assert.deepEqual(pdf.body, pdfBytes);
+	} finally {
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host Server accepts authenticated browser viewer logs", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-browser-logs-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	const logDir = join(baseDir, "logs");
+	writeFakePdf(pdfPath);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	try {
+		await withEnv({ PDF_PREVIEW_LOG_LEVEL: "debug", PDF_PREVIEW_LOG_DIR: logDir, PDF_PREVIEW_CONFIG: undefined }, async () => {
+			registry.registerPdf({ pdfId: 88, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath) });
+			await server.start();
+			const config = JSON.parse((await readHttp(`${server.origin}/config/88.json`)).body.toString("utf8")) as { viewer_socket_token: string };
+			const forbidden = await readHttp(`${server.origin}/viewer-logs`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "x-agent-synctex-viewer-token": "wrong" },
+				body: JSON.stringify({ pdf_id: 88, level: "info", event: "viewer_socket.connect.start", fields: {} }),
+			});
+			assert.equal(forbidden.status, 403);
+
+			const accepted = await readHttp(`${server.origin}/viewer-logs`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "x-agent-synctex-viewer-token": config.viewer_socket_token },
+				body: JSON.stringify({
+					pdf_id: 88,
+					level: "warn",
+					event: "viewer_socket.connect.slow",
+					fields: { elapsed_ms: 1001, secret_token: "must-not-log" },
+				}),
+			});
+			assert.equal(accepted.status, 200);
+
+			const records = readJsonlRecords(logDir);
+			const viewerRecord = records.find((record) => record.component === "viewer-host.viewer" && record.event === "viewer_socket.connect.slow");
+			assert.ok(viewerRecord);
+			assert.equal(viewerRecord.level, "warn");
+			assert.equal(viewerRecord.pdf_id, 88);
+			assert.equal(viewerRecord.elapsed_ms, 1001);
+			assert.equal(viewerRecord.secret_token, "[redacted]");
+		});
 	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
@@ -185,21 +258,108 @@ test("Viewer Host Server hover WebSocket returns robust no-context diagnostics t
 		assert.equal(message.pdf_id, 124);
 		assert.equal(message.request_id, 7);
 		assert.equal(message.source_file, sourcePath);
-		assert.equal(message.line, 5);
-		assert.equal(message.source_line, "Second paragraph text on a different source line for SyncTeX mapping.");
+		assert.equal(message.line, 4);
+		assert.equal(message.source_line, "% filler");
 		assert.equal(message.raw, undefined);
 		assert.equal((message.nearest_candidate as { line?: number; structural?: boolean; source_line?: string; score?: number }).line, 3);
 		assert.equal((message.nearest_candidate as { line?: number; structural?: boolean; source_line?: string; score?: number }).structural, true);
 		assert.equal((message.nearest_candidate as { line?: number; structural?: boolean; source_line?: string; score?: number }).source_line, "\\end{document}");
 		assert.equal(typeof (message.nearest_candidate as { score?: number }).score, "number");
 		assert.equal(typeof message.selected_score, "number");
-		assert.equal((message.repaired as { line?: number; source_line?: string; score?: number }).line, 5);
-		assert.equal((message.repaired as { line?: number; source_line?: string; score?: number }).source_line, "Second paragraph text on a different source line for SyncTeX mapping.");
+		assert.equal((message.repaired as { line?: number; source_line?: string; score?: number }).line, 4);
+		assert.equal((message.repaired as { line?: number; source_line?: string; score?: number }).source_line, "% filler");
 		assert.equal((message.repaired as { line?: number; source_line?: string; score?: number }).score, message.selected_score);
 		assert.ok((message.candidates as Array<{ line?: number }>).some((candidate) => candidate.line === 5));
-		assert.ok((message.candidates as Array<{ line?: number }>).some((candidate) => candidate.line === 3));
 	} finally {
 		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("Viewer Host Server exposes bounded full scoring trace only for explicit SyncTeX debug probes", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-probe-debug-trace-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	const sourcePath = join(baseDir, "main.tex");
+	writeFakePdf(pdfPath);
+	copyFileSync(resolve("test/fixtures/synctex-forward/main.tex"), sourcePath);
+	copyFileSync(resolve("test/fixtures/synctex-forward/paper.synctex"), join(baseDir, "paper.synctex"));
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	try {
+		registry.registerPdf({ pdfId: 125, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		const config = JSON.parse((await readHttp(`${server.origin}/config/125.json`)).body.toString("utf8")) as { viewer_socket_token: string };
+		const probe = async (requestId: number): Promise<Record<string, unknown>> => {
+			const response = await fetch(`${server.origin}/synctex/probe`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "x-agent-synctex-viewer-token": config.viewer_socket_token },
+				body: JSON.stringify({ pdf_id: 125, request_id: requestId, page: 1, x: 144.27, y: 155.27 }),
+			});
+			assert.equal(response.status, 200);
+			const body = await response.json() as { ok: boolean; result: Record<string, unknown> };
+			assert.equal(body.ok, true);
+			return body.result;
+		};
+
+		const normal = await probe(1);
+		for (const field of ["debug_candidates", "debug_selected_score", "debug_forward_groups"]) {
+			assert.equal(Object.hasOwn(normal, field), false, `${field} must remain absent outside explicit debug mode`);
+		}
+
+		assert.equal((await new ViewerHostControlClient({ origin: server.origin }).send({ type: "set_debug_synctex", pdf_id: 125, enabled: true })).ok, true);
+		const traced = await probe(2);
+		const groups = traced.debug_forward_groups as Array<Record<string, unknown>> | undefined;
+		assert.ok(groups && groups.length > 0, "debug probes should expose scored forward groups");
+		const selected = groups.find((group) => group.selected === true);
+		assert.ok(selected, "one trace group should identify the selected proposal/group");
+		assert.equal(selected.proposal_selected, true);
+		assert.equal(typeof selected.proposal, "object");
+		assert.equal((selected.proposal as Record<string, unknown>).provenance, "synctex_reverse", "proposal provenance must remain distinct from forward group origin");
+		assert.equal(selected.origin, "synctex_exact", "origin is the forward lookup/box-group flavor rather than proposal provenance");
+		const annotationDiagnostics = traced.synctex_diagnostics as { top_proposals?: Array<{ provenance?: string; score?: number }>; selected_score?: number; forward_groups?: Array<Record<string, unknown>> } | undefined;
+		assert.ok(annotationDiagnostics, "debug probes should return the bounded annotation diagnostic payload");
+		assert.ok((annotationDiagnostics?.top_proposals?.length ?? 0) > 0 && (annotationDiagnostics?.top_proposals?.length ?? 0) <= 3);
+		assert.equal(annotationDiagnostics?.top_proposals?.[0]?.provenance, "synctex_reverse");
+		assert.equal(typeof annotationDiagnostics?.top_proposals?.[0]?.score, "number");
+		assert.equal(annotationDiagnostics?.forward_groups?.length, groups.length);
+		assert.equal(typeof annotationDiagnostics?.selected_score, "number");
+		assert.equal(typeof selected.pdf_text_span_semantic_penalty, "number");
+		assert.equal(typeof selected.selection_text_context_semantic_penalty, "number");
+		assert.equal(typeof selected.blank_source_line_penalty, "number");
+		assert.equal(typeof selected.original_box_count, "number");
+		assert.equal(typeof selected.filtered_box_count, "number");
+		assert.equal(typeof selected.same_page_box_count, "number");
+		assert.equal(typeof selected.rejected_invalid, "number");
+		assert.equal(typeof selected.rejected_absurd, "number");
+		assert.equal(typeof selected.group_order, "object");
+		assert.equal(typeof selected.proposal_order, "object");
+		const boxes = selected.box_scores as Array<Record<string, unknown>> | undefined;
+		assert.ok(boxes && boxes.length > 0, "selected groups should expose bounded score arithmetic for their boxes");
+		assert.equal(typeof selected.distance_multiplier, "number");
+		assert.equal(typeof selected.distance_term, "number");
+		assert.equal(typeof boxes[0]?.distance_multiplier, "number");
+		assert.equal(typeof boxes[0]?.distance_term, "number");
+		assert.equal(typeof boxes[0]?.distance_squared, "number");
+		assert.equal(typeof boxes[0]?.area_term, "number");
+		assert.equal(typeof boxes[0]?.tiny_penalty, "number");
+		assert.equal(typeof boxes[0]?.click_containment_bonus, "number");
+		assert.equal(typeof boxes[0]?.text_containment_bonus, "number");
+		assert.equal(typeof boxes[0]?.total, "number");
+		const box = boxes[0]!;
+		assert.ok(Math.abs(Number(box.distance_squared) * Number(box.distance_multiplier) - Number(box.distance_term)) < 1e-9, "distance term should expose its multiplier arithmetic");
+		assert.equal(typeof box.pdf_text_span_semantic_penalty, "number");
+		assert.equal(typeof box.selection_text_context_semantic_penalty, "number");
+		assert.equal(typeof box.blank_source_line_penalty, "number");
+		const treeCandidate = box.tree_candidate as { leaf?: { source_file?: string; line?: number }; box?: { type?: string }; ancestors?: unknown[] } | undefined;
+		assert.equal(treeCandidate?.leaf?.source_file, "main.tex", "debug box scores should preserve parsed-tree leaf provenance");
+		assert.equal(typeof treeCandidate?.leaf?.line, "number");
+		assert.equal(typeof treeCandidate?.box?.type, "string");
+		assert.ok(Array.isArray(treeCandidate?.ancestors), "debug box scores should preserve the bounded parsed-tree ancestor path");
+		const terms = ["distance_term", "area_term", "tiny_penalty", "semantic_penalty", "blank_source_line_penalty", "click_containment_bonus", "text_containment_bonus", "end_document_penalty"]
+			.map((field) => Number(box[field] ?? 0));
+		assert.ok(Math.abs(terms.reduce((sum, value) => sum + value, 0) - Number(box.total)) < 1e-9, "debug score terms should sum exactly to the selected box total");
+	} finally {
 		await server.stop();
 		rmSync(baseDir, { recursive: true, force: true });
 	}

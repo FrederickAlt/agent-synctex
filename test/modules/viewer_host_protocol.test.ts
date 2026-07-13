@@ -55,6 +55,86 @@ test("Viewer Host protocol validates representative Host to MCP messages", () =>
 	}
 });
 
+test("Viewer Host protocol retains bounded SyncTeX diagnostics on PDF annotations", () => {
+	const diagnostics = {
+		top_proposals: [{
+			kind: "ranked", provenance: "synctex_reverse", source_file: "/tmp/main.tex", line: 42, column: 0, rank: 0, structural: false,
+			geometry_tier: 0, score: -900, precision: "verified", same_page_box_count: 1, contains_click: true,
+			click_containment_bonus: -1000, text_containment_bonus: 0, forward_lookup_mode: "exact",
+		}],
+		selected_score: -900,
+		forward_groups: [{
+			proposal: { kind: "ranked", provenance: "synctex_reverse", source_file: "/tmp/main.tex", line: 42, column: 0, rank: 0, structural: false },
+			proposal_selected: true,
+			proposal_order: { index: 0, geometry_tier: 0, total: -900, exact_lookup_preferred: true, same_page_box_count: 1, rank: 0, line: 42, source_file: "/tmp/main.tex" },
+			origin: "synctex_exact",
+			lookup_line: 42,
+			semantic_penalty: 0,
+			pdf_text_span_semantic_penalty: 0,
+			selection_text_context_semantic_penalty: 0,
+			blank_source_line_penalty: 0,
+			original_box_count: 1,
+			filtered_box_count: 1,
+			same_page_box_count: 1,
+			rejected_invalid: 0,
+			rejected_absurd: 0,
+			contains_click: true,
+			geometry_tier: 0,
+			click_containment_bonus: -1000,
+			text_containment_bonus: 0,
+			score: -900,
+			group_order: { index: 0, geometry_tier: 0, total: -900, exact_lookup_preferred: true },
+			selected: true,
+			box_score_count: 1,
+			box_scores_truncated: false,
+			box_scores: [{
+				box: { page: 2, h: 10, v: 20, W: 30, H: 4 },
+				contains_click: true,
+				geometry_tier: 0,
+				distance: 0,
+				distance_squared: 0,
+				distance_multiplier: 0.96,
+				distance_term: 0,
+				area: 120,
+				area_term: 2,
+				tiny_penalty: 0,
+				semantic_penalty: 0,
+				pdf_text_span_semantic_penalty: 0,
+				selection_text_context_semantic_penalty: 0,
+				blank_source_line_penalty: 0,
+				click_containment_bonus: -1000,
+				text_containment_bonus: 0,
+				end_document_penalty: 0,
+				total: -998,
+				order: 0,
+				selected: true,
+				tree_candidate: {
+					leaf: { page: 2, source_file: "/tmp/main.tex", line: 42, h: 10, v: 20, W: 30, H: 4 },
+					box: { type: "hbox", page: 2, source_file: "/tmp/main.tex", line: 42, h: 10, v: 20, W: 30, H: 4 },
+					ancestors: [{ type: "vbox", page: 2, source_file: "/tmp/main.tex", line: 42, h: 0, v: 30, W: 100, H: 20 }],
+				},
+			}],
+		}],
+	};
+	const message = {
+		type: "pdf_annotation",
+		pdf_id: 123,
+		annotation_id: "debug-a1",
+		page: 2,
+		x: 100,
+		y: 500,
+		source_file: "/tmp/main.tex",
+		line: 42,
+		synctex_diagnostics: diagnostics,
+	};
+
+	assert.deepEqual(validateViewerHostToMcpMessage(message), message);
+	assertValidationError(() => validateViewerHostToMcpMessage({
+		...message,
+		synctex_diagnostics: { ...diagnostics, top_proposals: Array.from({ length: 4 }, () => diagnostics.top_proposals[0]) },
+	}), /synctex_diagnostics\.top_proposals/);
+});
+
 test("Viewer Host protocol module stays framework-neutral", () => {
 	const source = readFileSync("src/modules/viewer_host_protocol.ts", "utf8");
 	assert.doesNotMatch(source, /from ["'][^"']*(pdfjs|browser|dom)[^"']*["']/i);

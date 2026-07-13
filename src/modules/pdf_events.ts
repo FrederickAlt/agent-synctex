@@ -1,3 +1,5 @@
+import type { ViewerHostPdfAnnotationSynctexDiagnostics } from "./viewer_host_protocol.ts";
+
 export interface ReverseSynctexSourceSpanEvent {
 	source_file: string;
 	start_line: number;
@@ -69,6 +71,8 @@ export interface PdfAnnotationEventInput {
 	page: number;
 	x: number;
 	y: number;
+	/** Bounded SyncTeX trace retained from an explicit debug reverse-forward probe. */
+	synctex_diagnostics?: ViewerHostPdfAnnotationSynctexDiagnostics;
 	comment?: string;
 }
 

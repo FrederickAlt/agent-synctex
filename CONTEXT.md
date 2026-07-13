@@ -303,6 +303,18 @@ Callers:
 - `ViewerHostMcpService` reverse-event handling uses `reverseSynctexPdfEventFromViewerMessage`.
 - `ViewerHostServer` uses `reverseSynctexHoverResult` in its hover socket handler and `reverseSynctexForwardProbeResult` in its authenticated `/synctex/probe` HTTP handler.
 
+### Development viewer diagnostics
+
+Use the development-only real-viewer runner to reproduce reverse SyncTeX marking decisions through PDF.js and the unmocked Viewer Host probe endpoint:
+
+```bash
+node scripts/debug-viewer-synctex.ts \
+  --pdf /path/document.pdf --out /tmp/synctex-debug \
+  --page 1 --x 250 --y 300
+```
+
+Coordinates force a mark at an arbitrary PDF point. Use `--text "visible phrase" [--page N]` to click a PDF.js text span, or `--interactive [--clicks N]` for headed manual clicks. The output directory contains private screenshots, a summary, and `viewer-synctex-diagnostic.json` with DOM hit geometry, probe payloads, candidate/group provenance, and score components. The runner is intentionally excluded from packaged production entrypoints and its artifacts may contain document and source text.
+
 ## Viewer events and agent-readable PDF events
 
 PDF event types and storage live in:

@@ -1376,7 +1376,7 @@ test("LaTeX Workshop viewer selection reverse SyncTeX payload preserves selected
 	}
 });
 
-test("LaTeX Workshop viewer annotation is active by default and hidden debug switch gates hover overlay", async () => {
+test("LaTeX Workshop viewer annotation is active by default and debug mode never renders hover overlays", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-hover-"));
 	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
 	const registry = new ViewerHostPdfRegistry();
@@ -1411,16 +1411,19 @@ test("LaTeX Workshop viewer annotation is active by default and hidden debug swi
 		await new ViewerHostControlClient({ origin: server.origin }).send({ type: "set_debug_synctex", pdf_id: 149, enabled: true });
 		await page.waitForFunction(() => document.body.dataset.hostLwDebugSynctexEnabled === "true", undefined, { timeout: 2_000 });
 		await page.mouse.move(point.clientX + 1, point.clientY + 1);
-		await page.waitForSelector("[data-reverse-synctex-hover='rect']", { state: "attached", timeout: 5_000 });
-		const overlay = await page.locator("[data-reverse-synctex-hover='rect']").evaluate((element) => ({
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		const overlay = await page.evaluate((() => {
+				const element = document.createElement("div");
+				return ({
 			width: Number.parseFloat((element as HTMLElement).style.width),
 			height: Number.parseFloat((element as HTMLElement).style.height),
 			pressed: document.getElementById("hostSynctexHoverButton")?.getAttribute("aria-pressed"),
 			debugEnabled: document.body.dataset.hostLwDebugSynctexEnabled,
+				})
 		}));
 		assert.equal(overlay.pressed, "true");
 		assert.equal(overlay.debugEnabled, "true");
-		assert.ok(overlay.width > 0 && overlay.height > 0, "hover result should render a visible overlay");
+		assert.equal(await page.locator("[data-reverse-synctex-hover='rect']").count(), 0, "debug mode must retain diagnostics without rendering a hover overlay");
 	} finally {
 		await browser?.close();
 		await server.stop();
@@ -1597,7 +1600,7 @@ test("interactive diagnostic capture forces PDF clicks past annotations without 
 	}
 });
 
-test("SyncTeX debug probe shows one selected forward-group box and Escape clears it", async () => {
+test("SyncTeX debug probes attach diagnostics to annotations without browser debug overlays", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-debug-forward-group-"));
 	const { pdfPath, sourcePath } = writeBrowserSynctexFixture(baseDir);
 	const registry = new ViewerHostPdfRegistry();
@@ -1615,7 +1618,12 @@ test("SyncTeX debug probe shows one selected forward-group box and Escape clears
 				type: "reverse_synctex_forward_probe_result", pdf_id: 259, request_id: body.request_id,
 				click_page: 1, click_x: 100, click_y: 100, page: 1, x: 40, y: 150, width: 20, height: 10,
 				ranges: [{ page: 1, h: 40, v: 150, W: 20, H: 10 }], source_file: sourcePath, line: 3, source_line: "fixture source",
-				debug_forward_groups: [
+				synctex_diagnostics: {
+						top_proposals: [{ source_file: sourcePath, line: 3, column: 0, score: 12, provenance: "synctex_reverse" }],
+						selected_score: 12,
+						forward_groups: [],
+					},
+					debug_forward_groups: [
 					{ origin: "synctex_exact", lookup_line: 3, semantic_penalty: 0, geometry_tier: 0, score: 12, selected: true, chosen_box: { page: 1, h: 40, v: 150, W: 20, H: 10 } },
 					{ origin: "pdf_text_span", lookup_line: 3, semantic_penalty: 0, geometry_tier: 0, score: 12, selected: false, chosen_box: { page: 1, h: 90, v: 150, W: 30, H: 10 } },
 				],
@@ -1626,10 +1634,20 @@ test("SyncTeX debug probe shows one selected forward-group box and Escape clears
 		const point = await lwCanvasPoint(page, 1, 120, 70);
 		await page.mouse.click(point.clientX, point.clientY);
 		const debugBoxes = page.locator("[data-synctex-probe-debug-box]");
-		await debugBoxes.waitFor({ state: "attached" });
-		assert.equal(await debugBoxes.count(), 1);
+		await page.waitForFunction(() => {
+				const annotationsByPdf = JSON.parse(localStorage.getItem("agent-synctex.pdfAnnotations") || "{}");
+				return Object.values(annotationsByPdf).some((annotations) => Array.isArray(annotations)
+					&& annotations.some((annotation) => annotation?.message?.synctex_diagnostics));
+			});
+		assert.equal(await debugBoxes.count(), 0, "debug probes must not render selected-box overlays");
 		const summary = page.locator("[data-synctex-probe-debug-summary]");
-		assert.match(await summary.textContent() ?? "", /pdf_text_span line 3 tier 0 penalty 0 score 12/);
+		assert.equal(await summary.count(), 0, "debug probes must not render score-summary overlays");
+			const diagnostics = await page.evaluate(() => {
+				const annotationsByPdf = JSON.parse(localStorage.getItem("agent-synctex.pdfAnnotations") || "{}");
+				return (Object.values(annotationsByPdf) as Array<Array<{ message?: { synctex_diagnostics?: unknown } }>>).flat().find((annotation) => annotation.message?.synctex_diagnostics)?.message?.synctex_diagnostics;
+			}) as { selected_score?: number; top_proposals?: Array<{ provenance?: string; score?: number }> } | undefined;
+			assert.equal(diagnostics?.selected_score, 12);
+			assert.deepEqual(diagnostics?.top_proposals?.[0], { source_file: sourcePath, line: 3, column: 0, score: 12, provenance: "synctex_reverse" });
 		await page.keyboard.press("Escape");
 		await page.waitForFunction(() => document.querySelectorAll("[data-synctex-probe-debug-box], [data-synctex-probe-debug-summary]").length === 0);
 	} finally {
@@ -1639,6 +1657,49 @@ test("SyncTeX debug probe shows one selected forward-group box and Escape clears
 	}
 });
 
+
+test("LaTeX Workshop debug probes submit their bounded trace with the annotation", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-debug-annotation-trace-"));
+	const { pdfPath } = writeBrowserSynctexFixture(baseDir);
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 263, pdfPath, title: "paper.pdf", revision: 1, fileSnapshot: snapshotPdf(pdfPath), workspaceCwd: baseDir });
+		await server.start();
+		await new ViewerHostControlClient({ origin: server.origin }).send({ type: "set_debug_synctex", pdf_id: 263, enabled: true });
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage();
+		await page.goto(`${server.origin}/viewer-lw/263`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		const point = await lwCanvasPoint(page, 1, 120, 70);
+		const responsePromise = page.waitForResponse((response) => new URL(response.url()).pathname === "/synctex/probe" && response.request().method() === "POST");
+		await page.mouse.click(point.clientX, point.clientY);
+		const probeResponse = await responsePromise;
+		const probe = await probeResponse.json() as { ok: boolean; result: { synctex_diagnostics?: unknown } };
+		assert.equal(probe.ok, true);
+		assert.ok(probe.result.synctex_diagnostics, "explicit debug probes should return an annotation trace");
+		await page.waitForFunction(() => {
+			const annotationsByPdf = JSON.parse(localStorage.getItem("agent-synctex.pdfAnnotations") || "{}");
+			return Object.values(annotationsByPdf).some((annotations) => Array.isArray(annotations)
+				&& annotations.some((annotation) => annotation?.message?.synctex_diagnostics));
+		});
+		assert.equal(await page.locator("[data-reverse-synctex-hover='rect'], [data-synctex-probe-debug-box], [data-synctex-probe-debug-summary]").count(), 0);
+
+		let marks: Array<{ synctex_diagnostics?: unknown }> = [];
+		for (let attempt = 0; attempt < 20 && marks.length === 0; attempt += 1) {
+			const claim = await (await fetch(`${server.origin}/marks/claim`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pdf_ids: [263] }) })).json() as { marks?: Array<{ synctex_diagnostics?: unknown }> };
+			marks = claim.marks ?? [];
+			if (marks.length === 0) await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		assert.equal(marks.length, 1, "debug-created annotation should enter pending marks");
+		assert.deepEqual(marks[0]?.synctex_diagnostics, probe.result.synctex_diagnostics);
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
 
 test("LaTeX Workshop viewer shows a SyncTeX capability banner when annotations cannot resolve", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-synctex-banner-"));
