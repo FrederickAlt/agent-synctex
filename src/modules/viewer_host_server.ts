@@ -204,6 +204,8 @@ export class ViewerHostServer {
 	private nextViewerMarkSnapshotRequestId = 1;
 	private visibleViewerTabs = new Map<number, ViewerTabEvent>();
 	private activeVisiblePdfId: number | undefined;
+	private pendingFocusPdfId: number | undefined;
+	private pendingSynctexForwardByPdfId = new Map<number, ViewerHostSynctexForwardMessage>();
 	private debugSynctexByPdfId = new Map<number, boolean>();
 	private pendingPdfRefreshSnapshots = new Map<number, PendingPdfRefreshSnapshot>();
 	private pdfRefreshDiagnostics = new Map<number, ViewerHostPdfRefreshDiagnostic>();
@@ -390,6 +392,8 @@ export class ViewerHostServer {
 		this.controlReady = false;
 		this.controlProtocolVersion = undefined;
 		this.visibleViewerTabs.clear();
+		this.pendingFocusPdfId = undefined;
+		this.pendingSynctexForwardByPdfId.clear();
 		this.debugSynctexByPdfId.clear();
 		this.mcpEvents.clear();
 		this.pendingPdfMarks.clear();
@@ -562,6 +566,8 @@ export class ViewerHostServer {
 		if (!payload) return;
 		const current = this.visibleViewerTabs.get(payload.pdf_id);
 		if (current?.revision === payload.revision && current.viewer_url === payload.viewer_url && current.visible_tab_token === payload.visible_tab_token) {
+			if (this.pendingFocusPdfId === payload.pdf_id) this.pendingFocusPdfId = undefined;
+			this.pendingSynctexForwardByPdfId.delete(payload.pdf_id);
 			this.visibleViewerTabs.delete(payload.pdf_id);
 			if (this.activeVisiblePdfId === payload.pdf_id) this.activeVisiblePdfId = this.lastVisibleViewerTab()?.pdf_id;
 			this.discardMcpEventsForPdfId(payload.pdf_id);
@@ -593,8 +599,14 @@ export class ViewerHostServer {
 		}
 		const selected = this.visibleViewerTabs.get(payload.pdf_id);
 		if (selected) {
+			if (this.pendingFocusPdfId !== undefined && this.pendingFocusPdfId !== payload.pdf_id) {
+				this.pendingSynctexForwardByPdfId.delete(this.pendingFocusPdfId);
+				this.pendingFocusPdfId = undefined;
+			}
+			if (this.pendingFocusPdfId === payload.pdf_id) this.pendingFocusPdfId = undefined;
 			this.activeVisiblePdfId = payload.pdf_id;
 			this.broadcastViewerEvent({ ...selected, type: "focus_pdf", active: true });
+			this.flushPendingSynctexForward(payload.pdf_id);
 			logger.info("viewer_tab.selected", { pdf_id: payload.pdf_id, revision: selected.revision });
 		}
 		textResponse(response, 200, "application/json; charset=utf-8", JSON.stringify({ ok: true }), false);
@@ -1169,8 +1181,12 @@ export class ViewerHostServer {
 			}
 			case "focus_pdf": {
 				const record = this.registry.getPdf(message.pdf_id);
+				const wasActive = this.activeVisiblePdfId === record.pdfId;
 				await this.viewerDispatch.focusPdf(record);
-					this.broadcastViewerTabEvent("focus_pdf", record);
+				if (this.pendingFocusPdfId !== undefined && this.pendingFocusPdfId !== record.pdfId) this.pendingSynctexForwardByPdfId.delete(this.pendingFocusPdfId);
+				this.pendingFocusPdfId = wasActive ? undefined : record.pdfId;
+				this.broadcastViewerTabEvent("focus_pdf", record);
+				if (wasActive) this.flushPendingSynctexForward(record.pdfId);
 				logger.info("control.focus_pdf", { pdf_id: record.pdfId, revision: record.revision });
 				return { ok: true, result: { type: "focus_pdf", pdf_id: record.pdfId } };
 			}
@@ -1183,7 +1199,12 @@ export class ViewerHostServer {
 			case "synctex_forward": {
 				const record = this.registry.getPdf(message.pdf_id);
 				await this.viewerDispatch.synctexForward(message, record);
-				this.broadcastViewerSocketMessage(record.pdfId, message);
+				const waitingForFocus = this.pendingFocusPdfId === record.pdfId;
+				if (waitingForFocus) {
+					this.pendingSynctexForwardByPdfId.set(record.pdfId, message);
+				} else if (this.broadcastViewerSocketMessage(record.pdfId, message) === 0) {
+					this.pendingSynctexForwardByPdfId.set(record.pdfId, message);
+				}
 				return { ok: true, result: { type: "synctex_forward", pdf_id: record.pdfId } };
 			}
 			case "pdf_maybe_updated": {
@@ -1277,6 +1298,7 @@ export class ViewerHostServer {
 		socket.once("error", cleanup);
 		socket.on("data", (chunk) => this.handleViewerSocketData(connection, chunk));
 		if (head.length > 0) this.handleViewerSocketData(connection, head);
+		this.flushPendingSynctexForward(pdfId);
 	}
 
 	private handleViewerSocketData(connection: ViewerSocketConnection, chunk: Buffer): void {
@@ -1661,6 +1683,15 @@ export class ViewerHostServer {
 		clients?.delete(connection);
 		if (clients?.size === 0) this.viewerSocketClientsByPdfId.delete(connection.pdfId);
 		logger.info("viewer_socket.closed", { pdf_id: connection.pdfId, clients_for_pdf: clients?.size ?? 0, active_viewer_clients: this.activeViewerClientCount(), rejected_snapshot_requests: rejectedSnapshots });
+	}
+
+	private flushPendingSynctexForward(pdfId: number): number {
+		if (this.pendingFocusPdfId === pdfId) return 0;
+		const message = this.pendingSynctexForwardByPdfId.get(pdfId);
+		if (message === undefined) return 0;
+		const delivered = this.broadcastViewerSocketMessage(pdfId, message);
+		if (delivered > 0) this.pendingSynctexForwardByPdfId.delete(pdfId);
+		return delivered;
 	}
 
 	private broadcastViewerSocketMessage(pdfId: number, message: object): number {

@@ -927,7 +927,7 @@ export class ViewerHostMcpService {
 				await this.sendWithReconnect({ type: "set_debug_synctex", pdf_id: record.pdfId, enabled: record.debugSynctexEnabled }, { reregisterBeforeSend: true });
 			}
 			const jump = resolveForwardSynctexJump({ pdfPath: record.pdfPath, sourceFile, line: request.line, cwd: request.workspace_context.cwd });
-			await this.sendWithReconnect({
+			const forwardMessage: Extract<McpToViewerHostMessage, { type: "synctex_forward" }> = {
 				type: "synctex_forward",
 				pdf_id: record.pdfId,
 				page: jump.page,
@@ -940,7 +940,8 @@ export class ViewerHostMcpService {
 				source_file: jump.sourceFile,
 				line: jump.line,
 				source_line: jump.sourceLine,
-			}, { reregisterBeforeSend: true });
+			};
+			await this.sendFocusAndSynctexForward({ type: "focus_pdf", pdf_id: record.pdfId }, forwardMessage);
 			return {
 				protocol_version: request.protocol_version,
 				request_id: request.request_id,
@@ -1202,6 +1203,26 @@ export class ViewerHostMcpService {
 			this.reconnectRequired = false;
 		}
 		return this.activeSession;
+	}
+
+	private async sendFocusAndSynctexForward(focus: Extract<McpToViewerHostMessage, { type: "focus_pdf" }>, forward: Extract<McpToViewerHostMessage, { type: "synctex_forward" }>): Promise<void> {
+		await this.enqueueLifecycle(async () => {
+			try {
+				await this.sendOnActiveSession(focus, true);
+				await this.sendOnActiveSession(forward, true);
+			} catch (error) {
+				this.reconnectRequired = true;
+				const firstReason = error instanceof Error ? error.message : String(error);
+				try {
+					await this.sendOnActiveSession(focus, true, true);
+					await this.sendOnActiveSession(forward, true);
+				} catch (retryError) {
+					this.reconnectRequired = true;
+					const retryReason = retryError instanceof Error ? retryError.message : String(retryError);
+					throw new Error(`${firstReason}; after relaunch/reconnect: ${retryReason}`);
+				}
+			}
+		});
 	}
 
 	private async sendWithReconnect(message: McpToViewerHostMessage, options: { reregisterBeforeSend: boolean }): Promise<void> {

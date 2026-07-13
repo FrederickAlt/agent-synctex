@@ -114,6 +114,8 @@ const MAX_PDF_BYTE_CACHE_BYTES = 128 * 1024 * 1024;
 let directViewerTabsConnected = false;
 let directViewerSwitchGeneration = 0;
 let pendingDirectViewerPdfId;
+let pendingForwardSynctexMessage;
+let initialDirectViewerSelectionNotified = false;
 
 function createNavigationHistoryState() {
   return {
@@ -1354,6 +1356,22 @@ function showSynctexMarker(message, options = {}) {
   return renderSynctexOverlay(message, { selector: "[data-synctex-marker]", datasetName: "synctexMarker", scroll: options.scroll !== false });
 }
 
+function handleForwardSynctexMessage(message) {
+  const pdfId = Number(message.pdf_id);
+  if (!Number.isInteger(pdfId) || pdfId !== activePdfId()) return;
+  const apply = () => {
+    if (!synctexOverlayPositions(message)) return false;
+    pushNavigationHistory();
+    return showSynctexMarker(message);
+  };
+  if (apply()) return;
+  pendingForwardSynctexMessage = message;
+  void waitForPagesReady(app()).then(() => {
+    if (pendingForwardSynctexMessage !== message || activePdfId() !== pdfId || !apply()) return;
+    pendingForwardSynctexMessage = undefined;
+  }).catch(() => undefined);
+}
+
 function annotationSourceLine(message) {
   return message.source_line ?? message.reverse_source_line;
 }
@@ -2176,11 +2194,13 @@ function createAnnotationFromMessage(message, { select = true, bubble = false, s
 }
 
 function clearForwardSynctexMarker() {
+	pendingForwardSynctexMessage = undefined;
 	synctexOverlayState.forwardMessage = undefined;
 	removeOverlays("[data-synctex-marker]");
 }
 
 function clearTransientSynctexState() {
+	pendingForwardSynctexMessage = undefined;
 	latestProbeRequestId += 1;
 	latestBoxRequestId += 1;
 	annotationBoxDrag = undefined;
@@ -2933,6 +2953,26 @@ function notifyDirectViewerTabSelected(tab) {
   }).catch(() => undefined);
 }
 
+function scheduleInitialDirectViewerTabSelection(tab) {
+  if (initialDirectViewerSelectionNotified || !tab) return;
+  const pdfId = tab.pdfId;
+  const deadline = Date.now() + 10_000;
+  void (async () => {
+    while (!initialDirectViewerSelectionNotified && Date.now() < deadline && activePdfId() === pdfId) {
+      await waitForPagesReady(app()).catch(() => undefined);
+      if (activePdfId() === pdfId && document.querySelector("#viewer .page[data-loaded='true']")) {
+        const current = directViewerTabs.get(pdfId);
+        if (current?.visibleTabToken) {
+          initialDirectViewerSelectionNotified = true;
+          notifyDirectViewerTabSelected(current);
+          return;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  })();
+}
+
 function cancelPendingDirectViewerSwitch(pdfId) {
 	if (pendingDirectViewerPdfId === undefined || (pdfId !== undefined && pendingDirectViewerPdfId !== pdfId)) return false;
 	directViewerSwitchGeneration += 1;
@@ -3025,6 +3065,7 @@ function updateDirectViewerTab(message) {
 	if (message.active === true) {
 		if (pdfId === activePdfId()) {
 			if (pendingDirectViewerPdfId !== pdfId) cancelPendingDirectViewerSwitch();
+			scheduleInitialDirectViewerTabSelection(tab);
 		}
 		else if (pendingDirectViewerPdfId !== pdfId) {
 			void switchDirectViewerTab(pdfId, tab.viewerUrl);
@@ -3579,8 +3620,7 @@ function handleHostMessage(message) {
     updateHostDataset();
     void prefetchPdfBytes(nextConfig).catch(() => undefined).then(() => refreshToConfig(nextConfig));
   } else if (message.type === "synctex_forward") {
-    pushNavigationHistory();
-    showSynctexMarker(message);
+    handleForwardSynctexMessage(message);
   } else if (message.type === "set_debug_synctex") {
     setDebugSynctexEnabled(message.enabled === true);
   }

@@ -341,6 +341,36 @@ test("synctex_forward and pdf_refresh messages are delivered only to viewer sock
 	}
 });
 
+test("forward SyncTeX waits for an inactive target tab to be selected before delivery", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-jump-focus-"));
+	const firstPdf = join(baseDir, "first.pdf");
+	const secondPdf = join(baseDir, "second.pdf");
+	writeFakePdf(firstPdf, "first");
+	writeFakePdf(secondPdf, "second");
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		registry.registerPdf({ pdfId: 1, pdfPath: firstPdf, title: basename(firstPdf), revision: 1, fileSnapshot: snapshotPdf(firstPdf) });
+		registry.registerPdf({ pdfId: 2, pdfPath: secondPdf, title: basename(secondPdf), revision: 1, fileSnapshot: snapshotPdf(secondPdf) });
+		await server.start();
+		const control = new ViewerHostControlClient({ origin: server.origin });
+		assert.equal((await control.send({ type: "open_pdf", pdf_id: 1, pdf_path: firstPdf, title: basename(firstPdf) })).ok, true);
+		assert.equal((await control.send({ type: "open_pdf", pdf_id: 2, pdf_path: secondPdf, title: basename(secondPdf) })).ok, true);
+		socket = await openViewerSocket(server.origin, 1, await getViewerSocketToken(server.origin, 1));
+		assert.equal((await control.send({ type: "focus_pdf", pdf_id: 1 })).ok, true);
+		const forwarded = nextJsonMessage(socket, (message) => message.type === "synctex_forward");
+		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 1, page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7 }), { ok: true, result: { type: "synctex_forward", pdf_id: 1 } });
+		await assertNoMessage(socket);
+		await fetch(`${server.origin}/viewer-tab-selected`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pdf_id: 1 }) });
+		assert.deepEqual(await forwarded, { type: "synctex_forward", pdf_id: 1, page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7 });
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("PDF refresh preserves annotation geometry and reverse-resolves source spans from that geometry", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-annotation-geometry-refresh-"));
 	const pdfPath = join(baseDir, "paper.pdf");

@@ -664,8 +664,8 @@ test("jump_pdf maps SyncTeX in MCP and sends synctex_forward through Viewer Host
 		const response = await withPath(`${binDir}:${process.env.PATH ?? ""}`, async () => await callTool(2, "jump_pdf", { pdf_id: 5, line: 3, source_file: sourcePath, workspace_context: { cwd: baseDir } }, service)) as { result?: { details?: Record<string, unknown> } };
 
 		assert.equal(response.result?.details?.handled, true);
-		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "synctex_forward"]);
-		const synctexMessage = client.messages[1] as unknown as Record<string, unknown>;
+		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "focus_pdf", "synctex_forward"]);
+		const synctexMessage = client.messages[2] as unknown as Record<string, unknown>;
 		assert.equal(synctexMessage.page, response.result?.details?.page);
 		assert.equal(synctexMessage.x, response.result?.details?.x);
 		assert.equal(synctexMessage.y, response.result?.details?.y);
@@ -690,8 +690,8 @@ test("jump_pdf maps SyncTeX in MCP and sends synctex_forward through Viewer Host
 		assert.equal(diagnostics.native.command, "synctex");
 		assert.match(diagnostics.native.stdout, /SyncTeX result begin/);
 		assert.deepEqual(diagnostics.native.parsedRectangles, expectedRanges);
-		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "width"), false, "ViewerHostMcpService.jumpPdf must emit native ranges without legacy width");
-		assert.equal(Object.hasOwn(client.messages[1] ?? {}, "height"), false, "ViewerHostMcpService.jumpPdf must emit native ranges without legacy height");
+		assert.equal(Object.hasOwn(client.messages[2] ?? {}, "width"), false, "ViewerHostMcpService.jumpPdf must emit native ranges without legacy width");
+		assert.equal(Object.hasOwn(client.messages[2] ?? {}, "height"), false, "ViewerHostMcpService.jumpPdf must emit native ranges without legacy height");
 		assert.equal(Object.hasOwn(response.result?.details ?? {}, "width"), false);
 		assert.equal(Object.hasOwn(response.result?.details ?? {}, "height"), false);
 	} finally {
@@ -869,9 +869,9 @@ test("jump_pdf relaunches, re-registers the existing pdf_id, then sends synctex_
 
 		assert.equal(response.result?.details?.handled, true);
 		assert.equal(response.result?.details?.pdf_id, 52);
-		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "synctex_forward"]);
+		assert.deepEqual(clients[1].messages.map((message) => message.type), ["open_pdf", "focus_pdf", "synctex_forward"]);
 		assert.deepEqual(clients[1].messages[0], { type: "open_pdf", pdf_id: 52, pdf_path: pdfPath, title: basename(pdfPath), workspace_cwd: baseDir });
-		assert.equal(clients[1].messages[1]?.type, "synctex_forward");
+		assert.equal(clients[1].messages[2]?.type, "synctex_forward");
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}
@@ -1038,7 +1038,7 @@ test("viewer_tab_closed host messages do not delete MCP-owned pdf_id state", asy
 		const response = await callTool(2, "jump_pdf", { pdf_id: 9, line: 3, source_file: sourcePath, workspace_context: { cwd: baseDir } }, service) as { result?: { details?: Record<string, unknown> } };
 
 		assert.equal(response.result?.details?.handled, true);
-		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "synctex_forward"]);
+		assert.deepEqual(client.messages.map((message) => message.type), ["open_pdf", "focus_pdf", "synctex_forward"]);
 	} finally {
 		rmSync(baseDir, { recursive: true, force: true });
 	}

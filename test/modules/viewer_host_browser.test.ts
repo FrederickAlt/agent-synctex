@@ -1206,6 +1206,44 @@ test("LaTeX Workshop viewer renders Host forward SyncTeX marker and range overla
 	}
 });
 
+test("LaTeX Workshop viewer activates an inactive tab before applying a forward SyncTeX jump", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-inactive-jump-"));
+	const firstPdf = join(baseDir, "first.pdf");
+	const secondPdf = join(baseDir, "second.pdf");
+	const sourcePath = join(baseDir, "main.tex");
+	writeFileSync(firstPdf, makeOnePagePdf());
+	writeFileSync(secondPdf, makeOnePagePdf());
+	writeFileSync(sourcePath, "\\documentclass{article}\n\\begin{document}Test\\end{document}\n");
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let browser: Browser | undefined;
+	try {
+		registry.registerPdf({ pdfId: 148, pdfPath: firstPdf, title: "first.pdf", revision: 1, fileSnapshot: snapshotPdf(firstPdf), workspaceCwd: baseDir });
+		registry.registerPdf({ pdfId: 149, pdfPath: secondPdf, title: "second.pdf", revision: 1, fileSnapshot: snapshotPdf(secondPdf), workspaceCwd: baseDir });
+		await server.start();
+		const control = new ViewerHostControlClient({ origin: server.origin });
+		assert.equal((await control.send({ type: "open_pdf", pdf_id: 148, pdf_path: firstPdf, title: "first.pdf", workspace_cwd: baseDir })).ok, true);
+		browser = await chromium.launch({ headless: true, executablePath: projectLocalChromiumExecutable() });
+		const page = await browser.newPage({ viewport: { width: 500, height: 360 } });
+		await page.goto(`${server.origin}/viewer-lw/148`, { waitUntil: "domcontentloaded" });
+		await waitForLwPageReady(page);
+		assert.equal((await page.evaluate(() => (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number } }).__hostLwLoadedState?.().activePdfId)), 148);
+
+		assert.equal((await control.send({ type: "open_pdf", pdf_id: 149, pdf_path: secondPdf, title: "second.pdf", workspace_cwd: baseDir })).ok, true);
+		await page.waitForFunction(() => (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number } }).__hostLwLoadedState?.().activePdfId === 149);
+		await page.waitForFunction(() => document.querySelectorAll("#hostPdfTabsContainer .hostPdfTab").length === 2);
+
+		assert.equal((await control.send({ type: "focus_pdf", pdf_id: 148 })).ok, true);
+		assert.deepEqual(await control.send({ type: "synctex_forward", pdf_id: 148, page: 1, x: 100, y: 53, width: 10, height: 8, source_file: sourcePath, line: 3 }), { ok: true, result: { type: "synctex_forward", pdf_id: 148 } });
+		await page.waitForFunction(() => (window as unknown as { __hostLwLoadedState?: () => { activePdfId?: number } }).__hostLwLoadedState?.().activePdfId === 148);
+		await page.waitForSelector("[data-synctex-marker='rect']", { state: "attached", timeout: 5_000 });
+	} finally {
+		await browser?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("LaTeX Workshop viewer shows pending mark feedback and clears it on a reported SyncTeX failure", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-lw-probe-failure-"));
 	const pdfPath = join(baseDir, "paper.pdf");
