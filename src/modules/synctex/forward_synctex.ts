@@ -5,6 +5,7 @@ import { collectCachedSyncTeXForwardTreeCandidates, inspectSyncTeXToTeXCandidate
 import { lineColumnForSourceIndex } from "./source_index.ts";
 import { readSourceLine } from "./source_line.ts";
 import { boxContainsClick, boxDistanceComponentsFromClick, buildSourceSearchFragments, filterForwardBoxes, findSourceTextMatches, type SourceTextMatchResult } from "./text_repair.ts";
+import { resolveExecutable } from "../executable_resolution.ts";
 
 export interface ForwardSynctexTarget {
 	page: number;
@@ -343,7 +344,7 @@ function cacheKeyForForwardSynctex(input: MapForwardSynctexInput): string | unde
 	const sidecarSnapshot = fileSnapshotCacheKey(sidecarPath);
 	const sourceSnapshot = fileSnapshotCacheKey(sourceFile);
 	if (sidecarSnapshot === undefined || sourceSnapshot === undefined) return undefined;
-	return [input.synctexCommand ?? "synctex", pdfPath, sidecarSnapshot, sourceFile, sourceSnapshot, input.lookupMode ?? "exact", input.line].join("\0");
+	return [input.synctexCommand ?? resolveExecutable("synctex"), pdfPath, sidecarSnapshot, sourceFile, sourceSnapshot, input.lookupMode ?? "exact", input.line].join("\0");
 }
 
 function cloneForwardSynctexJump(jump: ForwardSynctexJump): ForwardSynctexJump {
@@ -586,7 +587,7 @@ export function mapForwardSynctex(input: MapForwardSynctexInput): ForwardSynctex
 		sourceFile,
 		pdfPath,
 		runner: input.nativeRunner ?? defaultNativeSynctexRunner,
-		command: input.synctexCommand ?? "synctex",
+		command: input.synctexCommand ?? resolveExecutable("synctex"),
 	});
 	if (native.mapped !== undefined) {
 		const diagnostics = buildForwardDiagnostics({ branch: "native", pdfPath, sourceFile, line: effectiveLine, sidecarPath, native: native.diagnostics });
@@ -1582,7 +1583,7 @@ export function mapReverseSynctex(input: {
 	};
 	let mapped = jsMapped;
 	let branch: ReverseSynctexBranch = "js";
-	const nativeCommand = input.synctexCommand ?? "synctex";
+	const nativeCommand = input.synctexCommand ?? resolveExecutable("synctex");
 	const nativeArgs = ["edit", "-o", `${input.page}:${input.x}:${input.y}:${pdfPath}`];
 	const nativeCwd = dirname(pdfPath);
 	let nativeDiagnostics: ReverseSynctexDiagnostics["native"] = {

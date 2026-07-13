@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { createLogger } from "../logging.ts";
+import { executableSearchPath, resolveExecutable } from "../executable_resolution.ts";
 
 const logger = createLogger("latex.compiler");
 
@@ -535,7 +536,7 @@ function latexCommandForFile(latexFilePath: string, compiler?: LatexCompiler): L
 	const requested = compiler ?? DEFAULT_LATEX_COMPILER;
 	return {
 		displayName: requested === "latexmk" ? "latexmk(lualatex)" : `latexmk(${requested})`,
-		command: "latexmk",
+		command: resolveExecutable("latexmk"),
 		args: latexmkCompileArgs(latexFilePath, requested, false),
 		acceptUnchangedPdfWhenOutputWritten: true,
 	};
@@ -560,7 +561,7 @@ function runLatexCommand(spec: LatexCommandSpec, cwd: string, signal?: AbortSign
 			env: {
 				...process.env,
 				HOME: process.env.HOME || homedir(),
-				PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+				PATH: executableSearchPath(),
 			},
 		});
 

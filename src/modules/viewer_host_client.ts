@@ -104,6 +104,14 @@ export interface SystemBrowserViewerLauncherOptions {
 	args?: string[];
 }
 
+export function resolveSystemBrowserOpenConfig(viewerUrl: string, options: SystemBrowserViewerLauncherOptions = {}, platform: NodeJS.Platform = process.platform): { command: string; args: string[] } {
+	if (options.command !== undefined) return { command: options.command, args: [...(options.args ?? []), viewerUrl] };
+	if (process.env.AGENT_SYNCTEX_BROWSER_COMMAND?.trim()) return { command: process.env.AGENT_SYNCTEX_BROWSER_COMMAND, args: [viewerUrl] };
+	if (platform === "darwin") return { command: "open", args: [viewerUrl] };
+	if (platform === "win32") return { command: "cmd", args: ["/c", "start", "", viewerUrl] };
+	return { command: "xdg-open", args: [viewerUrl] };
+}
+
 export class SystemBrowserViewerLauncher implements BrowserViewerLauncher {
 	private readonly options: SystemBrowserViewerLauncherOptions;
 
@@ -129,11 +137,7 @@ export class SystemBrowserViewerLauncher implements BrowserViewerLauncher {
 	}
 
 	private resolveConfig(viewerUrl: string): { command: string; args: string[] } {
-		if (this.options.command !== undefined) return { command: this.options.command, args: [...(this.options.args ?? []), viewerUrl] };
-		if (process.env.AGENT_SYNCTEX_BROWSER_COMMAND?.trim()) return { command: process.env.AGENT_SYNCTEX_BROWSER_COMMAND, args: [viewerUrl] };
-		if (process.platform === "darwin") return { command: "open", args: [viewerUrl] };
-		if (process.platform === "win32") return { command: "cmd", args: ["/c", "start", "", viewerUrl] };
-		return { command: "xdg-open", args: [viewerUrl] };
+		return resolveSystemBrowserOpenConfig(viewerUrl, this.options);
 	}
 }
 

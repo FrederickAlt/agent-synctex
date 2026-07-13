@@ -13,6 +13,7 @@ import type { ViewerHostCompileActionMessage } from "./viewer_host_protocol.ts";
 import { areHarnessHooksInstalled } from "./installer/hook_install_state.ts";
 import { LATEXMK_CONTINUOUS_EVENT_PREFIX, latexmkContinuousArgs } from "./latex/latex_file_compiler.ts";
 import type { HarnessId } from "./installer/types.ts";
+import { executableSearchPath, resolveExecutable } from "./executable_resolution.ts";
 import {
 	frameClientPayload,
 	isRecord,
@@ -384,12 +385,12 @@ export class ViewerContinuousLatexmkController {
 		if (this.shuttingDown) return;
 		let child: ChildProcessWithoutNullStreams;
 		try {
-			child = this.spawnProcess("latexmk", latexmkContinuousArgs(sourcePath, undefined), {
+			child = this.spawnProcess(resolveExecutable("latexmk"), latexmkContinuousArgs(sourcePath, undefined), {
 				cwd: dirname(sourcePath),
 				env: {
 					...process.env,
 					HOME: process.env.HOME || homedir(),
-					PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+					PATH: executableSearchPath(),
 				},
 			});
 		} catch (error) {

@@ -5,6 +5,7 @@ import { startTexActionsStdioMcpRuntime } from "../stdio_mcp_runtime.ts";
 import { selectHarnessAdapters, selectInstallHarnessAdapters, isHarnessId } from "./detect_harnesses.ts";
 import { recordManifest, removeManifestHarness } from "./manifest.ts";
 import type { HarnessId, HarnessSelection, InstallerContext, InstallScope } from "./types.ts";
+import { findExecutable, MACTEX_BIN_DIR } from "../executable_resolution.ts";
 
 interface ParsedCli {
 	command?: string;
@@ -112,6 +113,11 @@ export async function runAgentSynctexCli(argv: string[], io: { stdin?: NodeJS.Re
 			return 0;
 		}
 		if (parsed.command === "doctor") {
+			for (const command of ["latexmk", "synctex"] as const) {
+				const resolved = findExecutable(command);
+				const found = resolved !== undefined;
+				stdout.write(`[${found ? "ok" : "warn"}] runtime: ${command} ${found ? `resolved to ${resolved}` : `was not found on PATH${process.platform === "darwin" ? ` or ${MACTEX_BIN_DIR}` : ""}`}\n`);
+			}
 			const adapters = await selectHarnessAdapters(ctx, parsed.harness === "auto" ? "all" : parsed.harness);
 			for (const adapter of adapters) {
 				for (const finding of await adapter.doctor(ctx)) {

@@ -1,5 +1,6 @@
 import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import type { HostServiceWorkspaceContext } from "./host_service_protocol.ts";
 import { getMcpTmpDir } from "./runtime_paths.ts";
@@ -109,7 +110,7 @@ function processLineageIdentities(startPid: number, maxCount: number): ProcessId
 	let nextPid = parentPidFor(startPid);
 	while (nextPid !== undefined && nextPid > 0 && !seen.has(nextPid) && identities.length < maxCount) {
 		seen.add(nextPid);
-		const identity = readLinuxProcessIdentity(nextPid) ?? { pid: nextPid };
+		const identity = readProcessIdentity(nextPid) ?? { pid: nextPid };
 		identities.push(identity);
 		nextPid = identity.ppid;
 	}
@@ -118,7 +119,30 @@ function processLineageIdentities(startPid: number, maxCount: number): ProcessId
 
 function parentPidFor(pid: number): number | undefined {
 	if (pid === process.pid) return process.ppid > 0 ? process.ppid : undefined;
-	return readLinuxProcessIdentity(pid)?.ppid;
+	return readProcessIdentity(pid)?.ppid;
+}
+
+function readProcessIdentity(pid: number): ProcessIdentity | undefined {
+	if (process.platform === "linux") return readLinuxProcessIdentity(pid);
+	if (process.platform === "darwin") return readDarwinProcessIdentity(pid);
+	return undefined;
+}
+
+function readDarwinProcessIdentity(pid: number): ProcessIdentity | undefined {
+	const result = spawnSync("ps", ["-o", "ppid=", "-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+	if (result.status !== 0) return undefined;
+	return parseDarwinProcessIdentity(pid, result.stdout);
+}
+
+export function parseDarwinProcessIdentity(pid: number, output: string): ProcessIdentity | undefined {
+	const match = /^\s*(\d+)\s+(.+?)\s*$/.exec(output);
+	if (!match) return undefined;
+	const ppid = Number(match[1]);
+	return {
+		pid,
+		...(Number.isInteger(ppid) && ppid > 0 ? { ppid } : {}),
+		...(match[2] ? { startTime: match[2].replace(/\s+/g, "-") } : {}),
+	};
 }
 
 function readLinuxProcessIdentity(pid: number): ProcessIdentity | undefined {
