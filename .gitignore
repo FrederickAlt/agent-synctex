@@ -1,6 +1,7 @@
 node_modules/
 .ms-playwright/
 .codegraph/
+.mermaid/
 dist/
 apps/viewer-desktop-tauri/src-tauri/target/
 apps/viewer-desktop-tauri/src-tauri/gen/

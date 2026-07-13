@@ -15,13 +15,20 @@ import { PendingPdfMarkStore, type AcknowledgedPdfMark } from "./pending_pdf_mar
 import { inferDefaultSourceFileForPdf } from "./pdf_tracking/pdf_tracking.ts";
 import { ViewerHostEventBacklog, type ViewerHostEventFilters } from "./viewer_host_event_backlog.ts";
 import { ViewerFailureReporter } from "./viewer_failure_reporter.ts";
+import { createLogger } from "./logging.ts";
 export type { ViewerHostServerAddress } from "./viewer_host_access_policy.ts";
+
+const logger = createLogger("viewer-host.server");
+const viewerLogger = createLogger("viewer-host.viewer");
 
 const LOCAL_HOST = "127.0.0.1";
 const DEFAULT_PORT = 0;
 const MAX_VIEWER_SOCKET_MESSAGE_BYTES = 64 * 1024;
 const DEFAULT_MAX_MCP_EVENT_BACKLOG = 500;
 const MAX_RETAINED_ANNOTATION_TOMBSTONES = 500;
+const VIEWER_MARK_SNAPSHOT_TIMEOUT_MS = 1_000;
+const VIEWER_LOG_LEVELS = new Set(["debug", "info", "warn", "error"] as const);
+const VIEWER_LOG_EVENT_PATTERN = /^[a-z0-9_.:-]{1,128}$/i;
 const LW_VIEWER_ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "viewer_lw");
 const LW_PDFJS_BUILD_ASSETS = new Map<string, { path: string; polyfillModernPromiseHelpers?: boolean }>([
 	["/viewer-lw/build/pdf.mjs", { path: resolve(LW_VIEWER_ASSET_ROOT, "build", "pdf.mjs"), polyfillModernPromiseHelpers: true }],
@@ -99,6 +106,13 @@ interface ViewerSocketConnection {
 	closed: boolean;
 }
 
+interface PendingViewerMarkSnapshotRequest {
+	connection: ViewerSocketConnection;
+	timer: ReturnType<typeof setTimeout>;
+	resolve(marks: ViewerHostPdfAnnotationMessage[]): void;
+	reject(error: Error): void;
+}
+
 interface PendingPdfRefreshSnapshot {
 	snapshot: ViewerHostFileSnapshot;
 	observedAtMs: number;
@@ -161,6 +175,8 @@ export class ViewerHostServer {
 	private readonly mcpEvents: ViewerHostEventBacklog;
 	private viewerSocketClientsByPdfId = new Map<number, Set<ViewerSocketConnection>>();
 	private viewerSocketTokensByPdfId = new Map<number, string>();
+	private readonly pendingViewerMarkSnapshotRequests = new Map<number, PendingViewerMarkSnapshotRequest>();
+	private nextViewerMarkSnapshotRequestId = 1;
 	private visibleViewerTabs = new Map<number, ViewerTabEvent>();
 	private activeVisiblePdfId: number | undefined;
 	private debugSynctexByPdfId = new Map<number, boolean>();
@@ -171,6 +187,10 @@ export class ViewerHostServer {
 	private nextVisibleTabToken = 1;
 	private originValue: string | undefined;
 	private addressValue: ViewerHostServerAddress | undefined;
+	private nextHttpRequestId = 1;
+	private nextTcpConnectionId = 1;
+	private readonly tcpConnectionIds = new WeakMap<Socket, number>();
+	private readonly tcpConnectionStartedAtMs = new WeakMap<Socket, number>();
 
 	constructor(options: ViewerHostServerOptions) {
 		this.registry = options.registry;
@@ -237,7 +257,7 @@ export class ViewerHostServer {
 	}
 
 	private activeViewerClientCount(): number {
-		let count = this.viewerEventClients.size;
+		let count = 0;
 		for (const clients of this.viewerSocketClientsByPdfId.values()) {
 			for (const client of clients) {
 				if (!client.closed) count += 1;
@@ -272,7 +292,21 @@ export class ViewerHostServer {
 	async start(): Promise<void> {
 		if (this.server) return;
 		const server = createServer((request, response) => {
-			void this.handleHttpRequest(request, response).catch(() => {
+			const requestId = this.nextHttpRequestId++;
+			const startedAt = Date.now();
+			const requestUrl = new URL(request.url ?? "/", this.originValue ?? `http://${LOCAL_HOST}`);
+			const connectionId = this.tcpConnectionIds.get(request.socket);
+			logger.debug("http.request", { request_id: requestId, connection_id: connectionId, method: request.method, pathname: requestUrl.pathname, remote_address: request.socket.remoteAddress, remote_port: request.socket.remotePort });
+			let loggedCompletion = false;
+			const logCompletion = (event: string) => {
+				if (loggedCompletion) return;
+				loggedCompletion = true;
+				logger.debug(event, { request_id: requestId, connection_id: connectionId, method: request.method, pathname: requestUrl.pathname, status_code: response.statusCode, elapsed_ms: Date.now() - startedAt });
+			};
+			response.once("finish", () => logCompletion("http.response"));
+			response.once("close", () => logCompletion(response.writableEnded ? "http.response_closed" : "http.response_aborted"));
+			void this.handleHttpRequest(request, response).catch((error) => {
+				logger.error("http.request_failed", { request_id: requestId, connection_id: connectionId, method: request.method, pathname: requestUrl.pathname, error });
 				if (response.headersSent) {
 					response.destroy();
 					return;
@@ -281,8 +315,16 @@ export class ViewerHostServer {
 			});
 		});
 		server.on("connection", (socket) => {
+			const connectionId = this.nextTcpConnectionId++;
+			const startedAt = Date.now();
+			this.tcpConnectionIds.set(socket, connectionId);
+			this.tcpConnectionStartedAtMs.set(socket, startedAt);
 			this.activeSockets.add(socket);
-			socket.once("close", () => this.activeSockets.delete(socket));
+			logger.debug("tcp.connection", { connection_id: connectionId, remote_address: socket.remoteAddress, remote_port: socket.remotePort });
+			socket.once("close", (hadError) => {
+				this.activeSockets.delete(socket);
+				logger.debug("tcp.closed", { connection_id: connectionId, had_error: hadError, elapsed_ms: Date.now() - startedAt });
+			});
 		});
 		server.on("upgrade", (request, socket, head) => {
 			this.handleViewerSocketUpgrade(request, socket as Socket, head);
@@ -309,6 +351,7 @@ export class ViewerHostServer {
 		}
 		this.addressValue = { host: this.accessPolicy.bindHost, port: address.port };
 		this.originValue = this.accessPolicy.originForAddress(this.addressValue);
+		logger.info("server.started", { origin: this.originValue, host: this.addressValue.host, port: this.addressValue.port, instance_id: this.instanceIdValue });
 		this.startPdfChangePolling();
 	}
 
@@ -333,6 +376,7 @@ export class ViewerHostServer {
 		}
 		this.viewerEventClients.clear();
 		this.activeVisiblePdfId = undefined;
+		logger.info("server.stopping", { instance_id: this.instanceIdValue });
 		if (!server) return;
 		await new Promise<void>((resolve, reject) => {
 			server.close((error) => error ? reject(error) : resolve());
@@ -363,6 +407,10 @@ export class ViewerHostServer {
 		}
 		if (requestUrl.pathname === "/viewer-tab-selected") {
 			await this.handleViewerTabSelectedRequest(request, response);
+			return;
+		}
+		if (requestUrl.pathname === "/viewer-logs") {
+			await this.handleViewerLogRequest(request, response);
 			return;
 		}
 		if (requestUrl.pathname === "/mcp-events/drain") {
@@ -496,6 +544,7 @@ export class ViewerHostServer {
 			for (const mark of cleared) this.rememberAnnotationCleared(mark);
 			this.broadcastAnnotationsCleared([payload.pdf_id]);
 			this.queueMcpEvent({ type: "viewer_tab_closed", pdf_id: payload.pdf_id });
+			logger.info("viewer_tab.closed", { pdf_id: payload.pdf_id, cleared_marks: cleared.length, active_pdf_id: this.activeVisiblePdfId });
 		}
 		textResponse(response, 200, "application/json; charset=utf-8", JSON.stringify({ ok: true }), false);
 	}
@@ -520,8 +569,45 @@ export class ViewerHostServer {
 		if (selected) {
 			this.activeVisiblePdfId = payload.pdf_id;
 			this.broadcastViewerEvent({ ...selected, type: "focus_pdf", active: true });
+			logger.info("viewer_tab.selected", { pdf_id: payload.pdf_id, revision: selected.revision });
 		}
 		textResponse(response, 200, "application/json; charset=utf-8", JSON.stringify({ ok: true }), false);
+	}
+
+	private async handleViewerLogRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		if (request.method !== "POST") {
+			jsonResponse(response, 405, { ok: false, error: { code: "method_not_allowed", message: "viewer log requires POST" } });
+			return;
+		}
+		let payload: unknown;
+		try {
+			payload = JSON.parse(await readRequestBody(request));
+		} catch {
+			jsonResponse(response, 400, { ok: false, error: { code: "malformed_json", message: "viewer log body must be valid JSON" } });
+			return;
+		}
+		if (!isRecord(payload)) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_request", message: "viewer log body must be an object" } });
+			return;
+		}
+		const pdfId = parsePositiveInteger(typeof payload.pdf_id === "number" || typeof payload.pdf_id === "string" ? String(payload.pdf_id) : undefined);
+		if (pdfId === undefined || !this.hasRegisteredPdf(pdfId)) {
+			jsonResponse(response, 404, { ok: false, error: { code: "unknown_pdf", message: "unknown pdf_id" } });
+			return;
+		}
+		if (request.headers["x-agent-synctex-viewer-token"] !== this.viewerSocketTokenForPdf(pdfId)) {
+			jsonResponse(response, 403, { ok: false, error: { code: "forbidden", message: "invalid viewer token" } });
+			return;
+		}
+		const level = isViewerLogLevel(payload.level) ? payload.level : undefined;
+		const event = typeof payload.event === "string" ? payload.event.trim() : "";
+		if (level === undefined || !VIEWER_LOG_EVENT_PATTERN.test(event)) {
+			jsonResponse(response, 400, { ok: false, error: { code: "invalid_log", message: "viewer log requires a valid level and event" } });
+			return;
+		}
+		const fields = isRecord(payload.fields) ? payload.fields : {};
+		viewerLogger[level](event, { pdf_id: pdfId, ...fields });
+		jsonResponse(response, 200, { ok: true });
 	}
 
 	private async readViewerTabPayload(request: IncomingMessage, response: ServerResponse, invalidPayloadError: string): Promise<ViewerTabPayload | undefined> {
@@ -587,9 +673,20 @@ export class ViewerHostServer {
 			jsonResponse(response, 400, { ok: false, error: { code: "invalid_max_marks", message: "mark claim max_marks must be a positive integer" } });
 			return;
 		}
+		const pdfIds = payload.pdf_ids === undefined ? undefined : new Set(payload.pdf_ids as number[]);
+		const maxMarks = payload.max_marks === undefined ? 20 : Number(payload.max_marks);
+		logger.info("marks.claim.request", { pdf_ids: pdfIds === undefined ? undefined : Array.from(pdfIds), max_marks: maxMarks, explicit_pdf_ids: pdfIds !== undefined });
+		try {
+			await this.flushViewerMarkSnapshots(pdfIds, maxMarks);
+		} catch (error) {
+			const detail = errorMessage(error);
+			logger.warn("marks.claim.snapshot_failed", { pdf_ids: pdfIds === undefined ? undefined : Array.from(pdfIds), max_marks: maxMarks, error });
+			jsonResponse(response, 504, { ok: false, error: { code: "viewer_mark_snapshot_failed", message: detail } });
+			return;
+		}
 		const claim = this.pendingPdfMarks.claim({
-			...(payload.pdf_ids === undefined ? {} : { pdfIds: new Set(payload.pdf_ids as number[]) }),
-			...(payload.max_marks === undefined ? {} : { maxMarks: Number(payload.max_marks) }),
+			...(pdfIds === undefined ? {} : { pdfIds }),
+			...(payload.max_marks === undefined ? {} : { maxMarks }),
 		});
 		const stalePdfIds = new Set<number>();
 		const marks = claim.marks.map((mark) => {
@@ -599,6 +696,7 @@ export class ViewerHostServer {
 			return { ...mark, source_stale: true };
 		});
 		for (const pdfId of stalePdfIds) await this.reportStaleSourceNotice(pdfId);
+		logger.info("marks.claim.response", { marks_count: marks.length, claim_id_present: claim.claimId !== undefined, stale_pdf_ids: Array.from(stalePdfIds) });
 		jsonResponse(response, 200, {
 			ok: true,
 			marks,
@@ -635,6 +733,7 @@ export class ViewerHostServer {
 		}
 		const acknowledged = this.pendingPdfMarks.acknowledge(payload.claim_id, payload.consumed as AcknowledgedPdfMark[]);
 		this.broadcastAcknowledgedMarks(acknowledged);
+		logger.info("marks.ack", { requested_count: payload.consumed.length, acknowledged_count: acknowledged.length });
 		jsonResponse(response, 200, { ok: true, acknowledged });
 	}
 
@@ -663,6 +762,7 @@ export class ViewerHostServer {
 			return;
 		}
 		const released = this.pendingPdfMarks.release(payload.claim_id);
+		logger.info("marks.release", { released_count: released.length, has_error: typeof payload.error === "string" });
 		if (typeof payload.error === "string") {
 			for (const pdfId of new Set(released.map((mark) => mark.pdf_id))) {
 				await this.failureReporter.report(payload.error, {
@@ -713,8 +813,11 @@ export class ViewerHostServer {
 		}
 		try {
 			const record = this.registry.getPdf(pdfId);
-			jsonResponse(response, 200, { ok: true, result: reverseSynctexForwardProbeResult({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd }, debugSynctex: this.debugSynctexByPdfId.get(pdfId) === true }) });
+			const result = reverseSynctexForwardProbeResult({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd }, debugSynctex: this.debugSynctexByPdfId.get(pdfId) === true });
+			logger.debug("synctex.probe", { pdf_id: pdfId, request_id: message.request_id, page: message.page, has_error: "error" in result });
+			jsonResponse(response, 200, { ok: true, result });
 		} catch (error) {
+			logger.warn("synctex.probe_failed", { pdf_id: pdfId, request_id: message.request_id, error });
 			jsonResponse(response, 200, {
 				ok: true,
 				result: { type: "reverse_synctex_forward_probe_result", pdf_id: pdfId, request_id: message.request_id, click_page: message.page, click_x: message.x, click_y: message.y, error: errorMessage(error) },
@@ -758,8 +861,11 @@ export class ViewerHostServer {
 		}
 		try {
 			const record = this.registry.getPdf(pdfId);
-			jsonResponse(response, 200, { ok: true, result: resolveReverseSynctexBox({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } }) });
+			const result = resolveReverseSynctexBox({ message, pdf: { pdfId: record.pdfId, pdfPath: record.pdfPath, workspaceCwd: record.workspaceCwd } });
+			logger.debug("synctex.box", { pdf_id: pdfId, request_id: message.request_id, page: message.page, has_error: "error" in result });
+			jsonResponse(response, 200, { ok: true, result });
 		} catch (error) {
+			logger.warn("synctex.box_failed", { pdf_id: pdfId, request_id: message.request_id, error });
 			jsonResponse(response, 200, {
 				ok: true,
 				result: {
@@ -993,11 +1099,15 @@ export class ViewerHostServer {
 		}
 
 		try {
-			jsonResponse(response, 200, await this.dispatchControlMessage(message));
+			logger.debug("control.request", { type: message.type, pdf_id: "pdf_id" in message ? message.pdf_id : undefined });
+			const result = await this.dispatchControlMessage(message);
+			logger.debug("control.response", { type: message.type, pdf_id: "pdf_id" in message ? message.pdf_id : undefined, ok: result.ok });
+			jsonResponse(response, 200, result);
 		} catch (error) {
-			const message = errorMessage(error);
-			const unknownPdf = /^Unknown pdf_id=/.test(message);
-			jsonResponse(response, unknownPdf ? 404 : 400, { ok: false, error: { code: unknownPdf ? "unknown_pdf" : "control_dispatch_failed", message } });
+			logger.warn("control.failed", { type: message.type, pdf_id: "pdf_id" in message ? message.pdf_id : undefined, error });
+			const detail = errorMessage(error);
+			const unknownPdf = /^Unknown pdf_id=/.test(detail);
+			jsonResponse(response, unknownPdf ? 404 : 400, { ok: false, error: { code: unknownPdf ? "unknown_pdf" : "control_dispatch_failed", message: detail } });
 		}
 	}
 
@@ -1009,6 +1119,7 @@ export class ViewerHostServer {
 				}
 				this.controlReady = true;
 				this.controlProtocolVersion = message.protocol_version;
+				logger.info("control.hello", { protocol_version: message.protocol_version, active_viewer_clients: this.activeViewerClientCount() });
 				return { ok: true, message: { type: "ready", protocol_version: VIEWER_HOST_PROTOCOL_VERSION, origin: this.origin, instance_id: this.instanceIdValue, active_viewer_clients: this.activeViewerClientCount() } };
 			case "open_pdf": {
 				const snapshot = await snapshotRegisteredPdf(this.fileSystem, message.pdf_path);
@@ -1027,12 +1138,14 @@ export class ViewerHostServer {
 				await this.viewerDispatch.openPdf(record);
 					this.broadcastViewerTabEvent("open_pdf", record);
 				this.scheduleSynctexPrewarm(record);
+				logger.info("control.open_pdf", { pdf_id: record.pdfId, revision: record.revision, pdf_path: record.pdfPath, workspace_cwd: record.workspaceCwd });
 				return { ok: true, result: { type: "open_pdf", pdf_id: record.pdfId, revision: record.revision } };
 			}
 			case "focus_pdf": {
 				const record = this.registry.getPdf(message.pdf_id);
 				await this.viewerDispatch.focusPdf(record);
 					this.broadcastViewerTabEvent("focus_pdf", record);
+				logger.info("control.focus_pdf", { pdf_id: record.pdfId, revision: record.revision });
 				return { ok: true, result: { type: "focus_pdf", pdf_id: record.pdfId } };
 			}
 			case "set_debug_synctex": {
@@ -1089,21 +1202,28 @@ export class ViewerHostServer {
 	private handleViewerSocketUpgrade(request: IncomingMessage, socket: Socket, head: Buffer): void {
 		const requestUrl = new URL(request.url ?? "/", this.originValue ?? `http://${LOCAL_HOST}`);
 		const pdfId = parsePositiveInteger(requestUrl.searchParams.get("pdf_id") ?? undefined);
+		const connectionId = this.tcpConnectionIds.get(socket);
+		const connectionStartedAt = this.tcpConnectionStartedAtMs.get(socket);
+		logger.info("viewer_socket.upgrade_received", { connection_id: connectionId, pdf_id: pdfId, pathname: requestUrl.pathname, connection_age_ms: connectionStartedAt === undefined ? undefined : Date.now() - connectionStartedAt, head_bytes: head.length, token_present: requestUrl.searchParams.has("token") });
 		if (requestUrl.pathname !== "/viewer-socket" || pdfId === undefined || !this.hasRegisteredPdf(pdfId)) {
+			logger.warn("viewer_socket.rejected", { reason: "unknown_pdf", pathname: requestUrl.pathname, pdf_id: pdfId });
 			rejectWebSocketUpgrade(socket, 404, "unknown pdf_id");
 			return;
 		}
 		if (!this.accessPolicy.isAllowedViewerSocketOrigin(request.headers.origin, this.origin)) {
+			logger.warn("viewer_socket.rejected", { reason: "forbidden_origin", pdf_id: pdfId, origin: request.headers.origin });
 			rejectWebSocketUpgrade(socket, 403, "forbidden origin");
 			return;
 		}
 		const token = requestUrl.searchParams.get("token") ?? "";
 		if (token !== this.viewerSocketTokenForPdf(pdfId)) {
+			logger.warn("viewer_socket.rejected", { reason: "invalid_token", pdf_id: pdfId });
 			rejectWebSocketUpgrade(socket, 403, "invalid viewer socket token");
 			return;
 		}
 		const headerError = validateWebSocketUpgradeHeaders(request);
 		if (headerError) {
+			logger.warn("viewer_socket.rejected", { reason: "invalid_headers", pdf_id: pdfId, detail: headerError });
 			rejectWebSocketUpgrade(socket, 400, headerError);
 			return;
 		}
@@ -1124,6 +1244,7 @@ export class ViewerHostServer {
 			this.viewerSocketClientsByPdfId.set(pdfId, clients);
 		}
 		clients.add(connection);
+		logger.info("viewer_socket.open", { connection_id: connectionId, pdf_id: pdfId, clients_for_pdf: clients.size, active_viewer_clients: this.activeViewerClientCount(), connection_age_ms: connectionStartedAt === undefined ? undefined : Date.now() - connectionStartedAt });
 		this.syncAnnotationStateToViewer(connection);
 		const cleanup = () => this.cleanupViewerSocket(connection);
 		socket.once("close", cleanup);
@@ -1137,6 +1258,7 @@ export class ViewerHostServer {
 		if (connection.closed) return;
 		connection.buffer = Buffer.concat([connection.buffer, chunk]);
 		if (connection.buffer.length > MAX_VIEWER_SOCKET_MESSAGE_BYTES + 14) {
+			logger.warn("viewer_socket.close", { pdf_id: connection.pdfId, reason: "message_too_large" });
 			this.closeViewerSocket(connection);
 			return;
 		}
@@ -1144,13 +1266,15 @@ export class ViewerHostServer {
 			let frame: { fin: boolean; opcode: number; masked: boolean; payload: Buffer; bytesRead: number } | undefined;
 			try {
 				frame = readWebSocketFrame(connection.buffer);
-			} catch {
+			} catch (error) {
+				logger.warn("viewer_socket.close", { pdf_id: connection.pdfId, reason: "invalid_frame", error });
 				this.closeViewerSocket(connection);
 				return;
 			}
 			if (!frame) return;
 			connection.buffer = connection.buffer.subarray(frame.bytesRead);
 			if (!frame.fin || !frame.masked) {
+				logger.warn("viewer_socket.close", { pdf_id: connection.pdfId, reason: "unsupported_frame", fin: frame.fin, masked: frame.masked });
 				this.closeViewerSocket(connection);
 				return;
 			}
@@ -1171,27 +1295,24 @@ export class ViewerHostServer {
 		let payload: unknown;
 		try {
 			payload = JSON.parse(text);
-			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "pdf_annotation" && payload.type !== "pdf_annotation_deleted" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover" && payload.type !== "compile_action")) return;
+			if (!isRecord(payload) || (payload.type !== "reverse_synctex" && payload.type !== "pdf_annotation" && payload.type !== "pdf_annotation_deleted" && payload.type !== "selection_debug" && payload.type !== "reverse_synctex_hover" && payload.type !== "compile_action" && payload.type !== "pdf_annotations_snapshot")) return;
 			if (payload.pdf_id !== undefined && payload.pdf_id !== connection.pdfId) {
 				throw new Error(`${String(payload.type)} pdf_id=${String(payload.pdf_id)} does not match viewer socket pdf_id=${connection.pdfId}`);
 			}
+			if (payload.type === "pdf_annotations_snapshot") {
+				this.handleViewerAnnotationSnapshot(connection, payload);
+				return;
+			}
 			const message = validateViewerHostToMcpMessage({ ...payload, pdf_id: connection.pdfId });
 			if (message.type === "pdf_annotation") {
-				const { source_stale: _ignoredSourceStale, ...mark } = message;
-				const record = this.registry.getPdf(mark.pdf_id);
-				if (!isMarkSourceInsideWorkspace(mark, record.workspaceCwd, record.pdfPath)) throw new Error("annotation source_file must be inside the PDF workspace");
-				const anchors = capturePdfMarkSourceAnchors(mark, record.workspaceCwd);
-				if (anchors === undefined) this.sourceAnchorsByMarkKey.delete(pdfMarkKey(mark));
-				else this.sourceAnchorsByMarkKey.set(pdfMarkKey(mark), anchors);
-				this.annotationClearIdsByPdfId.get(mark.pdf_id)?.delete(mark.annotation_id);
-				this.annotationRebasesByMarkKey.delete(pdfMarkKey(mark));
-				this.pendingPdfMarks.upsert(mark);
+				this.upsertViewerAnnotationMark(message);
 				return;
 			}
 			if (message.type === "pdf_annotation_deleted") {
 				this.sourceAnchorsByMarkKey.delete(pdfMarkKey(message));
 				this.rememberAnnotationCleared(message);
 				this.pendingPdfMarks.delete(message.pdf_id, message.annotation_id);
+				logger.info("marks.viewer_deleted", { pdf_id: message.pdf_id, annotation_id: message.annotation_id });
 				return;
 			}
 			if (message.type === "compile_action" && message.action === "inject_diagnostic" && message.inject_text?.trim()) {
@@ -1215,7 +1336,151 @@ export class ViewerHostServer {
 			}
 			this.queueMcpEvent(message);
 		} catch (error) {
+			logger.warn("viewer_socket.message_invalid", { pdf_id: connection.pdfId, error });
 			sendViewerSocketJson(connection, { type: "error", code: "invalid_viewer_message", message: errorMessage(error) });
+		}
+	}
+
+	private upsertViewerAnnotationMark(message: ViewerHostPdfAnnotationMessage): ViewerHostPdfAnnotationMessage {
+		const { source_stale: _ignoredSourceStale, ...mark } = message;
+		const record = this.registry.getPdf(mark.pdf_id);
+		if (!isMarkSourceInsideWorkspace(mark, record.workspaceCwd, record.pdfPath)) throw new Error("annotation source_file must be inside the PDF workspace");
+		const anchors = capturePdfMarkSourceAnchors(mark, record.workspaceCwd);
+		if (anchors === undefined) this.sourceAnchorsByMarkKey.delete(pdfMarkKey(mark));
+		else this.sourceAnchorsByMarkKey.set(pdfMarkKey(mark), anchors);
+		this.annotationClearIdsByPdfId.get(mark.pdf_id)?.delete(mark.annotation_id);
+		this.annotationRebasesByMarkKey.delete(pdfMarkKey(mark));
+		this.pendingPdfMarks.upsert(mark);
+		logger.info("marks.viewer_upsert", { pdf_id: mark.pdf_id, annotation_id: mark.annotation_id, page: mark.page, line: mark.line, source_file: mark.source_file, has_comment: typeof mark.comment === "string" && mark.comment.trim().length > 0 });
+		return mark;
+	}
+
+	private async flushViewerMarkSnapshots(pdfIds: ReadonlySet<number> | undefined, maxMarks: number): Promise<void> {
+		const implicitPdfIds = new Set(this.viewerSocketClientsByPdfId.keys());
+		if (this.activeVisiblePdfId !== undefined && this.visibleViewerTabs.has(this.activeVisiblePdfId)) implicitPdfIds.add(this.activeVisiblePdfId);
+		const targetPdfIds = pdfIds ?? implicitPdfIds;
+		logger.debug("marks.snapshot.flush.start", { snapshot_pdf_ids: Array.from(targetPdfIds), explicit_pdf_ids: pdfIds !== undefined, max_marks: maxMarks, active_visible_pdf_id: this.activeVisiblePdfId });
+		if (targetPdfIds.size === 0) {
+			logger.debug("marks.snapshot.flush.skip", { reason: "no_target_pdfs" });
+			return;
+		}
+		let connections = this.viewerMarkSnapshotConnections(targetPdfIds);
+		const connectedPdfIds = new Set(connections.map((connection) => connection.pdfId));
+		const visiblePdfIdsWithoutSocket = new Set(Array.from(targetPdfIds).filter((pdfId) => this.visibleViewerTabs.has(pdfId) && !connectedPdfIds.has(pdfId)));
+		if (visiblePdfIdsWithoutSocket.size > 0) {
+			logger.info("marks.snapshot.wait_for_socket", { pdf_ids: Array.from(visiblePdfIdsWithoutSocket), timeout_ms: VIEWER_MARK_SNAPSHOT_TIMEOUT_MS });
+			await this.waitForViewerMarkSnapshotConnections(visiblePdfIdsWithoutSocket);
+			connections = this.viewerMarkSnapshotConnections(targetPdfIds);
+		}
+		if (connections.length === 0) {
+			logger.debug("marks.snapshot.flush.skip", { reason: "no_connections", snapshot_pdf_ids: Array.from(targetPdfIds) });
+			return;
+		}
+		try {
+			const snapshots = await Promise.all(connections.map((connection) => this.requestViewerMarkSnapshot(connection, maxMarks)));
+			logger.info("marks.snapshot.flush.ok", { connection_count: connections.length, marks_count: snapshots.reduce((count, marks) => count + marks.length, 0), pdf_ids: Array.from(new Set(connections.map((connection) => connection.pdfId))) });
+		} catch (error) {
+			const detail = errorMessage(error);
+			for (const pdfId of new Set(connections.map((connection) => connection.pdfId))) {
+				await this.failureReporter.report(detail, {
+					pdfId,
+					code: "viewer_mark_snapshot_failed",
+					title: "Could not read PDF marks from the viewer",
+					detail,
+					injectText: `PDF mark delivery failed: ${detail}`,
+				});
+			}
+			throw error;
+		}
+	}
+
+	private viewerMarkSnapshotConnections(pdfIds: ReadonlySet<number>): ViewerSocketConnection[] {
+		const connections: ViewerSocketConnection[] = [];
+		for (const pdfId of pdfIds) {
+			const clients = this.viewerSocketClientsByPdfId.get(pdfId);
+			if (!clients) continue;
+			for (const connection of clients) {
+				if (!connection.closed) connections.push(connection);
+			}
+		}
+		return connections;
+	}
+
+	private async waitForViewerMarkSnapshotConnections(pdfIds: ReadonlySet<number>): Promise<ViewerSocketConnection[]> {
+		const visiblePdfIds = Array.from(pdfIds).filter((pdfId) => this.visibleViewerTabs.has(pdfId));
+		if (visiblePdfIds.length === 0) return [];
+		const startedAt = Date.now();
+		const deadline = startedAt + VIEWER_MARK_SNAPSHOT_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			const connections = this.viewerMarkSnapshotConnections(new Set(visiblePdfIds));
+			if (connections.length > 0) {
+				logger.info("marks.snapshot.socket_available", { pdf_ids: visiblePdfIds, connection_count: connections.length, waited_ms: Date.now() - startedAt });
+				return connections;
+			}
+			await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+		}
+		logger.warn("marks.snapshot.socket_timeout", { pdf_ids: visiblePdfIds, waited_ms: Date.now() - startedAt, timeout_ms: VIEWER_MARK_SNAPSHOT_TIMEOUT_MS });
+		throw new Error(`Timed out waiting ${VIEWER_MARK_SNAPSHOT_TIMEOUT_MS}ms for visible PDF viewer socket connection`);
+	}
+
+	private requestViewerMarkSnapshot(connection: ViewerSocketConnection, maxMarks: number): Promise<ViewerHostPdfAnnotationMessage[]> {
+		return new Promise((resolve, reject) => {
+			const requestId = this.nextViewerMarkSnapshotRequestId++;
+			const startedAt = Date.now();
+			const timer = setTimeout(() => {
+				this.pendingViewerMarkSnapshotRequests.delete(requestId);
+				logger.warn("marks.snapshot.request_timeout", { pdf_id: connection.pdfId, request_id: requestId, waited_ms: Date.now() - startedAt, timeout_ms: VIEWER_MARK_SNAPSHOT_TIMEOUT_MS });
+				reject(new Error(`Timed out waiting ${VIEWER_MARK_SNAPSHOT_TIMEOUT_MS}ms for viewer pdf_id=${connection.pdfId} to provide current PDF marks`));
+			}, VIEWER_MARK_SNAPSHOT_TIMEOUT_MS);
+			timer.unref?.();
+			this.pendingViewerMarkSnapshotRequests.set(requestId, { connection, timer, resolve, reject });
+			logger.debug("marks.snapshot.request", { pdf_id: connection.pdfId, request_id: requestId, max_marks: maxMarks });
+			try {
+				sendViewerSocketJson(connection, {
+					type: "pdf_annotations_snapshot_request",
+					pdf_id: connection.pdfId,
+					request_id: requestId,
+					max_marks: maxMarks,
+				});
+			} catch (error) {
+				clearTimeout(timer);
+				this.pendingViewerMarkSnapshotRequests.delete(requestId);
+				reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	}
+
+	private handleViewerAnnotationSnapshot(connection: ViewerSocketConnection, payload: Record<string, unknown>): void {
+		const requestId = typeof payload.request_id === "number" && Number.isInteger(payload.request_id) && payload.request_id > 0 ? payload.request_id : undefined;
+		if (requestId === undefined) throw new Error("pdf_annotations_snapshot requires a positive request_id");
+		const pending = this.pendingViewerMarkSnapshotRequests.get(requestId);
+		if (pending === undefined) return;
+		if (pending.connection !== connection) {
+			this.pendingViewerMarkSnapshotRequests.delete(requestId);
+			clearTimeout(pending.timer);
+			pending.reject(new Error("PDF mark snapshot response came from a different viewer socket"));
+			return;
+		}
+		if (!Array.isArray(payload.annotations)) {
+			this.pendingViewerMarkSnapshotRequests.delete(requestId);
+			clearTimeout(pending.timer);
+			pending.reject(new Error("pdf_annotations_snapshot annotations must be an array"));
+			return;
+		}
+		try {
+			const marks = payload.annotations.map((entry, index) => {
+				const message = validateViewerHostToMcpMessage({ ...(isRecord(entry) ? entry : {}), pdf_id: connection.pdfId });
+				if (message.type !== "pdf_annotation") throw new Error(`pdf_annotations_snapshot annotations[${index}] must be a PDF annotation`);
+				return this.upsertViewerAnnotationMark(message);
+			});
+			this.pendingViewerMarkSnapshotRequests.delete(requestId);
+			clearTimeout(pending.timer);
+			logger.info("marks.snapshot.response", { pdf_id: connection.pdfId, request_id: requestId, marks_count: marks.length });
+			pending.resolve(marks);
+		} catch (error) {
+			this.pendingViewerMarkSnapshotRequests.delete(requestId);
+			clearTimeout(pending.timer);
+			pending.reject(error instanceof Error ? error : new Error(String(error)));
 		}
 	}
 
@@ -1367,9 +1632,18 @@ export class ViewerHostServer {
 	private cleanupViewerSocket(connection: ViewerSocketConnection): void {
 		if (connection.closed) return;
 		connection.closed = true;
+		let rejectedSnapshots = 0;
+		for (const [requestId, pending] of this.pendingViewerMarkSnapshotRequests) {
+			if (pending.connection !== connection) continue;
+			clearTimeout(pending.timer);
+			this.pendingViewerMarkSnapshotRequests.delete(requestId);
+			rejectedSnapshots += 1;
+			pending.reject(new Error(`Viewer socket for pdf_id=${connection.pdfId} closed before providing current PDF marks`));
+		}
 		const clients = this.viewerSocketClientsByPdfId.get(connection.pdfId);
 		clients?.delete(connection);
 		if (clients?.size === 0) this.viewerSocketClientsByPdfId.delete(connection.pdfId);
+		logger.info("viewer_socket.closed", { pdf_id: connection.pdfId, clients_for_pdf: clients?.size ?? 0, active_viewer_clients: this.activeViewerClientCount(), rejected_snapshot_requests: rejectedSnapshots });
 	}
 
 	private broadcastViewerSocketMessage(pdfId: number, message: object): number {
@@ -1631,6 +1905,10 @@ function webSocketRejectReason(status: number): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
+}
+
+function isViewerLogLevel(value: unknown): value is "debug" | "info" | "warn" | "error" {
+	return typeof value === "string" && VIEWER_LOG_LEVELS.has(value as "debug" | "info" | "warn" | "error");
 }
 
 async function snapshotRegisteredPdf(fileSystem: ViewerHostFileSystem, pdfPath: string): Promise<{ size: number; mtimeMs: number }> {

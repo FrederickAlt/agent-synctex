@@ -52,7 +52,7 @@ async function getViewerSocketToken(origin: string, pdfId: number): Promise<stri
 	return token;
 }
 
-async function openViewerSocket(origin: string, pdfId: number, token: string): Promise<TestWebSocket> {
+async function openViewerSocket(origin: string, pdfId: number, token: string, initialVisibleMarks: readonly Record<string, unknown>[] = []): Promise<TestWebSocket> {
 	const WebSocket = socketCtor();
 	const socket = new WebSocket(`${origin.replace(/^http:/, "ws:")}/viewer-socket?pdf_id=${pdfId}&token=${encodeURIComponent(token)}`);
 	await new Promise<void>((resolve, reject) => {
@@ -60,7 +60,38 @@ async function openViewerSocket(origin: string, pdfId: number, token: string): P
 		socket.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
 		socket.addEventListener("error", () => { clearTimeout(timer); reject(new Error(`viewer socket errored before open for pdf_id=${pdfId}`)); }, { once: true });
 	});
-	return socket;
+	const visibleMarks = new Map<string, Record<string, unknown>>();
+	for (const mark of initialVisibleMarks) {
+		if (typeof mark.annotation_id === "string") visibleMarks.set(mark.annotation_id, mark);
+	}
+	socket.addEventListener("message", (event) => {
+		const data = typeof event.data === "string" ? event.data : Buffer.from(event.data as ArrayBuffer).toString("utf8");
+		const message = JSON.parse(data) as Record<string, unknown>;
+		if (message.type === "pdf_annotations_snapshot_request") {
+			const maxMarks = Number.isInteger(Number(message.max_marks)) && Number(message.max_marks) > 0 ? Number(message.max_marks) : visibleMarks.size;
+			socket.send(JSON.stringify({
+				type: "pdf_annotations_snapshot",
+				pdf_id: message.pdf_id,
+				request_id: message.request_id,
+				annotations: Array.from(visibleMarks.values()).slice(0, maxMarks),
+			}));
+		} else if (message.type === "annotations_cleared") {
+			const ids = Array.isArray(message.annotation_ids) ? new Set(message.annotation_ids.filter((id): id is string => typeof id === "string")) : undefined;
+			if (ids === undefined) visibleMarks.clear();
+			else for (const id of ids) visibleMarks.delete(id);
+		}
+	});
+	return {
+		get readyState() { return socket.readyState; },
+		send(data: string) {
+			const message = JSON.parse(data) as Record<string, unknown>;
+			if (message.type === "pdf_annotation" && typeof message.annotation_id === "string") visibleMarks.set(message.annotation_id, message);
+			else if (message.type === "pdf_annotation_deleted" && typeof message.annotation_id === "string") visibleMarks.delete(message.annotation_id);
+			socket.send(data);
+		},
+		close() { socket.close(); },
+		addEventListener: socket.addEventListener.bind(socket),
+	};
 }
 
 interface TestMarkClaim {
@@ -150,14 +181,22 @@ async function rawWebSocketUpgradeStatus(origin: string, path: string, headers: 
 	}
 }
 
-async function nextJsonMessage(socket: TestWebSocket): Promise<Record<string, unknown>> {
+async function nextJsonMessage(socket: TestWebSocket, predicate: (message: Record<string, unknown>) => boolean = () => true): Promise<Record<string, unknown>> {
 	return await new Promise<Record<string, unknown>>((resolve, reject) => {
 		const timer = setTimeout(() => reject(new Error("timed out waiting for viewer socket message")), 2_000);
-		socket.addEventListener("message", (event) => {
-			clearTimeout(timer);
-			const data = typeof event.data === "string" ? event.data : Buffer.from(event.data as ArrayBuffer).toString("utf8");
-			resolve(JSON.parse(data) as Record<string, unknown>);
-		}, { once: true });
+		const listen = () => {
+			socket.addEventListener("message", (event) => {
+				const data = typeof event.data === "string" ? event.data : Buffer.from(event.data as ArrayBuffer).toString("utf8");
+				const message = JSON.parse(data) as Record<string, unknown>;
+				if (message.type === "pdf_annotations_snapshot_request" || !predicate(message)) {
+					listen();
+					return;
+				}
+				clearTimeout(timer);
+				resolve(message);
+			}, { once: true });
+		};
+		listen();
 	});
 }
 
@@ -407,6 +446,65 @@ test("Viewer Host bounds its transient MCP event backlog", async () => {
 	}
 });
 
+test("mark claims wait for a freshly opened visible viewer socket before snapshot", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-fresh-viewer-snapshot-"));
+	const pdfPath = join(baseDir, "paper.pdf");
+	const sourcePath = join(baseDir, "main.tex");
+	writeFakePdf(pdfPath);
+	writeFileSync(sourcePath, "fresh mark\n");
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		await server.start();
+		const client = new ViewerHostControlClient({ origin: server.origin });
+		const opened = await client.send({ type: "open_pdf", pdf_id: 51, pdf_path: pdfPath, title: basename(pdfPath) });
+		assert.deepEqual(opened, { ok: true, result: { type: "open_pdf", pdf_id: 51, revision: 1 } });
+
+		const claimPromise = claimMarks(server.origin, { pdf_ids: [51] });
+		await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+		socket = await openViewerSocket(server.origin, 51, await getViewerSocketToken(server.origin, 51), [
+			{ type: "pdf_annotation", annotation_id: "fresh", page: 1, x: 1, y: 2, source_file: sourcePath, line: 1 },
+		]);
+
+		const claim = await claimPromise;
+		assert.deepEqual(claim.marks.map(({ source_stale: _sourceStale, ...mark }) => mark), [{ type: "pdf_annotation", pdf_id: 51, annotation_id: "fresh", page: 1, x: 1, y: 2, source_file: sourcePath, line: 1 }]);
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
+test("unscoped mark claims do not wait on inactive visible tabs without sockets", async () => {
+	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-inactive-visible-no-socket-"));
+	const firstPdf = join(baseDir, "first.pdf");
+	const secondPdf = join(baseDir, "second.pdf");
+	const secondSource = join(baseDir, "second.tex");
+	writeFakePdf(firstPdf, "first");
+	writeFakePdf(secondPdf, "second");
+	writeFileSync(secondSource, "second mark\n");
+	const registry = new ViewerHostPdfRegistry();
+	const server = new ViewerHostServer({ registry });
+	let socket: TestWebSocket | undefined;
+	try {
+		await server.start();
+		const client = new ViewerHostControlClient({ origin: server.origin });
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 61, pdf_path: firstPdf, title: basename(firstPdf) })).ok, true);
+		assert.equal((await client.send({ type: "open_pdf", pdf_id: 62, pdf_path: secondPdf, title: basename(secondPdf) })).ok, true);
+		socket = await openViewerSocket(server.origin, 62, await getViewerSocketToken(server.origin, 62));
+		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "second-mark", page: 1, x: 1, y: 2, source_file: secondSource, line: 1 }));
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		const claim = await claimMarks(server.origin);
+		assert.deepEqual(claim.marks.map(({ source_stale: _sourceStale, ...mark }) => mark), [{ type: "pdf_annotation", pdf_id: 62, annotation_id: "second-mark", page: 1, x: 1, y: 2, source_file: secondSource, line: 1 }]);
+	} finally {
+		socket?.close();
+		await server.stop();
+		rmSync(baseDir, { recursive: true, force: true });
+	}
+});
+
 test("generic event drains do not consume or clear pending PDF marks", async () => {
 	const baseDir = mkdtempSync(join(tmpdir(), "viewer-host-socket-filtered-drain-"));
 	const pdfPath = join(baseDir, "paper.pdf");
@@ -434,7 +532,7 @@ test("generic event drains do not consume or clear pending PDF marks", async () 
 		assert.equal(allPayload.ok, true);
 		assert.deepEqual(allPayload.events, []);
 		const claim = await claimMarks(server.origin, { pdf_ids: [31] });
-		assert.deepEqual(claim.marks, [{ type: "pdf_annotation", pdf_id: 31, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, comment: "keep me" }]);
+		assert.deepEqual(claim.marks.map(({ source_stale: _sourceStale, ...mark }) => mark), [{ type: "pdf_annotation", pdf_id: 31, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, comment: "keep me" }]);
 		await assertNoMessage(socket);
 	} finally {
 		socket?.close();
@@ -503,7 +601,7 @@ test("PDF annotation socket payloads are coalesced for mark claims and targeted 
 		socket.send(JSON.stringify({ type: "pdf_annotation_deleted", annotation_id: "a2" }));
 		await new Promise((resolve) => setTimeout(resolve, 50));
 
-		const clearMessage = nextJsonMessage(socket);
+		const clearMessage = nextJsonMessage(socket, (message) => message.type === "annotations_cleared");
 		const claim = await claimMarks(server.origin);
 		assert.deepEqual(claim.marks, [{ type: "pdf_annotation", pdf_id: 33, annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, source_line: "new", comment: "new" }]);
 		assert.deepEqual(await acknowledgeMarks(server.origin, claim), [{ pdf_id: 33, annotation_id: "a1" }]);
@@ -537,13 +635,13 @@ test("mark claims can be scoped to owned pdf_ids without consuming other marks",
 		secondSocket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a2", page: 1, x: 30, y: 40, source_file: join(baseDir, "second.tex"), line: 2 }));
 		await new Promise((resolve) => setTimeout(resolve, 50));
 
-		const firstClearMessage = nextJsonMessage(firstSocket);
+		const firstClearMessage = nextJsonMessage(firstSocket, (message) => message.type === "annotations_cleared");
 		const scopedClaim = await claimMarks(server.origin, { pdf_ids: [41] });
 		assert.deepEqual(scopedClaim.marks.map((mark) => mark.pdf_id), [41]);
 		await acknowledgeMarks(server.origin, scopedClaim);
 		assert.deepEqual(await firstClearMessage, { type: "annotations_cleared", pdf_id: 41, pdf_ids: [41], annotation_ids: ["a1"] });
 
-		const secondClearMessage = nextJsonMessage(secondSocket);
+		const secondClearMessage = nextJsonMessage(secondSocket, (message) => message.type === "annotations_cleared");
 		const remainingClaim = await claimMarks(server.origin);
 		assert.deepEqual(remainingClaim.marks.map((mark) => mark.pdf_id), [42]);
 		await acknowledgeMarks(server.origin, remainingClaim);
@@ -573,7 +671,7 @@ test("closing a visible viewer tab discards queued marks and clears viewer annot
 		socket.send(JSON.stringify({ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: join(baseDir, "main.tex"), line: 7, source_line: "marked", comment: "note" }));
 		await new Promise((resolve) => setTimeout(resolve, 50));
 
-		const clearMessage = nextJsonMessage(socket);
+		const clearMessage = nextJsonMessage(socket, (message) => message.type === "annotations_cleared");
 		const closeResponse = await fetch(`${server.origin}/viewer-tab-closed`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -605,7 +703,7 @@ test("clear_pdf_annotations reaches active viewer sockets for inactive PDFs", as
 		await server.start();
 		const token = await getViewerSocketToken(server.origin, 34);
 		socket = await openViewerSocket(server.origin, 34, token);
-		const clearMessage = nextJsonMessage(socket);
+		const clearMessage = nextJsonMessage(socket, (message) => message.type === "annotations_cleared");
 		const response = await new ViewerHostControlClient({ origin: server.origin }).send({ type: "clear_pdf_annotations", pdf_id: 33 });
 		assert.deepEqual(response, { ok: true, result: { type: "clear_pdf_annotations", pdf_id: 33 } });
 		assert.deepEqual(await clearMessage, { type: "annotations_cleared", pdf_id: 33, pdf_ids: [33] });

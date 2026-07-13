@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 
 export const PDF_PREVIEW_CONFIG_FILE_NAME = "config.json";
-export const PDF_PREVIEW_CONFIG_DIR_NAME = "pi-pdf-preview";
+export const PDF_PREVIEW_CONFIG_DIR_NAME = ".agent-synctex";
 
 export const LOG_LEVELS = ["debug", "info", "warn", "error", "off"] as const;
 export type PdfPreviewLogLevel = (typeof LOG_LEVELS)[number];
@@ -38,16 +38,12 @@ function normalizePath(path: string): string {
 	return resolve(expandHomePath(path));
 }
 
-function configHome(env: Env = process.env): string {
-	return normalizePath(env.XDG_CONFIG_HOME || resolve(homedir(), ".config"));
-}
-
-function stateHome(env: Env = process.env): string {
-	return normalizePath(env.XDG_STATE_HOME || resolve(homedir(), ".local", "state"));
+function workspaceRoot(env: Env = process.env): string {
+	return normalizePath(env.PDF_PREVIEW_WORKSPACE || env.INIT_CWD || process.cwd());
 }
 
 export function defaultPdfPreviewConfigPath(env: Env = process.env): string {
-	return resolve(configHome(env), PDF_PREVIEW_CONFIG_DIR_NAME, PDF_PREVIEW_CONFIG_FILE_NAME);
+	return resolve(workspaceRoot(env), PDF_PREVIEW_CONFIG_DIR_NAME, PDF_PREVIEW_CONFIG_FILE_NAME);
 }
 
 export function resolvePdfPreviewConfigPath(env: Env = process.env): string {
@@ -56,7 +52,7 @@ export function resolvePdfPreviewConfigPath(env: Env = process.env): string {
 }
 
 export function defaultPdfPreviewLogDir(env: Env = process.env): string {
-	return resolve(stateHome(env), PDF_PREVIEW_CONFIG_DIR_NAME, "logs");
+	return resolve(workspaceRoot(env), PDF_PREVIEW_CONFIG_DIR_NAME, "logs");
 }
 
 function normalizeLogLevel(value: unknown): PdfPreviewLogLevel | undefined {

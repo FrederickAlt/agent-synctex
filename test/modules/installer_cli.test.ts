@@ -171,7 +171,13 @@ test("installed Pi and OpenCode integrations surface mark-fetch failures", async
 			sessionManager: { getSessionId: () => "pi-failure-session" },
 			ui: { notify(message: string, level: string) { notifications.push({ message, level }); } },
 		});
-		assert.equal(piResult, undefined);
+		assert.deepEqual(piResult, {
+			message: {
+				customType: "pdf-viewer-context",
+				content: "Agent SyncTeX hook failed: simulated fetch-info failure",
+				display: true,
+			},
+		});
 		assert.deepEqual(notifications, [{ message: "Agent SyncTeX hook failed: simulated fetch-info failure", level: "warning" }]);
 
 		const openCodeModule = await import(`${pathToFileURL(join(cwd, ".opencode", "plugins", "agent-synctex-post-user.ts")).href}?failure=${Date.now()}`);
@@ -179,6 +185,38 @@ test("installed Pi and OpenCode integrations surface mark-fetch failures", async
 		const output = { parts: [{ type: "text", text: "Read marks" }] };
 		await openCodeHooks["chat.message"]({ messageID: "message-1", sessionID: "session-1" }, output);
 		assert.match(String(output.parts.at(-1)?.text), /Agent SyncTeX hook failed: simulated fetch-info failure/);
+	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("installed Pi integration suppresses transient viewer socket timeout injections", async () => {
+	const cwd = tempProject("agent-synctex-pi-socket-timeout-{}");
+	const previousPath = process.env.PATH;
+	try {
+		const install = await runCli(cwd, ["install", "hooks", "--harness", "pi", "--local"]);
+		assert.equal(install.code, 0, install.stderr);
+		const binDir = join(cwd, "bin");
+		mkdirSync(binDir, { recursive: true });
+		const fakeCli = join(binDir, "agent-synctex");
+		writeFileSync(fakeCli, "#!/usr/bin/env node\nprocess.stderr.write('Agent SyncTeX mark fetch failed: Timed out waiting 1000ms for visible PDF viewer socket connection\\n');\nprocess.exit(23);\n");
+		chmodSync(fakeCli, 0o755);
+		process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+
+		const piHandlers = new Map<string, (event: unknown, context: unknown) => Promise<unknown>>();
+		const piModule = await import(`${pathToFileURL(join(cwd, ".pi", "extensions", "agent-synctex-post-user.ts")).href}?socketTimeout=${Date.now()}`);
+		piModule.default({ on(name: string, handler: (event: unknown, context: unknown) => Promise<unknown>) { piHandlers.set(name, handler); } });
+		const notifications: Array<{ message: string; level: string }> = [];
+		const piResult = await piHandlers.get("before_agent_start")?.({ prompt: "Read marks", cwd }, {
+			cwd,
+			sessionManager: { getSessionId: () => "pi-socket-timeout-session" },
+			ui: { notify(message: string, level: string) { notifications.push({ message, level }); } },
+		});
+
+		assert.equal(piResult, undefined);
+		assert.deepEqual(notifications, []);
 	} finally {
 		if (previousPath === undefined) delete process.env.PATH;
 		else process.env.PATH = previousPath;

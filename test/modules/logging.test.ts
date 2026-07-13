@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -38,40 +38,44 @@ function readJsonlRecords(dir: string): Record<string, unknown>[] {
 		.map((line) => JSON.parse(line) as Record<string, unknown>));
 }
 
-test("runtime config reads shared home config and supports env overrides", () => {
+test("runtime config reads workspace-local config and supports env overrides", () => {
 	const base = temporaryDir("pdf-preview-config-test-");
 	try {
-		const configPath = join(base, "config.json");
-		const configLogDir = join(base, "configured-logs");
+		const configDir = join(base, ".agent-synctex");
+		const configPath = join(configDir, "config.json");
+		const configLogDir = join(configDir, "configured-logs");
+		mkdirSync(configDir, { recursive: true });
 		writeFileSync(configPath, JSON.stringify({ logging: { level: "debug", dir: configLogDir } }));
 
 		const fromConfig = loadPdfPreviewRuntimeConfig({
-			PDF_PREVIEW_CONFIG: configPath,
+			PDF_PREVIEW_WORKSPACE: base,
 		} as NodeJS.ProcessEnv);
 		assert.equal(fromConfig.configPath, configPath);
 		assert.equal(fromConfig.logging.level, "debug");
 		assert.equal(fromConfig.logging.dir, configLogDir);
 
 		const fromEnv = loadPdfPreviewRuntimeConfig({
-			PDF_PREVIEW_CONFIG: configPath,
+			PDF_PREVIEW_WORKSPACE: base,
 			PDF_PREVIEW_LOG_LEVEL: "error",
-			PDF_PREVIEW_LOG_DIR: join(base, "env-logs"),
+			PDF_PREVIEW_LOG_DIR: join(configDir, "env-logs"),
 		} as NodeJS.ProcessEnv);
 		assert.equal(fromEnv.logging.level, "error");
-		assert.equal(fromEnv.logging.dir, join(base, "env-logs"));
+		assert.equal(fromEnv.logging.dir, join(configDir, "env-logs"));
 	} finally {
 		rmSync(base, { recursive: true, force: true });
 	}
 });
 
-test("logger writes JSONL using shared config and redacts sensitive fields", () => {
+test("logger writes JSONL using workspace-local config and redacts sensitive fields", () => {
 	const base = temporaryDir("pdf-preview-logging-test-");
 	try {
-		const configPath = join(base, "config.json");
-		const logDir = join(base, "logs");
+		const configDir = join(base, ".agent-synctex");
+		const configPath = join(configDir, "config.json");
+		const logDir = join(configDir, "logs");
+		mkdirSync(configDir, { recursive: true });
 		writeFileSync(configPath, JSON.stringify({ logging: { level: "debug", dir: logDir } }));
 
-		withEnv({ PDF_PREVIEW_CONFIG: configPath, PDF_PREVIEW_LOG_LEVEL: undefined, PDF_PREVIEW_LOG_DIR: undefined }, () => {
+		withEnv({ PDF_PREVIEW_WORKSPACE: base, PDF_PREVIEW_CONFIG: undefined, PDF_PREVIEW_LOG_LEVEL: undefined, PDF_PREVIEW_LOG_DIR: undefined }, () => {
 			const logger = createLogger("test.logger");
 			logger.debug("event.name", {
 				visible: "value",
@@ -96,14 +100,11 @@ test("logger writes JSONL using shared config and redacts sensitive fields", () 
 	}
 });
 
-test("logger defaults to off without shared config or env overrides", () => {
+test("logger defaults to off without workspace-local config or env overrides", () => {
 	const base = temporaryDir("pdf-preview-logging-default-test-");
 	try {
-		const configHome = join(base, "config");
-		const stateHome = join(base, "state");
 		withEnv({
-			XDG_CONFIG_HOME: configHome,
-			XDG_STATE_HOME: stateHome,
+			PDF_PREVIEW_WORKSPACE: base,
 			PDF_PREVIEW_CONFIG: undefined,
 			PDF_PREVIEW_LOG_LEVEL: undefined,
 			PDF_PREVIEW_LOG_DIR: undefined,
@@ -112,7 +113,7 @@ test("logger defaults to off without shared config or env overrides", () => {
 			logger.error("error.skipped");
 		});
 
-		const logDir = join(stateHome, "pi-pdf-preview", "logs");
+		const logDir = join(base, ".agent-synctex", "logs");
 		assert.equal(existsSync(logDir), false);
 	} finally {
 		rmSync(base, { recursive: true, force: true });

@@ -33,7 +33,35 @@ async function openViewerSocket(viewerSocketUrl: string): Promise<TestWebSocket>
 		socket.addEventListener("open", () => { clearTimeout(timer); resolveOpen(); }, { once: true });
 		socket.addEventListener("error", () => { clearTimeout(timer); rejectOpen(new Error("viewer socket errored before open")); }, { once: true });
 	});
-	return socket;
+	const visibleMarks = new Map<string, Record<string, unknown>>();
+	socket.addEventListener("message", (event) => {
+		const data = typeof event.data === "string" ? event.data : Buffer.from(event.data as ArrayBuffer).toString("utf8");
+		const message = JSON.parse(data) as Record<string, unknown>;
+		if (message.type === "pdf_annotations_snapshot_request") {
+			const maxMarks = Number.isInteger(Number(message.max_marks)) && Number(message.max_marks) > 0 ? Number(message.max_marks) : visibleMarks.size;
+			socket.send(JSON.stringify({
+				type: "pdf_annotations_snapshot",
+				pdf_id: message.pdf_id,
+				request_id: message.request_id,
+				annotations: Array.from(visibleMarks.values()).slice(0, maxMarks),
+			}));
+		} else if (message.type === "annotations_cleared") {
+			const ids = Array.isArray(message.annotation_ids) ? new Set(message.annotation_ids.filter((id): id is string => typeof id === "string")) : undefined;
+			if (ids === undefined) visibleMarks.clear();
+			else for (const id of ids) visibleMarks.delete(id);
+		}
+	});
+	return {
+		get readyState() { return socket.readyState; },
+		send(data: string) {
+			const message = JSON.parse(data) as Record<string, unknown>;
+			if (message.type === "pdf_annotation" && typeof message.annotation_id === "string") visibleMarks.set(message.annotation_id, message);
+			else if (message.type === "pdf_annotation_deleted" && typeof message.annotation_id === "string") visibleMarks.delete(message.annotation_id);
+			socket.send(data);
+		},
+		close() { socket.close(); },
+		addEventListener: socket.addEventListener.bind(socket),
+	};
 }
 
 function writeReverseSynctexFixture(baseDir: string): { pdfPath: string; sourcePath: string } {

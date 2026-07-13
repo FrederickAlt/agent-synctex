@@ -41,7 +41,6 @@ async function loadInitialConfig() {
 const initialConfig = await loadInitialConfig();
 const initialViewerHash = location.hash.startsWith("#") ? location.hash.slice(1) : "";
 
-const HOVER_THROTTLE_MS = 60;
 const NAVIGATION_SETTLE_MS = 200;
 const MIN_HISTORY_SCROLL_DELTA = 24;
 const THEME_STORAGE_KEY = "agent-synctex.pdfViewerTheme";
@@ -59,6 +58,7 @@ const ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX = 360;
 const ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX = 12;
 const SELECTION_DEBUG_TEXT_MAX_LENGTH = 2000;
 const COMPILE_RUNNING_INDICATOR_DELAY_MS = 500;
+const SOCKET_CONNECTING_NOTICE_DELAY_MS = 500;
 const PDF_MARK_PROBE_TIMEOUT_MS = 5_000;
 const ANNOTATION_BOX_DRAG_THRESHOLD_PX = 5;
 
@@ -83,15 +83,13 @@ const viewerNotificationByPdfId = new Map();
 const compileRunningIndicatorTimersByPdfId = new Map();
 let activeRefreshLoadingTask;
 let activeSocket;
+let activeSocketConnectStartedAt;
 let reconnectTimer;
+let socketConnectingNoticeTimer;
 let selectionGeneration = 0;
 let lastSentSelectionSignature;
 let lastSentSelectionGeneration = -1;
 let pendingSelectionSend;
-let hoverTimer;
-let pendingHover;
-let hoverRequestId = 0;
-let latestHoverRequestId = 0;
 let probeRequestId = 0;
 let latestProbeRequestId = 0;
 let activeProbeAbortController;
@@ -101,7 +99,6 @@ let outlinePromise;
 
 const synctexOverlayState = {
   forwardMessage: undefined,
-  hoverResult: undefined,
   probeResult: undefined,
   redrawTimer: undefined,
 };
@@ -169,6 +166,54 @@ function viewerContainer() {
 function activePdfId() {
   const pdfId = Number((hostState.config ?? initialConfig)?.pdf_id);
   return Number.isInteger(pdfId) && pdfId > 0 ? pdfId : undefined;
+}
+
+function viewerLog(level, event, fields = {}) {
+  const pdfId = activePdfId();
+  const viewerToken = hostState.config?.viewer_socket_token;
+  if (!pdfId || typeof viewerToken !== "string" || viewerToken.length === 0 || typeof fetch !== "function") return;
+  void fetch("/viewer-logs", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-agent-synctex-viewer-token": viewerToken,
+    },
+    body: JSON.stringify({ level, event, pdf_id: pdfId, fields }),
+    keepalive: true,
+  }).catch(() => undefined);
+}
+
+function sameOriginResourceDiagnostics() {
+  const origin = location.origin;
+  const resources = typeof performance?.getEntriesByType === "function"
+    ? performance.getEntriesByType("resource").filter((entry) => typeof entry.name === "string" && entry.name.startsWith(origin))
+    : [];
+  const byInitiator = {};
+  for (const entry of resources) byInitiator[entry.initiatorType || "unknown"] = (byInitiator[entry.initiatorType || "unknown"] || 0) + 1;
+  const recent = resources.slice(-12).map((entry) => {
+    let pathname = "unknown";
+    try { pathname = new URL(entry.name).pathname; } catch {}
+    return {
+      pathname,
+      initiator_type: entry.initiatorType || "unknown",
+      start_ms: Math.round(entry.startTime),
+      duration_ms: Math.round(entry.duration),
+      transfer_size: typeof entry.transferSize === "number" ? entry.transferSize : undefined,
+    };
+  });
+  return { resource_count: resources.length, resource_by_initiator: byInitiator, recent_resources: recent };
+}
+
+function viewerSocketConnectDiagnostics(startedAt) {
+  return {
+    elapsed_ms: Date.now() - startedAt,
+    socket_status: hostState.socketStatus,
+    socket_ready_state: activeSocket?.readyState,
+    document_ready_state: document.readyState,
+    visibility_state: document.visibilityState,
+    focused: document.hasFocus(),
+    ...sameOriginResourceDiagnostics(),
+  };
 }
 
 function hasActiveConfig(config = hostState.config) {
@@ -1289,7 +1334,6 @@ function renderSynctexOverlay(message, { selector, datasetName, label, scroll = 
 function redrawSynctexOverlays() {
   synctexOverlayState.redrawTimer = undefined;
   if (synctexOverlayState.forwardMessage) renderSynctexOverlay(synctexOverlayState.forwardMessage, { selector: "[data-synctex-marker]", datasetName: "synctexMarker", scroll: false });
-  if (synctexOverlayState.hoverResult) showHoverResult(synctexOverlayState.hoverResult, { scroll: false, remember: false });
   renderAnnotations(false);
 }
 
@@ -1384,6 +1428,7 @@ function annotationPayload(annotation) {
     line,
     ...(annotationSourceLine(message) === undefined ? {} : { source_line: annotationSourceLine(message) }),
     ...(typeof message.pdf_mark === "string" && message.pdf_mark.trim() ? { pdf_mark: message.pdf_mark.trim() } : {}),
+    ...(message.synctex_diagnostics === undefined ? {} : { synctex_diagnostics: message.synctex_diagnostics }),
     source_spans: sourceSpans,
     ...(annotation.comment ? { comment: annotation.comment } : {}),
   };
@@ -1391,7 +1436,59 @@ function annotationPayload(annotation) {
 
 function sendAnnotationUpdate(annotation) {
   const payload = annotationPayload(annotation);
-  if (payload) sendViewerSocketPayload(payload);
+  const sent = payload !== undefined && sendViewerSocketPayload(payload);
+  if (!sent && activeSocket?.readyState === WebSocket.CONNECTING) scheduleSocketConnectingNotice(activeSocket, activeSocketConnectStartedAt ?? Date.now());
+  viewerLog(sent ? "info" : "warn", sent ? "marks.annotation.socket_sent" : "marks.annotation.socket_pending", {
+    annotation_id: annotation.id,
+    page: annotation.pageNumber,
+    line: annotation.line,
+    source_file: annotation.sourceFile,
+    socket_status: hostState.socketStatus,
+    socket_ready_state: activeSocket?.readyState,
+  });
+  annotation.pendingSocketSync = !sent;
+  persistAnnotations();
+}
+
+function annotationSnapshotPayloads(maxMarks) {
+  const limit = Number.isInteger(Number(maxMarks)) && Number(maxMarks) > 0 ? Number(maxMarks) : annotations.size;
+  const payloads = [];
+  for (const annotation of annotations.values()) {
+    const payload = annotationPayload(annotation);
+    if (!payload) continue;
+    payloads.push(payload);
+    if (payloads.length >= limit) break;
+  }
+  return payloads;
+}
+
+function sendAnnotationSnapshot(message) {
+  const pdfId = activePdfId();
+  if (!pdfId || Number(message.pdf_id) !== pdfId) return;
+  const snapshot = annotationSnapshotPayloads(message.max_marks);
+  const sent = sendViewerSocketPayload({
+    type: "pdf_annotations_snapshot",
+    pdf_id: pdfId,
+    request_id: message.request_id,
+    annotations: snapshot,
+  });
+  viewerLog(sent ? "info" : "warn", sent ? "marks.snapshot.response_sent" : "marks.snapshot.response_failed", {
+    request_id: message.request_id,
+    marks_count: snapshot.length,
+    socket_status: hostState.socketStatus,
+    socket_ready_state: activeSocket?.readyState,
+  });
+}
+
+function replayPendingAnnotationUpdates() {
+  let replayed = 0;
+  for (const annotation of annotations.values()) {
+    if (annotation.pendingSocketSync === true) {
+      replayed += 1;
+      sendAnnotationUpdate(annotation);
+    }
+  }
+  if (replayed > 0) viewerLog("info", "marks.pending_replayed", { count: replayed });
 }
 
 function annotationStorageKey(pdfId = activePdfId()) {
@@ -1411,6 +1508,7 @@ function persistAnnotations() {
     message: annotation.message,
     comment: annotation.comment || "",
     hasBubble: annotation.hasBubble === true,
+    ...(annotation.pendingSocketSync === true ? { pendingSocketSync: true } : {}),
     ...(typeof annotation.bubbleLeft === "number" ? { bubbleLeft: annotation.bubbleLeft } : {}),
     ...(typeof annotation.bubbleTop === "number" ? { bubbleTop: annotation.bubbleTop } : {}),
     ...(typeof annotation.bubbleWidth === "number" ? { bubbleWidth: annotation.bubbleWidth } : {}),
@@ -1431,6 +1529,7 @@ function restoreAnnotationsForActivePdf() {
         message: annotation.message,
         comment: typeof annotation.comment === "string" ? annotation.comment : "",
         hasBubble: annotation.hasBubble === true,
+        ...(annotation.pendingSocketSync === true ? { pendingSocketSync: true } : {}),
         ...(typeof annotation.bubbleLeft === "number" ? { bubbleLeft: annotation.bubbleLeft } : {}),
         ...(typeof annotation.bubbleTop === "number" ? { bubbleTop: annotation.bubbleTop } : {}),
         ...(typeof annotation.bubbleWidth === "number" ? { bubbleWidth: annotation.bubbleWidth } : {}),
@@ -1926,14 +2025,17 @@ function createAnnotationFromMessage(message, { select = true, bubble = false, s
   const existing = findExistingAnnotationForMessage(message);
   if (existing) {
     if (bubble) existing.hasBubble = true;
+    const receivedDiagnostics = message.synctex_diagnostics;
+    if (receivedDiagnostics !== undefined) existing.message = { ...existing.message, ...message };
     persistAnnotations();
     if (select) selectedAnnotationId = existing.id;
     renderAnnotations(scroll);
+    if (receivedDiagnostics !== undefined) sendAnnotationUpdate(existing);
     return true;
   }
   const id = `annotation-${Date.now()}-${nextAnnotationNumber}`;
   nextAnnotationNumber += 1;
-  const annotation = { id, message, comment: "", hasBubble: bubble };
+  const annotation = { id, message, comment: "", hasBubble: bubble, pendingSocketSync: true };
   annotations.set(id, annotation);
   persistAnnotations();
   if (select) selectedAnnotationId = id;
@@ -1948,22 +2050,17 @@ function clearForwardSynctexMarker() {
 }
 
 function clearTransientSynctexState() {
-	latestHoverRequestId += 1;
 	latestProbeRequestId += 1;
 	latestBoxRequestId += 1;
 	annotationBoxDrag = undefined;
 	clearProvisionalAnnotationBox();
-	pendingHover = undefined;
 	activeProbeAbortController?.abort();
 	activeProbeAbortController = undefined;
 	pendingSelectionSend = undefined;
 	selectionGeneration += 1;
 	lastSentSelectionSignature = undefined;
-	if (hoverTimer !== undefined) clearTimeout(hoverTimer);
-	hoverTimer = undefined;
-	synctexOverlayState.hoverResult = undefined;
 	synctexOverlayState.probeResult = undefined;
-	removeOverlays("[data-reverse-synctex-hover], [data-reverse-synctex-forward-probe], [data-pdf-mark-status]");
+	removeOverlays("[data-reverse-synctex-forward-probe], [data-pdf-mark-status]");
 }
 
 function convertForwardMarkerToAnnotation() {
@@ -2237,17 +2334,12 @@ function setHoverEnabled(enabled) {
     button.setAttribute("aria-label", button.title);
   }
   if (!enabled) {
-    latestHoverRequestId += 1;
     latestProbeRequestId += 1;
     latestBoxRequestId += 1;
     annotationBoxDrag = undefined;
     clearProvisionalAnnotationBox();
-    pendingHover = undefined;
     activeProbeAbortController?.abort();
     activeProbeAbortController = undefined;
-    if (hoverTimer !== undefined) clearTimeout(hoverTimer);
-    hoverTimer = undefined;
-    removeOverlays("[data-reverse-synctex-hover]");
   }
   updateHostDataset();
 }
@@ -2258,17 +2350,11 @@ function setDebugSynctexEnabled(enabled) {
   if (button) {
     button.setAttribute("aria-pressed", enabled ? "true" : "false");
     button.classList.toggle("toggled", enabled);
-    button.title = enabled ? "Disable SyncTeX debug overlays" : "Enable SyncTeX debug overlays";
+    button.title = enabled ? "Disable SyncTeX diagnostics" : "Enable SyncTeX diagnostics";
     button.setAttribute("aria-label", button.title);
   }
-  if (!enabled) {
-    latestHoverRequestId += 1;
-    pendingHover = undefined;
-    if (hoverTimer !== undefined) clearTimeout(hoverTimer);
-    hoverTimer = undefined;
-    synctexOverlayState.hoverResult = undefined;
-    removeOverlays("[data-reverse-synctex-hover], [data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
-  }
+  // Debug traces are retained with debug-created annotations, not rendered in the browser.
+  removeOverlays("[data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
   updateHostDataset();
 }
 
@@ -2296,8 +2382,7 @@ function invokeHistoryShortcut(direction, originalTarget) {
 function handleHistoryKeydown(event) {
   if (event.key === "Escape" && !hasEditableFocus()) {
     clearForwardSynctexMarker();
-    synctexOverlayState.hoverResult = undefined;
-    removeOverlays("[data-reverse-synctex-hover], [data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
+    removeOverlays("[data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
     return;
   }
   if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
@@ -2948,24 +3033,6 @@ function installHoverToolbarButton() {
   setHoverEnabled(true);
 }
 
-function scheduleHover(event, pageNumber) {
-  if (!hostState.debugSynctexEnabled || !viewerSocketOpen()) return;
-  const point = clientPointToPdfPoint(event, pageNumber);
-  if (!point) return;
-  const requestId = hoverRequestId + 1;
-  hoverRequestId = requestId;
-  latestHoverRequestId = requestId;
-  pendingHover = { type: "reverse_synctex_hover", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexProbeContext(event, pageNumber) };
-  if (hoverTimer !== undefined) return;
-  hoverTimer = setTimeout(() => {
-    hoverTimer = undefined;
-    const payload = pendingHover;
-    pendingHover = undefined;
-    if (!hostState.debugSynctexEnabled || !payload) return;
-    sendViewerSocketPayload(payload);
-  }, HOVER_THROTTLE_MS);
-}
-
 function showPendingProbe(payload) {
   const overlay = synctexOverlayPositions(payload);
   const position = overlay?.positions[0];
@@ -3000,6 +3067,7 @@ async function requestProbe(payload) {
   const timeout = setTimeout(() => controller.abort(new Error(`PDF mark resolution exceeded ${PDF_MARK_PROBE_TIMEOUT_MS}ms`)), PDF_MARK_PROBE_TIMEOUT_MS);
   try {
     if (typeof viewerToken !== "string" || viewerToken.length === 0) throw new Error("The active PDF has no Viewer Host authentication token");
+    viewerLog("debug", "synctex.probe.request", { request_id: payload.request_id, page: payload.page });
     const response = await fetch("/synctex/probe", {
       method: "POST",
       headers: {
@@ -3014,12 +3082,14 @@ async function requestProbe(payload) {
       throw new Error(body?.error?.message || `Viewer Host returned HTTP ${response.status}`);
     }
     if (activePdfId() !== pdfId) return;
+    viewerLog(body.result?.error ? "warn" : "debug", body.result?.error ? "synctex.probe.result_error" : "synctex.probe.result", { request_id: payload.request_id, page: payload.page, error: body.result?.error });
     showProbeResult(body.result);
   } catch (error) {
     if (Number(payload.request_id) !== latestProbeRequestId || activePdfId() !== pdfId) return;
     const detail = controller.signal.aborted
       ? controller.signal.reason?.message || "PDF mark resolution was cancelled"
       : error?.message || String(error);
+    viewerLog("warn", "synctex.probe.failed", { request_id: payload.request_id, page: payload.page, detail });
     showProbeResult({
       type: "reverse_synctex_forward_probe_result",
       pdf_id: pdfId,
@@ -3044,11 +3114,6 @@ function sendProbe(event, pageNumber) {
   const requestId = probeRequestId + 1;
   probeRequestId = requestId;
   latestProbeRequestId = requestId;
-  if (hostState.debugSynctexEnabled) {
-    latestHoverRequestId += 1;
-    synctexOverlayState.hoverResult = undefined;
-    removeOverlays("[data-reverse-synctex-hover]");
-  }
   removeOverlays("[data-reverse-synctex-forward-probe], [data-pdf-mark-status], [data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
   const payload = { type: "reverse_synctex_forward_probe", request_id: requestId, page: pageNumber, x: point[0], y: point[1], ...reverseSynctexProbeContext(event, pageNumber) };
   showPendingProbe(payload);
@@ -3089,6 +3154,7 @@ async function requestAnnotationBox(payload) {
   const viewerToken = hostState.config?.viewer_socket_token;
   try {
     if (typeof viewerToken !== "string" || viewerToken.length === 0) throw new Error("The active PDF has no Viewer Host authentication token");
+    viewerLog("debug", "synctex.box.request", { request_id: payload.request_id, page: payload.page });
     const response = await fetch("/synctex/box", {
       method: "POST",
       headers: {
@@ -3101,10 +3167,12 @@ async function requestAnnotationBox(payload) {
     if (!response.ok || body?.ok !== true || !body.result) throw new Error(body?.error?.message || `Viewer Host returned HTTP ${response.status}`);
     if (body.result.error) throw new Error(String(body.result.error));
     if (payload.request_id !== latestBoxRequestId || activePdfId() !== pdfId) return;
+    viewerLog("info", "synctex.box.result", { request_id: payload.request_id, page: payload.page, source_file: body.result.source_file, line: body.result.line });
     if (createAnnotationFromMessage(body.result, { select: true, bubble: false, scroll: false })) clearSynctexCapabilityIssue();
   } catch (error) {
     if (payload.request_id !== latestBoxRequestId || activePdfId() !== pdfId) return;
     const detail = error?.message || String(error);
+    viewerLog("warn", "synctex.box.failed", { request_id: payload.request_id, page: payload.page, detail });
     setSynctexCapabilityIssue(synctexCapabilityIssueFromError(detail));
   } finally {
     if (payload.request_id === latestBoxRequestId) clearProvisionalAnnotationBox();
@@ -3162,122 +3230,6 @@ function startAnnotationBoxDrag(event, pageNumber) {
   window.addEventListener("pointercancel", onCancel, true);
 }
 
-function hoverDiagnosticsLabel(message) {
-  const file = String(message.source_file || "").split(/[\\/]/).pop() || "source";
-  return `${file}:${message.line ?? "?"}${message.source_line ? ` ${String(message.source_line).slice(0, 100)}` : ""}`;
-}
-
-function hoverRectPosition(rect, page, viewport) {
-  const leftTop = viewport.convertToViewportPoint(Number(rect.left), Number(rect.top));
-  const rightBottom = viewport.convertToViewportPoint(Number(rect.right), Number(rect.bottom));
-  const pageHeight = pageViewportHeight(page, viewport);
-  return {
-    left: Math.min(leftTop[0], rightBottom[0]),
-    top: pageHeight - Math.max(leftTop[1], rightBottom[1]),
-    width: Math.max(2, Math.abs(rightBottom[0] - leftTop[0])),
-    height: Math.max(2, Math.abs(leftTop[1] - rightBottom[1])),
-  };
-}
-
-function debugCandidateLines(candidates, selectedScore) {
-  const lines = [];
-  if (Number.isFinite(selectedScore)) lines.push(`selected score ${selectedScore.toFixed(1)}`);
-  for (const [index, candidate] of (Array.isArray(candidates) ? candidates.slice(0, 3) : []).entries()) {
-    lines.push(`#${index + 1} ${hoverDiagnosticsLabel(candidate)}${Number.isFinite(candidate.score) ? ` score ${candidate.score.toFixed(1)}` : ""}${Number.isFinite(candidate.distance) ? ` distance ${candidate.distance.toFixed(1)}` : ""}`);
-  }
-  return lines;
-}
-
-function debugForwardGroupLines(groups) {
-  return (Array.isArray(groups) ? groups : []).map((group) => {
-    const score = Number(group?.score);
-    const penalty = Number(group?.semantic_penalty);
-    const tier = Number(group?.geometry_tier);
-    return `${group?.selected === true ? "*" : " "} ${String(group?.origin ?? "unknown")} line ${Number(group?.lookup_line)}`
-      + `${Number.isFinite(tier) ? ` tier ${tier}` : ""}`
-      + `${Number.isFinite(penalty) ? ` penalty ${penalty}` : ""}`
-      + `${Number.isFinite(score) ? ` score ${score}` : ""}`;
-  });
-}
-
-function selectedDebugForwardBox(message) {
-  const selected = Array.isArray(message.debug_forward_groups)
-    ? message.debug_forward_groups.find((group) => group?.selected === true && group.chosen_box)
-    : undefined;
-  return selected?.chosen_box;
-}
-
-function renderProbeDebugBox(message) {
-  removeOverlays("[data-synctex-probe-debug-box]");
-  if (!hostState.debugSynctexEnabled) return;
-  const box = selectedDebugForwardBox(message);
-  if (!box) return;
-  renderSynctexOverlay({ page: box.page, ranges: [box] }, {
-    selector: "[data-synctex-probe-debug-box]",
-    datasetName: "synctexProbeDebugBox",
-    scroll: false,
-  });
-}
-
-function renderProbeDebugSummary(message) {
-  const groups = Array.isArray(message.debug_forward_groups) ? message.debug_forward_groups : [];
-  const candidates = Array.isArray(message.debug_candidates) ? message.debug_candidates : [];
-  if (!hostState.debugSynctexEnabled || (groups.length === 0 && candidates.length === 0)) return;
-  const box = selectedDebugForwardBox(message);
-  const overlay = synctexOverlayPositions(box ? { page: box.page, ranges: [box] } : { page: message.page, x: message.x, y: message.y, width: message.width, height: message.height, ranges: message.ranges });
-  const position = overlay?.positions[0];
-  if (!overlay || !position) return;
-  removeOverlays("[data-synctex-probe-debug-summary]");
-  const summary = document.createElement("div");
-  summary.dataset.synctexProbeDebugSummary = "true";
-  summary.className = "hostSynctexOverlayLabel";
-  summary.style.position = "absolute";
-  summary.style.pointerEvents = "none";
-  summary.style.zIndex = "100030";
-  summary.style.left = `${Math.max(0, position.left)}px`;
-  summary.style.top = `${Math.max(0, position.top - 32)}px`;
-  summary.style.width = `${ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX}px`;
-  summary.style.maxWidth = `calc(100% - ${ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX * 2}px)`;
-  summary.style.whiteSpace = "pre-wrap";
-  summary.textContent = [...debugCandidateLines(candidates, message.debug_selected_score), ...debugForwardGroupLines(groups)].join("\n");
-  overlay.overlayParent.append(summary);
-}
-
-function showHoverResult(message, options = {}) {
-  if (!hostState.debugSynctexEnabled || Number(message.request_id) !== latestHoverRequestId) return;
-  if (options.remember !== false) synctexOverlayState.hoverResult = message;
-  removeOverlays("[data-reverse-synctex-hover]");
-  if (message.error || !message.rect) return;
-  const pageNumber = Number(message.page);
-  const page = pageElement(pageNumber);
-  const viewport = pageViewport(pageNumber);
-  if (!page || !viewport) return;
-  const position = hoverRectPosition(message.rect, page, viewport);
-  const overlayParent = pageOverlayParent(page);
-  const marker = document.createElement("div");
-  marker.dataset.reverseSynctexHover = "rect";
-  marker.style.position = "absolute";
-  marker.style.pointerEvents = "none";
-  marker.style.zIndex = "100001";
-  marker.style.left = `${position.left}px`;
-  marker.style.top = `${position.top}px`;
-  marker.style.width = `${position.width}px`;
-  marker.style.height = `${position.height}px`;
-  marker.style.outline = "2px solid rgba(14,165,233,.9)";
-  marker.style.background = "rgba(14,165,233,.18)";
-  const label = document.createElement("div");
-  label.dataset.reverseSynctexHover = "label";
-  label.className = "hostSynctexOverlayLabel";
-  label.style.left = `${Math.max(0, position.left)}px`;
-  label.style.top = `${Math.max(0, position.top - 28)}px`;
-  label.style.width = `${ANNOTATION_BUBBLE_DEFAULT_WIDTH_PX}px`;
-  label.style.maxWidth = `calc(100% - ${ANNOTATION_BUBBLE_VIEWPORT_MARGIN_PX * 2}px)`;
-  label.style.whiteSpace = "pre-wrap";
-  const lines = debugCandidateLines(message.candidates, message.selected_score);
-  label.textContent = [hoverDiagnosticsLabel(message), ...lines].join("\n");
-  overlayParent.append(marker, label);
-}
-
 function showProbeResult(message, options = {}) {
   if (Number(message.request_id) !== latestProbeRequestId) return;
   removeOverlays("[data-reverse-synctex-forward-probe], [data-pdf-mark-status], [data-synctex-probe-debug-summary], [data-synctex-probe-debug-box]");
@@ -3290,8 +3242,6 @@ function showProbeResult(message, options = {}) {
     return;
   }
   if (createAnnotationFromMessage(message, { select: true, bubble: false, scroll: options.scroll !== false })) clearSynctexCapabilityIssue();
-  renderProbeDebugBox(message);
-  renderProbeDebugSummary(message);
 }
 
 function decodePdfHashDestination(hash) {
@@ -3448,11 +3398,6 @@ function installPageEventHandlers() {
     sendSelectionDebug("mouseup", pageNumber, { clientX: event.clientX, clientY: event.clientY, selectedTextLength: selectedText.length, generation: selectionGeneration });
     if (selectedText.length > 0) scheduleSelectionPayload(pageNumber);
   }, true);
-  viewer.addEventListener("mousemove", (event) => {
-    const pageNumber = pageNumberFromElement(event.target);
-    if (!pageNumber) return;
-    scheduleHover(event, pageNumber);
-  }, true);
 }
 
 function handleHostMessage(message) {
@@ -3482,6 +3427,10 @@ function handleHostMessage(message) {
     setViewerFailure(message);
     return;
   }
+  if (message.type === "pdf_annotations_snapshot_request") {
+    sendAnnotationSnapshot(message);
+    return;
+  }
   if (Number(message.pdf_id) !== activePdfId()) return;
   if (message.type === "pdf_refresh") {
     const nextRevision = Number(message.revision);
@@ -3495,10 +3444,6 @@ function handleHostMessage(message) {
     showSynctexMarker(message);
   } else if (message.type === "set_debug_synctex") {
     setDebugSynctexEnabled(message.enabled === true);
-  } else if (message.type === "reverse_synctex_hover_result") {
-    if (message.error) setSynctexCapabilityIssue(synctexCapabilityIssueFromError(message.error));
-    else clearSynctexCapabilityIssue();
-    showHoverResult(message);
   }
 }
 
@@ -3534,14 +3479,37 @@ async function reportInitialLoadedState() {
 function disconnectViewerSocket() {
   const socket = activeSocket;
   activeSocket = undefined;
+  activeSocketConnectStartedAt = undefined;
   if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
   reconnectTimer = undefined;
-  pendingHover = undefined;
-  if (hoverTimer !== undefined) clearTimeout(hoverTimer);
-  hoverTimer = undefined;
+  clearSocketConnectingNoticeTimer();
   socket?.close?.();
   hostState.socketStatus = "disconnected";
   updateHostDataset();
+}
+
+function clearSocketConnectingNoticeTimer() {
+  if (socketConnectingNoticeTimer === undefined) return;
+  clearTimeout(socketConnectingNoticeTimer);
+  socketConnectingNoticeTimer = undefined;
+}
+
+function showSocketConnectingNotice(startedAt = activeSocketConnectStartedAt ?? Date.now()) {
+  viewerLog("warn", "viewer_socket.connect.slow", viewerSocketConnectDiagnostics(startedAt));
+  setSynctexCapabilityIssue({
+    code: "server_connecting",
+    title: "PDF mark connection is still starting",
+    detail: "The viewer is connected to the local Viewer Host over HTTP, but its mark WebSocket has not opened yet. Marks are saved locally and will sync when the connection opens.",
+  });
+}
+
+function scheduleSocketConnectingNotice(socket, startedAt) {
+  clearSocketConnectingNoticeTimer();
+  const delayMs = Math.max(0, startedAt + SOCKET_CONNECTING_NOTICE_DELAY_MS - Date.now());
+  socketConnectingNoticeTimer = setTimeout(() => {
+    socketConnectingNoticeTimer = undefined;
+    if (activeSocket === socket && socket.readyState === WebSocket.CONNECTING) showSocketConnectingNotice(startedAt);
+  }, delayMs);
 }
 
 function connectViewerSocket() {
@@ -3554,21 +3522,34 @@ function connectViewerSocket() {
     });
     return;
   }
+  const startedAt = Date.now();
   const socket = new WebSocket(socketUrl);
+  viewerLog("info", "viewer_socket.connect.start", { previous_socket_status: hostState.socketStatus, ...viewerSocketConnectDiagnostics(startedAt) });
   activeSocket = socket;
-  hostState.socketStatus = "connecting";
+  activeSocketConnectStartedAt = startedAt;
+  hostState.socketStatus = socket.readyState === WebSocket.OPEN ? "connected" : "connecting";
+  if (socket.readyState === WebSocket.CONNECTING) scheduleSocketConnectingNotice(socket, startedAt);
   updateHostDataset();
-	  socket.addEventListener("open", () => {
-    if (activeSocket !== socket) return;
+
+  let opened = false;
+  const onOpen = () => {
+    if (activeSocket !== socket || opened) return;
+    opened = true;
+    clearSocketConnectingNoticeTimer();
+    activeSocketConnectStartedAt = undefined;
     hostState.socketStatus = "connected";
+    clearSynctexCapabilityIssue("server_connecting");
     clearSynctexCapabilityIssue("server_unreachable");
+    viewerLog("info", "viewer_socket.open", viewerSocketConnectDiagnostics(startedAt));
     updateHostDataset();
     sendLoadedStateDiagnostic("lw_loaded_state", { trigger: "socket_open" });
     sendToolsHitTargetDiagnostic("socket_open");
-	    sendCompileAction("status");
-	    void reconcileActivePdfAfterSocketOpen(socket);
-	  });
-  socket.addEventListener("message", (event) => {
+    replayPendingAnnotationUpdates();
+    sendCompileAction("status");
+    void reconcileActivePdfAfterSocketOpen(socket);
+  };
+
+  const onMessage = (event) => {
     if (activeSocket !== socket) return;
     try {
       handleHostMessage(JSON.parse(event.data));
@@ -3582,10 +3563,18 @@ function connectViewerSocket() {
       });
       updateHostDataset();
     }
-  });
-  socket.addEventListener("close", () => {
+  };
+
+  socket.addEventListener("open", onOpen);
+  socket.addEventListener("message", onMessage);
+  if (socket.readyState === WebSocket.OPEN) queueMicrotask(onOpen);
+
+  socket.addEventListener("close", (event) => {
     if (activeSocket !== socket) return;
+    clearSocketConnectingNoticeTimer();
+    activeSocketConnectStartedAt = undefined;
     hostState.socketStatus = "disconnected";
+    viewerLog("warn", "viewer_socket.close", { ...viewerSocketConnectDiagnostics(startedAt), code: event.code, was_clean: event.wasClean });
     if (hasActiveConfig(hostState.config)) setSynctexCapabilityIssue({
       code: "server_unreachable",
       title: "Viewer Host connection is unavailable",
@@ -3596,7 +3585,10 @@ function connectViewerSocket() {
   });
   socket.addEventListener("error", () => {
     if (activeSocket !== socket) return;
+    clearSocketConnectingNoticeTimer();
+    activeSocketConnectStartedAt = undefined;
     hostState.socketStatus = "error";
+    viewerLog("warn", "viewer_socket.error", viewerSocketConnectDiagnostics(startedAt));
     setSynctexCapabilityIssue({
       code: "server_unreachable",
       title: "Viewer Host connection is unavailable",
@@ -3609,6 +3601,7 @@ function connectViewerSocket() {
 forceShowLaTeXWorkshopChrome();
 
 installWebViewerLoadedConfigListener();
+viewerLog("info", "viewer.bootstrap", { has_active_config: hasActiveConfig(initialConfig), revision: initialConfig.revision, user_agent: navigator.userAgent });
 
 await import("/viewer-lw/viewer.mjs");
 forceShowLaTeXWorkshopChrome();
@@ -3622,13 +3615,14 @@ installPdfThemeButton();
 installHoverToolbarButton();
 installCompileToolbarButtons();
 setDebugSynctexEnabled(initialConfig.debug_synctex === true);
+if (hasActiveConfig(initialConfig)) connectViewerSocket();
 installToolsHitboxFallback();
 installPageEventHandlers();
 void applyInitialHashWhenReady();
 void restoreStoredPdfViewStateWhenReady();
 void restoreAnnotationsForActivePdfWhenReady();
-if (hasActiveConfig(initialConfig)) connectViewerSocket();
 updateHostDataset();
+viewerLog("info", "viewer.ready", { visible_revision: hostState.visibleRevision, socket_status: hostState.socketStatus });
 void reportInitialLoadedState();
 
 globalThis.__hostLwRefreshDebug = {
