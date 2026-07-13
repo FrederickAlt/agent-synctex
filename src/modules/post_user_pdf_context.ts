@@ -73,17 +73,22 @@ export function formatPdfAnnotationContext(events: PdfAnnotationEvent[], options
 	return formatPdfAnnotationContextResult(events, options).text;
 }
 
+interface PdfAnnotationContextGroup {
+	events: PdfAnnotationEvent[];
+	spans: Array<{ source_file: string; start_line: number; end_line: number }>;
+}
+
 function formatPdfAnnotationContextResult(events: PdfAnnotationEvent[], options: { cwd?: string } = {}): { text: string; events: PdfAnnotationEvent[] } {
 	if (events.length === 0) return { text: "", events: [] };
+	const groups = groupAnnotationEvents(events);
 	const sourceCache = new Map<string, string[] | undefined>();
 	const lines = ["## PDF marks from the User", ""];
-	for (const event of events) {
-		const spans = sourceSpansForAnnotation(event);
-		const sourceLine = event.source_line?.trim();
-		const comment = event.comment?.trim();
+	for (const group of groups) {
+		const { spans } = group;
+		const sourceLine = group.events.find((event) => event.source_line?.trim())?.source_line?.trim();
 		let remainingLines = 50;
 		lines.push(`- ${spans.map((span) => `${displaySourceFile(span.source_file, options.cwd)}:${formatLineRange(span.start_line, span.end_line)}`).join(", ")}`);
-		if (event.source_stale === true) {
+		if (group.events.some((event) => event.source_stale === true)) {
 			lines.push("  Warning: this source changed after the displayed PDF was compiled; the excerpt is current, but the mark may refer to the earlier PDF.");
 		}
 		let sourceBudgetOmitted = false;
@@ -95,24 +100,27 @@ function formatPdfAnnotationContextResult(events: PdfAnnotationEvent[], options:
 			const sourceExcerpt = readSourceExcerpt(span.source_file, span.start_line, span.end_line, options.cwd, sourceCache, remainingLines);
 			if (sourceExcerpt !== undefined) {
 				const excerptLabel = spans.length === 1
-					? "  Already read TeX source excerpt:"
-					: `  Already read TeX source excerpt: ${displaySourceFile(span.source_file, options.cwd)}:${formatLineRange(span.start_line, span.end_line)}`;
+					? "  TeX source excerpt:"
+					: `  TeX source excerpt: ${displaySourceFile(span.source_file, options.cwd)}:${formatLineRange(span.start_line, span.end_line)}`;
 				lines.push(excerptLabel, "  ```tex", ...sourceExcerpt.lines.map((line) => `  ${line}`), "  ```");
 				remainingLines -= sourceExcerpt.lines.length;
 				if (sourceExcerpt.truncated) lines.push(remainingLines === 0 && spans.length > 1
 					? "  (excerpt truncated to the 50-source-line total budget per annotation)"
 					: "  (excerpt truncated to 50 lines)");
 			} else if (spans.length === 1 && sourceLine !== undefined) {
-				lines.push(`  Already read TeX source excerpt: \`${escapeInlineCode(sourceLine)}\``);
+				lines.push(`  TeX source excerpt: \`${escapeInlineCode(sourceLine)}\``);
 			}
 		}
 		if (sourceBudgetOmitted) lines.push("  (source excerpt omitted: 50-source-line total budget per annotation exhausted)");
-			formatSynctexDiagnostics(event, lines);
-		if (comment !== undefined && comment !== "") {
-			lines.push("  Messages:", `  - ${comment.replace(/\n/g, "\n    ")}`);
+		for (const event of group.events) formatSynctexDiagnostics(event, lines);
+		const comments = group.events
+			.map((event) => event.comment?.trim())
+			.filter((comment): comment is string => comment !== undefined && comment !== "");
+		if (comments.length > 0) {
+			lines.push("  Messages:", ...comments.map((comment) => `  - ${comment.replace(/\n/g, "\n    ")}`));
 		}
 	}
-	return { text: lines.join("\n"), events };
+	return { text: lines.join("\n"), events: groups.flatMap((group) => group.events) };
 }
 
 const MAX_FORMATTED_SYNCTEX_DEBUG_PROPOSALS = 3;
@@ -143,6 +151,21 @@ function formatSynctexDiagnostics(event: PdfAnnotationEvent, lines: string[]): v
 
 function formatDebugNumber(value: number): string {
 	return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/\.?(?:0+)$/, "");
+}
+
+function groupAnnotationEvents(events: PdfAnnotationEvent[]): PdfAnnotationContextGroup[] {
+	const groupsByKey = new Map<string, PdfAnnotationContextGroup>();
+	for (const event of events) {
+		const spans = sourceSpansForAnnotation(event);
+		const key = `${event.pdf_id}\u0000${spans.map((span) => `${span.source_file}\u0000${span.start_line}\u0000${span.end_line}`).join("\u0001")}`;
+		let group = groupsByKey.get(key);
+		if (group === undefined) {
+			group = { events: [], spans };
+			groupsByKey.set(key, group);
+		}
+		group.events.push(event);
+	}
+	return Array.from(groupsByKey.values());
 }
 
 function sourceSpansForAnnotation(event: PdfAnnotationEvent): Array<{ source_file: string; start_line: number; end_line: number }> {

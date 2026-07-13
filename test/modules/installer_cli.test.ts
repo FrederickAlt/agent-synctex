@@ -192,6 +192,41 @@ test("installed Pi and OpenCode integrations surface mark-fetch failures", async
 	}
 });
 
+test("installed Pi integration bounds a hung fetch-info subprocess", async () => {
+	const cwd = tempProject("agent-synctex-pi-fetch-timeout-{}");
+	const previousPath = process.env.PATH;
+	const previousTimeout = process.env.AGENT_SYNCTEX_PI_FETCH_TIMEOUT_MS;
+	try {
+		const install = await runCli(cwd, ["install", "hooks", "--harness", "pi", "--local"]);
+		assert.equal(install.code, 0, install.stderr);
+		const binDir = join(cwd, "bin");
+		mkdirSync(binDir, { recursive: true });
+		const fakeCli = join(binDir, "agent-synctex");
+		writeFileSync(fakeCli, "#!/usr/bin/env node\nsetTimeout(() => {}, 10_000);\n");
+		chmodSync(fakeCli, 0o755);
+		process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+		process.env.AGENT_SYNCTEX_PI_FETCH_TIMEOUT_MS = "100";
+
+		const piHandlers = new Map<string, (event: unknown, context: unknown) => Promise<unknown>>();
+		const piModule = await import(`${pathToFileURL(join(cwd, ".pi", "extensions", "agent-synctex-post-user.ts")).href}?fetchTimeout=${Date.now()}`);
+		piModule.default({ on(name: string, handler: (event: unknown, context: unknown) => Promise<unknown>) { piHandlers.set(name, handler); } });
+		const startedAt = Date.now();
+		const piResult = await piHandlers.get("before_agent_start")?.({ prompt: "Read marks", cwd }, {
+			cwd,
+			sessionManager: { getSessionId: () => "pi-fetch-timeout-session" },
+		});
+
+		assert.ok(Date.now() - startedAt < 2_000, "hung fetch-info must not make the Pi hook unresponsive");
+		assert.match(JSON.stringify(piResult), /Agent SyncTeX hook failed: .*ETIMEDOUT/);
+	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		if (previousTimeout === undefined) delete process.env.AGENT_SYNCTEX_PI_FETCH_TIMEOUT_MS;
+		else process.env.AGENT_SYNCTEX_PI_FETCH_TIMEOUT_MS = previousTimeout;
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 test("installed Pi integration suppresses transient viewer socket timeout injections", async () => {
 	const cwd = tempProject("agent-synctex-pi-socket-timeout-{}");
 	const previousPath = process.env.PATH;

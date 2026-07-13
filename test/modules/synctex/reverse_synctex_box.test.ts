@@ -54,10 +54,27 @@ test("box reverse SyncTeX seeds from the best covered line and stops before fail
 		...pageLeaf(10, 0, 100),
 	]);
 	try {
-		const result = resolveReverseSynctexBox({ message: message(), pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
+		const result = resolveReverseSynctexBox({ message: message({ H: 20 }), pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
 		assert.deepEqual(result.source_spans, [{ source_file: fixture.sourcePath, start_line: 3, end_line: 5 }]);
 		assert.deepEqual(result.ranges?.map((range) => Math.round(range.h)), [0]);
 		assert.equal(result.ranges?.length, 1);
+	} finally {
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+test("box reverse SyncTeX stops at one box when the drag closely matches the best text line", () => {
+	const fixture = writeFixture("unrelated formula\nText below the left minipage math.\nunrelated tail\n", [
+		...pageLeaf(1, 0, 100),
+		...pageLeaf(2, 0, 100),
+		...pageLeaf(3, 0, 100),
+	]);
+	try {
+		const result = resolveReverseSynctexBox({
+			message: message({ pdf_text_spans: [{ page: 1, h: 0, v: 100, W: 10, H: 10, text: "Text below the left minipage math." }] }),
+			pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir },
+		});
+		assert.deepEqual(result.source_spans, [{ source_file: fixture.sourcePath, start_line: 2, end_line: 2 }]);
 	} finally {
 		rmSync(fixture.dir, { recursive: true, force: true });
 	}
@@ -113,7 +130,7 @@ test("box reverse SyncTeX promotes an opening environment marker only with later
 		...pageLeaf(5, 6, 100),
 	]);
 	try {
-		const result = resolveReverseSynctexBox({ message: message(), pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
+		const result = resolveReverseSynctexBox({ message: message({ H: 20 }), pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
 		assert.deepEqual(result.source_spans, [{ source_file: fixture.sourcePath, start_line: 1, end_line: 4 }]);
 	} finally {
 		rmSync(fixture.dir, { recursive: true, force: true });
@@ -142,7 +159,7 @@ test("box reverse SyncTeX merges accepted lines across at most two missing lines
 		...pageLeaf(8, 0, 100, 6),
 	]);
 	try {
-		const result = resolveReverseSynctexBox({ message: message({ W: 6 }), pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
+		const result = resolveReverseSynctexBox({ message: message({ W: 6, H: 20 }), pdf: { pdfId: 7, pdfPath: fixture.pdfPath, workspaceCwd: fixture.dir } });
 		assert.deepEqual(result.source_spans, [
 			{ source_file: fixture.sourcePath, start_line: 1, end_line: 4 },
 			{ source_file: fixture.sourcePath, start_line: 8, end_line: 8 },

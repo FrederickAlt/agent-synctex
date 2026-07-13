@@ -105,17 +105,25 @@ function stableHash(value: string | undefined): string | undefined {
 	return value ? createHash("sha256").update(value).digest("hex").slice(0, 12) : undefined;
 }
 
+function hookFetchTimeoutMs(): number {
+	const raw = Number(process.env.AGENT_SYNCTEX_PI_FETCH_TIMEOUT_MS ?? "5000");
+	return Number.isInteger(raw) && raw >= 100 ? raw : 5000;
+}
+
 function fetchPdfContext(prompt: string, cwd: string | undefined, sessionId: string | undefined): { text: string; error?: string } {
 	const args = ["fetch-info", "--harness", "pi"];
 	if (cwd) args.push("--cwd", cwd);
 	if (sessionId) args.push("--agent-id", sessionId);
+	const timeout = hookFetchTimeoutMs();
 	const options = {
 		input: prompt,
 		encoding: "utf8" as const,
+		timeout,
+		killSignal: "SIGKILL" as const,
 		...(cwd ? { cwd } : {}),
 	};
 	traceHook("fetch-start", { cwd_hash: stableHash(cwd), session_hash: stableHash(sessionId) });
-	hookLog("info", "fetch.start", { cwd_hash: stableHash(cwd), session_hash: stableHash(sessionId), prompt_bytes: Buffer.byteLength(prompt), args }, cwd);
+	hookLog("info", "fetch.start", { cwd_hash: stableHash(cwd), session_hash: stableHash(sessionId), prompt_bytes: Buffer.byteLength(prompt), timeout_ms: timeout, args }, cwd);
 	const startedAt = Date.now();
 	const direct = spawnSync("agent-synctex", args, options);
 	if (direct.status === 0) {

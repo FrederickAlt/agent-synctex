@@ -37,7 +37,7 @@ test("PDF annotation context keeps multi-range annotations separate and limits a
 		assert.doesNotMatch(result.text, /line 71/);
 		assert.match(result.text, /excerpt truncated to the 50-source-line total budget per annotation/);
 		assert.match(result.text, /source excerpt omitted: 50-source-line total budget per annotation exhausted/);
-		assert.match(result.text, /- main\.tex:13\n  Already read TeX source excerpt:\n  ```tex\n  line 13\n  ```\n  Messages:\n  - Second message\./);
+		assert.match(result.text, /- main\.tex:13\n  TeX source excerpt:\n  ```tex\n  line 13\n  ```\n  Messages:\n  - Second message\./);
 		assert.equal((result.text.match(/Messages:/g) ?? []).length, 2);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });

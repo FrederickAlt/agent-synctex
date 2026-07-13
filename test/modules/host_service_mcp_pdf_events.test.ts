@@ -50,12 +50,12 @@ test("fetch_pdf_context formats PDF annotation comments as concise source-cited 
 	assert.ok(response && "result" in response);
 	const result = response.result as { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> };
 	const text = result.content?.[0]?.text ?? "";
-	assert.equal(text, "## PDF marks from the User\n\n- /tmp/paper/main.tex:42\n  Already read TeX source excerpt: `E = mc^2`\n  Messages:\n  - Please justify this step.");
+	assert.equal(text, "## PDF marks from the User\n\n- /tmp/paper/main.tex:42\n  TeX source excerpt: `E = mc^2`\n  Messages:\n  - Please justify this step.");
 	assert.deepEqual(result.details, { pdf_ids: [34942382], event_count: 1, cleared: true });
 	assert.doesNotMatch(text, /selection_debug|page=3|E = mc²/);
 });
 
-test("PDF mark context preserves separate annotations on one source line", () => {
+test("PDF mark context merges separate annotations on one source line", () => {
 	const events: PdfEvent[] = [
 		{ type: "pdf_annotation", sequence: 1, pdf_id: 1, annotation_id: "left", timestamp: "2026-07-11T00:00:00.000Z", source_file: "/tmp/paper/main.tex", line: 42, source_line: "The shared source line.", pdf_mark: "First PDF box.", page: 1, x: 10, y: 20, comment: "First user message." },
 		{ type: "pdf_annotation", sequence: 2, pdf_id: 1, annotation_id: "right", timestamp: "2026-07-11T00:00:01.000Z", source_file: "/tmp/paper/main.tex", line: 42, source_line: "The shared source line.", pdf_mark: "Second PDF box.", page: 1, x: 90, y: 20, comment: "Second user message." },
@@ -64,7 +64,7 @@ test("PDF mark context preserves separate annotations on one source line", () =>
 	const result = collectPostUserPdfContextFromEvents(events, { pdfId: 1, clearViewer: true });
 
 	assert.equal(result.eventCount, 2);
-	assert.equal(result.text, "## PDF marks from the User\n\n- /tmp/paper/main.tex:42\n  Already read TeX source excerpt: `The shared source line.`\n  Messages:\n  - First user message.\n- /tmp/paper/main.tex:42\n  Already read TeX source excerpt: `The shared source line.`\n  Messages:\n  - Second user message.");
+	assert.equal(result.text, "## PDF marks from the User\n\n- /tmp/paper/main.tex:42\n  TeX source excerpt: `The shared source line.`\n  Messages:\n  - First user message.\n  - Second user message.");
 });
 
 test("PDF mark context warns when source changed after PDF compilation", () => {
@@ -84,7 +84,7 @@ test("PDF mark context warns when source changed after PDF compilation", () => {
 	}], { clearViewer: true });
 
 	assert.match(result.text, /Warning: this source changed after the displayed PDF was compiled/);
-	assert.match(result.text, /Already read TeX source excerpt: `stale source line`/);
+	assert.match(result.text, /TeX source excerpt: `stale source line`/);
 });
 
 test("PDF mark context preserves long user comments without truncation or omission", () => {
@@ -128,7 +128,7 @@ test("PDF mark context keeps absolute source paths outside cwd", () => {
 		y: 1,
 	}], { cwd: "/tmp/workspace", clearViewer: true });
 
-	assert.equal(result.text, "## PDF marks from the User\n\n- /tmp/outside/main.tex:3\n  Already read TeX source excerpt: `outside`");
+	assert.equal(result.text, "## PDF marks from the User\n\n- /tmp/outside/main.tex:3\n  TeX source excerpt: `outside`");
 });
 
 test("PDF mark context normalizes a mark without a source span to a singular line range", () => {
@@ -146,7 +146,7 @@ test("PDF mark context normalizes a mark without a source span to a singular lin
 		y: 1,
 	}], { cwd: "/tmp/workspace", clearViewer: true });
 
-	assert.equal(result.text, "## PDF marks from the User\n\n- main.tex:157\n  Already read TeX source excerpt: `}`");
+	assert.equal(result.text, "## PDF marks from the User\n\n- main.tex:157\n  TeX source excerpt: `}`");
 });
 
 test("PDF mark context keeps overlapping source spans with their annotations", () => {
@@ -159,7 +159,7 @@ test("PDF mark context keeps overlapping source spans with their annotations", (
 			source_file: sourceFile, line: start_line, source_span: { source_file: sourceFile, start_line, end_line }, page: 1, x: 1, y: 1,
 		}));
 
-		assert.equal(collectPostUserPdfContextFromEvents(events, { cwd: dir }).text, "## PDF marks from the User\n\n- main.tex:2-4\n  Already read TeX source excerpt:\n  ```tex\n  two\n  three\n  four\n  ```\n- main.tex:4-6\n  Already read TeX source excerpt:\n  ```tex\n  four\n  five\n  six\n  ```\n- main.tex:6-8\n  Already read TeX source excerpt:\n  ```tex\n  six\n  seven\n  eight\n  ```");
+		assert.equal(collectPostUserPdfContextFromEvents(events, { cwd: dir }).text, "## PDF marks from the User\n\n- main.tex:2-4\n  TeX source excerpt:\n  ```tex\n  two\n  three\n  four\n  ```\n- main.tex:4-6\n  TeX source excerpt:\n  ```tex\n  four\n  five\n  six\n  ```\n- main.tex:6-8\n  TeX source excerpt:\n  ```tex\n  six\n  seven\n  eight\n  ```");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -175,7 +175,7 @@ test("PDF mark context keeps disjoint source spans separate", () => {
 	assert.equal(collectPostUserPdfContextFromEvents(events).text, "## PDF marks from the User\n\n- /tmp/missing-disjoint.tex:1-2\n- /tmp/missing-disjoint.tex:4-5");
 });
 
-test("PDF mark context truncates already read TeX source excerpts at 50 lines", () => {
+test("PDF mark context truncates TeX source excerpts at 50 lines", () => {
 	const dir = mkdtempSync(join(tmpdir(), "pdf-mark-range-truncation-"));
 	try {
 		const sourceFile = join(dir, "main.tex");
@@ -196,7 +196,7 @@ test("PDF mark context falls back to stored source lines when source reading fai
 		source_file: "/tmp/missing-source.tex", line: 9, source_line: "\\section{Fallback}", page: 1, x: 1, y: 1,
 	}]);
 
-	assert.equal(result.text, "## PDF marks from the User\n\n- /tmp/missing-source.tex:9\n  Already read TeX source excerpt: `\\section{Fallback}`");
+	assert.equal(result.text, "## PDF marks from the User\n\n- /tmp/missing-source.tex:9\n  TeX source excerpt: `\\section{Fallback}`");
 });
 
 test("PDF mark context delivers every selected event without a hidden output budget", () => {
@@ -265,7 +265,7 @@ test("Viewer Host MCP service fetches context and clears consumed viewer annotat
 
 		const result = await service.fetchPdfContext({ pdf_id: 513, max_events: 5, cwd: dir });
 
-		assert.equal(result.text, "## PDF marks from the User\n\n- main.tex:5-8\n  Already read TeX source excerpt: `marked source`\n  Messages:\n  - user note");
+		assert.equal(result.text, "## PDF marks from the User\n\n- main.tex:5-8\n  TeX source excerpt: `marked source`\n  Messages:\n  - user note");
 		assert.deepEqual(client.messages.at(-1), { type: "clear_pdf_annotations", pdf_id: 513 });
 		assert.deepEqual(await service.getPdfEvents({ pdf_id: 513, max_events: 5 }), []);
 	} finally {

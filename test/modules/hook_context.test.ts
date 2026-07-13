@@ -215,7 +215,7 @@ test("hook context claims marks directly from the Viewer Host and acknowledges o
 		const firstSnapshot = await nextJsonMessage(socket, (message) => message.type === "pdf_annotations_snapshot_request");
 		sendMarkSnapshot(socket, firstSnapshot, [{ type: "pdf_annotation", annotation_id: "a1", page: 1, x: 10, y: 20, source_file: sourcePath, line: 1, source_line: "Marked source line.", pdf_mark: "Visible PDF text.", comment: "direct note" }]);
 		const cleared = nextJsonMessage(socket, (message) => message.type === "annotations_cleared");
-		assert.equal(await firstContext, "## PDF marks from the User\n\n- main.tex:1\n  Already read TeX source excerpt:\n  ```tex\n  Marked source line.\n  ```\n  Messages:\n  - direct note");
+		assert.equal(await firstContext, "## PDF marks from the User\n\n- main.tex:1\n  TeX source excerpt:\n  ```tex\n  Marked source line.\n  ```\n  Messages:\n  - direct note");
 		assert.deepEqual(await cleared, { type: "annotations_cleared", pdf_id: 12, pdf_ids: [12], annotation_ids: ["a1"] });
 		const emptyContext = fetchHookContext({ runtimeRoot, agentId: "direct-agent", cwd: baseDir });
 		const emptySnapshot = await nextJsonMessage(socket, (message) => message.type === "pdf_annotations_snapshot_request");
@@ -401,7 +401,7 @@ test("hook discovery never overrides an explicit agent identity and uses only an
 		const cwdContext = fetchHookContext({ runtimeRoot, cwd: projectCwd });
 		const cwdSnapshot = await nextJsonMessage(socket, (message) => message.type === "pdf_annotations_snapshot_request");
 		sendMarkSnapshot(socket, cwdSnapshot, [{ type: "pdf_annotation", annotation_id: "cwd", page: 1, x: 1, y: 2, source_file: sourcePath, line: 1, pdf_mark: "CWD PDF mark." }]);
-		assert.equal(await cwdContext, "## PDF marks from the User\n\n- main.tex:1\n  Already read TeX source excerpt:\n  ```tex\n  CWD source.\n  ```");
+		assert.equal(await cwdContext, "## PDF marks from the User\n\n- main.tex:1\n  TeX source excerpt:\n  ```tex\n  CWD source.\n  ```");
 	} finally {
 		socket?.close();
 		await server.stop();
@@ -464,7 +464,7 @@ test("agent-synctex fetch-info consumes direct Viewer Host context without a bri
 		sendMarkSnapshot(socket, cliSnapshot, [{ type: "pdf_annotation", annotation_id: "cli", page: 1, x: 1, y: 2, source_file: sourcePath, line: 1, pdf_mark: "CLI PDF mark." }]);
 		const code = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
 		assert.equal(code, 0);
-		assert.equal(stdout, "## PDF marks from the User\n\n- main.tex:1\n  Already read TeX source excerpt:\n  ```tex\n  CLI source.\n  ```");
+		assert.equal(stdout, "## PDF marks from the User\n\n- main.tex:1\n  TeX source excerpt:\n  ```tex\n  CLI source.\n  ```");
 	} finally {
 		socket?.close();
 		await server.stop();

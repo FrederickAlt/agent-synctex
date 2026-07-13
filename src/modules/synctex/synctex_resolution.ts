@@ -37,6 +37,7 @@ export type ReverseSynctexMapper = typeof mapReverseSynctex;
 const MAX_REVERSE_SYNCTEX_BOX_LEAF_BOXES = MAX_CACHED_SYNC_TEX_PAGE_LEAF_BOXES;
 const MAX_REVERSE_SYNCTEX_BOX_SOURCE_LOCATIONS = 2_000;
 const MIN_BOX_COVERAGE = 0.5;
+const HIGH_CONFIDENCE_BOX_MATCH = 0.8;
 const SCORE_EPSILON = 1e-9;
 const MIN_TEXT_MATCH_LENGTH = 8;
 const MAX_DEBUG_SYNCTEX_PROPOSALS = 3;
@@ -110,8 +111,10 @@ export function resolveReverseSynctexBox(input: {
 
 	const boxesByLine = pageBoxesBySource.get(seed.rawSourceFile) ?? new Map();
 	const accepted = [seed];
-	growBoxSelection({ direction: -1, seedLine: seed.line, source: seed.source, rawSourceFile: seed.rawSourceFile, boxesByLine, message, accepted });
-	growBoxSelection({ direction: 1, seedLine: seed.line, source: seed.source, rawSourceFile: seed.rawSourceFile, boxesByLine, message, accepted });
+	if (!isHighConfidenceBoxMatch(seed, message)) {
+		growBoxSelection({ direction: -1, seedLine: seed.line, source: seed.source, rawSourceFile: seed.rawSourceFile, boxesByLine, message, accepted });
+		growBoxSelection({ direction: 1, seedLine: seed.line, source: seed.source, rawSourceFile: seed.rawSourceFile, boxesByLine, message, accepted });
+	}
 	const sourceSpans = mergeAcceptedSourceSpans(normalizedSourceSpansForLines(seed.source.sourceFile, accepted.map((candidate) => candidate.line)));
 	const firstSpan = sourceSpans[0]!;
 	return {
@@ -239,6 +242,11 @@ function compareScoredBoxCandidates(left: ScoredBoxCandidate, right: ScoredBoxCa
 		|| left.line - right.line
 		|| left.box.h - right.box.h
 		|| left.box.v - right.box.v;
+}
+
+function isHighConfidenceBoxMatch(candidate: ScoredBoxCandidate, message: ViewerHostReverseSynctexBoxMessage): boolean {
+	return candidate.coverage + SCORE_EPSILON >= HIGH_CONFIDENCE_BOX_MATCH
+		&& boxCoverage(message, candidate.box) + SCORE_EPSILON >= HIGH_CONFIDENCE_BOX_MATCH;
 }
 
 function textMatchBonus(source: ResolvedSource, span: ViewerHostSourceSpan, box: ViewerHostSynctexForwardRange, pdfTextSpans: ViewerHostPdfTextSpan[] | undefined): number {
