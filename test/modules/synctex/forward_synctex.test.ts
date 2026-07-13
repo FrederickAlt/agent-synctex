@@ -2145,6 +2145,32 @@ test("reverse SyncTeX adapter normalizes \\end{equation} to the enclosing formul
 	}
 });
 
+test("reverse SyncTeX normalizes a theorem closing line when begin has an attached label", () => {
+	const project = makeFixtureProject({ sidecar: "synctex" });
+	try {
+		writeFileSync(project.sourcePath, [
+			"\\begin{theorem}\\label{thm:sample}",
+			"  The claim.",
+			"\\end{theorem}",
+			"",
+		].join("\n"));
+
+		const location = mapReverseSynctex({
+			pdfPath: project.pdfPath,
+			page: 1,
+			x: 144.27,
+			y: 155.27,
+			cwd: project.dir,
+			nativeRunner: failNativeRunner,
+		});
+
+		assert.deepEqual(location.normalizedSourceSpan, { sourceFile: project.sourcePath, startLine: 1, endLine: 3 });
+		assert.equal(location.normalizedSourceExcerpt, "\\begin{theorem}\\label{thm:sample}\n  The claim.\n\\end{theorem}");
+	} finally {
+		rmSync(project.dir, { recursive: true, force: true });
+	}
+});
+
 test("reverse SyncTeX adapter normalizes align and align* closing lines", () => {
 	for (const environment of ["align", "align*"]) {
 		const project = makeFixtureProject({ sidecar: "synctex" });

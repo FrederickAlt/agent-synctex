@@ -1253,7 +1253,7 @@ function spanEnvironmentToken(line: string, environment: string): "begin" | "end
 	const escaped = environment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	const trimmed = line.trim();
 	if (new RegExp(`^\\\\end\\{${escaped}\\}\\s*(?:%.*)?$`).test(trimmed)) return "end";
-	return new RegExp(`^\\\\begin\\{${escaped}\\}(?=\\s|\\[|\\{|%|$)`).test(trimmed) ? "begin" : undefined;
+	return new RegExp(`^\\\\begin\\{${escaped}\\}`).test(trimmed) ? "begin" : undefined;
 }
 
 /**
