@@ -583,8 +583,6 @@ export class HostServiceCompileService {
 				request.request_id,
 				request.workspace_context,
 				pdf,
-				request.details.reuse_existing,
-				request.details.require_persistent_viewer,
 				request.details.debug_synctex,
 			);
 		} catch (error) {
@@ -669,8 +667,6 @@ export class HostServiceCompileService {
 		requestId: string,
 		workspaceContext: HostServiceWorkspaceContext,
 		pdfPath: string,
-		reuseExisting?: boolean,
-		requirePersistentViewer?: boolean,
 		debugSynctex?: boolean,
 	): Promise<HostServiceOpenResponseEnvelope> {
 		return this.managedViewerService.openViewer({
@@ -681,8 +677,6 @@ export class HostServiceCompileService {
 			workspace_context: workspaceContext,
 			details: {
 				pdf_path: pdfPath,
-				reuse_existing: reuseExisting ?? true,
-				require_persistent_viewer: requirePersistentViewer ?? false,
 				...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
 			},
 		});

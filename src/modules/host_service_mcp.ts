@@ -304,7 +304,7 @@ function parseJumpWorkspaceContext(rawWorkspaceContext: unknown, sourceFile?: st
 }
 
 function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileRequest: HostServiceCompileRequest; hideWarnings: boolean } {
-	const allowedArgs = new Set(["latex_file_path", "compiler", "clean", "open_pdf", "hide_warnings", "reuse_existing", "require_persistent_viewer", "debug_synctex", "workspace_context"]);
+	const allowedArgs = new Set(["latex_file_path", "compiler", "clean", "open_pdf", "hide_warnings", "debug_synctex", "workspace_context"]);
 	for (const key of Object.keys(args)) {
 		if (!allowedArgs.has(key)) {
 			throw new Error(`compile_latex_file unknown argument: ${key}`);
@@ -315,8 +315,6 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 	const clean = parseBooleanArg(args, "clean");
 	const openPdf = parseBooleanArg(args, "open_pdf");
 	const hideWarnings = parseBooleanArg(args, "hide_warnings") ?? true;
-	const reuseExisting = openPdf ? parseBooleanArg(args, "reuse_existing") : undefined;
-	const requirePersistentViewer = openPdf ? parseBooleanArg(args, "require_persistent_viewer") : undefined;
 	const debugSynctex = openPdf ? parseBooleanArg(args, "debug_synctex") : undefined;
 	const workspaceContext = parseCompileWorkspaceContext(latexFilePath, args.workspace_context);
 	return {
@@ -331,8 +329,6 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 				...(compiler === undefined ? {} : { compiler }),
 				...(clean === undefined ? {} : { clean }),
 				...(openPdf === undefined ? {} : { open_pdf: openPdf }),
-				...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
-				...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
 				...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
 			},
 		},
@@ -341,7 +337,7 @@ function parseCompileLatexFileRequest(args: Record<string, unknown>): { compileR
 }
 
 function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequest {
-	const allowedArgs = new Set(["pdf_file_path", "reuse_existing", "require_persistent_viewer", "debug_synctex", "workspace_context"]);
+	const allowedArgs = new Set(["pdf_file_path", "debug_synctex", "workspace_context"]);
 	for (const key of Object.keys(args)) {
 		if (!allowedArgs.has(key)) {
 			throw new Error(`open_pdf unknown argument: ${key}`);
@@ -354,8 +350,6 @@ function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequ
 	const rawWorkspaceContext = args.workspace_context;
 	const workspaceContext = parseOpenWorkspaceContext(pdfPath, rawWorkspaceContext);
 	const resolvedPdfPath = isAbsolute(pdfPath) ? pdfPath : resolve(workspaceContext.cwd, pdfPath);
-	const reuseExisting = parseBooleanArg(args, "reuse_existing");
-	const requirePersistentViewer = parseBooleanArg(args, "require_persistent_viewer");
 	const debugSynctex = parseBooleanArg(args, "debug_synctex");
 	return {
 		protocol_version: MCP_RUNTIME_PROTOCOL_VERSION,
@@ -365,8 +359,6 @@ function parseOpenPdfRequest(args: Record<string, unknown>): HostServiceOpenRequ
 		workspace_context: workspaceContext,
 		details: {
 			pdf_path: resolvedPdfPath,
-			...(reuseExisting === undefined ? {} : { reuse_existing: reuseExisting }),
-			...(requirePersistentViewer === undefined ? {} : { require_persistent_viewer: requirePersistentViewer }),
 			...(debugSynctex === undefined ? {} : { debug_synctex: debugSynctex }),
 		},
 	};
@@ -629,15 +621,15 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 	const tools: McpToolDefinition[] = [
 		{
 			name: "show_latex",
-			description: "Render LaTeX as a temporary PDF and route its viewer open request through the Viewer Host Client boundary. Without preamble_root_file, source must be a complete LaTeX document. With preamble_root_file, the discovered preamble for that LaTeX root wraps either a \\begin{document}...\\end{document} body or document body content. The response includes the generated editable .tex source path so callers can edit it and recompile; for small changes, prefer editing that existing temporary file over creating a new show_latex document. Warning message details are hidden by default; set hide_warnings=false to show them. If a browser viewer is detected after launch/focus, the tool returns only pdf_id plus that source location because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
+			description: "Compile LaTeX into a temporary PDF and open it in the viewer. Pass a complete document unless preamble_root_file is set; with a root, pass a document body to wrap with that root's preamble. Returns the generated editable .tex path and PDF id. For revisions, edit and recompile the returned .tex file instead of calling show_latex again.",
 			inputSchema: {
 				type: "object",
 				properties: {
-					source: { type: "string", minLength: 1, description: "LaTeX source. Without preamble_root_file, pass a complete document. With preamble_root_file, pass either a \\begin{document}...\\end{document} body or only document body content." },
-					name: { type: "string", minLength: 1, description: "Optional filename for the generated snippet source, with or without a .tex suffix. Path components are not allowed. Existing names receive an increasing numeric suffix." },
-					compiler: { type: "string" },
-					preamble_root_file: { type: "string", minLength: 1, description: "LaTeX root file whose discovered preamble should wrap this source. Relative paths resolve from the workspace cwd." },
-					hide_warnings: { type: "boolean", default: true, description: "Defaults to true. Set false to include warning summaries and details.warnings." },
+					source: { type: "string", minLength: 1, description: "Complete LaTeX document, or a document body when preamble_root_file is set." },
+					name: { type: "string", minLength: 1, description: "Filename for the generated source, with or without a .tex suffix. Do not include path components. A numeric suffix is added if the name already exists." },
+					compiler: { type: "string", enum: ["lualatex", "pdflatex", "xelatex", "latexmk"], description: "LaTeX compiler to use." },
+					preamble_root_file: { type: "string", minLength: 1, description: "Root .tex file whose preamble should wrap source. Relative paths resolve from the current working directory." },
+					hide_warnings: { type: "boolean", default: true, description: "Hide warning details while preserving the warning count. Defaults to true." },
 					workspace_context: workspaceContextSchema(),
 				},
 				required: ["source"],
@@ -646,17 +638,15 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 		},
 		{
 			name: "compile_latex_file",
-			description: "Compile a LaTeX source file once with latexmk and optionally route the output PDF open request through the Viewer Host Client boundary. The compiler option selects the TeX engine latexmk should run. Same-root requests are coordinated in the MCP runtime to avoid overlapping latexmk processes. Set clean=true to remove common same-basename artifacts before compiling. Warning message details are hidden by default; set hide_warnings=false to show warning summaries and details.warnings. When open_pdf=true, if a browser viewer is detected after launch/focus, the tool returns only pdf_id because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
+			description: "Compile a .tex file with latexmk. Use clean to remove existing build artifacts first, and open_pdf to open the resulting PDF in the viewer.",
 			inputSchema: {
 				type: "object",
 				properties: {
-					latex_file_path: { type: "string", minLength: 1 },
-					compiler: { type: "string" },
-					clean: { type: "boolean" },
-					open_pdf: { type: "boolean" },
-					hide_warnings: { type: "boolean", default: true, description: "Defaults to true. When true, successful compiles keep warning_count metadata but hide warning message details from text and omit details.warnings. Set hide_warnings=false to show warning summaries and details.warnings." },
-					reuse_existing: { type: "boolean" },
-					require_persistent_viewer: { type: "boolean" },
+					latex_file_path: { type: "string", minLength: 1, description: "Source .tex path. Relative paths resolve from the current working directory." },
+					compiler: { type: "string", enum: ["lualatex", "pdflatex", "xelatex", "latexmk"], description: "LaTeX compiler to use." },
+					clean: { type: "boolean", description: "Remove common same-basename build artifacts before compiling." },
+					open_pdf: { type: "boolean", description: "Open the compiled PDF in the viewer." },
+					hide_warnings: { type: "boolean", default: true, description: "Hide warning details while preserving the warning count. Defaults to true." },
 					workspace_context: workspaceContextSchema(),
 				},
 				required: ["latex_file_path"],
@@ -665,13 +655,11 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 		},
 		{
 			name: "open_pdf",
-			description: "Register a PDF in MCP state, send an open/focus request through the Viewer Host Client boundary, and return a runtime PDF id. If a browser viewer is detected after launch/focus, the tool returns only pdf_id because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
+			description: "Open a PDF in the viewer and return its PDF id for later jump_pdf or fetch_pdf_context calls.",
 			inputSchema: {
 				type: "object",
 				properties: {
-					pdf_file_path: { type: "string", minLength: 1 },
-					reuse_existing: { type: "boolean" },
-					require_persistent_viewer: { type: "boolean" },
+					pdf_file_path: { type: "string", minLength: 1, description: "PDF path. Relative paths resolve from the current working directory." },
 					workspace_context: workspaceContextSchema(),
 				},
 				required: ["pdf_file_path"],
@@ -680,13 +668,13 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 		},
 		{
 			name: "jump_pdf",
-			description: "Jump a tracked PDF to a source line via forward SyncTeX. If a browser viewer is detected after launch/focus, the tool returns only pdf_id/handled status because the user can already see the output; it includes a Viewer URL only when no live browser viewer is detected.",
+			description: "Jump an open PDF to the location corresponding to a LaTeX source line using SyncTeX. Pass the PDF id returned by open_pdf, show_latex, or compile_latex_file. Omit source_file when it can be inferred from the PDF.",
 			inputSchema: {
 				type: "object",
 				properties: {
-					pdf_id: { type: "integer", minimum: 1 },
-					line: { type: "integer", minimum: 1 },
-					source_file: { type: "string", minLength: 1 },
+					pdf_id: { type: "integer", minimum: 1, description: "PDF id returned by open_pdf, show_latex, or compile_latex_file." },
+					line: { type: "integer", minimum: 1, description: "One-based source line number." },
+					source_file: { type: "string", minLength: 1, description: "Source .tex path. Required only when it cannot be inferred from the PDF. Relative paths resolve from the current working directory." },
 					workspace_context: workspaceContextSchema(),
 				},
 				required: ["pdf_id", "line"],
@@ -697,12 +685,12 @@ function mcpToolDescriptions(options: HostServiceMcpOptions = {}): readonly McpT
 	if (shouldExposeFetchPdfContext(options)) {
 		tools.push({
 			name: "fetch_pdf_context",
-			description: "Fetch unread PDF viewer marks/comments as concise source-cited context. Returns user comments attached to LaTeX source lines and consumes pending viewer marks.",
+			description: "Fetch and consume pending PDF marks and comments as source-linked LaTeX context. Omit pdf_id to fetch context from all tracked PDFs.",
 			inputSchema: {
 				type: "object",
 				properties: {
-					pdf_id: { type: "integer", minimum: 1 },
-					max_events: { type: "integer", minimum: 1 },
+					pdf_id: { type: "integer", minimum: 1, description: "Fetch context only for this tracked PDF id." },
+					max_events: { type: "integer", minimum: 1, description: "Maximum number of pending events to consume." },
 				},
 				required: [],
 				additionalProperties: false,

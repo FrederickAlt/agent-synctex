@@ -7,7 +7,7 @@ function request(id: number, method: string, params: Record<string, unknown> = {
 }
 
 test("v1 tools/list exposes Viewer Host tools and omits raw event and close tools", async () => {
-	const response = await handleMcpRequest(request(1, "tools/list")) as unknown as { result: { tools: Array<{ name: string }> } };
+	const response = await handleMcpRequest(request(1, "tools/list")) as unknown as { result: { tools: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown> } }> } };
 	const names = response.result.tools.map((tool) => tool.name);
 
 	assert.deepEqual(names, [
@@ -19,6 +19,23 @@ test("v1 tools/list exposes Viewer Host tools and omits raw event and close tool
 	]);
 	assert.equal(names.includes("get_pdf_events"), false);
 	assert.equal(names.includes("close_pdf"), false);
+	const toolsByName = new Map(response.result.tools.map((tool) => [tool.name, tool]));
+	assert.equal(toolsByName.get("compile_latex_file")?.inputSchema?.properties?.reuse_existing, undefined);
+	assert.equal(toolsByName.get("compile_latex_file")?.inputSchema?.properties?.require_persistent_viewer, undefined);
+	assert.equal(toolsByName.get("open_pdf")?.inputSchema?.properties?.reuse_existing, undefined);
+	assert.equal(toolsByName.get("open_pdf")?.inputSchema?.properties?.require_persistent_viewer, undefined);
+});
+
+test("removed viewer lifecycle arguments are rejected", async () => {
+	for (const [name, arguments_] of [
+		["compile_latex_file", { latex_file_path: "/tmp/paper.tex", reuse_existing: true }],
+		["compile_latex_file", { latex_file_path: "/tmp/paper.tex", require_persistent_viewer: true }],
+		["open_pdf", { pdf_file_path: "/tmp/paper.pdf", reuse_existing: true }],
+		["open_pdf", { pdf_file_path: "/tmp/paper.pdf", require_persistent_viewer: true }],
+	] as const) {
+		const response = await handleMcpRequest(request(10, "tools/call", { name, arguments: arguments_ })) as { error?: { message?: string } };
+		assert.match(response.error?.message ?? "", /unknown argument/);
+	}
 });
 
 test("hook-aware tools/list hides manual PDF context tool", async () => {

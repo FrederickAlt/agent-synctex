@@ -25,8 +25,6 @@ export interface HostServiceCompileRequest {
 		compiler?: unknown;
 		clean?: boolean;
 		open_pdf?: boolean;
-		reuse_existing?: boolean;
-		require_persistent_viewer?: boolean;
 		debug_synctex?: boolean;
 	};
 }
@@ -45,8 +43,6 @@ export interface HostServiceCompileSnippetRequest {
 		suppress_page_numbers?: boolean;
 		crop_to_content?: boolean;
 		open_pdf?: boolean;
-		reuse_existing?: boolean;
-		require_persistent_viewer?: boolean;
 		debug_synctex?: boolean;
 	};
 }
@@ -59,8 +55,6 @@ export interface HostServiceOpenRequest {
 	workspace_context: HostServiceWorkspaceContext;
 	details: {
 		pdf_path: string;
-		reuse_existing?: boolean;
-		require_persistent_viewer?: boolean;
 		debug_synctex?: boolean;
 	};
 }

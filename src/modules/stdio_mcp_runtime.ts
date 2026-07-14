@@ -512,7 +512,7 @@ function installViewerCompileActions(service: ViewerHostMcpService, compileServi
 				operation: "compile_latex_file",
 				created_at_ns: Date.now() * 1_000_000,
 				workspace_context: { cwd: record.workspaceCwd },
-				details: { latex_file_path: sourcePath, open_pdf: true, reuse_existing: true },
+				details: { latex_file_path: sourcePath, open_pdf: true },
 			}, controller.signal);
 			if (active.get(record.pdfId) !== run) return;
 			active.delete(record.pdfId);
