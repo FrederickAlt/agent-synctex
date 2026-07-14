@@ -10,83 +10,71 @@ Agent SyncTeX is a local stdio MCP server for LaTeX workflows. It can compile La
 - A TeX installation providing `latexmk` and `synctex`
 - A local web browser for the PDF viewer
 
+## Supported harnesses
+
+- Codex (tested)
+- Pi (tested)
+- Claude (untested)
+- Cline (untested)
+- OpenCode (untested)
+
+Supported platforms:
+
+- Linux (tested)
+- macOS (untested)
+
 ## Install from npm
 
-Install the CLI globally so agent harnesses and generated hooks can invoke it:
+Install the CLI globally, then configure Codex:
 
 ```bash
 npm install --global agent-synctex
+agent-synctex install --harness codex
 ```
 
-Verify the executable is available:
+Use `--harness pi` for Pi, `--harness all` to configure every detected harness, or `--local` for project-local configuration. Restart the harness after installation. Check the installation with `agent-synctex doctor --harness codex`.
+
+## Hooks and manual mode
+
+The default hook-enabled installation injects PDF comments into the agent automatically at the appropriate prompt or tool-hook boundary.
+
+If hooks are unavailable or undesired, install manual mode:
 
 ```bash
-agent-synctex --help
+agent-synctex install --harness codex --no-hooks
 ```
 
-Configure one supported harness:
+In manual mode, the agent must explicitly call the `fetch_pdf_context` MCP tool to retrieve pending PDF marks and comments. They are not injected automatically.
+
+## Uninstall
+
+Remove managed harness configuration and hooks, then remove the npm package:
 
 ```bash
-agent-synctex install --harness claude
-```
-
-Replace `claude` with `codex`, `cline`, `pi`, or `opencode`. To configure every detected harness:
-
-```bash
-agent-synctex install --harness all
-```
-
-Restart the configured harness after installation. Check the integration and external commands with:
-
-```bash
-agent-synctex doctor --harness claude
-```
-
-Use `--local` to write project-local harness configuration instead of user-level configuration:
-
-```bash
-agent-synctex install --harness claude --local
-```
-
-To install the MCP config and hooks separately:
-
-```bash
-agent-synctex install mcp --harness claude
-agent-synctex install hooks --harness claude
-```
-
-Upgrade the npm package, then rerun the installer to refresh managed configuration and hooks:
-
-```bash
-npm install --global agent-synctex@latest
-agent-synctex install --harness claude
-```
-
-Uninstall managed configuration and hooks before removing the package:
-
-```bash
-agent-synctex uninstall --harness claude
+agent-synctex uninstall --harness codex
 npm uninstall --global agent-synctex
 ```
+
+Use the same harness and `--local` options used during installation.
 
 ## MCP command
 
 Hook-capable mode, used by installed MCP configs:
 
 ```bash
-agent-synctex mcp --harness claude
+agent-synctex mcp --harness codex
 ```
 
 Pure MCP/manual mode:
 
 ```bash
-agent-synctex mcp --harness claude --no-hooks
+agent-synctex mcp --harness codex --no-hooks
 ```
 
 Install pure MCP mode with:
 
 ```bash
-agent-synctex install --harness claude --no-hooks
+agent-synctex install --harness codex --no-hooks
 ```
 
 ## Tools
