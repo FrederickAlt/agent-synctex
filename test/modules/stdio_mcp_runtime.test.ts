@@ -561,7 +561,10 @@ test("actual agent-synctex mcp entrypoint routes open_pdf to the Viewer Host bou
 		assert.equal(openResponse.result?.content?.[0]?.text, `open_pdf ok: pdf_id=${pdfId}\nPass this Viewer URL to the user: ${viewerUrl}`);
 		assert.doesNotMatch(JSON.stringify(openResponse.result?.details), /127\.0\.0\.1|viewer_url/);
 		assert.equal(viewerUrl.includes(pdfPath), false, "viewer URL must not expose raw PDF paths");
-		assert.match(stderr, /Agent SyncTeX viewer: http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/\d+/);
+		assert.ok(
+			stderr.length === 0 || /Agent SyncTeX viewer: http:\/\/127\.0\.0\.1:\d+\/viewer-lw\/\d+/.test(stderr),
+			"viewer URL fallback must be written to stderr when it is not written directly to the controlling terminal",
+		);
 		const viewer = await fetch(viewerUrl);
 		assert.equal(viewer.status, 200, "returned viewer URL should remain reachable while the Host is alive");
 		const config = await fetch(`${origin}/config/${pdfId}.json`);
