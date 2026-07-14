@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Agent SyncTeX stdio MCP server and harness hook installer for LaTeX PDF workflows with a Viewer Host boundary",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FrederickAlt/agent-synctex.git"
+  },
+  "homepage": "https://github.com/FrederickAlt/agent-synctex#readme",
+  "bugs": {
+    "url": "https://github.com/FrederickAlt/agent-synctex/issues"
+  },
   "type": "module",
   "files": [
     "dist",
@@ -21,6 +29,8 @@
     "test:verbose": "node --test \"test/**/*.test.ts\"",
     "smoke:stdio-viewer": "node --test --test-reporter=spec --test-name-pattern=\"routes open_pdf to the Viewer Host boundary without owning PDF serving\" test/modules/stdio_mcp_runtime.test.ts",
     "verify": "npm run check && npm test",
+    "release:check": "npm run verify && npm pack --dry-run",
+    "prepublishOnly": "npm run verify",
     "prepack": "npm run build",
     "viewer-host": "node scripts/viewer-host-server.ts"
   },

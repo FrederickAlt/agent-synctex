@@ -444,7 +444,11 @@ test("fetch_pdf_context schema is advertised while raw get_pdf_events remains hi
 	assert.equal(tools.find((candidate) => candidate.name === "get_pdf_events"), undefined);
 	const tool = tools.find((candidate) => candidate.name === "fetch_pdf_context");
 	assert.equal(tool?.inputSchema?.properties?.clear, undefined);
-	assert.deepEqual(tool?.inputSchema?.properties?.max_events, { type: "integer", minimum: 1 });
+	assert.deepEqual(tool?.inputSchema?.properties?.max_events, {
+		type: "integer",
+		minimum: 1,
+		description: "Maximum number of pending events to consume.",
+	});
 
 	const accepted = await handleMcpRequest(JSON.stringify({
 		jsonrpc: "2.0",
